@@ -779,6 +779,18 @@
       'Set data cap / expiry': 'Задать лимит / срок',
       'Reset usage counter': 'Сбросить счётчик',
       'Reset usage': 'Сброс счётчика',
+      'Profiles': 'Профили',
+      'Select all': 'Выбрать все',
+      '{} profile(s) selected': 'Выбрано профилей: {}',
+      'Label prefix': 'Префикс названия',
+      'Combined client config': 'Общий конфиг клиента',
+      'Copy all': 'Копировать всё',
+      'Download .conf': 'Скачать .conf',
+      'Generate config': 'Создать конфиг',
+      'The file contains credentials. Import the file or paste all lines into the qeli client.':
+        'Файл содержит учётные данные. Импортируйте файл или вставьте все строки в клиент qeli.',
+      'Select at least one profile': 'Выберите хотя бы один профиль',
+      'Config copied': 'Конфиг скопирован',
 
       // ── i18n audit: config — origins / traffic shaping ──
       '+ Add origin': '+ Добавить origin',

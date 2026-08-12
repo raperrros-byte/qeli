@@ -17,8 +17,9 @@ public static class InputDialog
         var win = new Window
         {
             Title = title, Width = 560, Height = multiline ? 440 : 210,
+            MinWidth = 400, MinHeight = multiline ? 280 : 180,
             WindowStartupLocation = WindowStartupLocation.CenterOwner, Owner = owner,
-            Background = bg, ResizeMode = ResizeMode.CanResize,
+            Background = bg, ResizeMode = ResizeMode.CanResizeWithGrip,
             FontFamily = (FontFamily)Application.Current.FindResource("UiFont"),
         };
 

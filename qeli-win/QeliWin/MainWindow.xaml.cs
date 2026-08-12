@@ -12,10 +12,10 @@ using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Threading;
 using QeliWin.Model;
+using Qeli.Shared;
 using Qeli.Shared.Protocol;
 using QeliWin.Service;
 using QeliWin.Vpn;
-using Qeli.Shared;
 using Qeli.Shared.Model;
 using Qeli.Shared.Vpn;
 
@@ -54,9 +54,18 @@ public partial class MainWindow : Window
     private DispatcherTimer? _serviceTimer;
     private long _serviceLogPos;
 
-    // Live stats (sampled once a second while connected): speed tiles + sparkline.
+    // Live stats (sampled while connected): speed tiles + server metrics charts.
     private DispatcherTimer? _statsTimer;
     private long _prevUp, _prevDown, _prevStatsTick;
+    private readonly Queue<double> _cpuHist = new();
+    private readonly Queue<double> _memHist = new();
+    private readonly ServerMetricsClient _serverMetrics = new();
+    private int _metricsTick;
+    private const int ChartPoints = 60;
+    // Profiles marked via the list checkboxes for bulk delete.
+    private readonly HashSet<string> _checkedProfileIds = new();
+    // Suppress traffic-mode UI handlers while seeding controls from settings.
+    private bool _suppressTrafficUi;
     private ServiceStatus? _svc;                      // last service snapshot (service mode)
     private ICollectionView? _view;                   // profiles view (for search filtering)
 
@@ -91,6 +100,8 @@ public partial class MainWindow : Window
         if (_profiles.Count > 0) Programmatic(() => ProfilesList.SelectedIndex = 0);
         UpdateEmptyHint();
         ApplyTileLabels();
+        InitTrafficModeUi();
+        SyncProfilesToGlobalTrafficMode(reconnect: false);
         CheckReachabilityAll();
         ConfigureProbeTimer(); // start auto-poll (no-op when auto is off)
 
@@ -212,14 +223,40 @@ public partial class MainWindow : Window
 
     private void OnSettings(object sender, RoutedEventArgs e) => OpenSettings();
 
-    private void OpenSettings()
+    private async void OpenSettings()
     {
+        // App-level settings (routing preset, panel credentials, service/autostart policy)
+        // are consumed during tunnel/proxy startup. Preserve the currently running profile
+        // and restart it after Save so the new values take effect immediately.
+        var runningProfile = !_serviceMode
+            && _status is VpnStatus.Connected or VpnStatus.Connecting
+                ? _activeProfile ?? Selected
+                : null;
         bool saved = SettingsWindow.Show(this, _profiles);
         if (saved)
         {
             ApplyServiceSettings();
             ReapplyLanguage(); // language may have changed (live)
             ConfigureProbeTimer(); // auto-poll toggle / interval may have changed
+            ConfigureServerMetricsClient();
+
+            if (runningProfile != null && !_serviceMode)
+            {
+                if (_toggleBusy) return;
+                _toggleBusy = true;
+                ConnectBtn.IsEnabled = false;
+                try
+                {
+                    await Task.Run(() => { try { _tunnel.Stop(); } catch { } });
+                    _activeProfile = runningProfile;
+                    await Task.Run(() => _tunnel.Start(runningProfile));
+                }
+                finally
+                {
+                    _toggleBusy = false;
+                    ConnectBtn.IsEnabled = true;
+                }
+            }
         }
     }
 
@@ -580,6 +617,7 @@ public partial class MainWindow : Window
     {
         ApplyTileLabels();
         RenderStatus(_status, _lastExtra);
+        RefreshTrafficModeLabels();
     }
 
     private void ApplyTileLabels()
@@ -588,6 +626,203 @@ public partial class MainWindow : Window
         UpLabel.Text = "↑ " + Loc.T("StatUpload");
         SessionLabel.Text = "⏱ " + Loc.T("StatSession");
         IpLabel.Text = Loc.T("StatTunnelIp");
+        if (CpuLabel != null) CpuLabel.Text = Loc.T("StatServerCpu");
+        if (MemLabel != null) MemLabel.Text = Loc.T("StatServerMem");
+    }
+
+    // ── global traffic mode (tunnel XOR local proxy → all profiles) ─────────────
+    private void InitTrafficModeUi()
+    {
+        _suppressTrafficUi = true;
+        try
+        {
+            GlobalProxyModeBox.Items.Clear();
+            GlobalProxyModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("ProxyModeMixed"), Tag = "mixed" });
+            GlobalProxyModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("ProxyModeSocks5"), Tag = "socks5" });
+            GlobalProxyModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("ProxyModeHttp"), Tag = "http" });
+
+            var s = AppSettings.Current;
+            bool proxy = s.TrafficMode.Equals("proxy", StringComparison.OrdinalIgnoreCase);
+            ModeTunnelRadio.IsChecked = !proxy;
+            ModeProxyRadio.IsChecked = proxy;
+            ProxyOptsPanel.Visibility = proxy ? Visibility.Visible : Visibility.Collapsed;
+            GlobalProxyPortBox.Text = ClampProxyPort(s.ProxyPort).ToString();
+            SelectProxyModeTag(string.IsNullOrWhiteSpace(s.ProxyMode) ? "mixed" : s.ProxyMode);
+        }
+        finally { _suppressTrafficUi = false; }
+    }
+
+    private void RefreshTrafficModeLabels()
+    {
+        if (TrafficModeLabel == null) return;
+        _suppressTrafficUi = true;
+        try
+        {
+            TrafficModeLabel.Text = Loc.T("TrafficMode");
+            ModeTunnelRadio.Content = Loc.T("TrafficModeTunnel");
+            ModeProxyRadio.Content = Loc.T("TrafficModeProxy");
+            string? tag = (GlobalProxyModeBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "mixed";
+            GlobalProxyModeBox.Items.Clear();
+            GlobalProxyModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("ProxyModeMixed"), Tag = "mixed" });
+            GlobalProxyModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("ProxyModeSocks5"), Tag = "socks5" });
+            GlobalProxyModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("ProxyModeHttp"), Tag = "http" });
+            SelectProxyModeTag(tag);
+        }
+        finally { _suppressTrafficUi = false; }
+    }
+
+    private void SelectProxyModeTag(string tag)
+    {
+        foreach (ComboBoxItem item in GlobalProxyModeBox.Items)
+        {
+            if ((item.Tag as string)?.Equals(tag, StringComparison.OrdinalIgnoreCase) == true)
+            {
+                GlobalProxyModeBox.SelectedItem = item;
+                return;
+            }
+        }
+        if (GlobalProxyModeBox.Items.Count > 0)
+            GlobalProxyModeBox.SelectedIndex = 0;
+    }
+
+    private static int ClampProxyPort(int port) => port is >= 1 and <= 65535 ? port : 1080;
+
+    private VpnConfig ApplyCurrentGlobal(VpnConfig c)
+    {
+        var s = AppSettings.Current;
+        bool proxy = s.TrafficMode.Equals("proxy", StringComparison.OrdinalIgnoreCase);
+        return c.WithGlobalTrafficMode(proxy, $"127.0.0.1:{ClampProxyPort(s.ProxyPort)}",
+            string.IsNullOrWhiteSpace(s.ProxyMode) ? "mixed" : s.ProxyMode.Trim());
+    }
+
+    private void OnTrafficModeChanged(object sender, RoutedEventArgs e)
+    {
+        if (_suppressTrafficUi) return;
+        bool proxy = ModeProxyRadio.IsChecked == true;
+        ProxyOptsPanel.Visibility = proxy ? Visibility.Visible : Visibility.Collapsed;
+        PersistTrafficSettingsFromUi();
+        _ = ApplyTrafficModeAndMaybeReconnectAsync(userInitiated: true);
+    }
+
+    private void OnGlobalProxyOptsChanged(object sender, EventArgs e)
+    {
+        if (_suppressTrafficUi) return;
+        if (ModeProxyRadio.IsChecked != true) return;
+        if (!PersistTrafficSettingsFromUi()) return;
+        _ = ApplyTrafficModeAndMaybeReconnectAsync(userInitiated: true);
+    }
+
+    private void OnGlobalProxyPortKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (e.Key == System.Windows.Input.Key.Enter)
+        {
+            e.Handled = true;
+            OnGlobalProxyOptsChanged(sender, e);
+        }
+    }
+
+    /// <summary>Write main-window traffic controls into AppSettings. Returns false if the
+    /// proxy port is invalid (and shows a toast).</summary>
+    private bool PersistTrafficSettingsFromUi()
+    {
+        var s = AppSettings.Current;
+        s.TrafficMode = ModeProxyRadio.IsChecked == true ? "proxy" : "tunnel";
+        if (s.TrafficMode == "proxy")
+        {
+            if (!int.TryParse(GlobalProxyPortBox.Text.Trim(), out int port) || port is < 1 or > 65535)
+            {
+                Toast.Show(ToastKind.Error, Loc.T("BadProxyPort"), "");
+                GlobalProxyPortBox.Text = ClampProxyPort(s.ProxyPort).ToString();
+                return false;
+            }
+            s.ProxyPort = port;
+            s.ProxyMode = (GlobalProxyModeBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "mixed";
+        }
+        s.Save();
+        return true;
+    }
+
+    private void SyncProfilesToGlobalTrafficMode(bool reconnect) =>
+        _ = ApplyTrafficModeAndMaybeReconnectAsync(userInitiated: false, reconnect);
+
+    private async Task ApplyTrafficModeAndMaybeReconnectAsync(bool userInitiated, bool reconnect = true)
+    {
+        string? selId = Selected?.Id;
+        string? actId = _activeProfile?.Id;
+        bool wasRunning = reconnect
+            && actId != null
+            && !_serviceMode
+            && _status is VpnStatus.Connected or VpnStatus.Connecting;
+
+        Programmatic(() =>
+        {
+            for (int i = 0; i < _profiles.Count; i++)
+                _profiles[i] = ApplyCurrentGlobal(_profiles[i]);
+            if (selId != null)
+                ProfilesList.SelectedItem = _profiles.FirstOrDefault(p => p.Id == selId);
+        });
+        if (actId != null)
+            _activeProfile = _profiles.FirstOrDefault(p => p.Id == actId);
+        ProfileStore.Save(_profiles);
+
+        if (userInitiated)
+            Toast.Show(ToastKind.Info, Loc.T("TrafficModeApplied"), "");
+
+        if (!wasRunning || _activeProfile == null) return;
+        if (_toggleBusy) return;
+        _toggleBusy = true;
+        ConnectBtn.IsEnabled = false;
+        try
+        {
+            await Task.Run(() => { try { _tunnel.Stop(); } catch { } });
+            var p = _activeProfile;
+            ClearLog(p);
+            await Task.Run(() => _tunnel.Start(p));
+        }
+        finally
+        {
+            _toggleBusy = false;
+            ConnectBtn.IsEnabled = true;
+        }
+    }
+
+    // ── bulk profile selection / delete ─────────────────────────────────────────
+    private void OnProfileCheckLoaded(object sender, RoutedEventArgs e)
+    {
+        if (sender is CheckBox cb && cb.DataContext is VpnConfig p)
+            cb.IsChecked = _checkedProfileIds.Contains(p.Id);
+    }
+
+    private void OnProfileCheckClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not CheckBox cb || cb.DataContext is not VpnConfig p) return;
+        if (cb.IsChecked == true) _checkedProfileIds.Add(p.Id);
+        else _checkedProfileIds.Remove(p.Id);
+        DeleteSelectedBtn.IsEnabled = _checkedProfileIds.Count > 0;
+    }
+
+    private async void OnDeleteSelected(object sender, RoutedEventArgs e)
+    {
+        var toDelete = _profiles.Where(p => _checkedProfileIds.Contains(p.Id)).ToList();
+        if (toDelete.Count == 0) return;
+        if (MessageBox.Show(this, Loc.F("DeleteManyConfirm", toDelete.Count), Loc.T("DeleteTitle"),
+                MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+
+        if (toDelete.Any(IsRunning) && !_serviceMode)
+        {
+            await Task.Run(() => { try { _tunnel.Stop(); } catch { } });
+            _activeProfile = null;
+        }
+
+        Programmatic(() =>
+        {
+            foreach (var p in toDelete)
+                _profiles.Remove(p);
+        });
+        foreach (var p in toDelete) _checkedProfileIds.Remove(p.Id);
+        ProfileStore.Save(_profiles);
+        DeleteSelectedBtn.IsEnabled = _checkedProfileIds.Count > 0;
+        UpdateEmptyHint();
     }
 
     // ── search filter ────────────────────────────────────────────────────────────
@@ -724,8 +959,8 @@ public partial class MainWindow : Window
                 cfg.Validate();
                 cfg.Name ??= cfg.ServerAddress;
                 cfg.Id = Guid.NewGuid().ToString("N");
-                _profiles.Add(cfg);
-                last = cfg;
+                _profiles.Add(ApplyCurrentGlobal(cfg));
+                last = _profiles[^1];
             }
             ProfileStore.Save(_profiles);
             if (last != null) PersistAndSelect(last);
@@ -743,8 +978,8 @@ public partial class MainWindow : Window
     {
         var cfg = ConfigEditorWindow.Show(this, null);
         if (cfg == null) return;
-        _profiles.Add(cfg);
-        PersistAndSelect(cfg);
+        _profiles.Add(ApplyCurrentGlobal(cfg));
+        PersistAndSelect(_profiles[^1]);
     }
 
     // Per-card "⋯" menu: Edit / Duplicate / Share-QR / Delete.
@@ -766,7 +1001,7 @@ public partial class MainWindow : Window
     private void OnMenuDuplicate(object sender, RoutedEventArgs e)
     {
         if (Ctx(sender) is not { } p) return;
-        var copy = p.Clone();
+        var copy = ApplyCurrentGlobal(p.Clone());
         copy.Name = p.DisplayName + Loc.T("CopySuffix");
         _profiles.Add(copy);
         PersistAndSelect(copy);
@@ -785,6 +1020,7 @@ public partial class MainWindow : Window
     {
         var edited = ConfigEditorWindow.Show(this, p);
         if (edited == null) return;
+        edited = ApplyCurrentGlobal(edited);
         bool wasRunning = IsRunning(p);
         int idx = _profiles.IndexOf(p);
         // Replacing the item + reselecting it both raise SelectionChanged; suppress the
@@ -995,10 +1231,25 @@ public partial class MainWindow : Window
     {
         var (up, down, _) = StatsSource();
         _prevUp = up; _prevDown = down; _prevStatsTick = Environment.TickCount64;
-        _statsTimer ??= new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        _metricsTick = 0;
+        ConfigureServerMetricsClient();
+        _statsTimer ??= new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
         _statsTimer.Tick -= StatsTick;
         _statsTimer.Tick += StatsTick;
         _statsTimer.Start();
+    }
+
+    private void ConfigureServerMetricsClient()
+    {
+        var s = AppSettings.Current;
+        string url = s.ServerPanelUrl.Trim();
+        if (url.Length == 0)
+        {
+            var host = Selected?.ServerAddress;
+            if (!string.IsNullOrWhiteSpace(host))
+                url = $"http://{host}:8080";
+        }
+        _serverMetrics.Configure(url, s.ServerPanelUser, s.ServerPanelPassword);
     }
 
     private void StopStatsTimer()
@@ -1013,9 +1264,17 @@ public partial class MainWindow : Window
         DownVal.Text = UpVal.Text = SessionVal.Text = IpVal.Text = "—";
         TotalDownVal.Text = TotalUpVal.Text = "—";
         SessionSubVal.Text = IpSubVal.Text = "";
+        if (CpuVal != null) CpuVal.Text = "—";
+        if (MemVal != null) MemVal.Text = "—";
+        if (CpuSubVal != null) CpuSubVal.Text = "";
+        if (MemSubVal != null) MemSubVal.Text = "";
+        _cpuHist.Clear();
+        _memHist.Clear();
+        CpuChart?.Children.Clear();
+        MemChart?.Children.Clear();
     }
 
-    private void StatsTick(object? sender, EventArgs e)
+    private async void StatsTick(object? sender, EventArgs e)
     {
         var (up, down, since) = StatsSource();
         long now = Environment.TickCount64;
@@ -1029,11 +1288,73 @@ public partial class MainWindow : Window
         SessionVal.Text = since is DateTime t ? FormatDuration(DateTime.Now - t) : "—";
         IpVal.Text = string.IsNullOrEmpty(_lastExtra) ? "—" : _lastExtra;
 
-        // Context sub-lines: session totals (since connect), session start, wire mode.
         TotalDownVal.Text = Loc.F("StatTotal", FormatBytes(down));
         TotalUpVal.Text = Loc.F("StatTotal", FormatBytes(up));
-        SessionSubVal.Text = since is DateTime s ? Loc.F("StatSince", s.ToString("HH:mm")) : "";
+        SessionSubVal.Text = since is DateTime s0 ? Loc.F("StatSince", s0.ToString("HH:mm")) : "";
         IpSubVal.Text = Selected?.WireMode ?? "";
+
+        // Poll server panel every ~2s (4 ticks at 500ms).
+        if (++_metricsTick % 4 == 0 && _serverMetrics.IsConfigured)
+        {
+            var sample = await _serverMetrics.FetchAsync().ConfigureAwait(true);
+            if (sample is ServerMetricsSample m)
+            {
+                // CPU: % + nominal busy cores / total cores + loadavg-1m
+                double busyCores = m.Cores > 0 ? m.CpuPct / 100.0 * m.Cores : 0;
+                CpuVal.Text = m.Cores > 0
+                    ? $"{m.CpuPct:0.0}% · {busyCores:0.00}/{m.Cores}"
+                    : $"{m.CpuPct:0.0}%";
+                CpuSubVal.Text = $"load {m.Load1:0.00}";
+
+                // RAM: used/total bytes + %
+                MemVal.Text = m.MemTotal > 0
+                    ? $"{FormatBytes(m.MemUsed)} / {FormatBytes(m.MemTotal)}"
+                    : $"{m.MemPct:0.0}%";
+                MemSubVal.Text = m.MemTotal > 0 ? $"{m.MemPct:0.0}%" : "";
+
+                PushHist(_cpuHist, m.CpuPct);
+                PushHist(_memHist, m.MemPct);
+                DrawSparkline(CpuChart, _cpuHist, Color.FromRgb(0x3B, 0x82, 0xF6));
+                DrawSparkline(MemChart, _memHist, Color.FromRgb(0x22, 0xC5, 0x5E));
+            }
+        }
+    }
+
+    private static void PushHist(Queue<double> q, double v)
+    {
+        q.Enqueue(v);
+        while (q.Count > ChartPoints) q.Dequeue();
+    }
+
+    private static void DrawSparkline(System.Windows.Controls.Canvas? canvas, Queue<double> hist, Color color)
+    {
+        if (canvas == null) return;
+        canvas.Children.Clear();
+        var vals = hist.ToArray();
+        if (vals.Length < 2) return;
+        double w = canvas.ActualWidth > 1 ? canvas.ActualWidth : canvas.Width;
+        if (w <= 1) w = 200;
+        double h = canvas.ActualHeight > 1 ? canvas.ActualHeight : 36;
+        double max = Math.Max(100, vals.Max());
+        var geo = new StreamGeometry();
+        using (var ctx = geo.Open())
+        {
+            for (int i = 0; i < vals.Length; i++)
+            {
+                double x = i * (w - 2) / (vals.Length - 1);
+                double y = h - 2 - (vals[i] / max) * (h - 4);
+                if (i == 0) ctx.BeginFigure(new Point(x, y), false, false);
+                else ctx.LineTo(new Point(x, y), true, false);
+            }
+        }
+        geo.Freeze();
+        canvas.Children.Add(new System.Windows.Shapes.Path
+        {
+            Data = geo,
+            Stroke = new SolidColorBrush(color),
+            StrokeThickness = 1.5,
+            SnapsToDevicePixels = true,
+        });
     }
 
     private static string FormatRate(long bytesPerSec)

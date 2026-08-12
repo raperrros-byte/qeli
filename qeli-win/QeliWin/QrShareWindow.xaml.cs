@@ -15,6 +15,8 @@ public partial class QrShareWindow : Window
         InitializeComponent();
         Owner = owner;
         Icon = owner.Icon;
+        SizeToContent = SizeToContent.Manual;
+        ResizeMode = ResizeMode.CanResize;
         HeaderText.Text = profile.DisplayName;
 
         _link = profile.ToQeliUri();

@@ -13,6 +13,8 @@ public partial class AboutWindow : Window
         InitializeComponent();
         Owner = owner;
         Icon = owner.Icon;
+        SizeToContent = SizeToContent.Manual;
+        ResizeMode = ResizeMode.CanResize;
         LogoImage.Source = Ui.Png(Branding.AppIconPng(96));
         VersionLabel.Text = Loc.F("AboutVersion", AppVersion());
     }

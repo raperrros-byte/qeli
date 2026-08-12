@@ -485,6 +485,26 @@ public sealed class VpnConfig : INotifyPropertyChanged
         // gone, so carrying the marker would reject a profile that is now fine.
     };
 
+    /// <summary>Apply the main-window global traffic mode (full tunnel XOR local proxy) while
+    /// preserving every unrelated field. Proxy mode forces split-tunnel + gateway off so the
+    /// OS default route stays on the physical NIC; tunnel mode restores full-tunnel.</summary>
+    public VpnConfig WithGlobalTrafficMode(bool proxyEnabled, string proxyListen, string proxyMode) =>
+        WithEditorFields(
+            name: Name, serverAddress: ServerAddress, port: Port, protocol: Protocol,
+            wireMode: WireMode, obfsKey: ObfsKey, obfsFronting: ObfsFronting,
+            realityShortId: RealityShortId, sni: Sni, quicEnabled: QuicEnabled,
+            username: Username, password: Password, serverPublicKeyHex: ServerPublicKeyHex,
+            routingMode: proxyEnabled ? "split-tunnel" : "full-tunnel",
+            addDefaultGateway: !proxyEnabled,
+            routeLocalNetworks: RouteLocalNetworks,
+            mtu: Mtu, dnsServers: DnsServers,
+            paddingEnabled: PaddingEnabled, paddingMin: PaddingMin, paddingMax: PaddingMax,
+            heartbeatEnabled: HeartbeatEnabled, heartbeatIntervalMs: HeartbeatIntervalMs,
+            heartbeatJitterMs: HeartbeatJitterMs,
+            proxyEnabled: proxyEnabled,
+            proxyListen: string.IsNullOrWhiteSpace(proxyListen) ? "127.0.0.1:1080" : proxyListen.Trim(),
+            proxyMode: string.IsNullOrWhiteSpace(proxyMode) ? "mixed" : proxyMode.Trim());
+
     /// <summary>Bracket-wrap a bare IPv6 literal for a URI authority (RFC 3986:
     /// <c>qeli://user@[2001:db8::1]:443</c>); IPv4 / hostnames pass through unchanged.</summary>
     private static string UriHost(string host) =>

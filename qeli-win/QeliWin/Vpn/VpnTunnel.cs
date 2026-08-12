@@ -1,5 +1,4 @@
 using System.Net;
-using System.Net.NetworkInformation;
 using System.Text.Json.Nodes;
 using Qeli.Shared.Model;
 using Qeli.Shared.Vpn;
@@ -22,25 +21,11 @@ public sealed class VpnTunnel : VpnTunnelBase
     /// policy in the shared base. (Р2)</summary>
     protected override bool NetworkDnsFailed => _net?.DnsFailed ?? false;
 
-    /// <summary>OS-level Wintun octets (BytesSent = uplink into tunnel, BytesReceived = downlink).</summary>
-    protected override bool TryReadAdapterOctets(uint ifIndex, out long bytesSent, out long bytesReceived)
+    /// <summary>Split-tunnel local proxy: pin dest/32 via TUN for the dial lifetime.</summary>
+    protected override IDisposable? PinProxyHostViaTunnel(IPAddress destination)
     {
-        bytesSent = bytesReceived = 0;
-        if (ifIndex == 0) return false;
-        try
-        {
-            foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
-            {
-                var v4 = ni.GetIPProperties()?.GetIPv4Properties();
-                if (v4 == null || (uint)v4.Index != ifIndex) continue;
-                var s = ni.GetIPStatistics();
-                bytesSent = s.BytesSent;
-                bytesReceived = s.BytesReceived;
-                return true;
-            }
-        }
-        catch { /* fall back to userspace counters */ }
-        return false;
+        if (_net == null || TunIfIndex == 0) return null;
+        return _net.PinHostViaTunnel(destination, TunIfIndex);
     }
 
     // Wintun adapter creation (~10 s) started in the background at connect kickoff so it

@@ -386,6 +386,75 @@ public sealed class NetworkConfigurator : IDisposable
         _log($"exclude {cidr} via physical gateway {gateway}");
     }
 
+    /// <summary>
+    /// Temporary dest/32 via the TUN for local-proxy dials in split-tunnel mode.
+    /// Refcounted so concurrent sessions to the same IP share one route entry.
+    /// </summary>
+    public IDisposable PinHostViaTunnel(IPAddress dest, uint tunIndex)
+    {
+        if (dest.AddressFamily != AddressFamily.InterNetwork)
+            return EmptyLease.Instance;
+        string key = dest.ToString();
+        lock (_pinLock)
+        {
+            if (!_hostPins.TryGetValue(key, out var pin) || pin.Count <= 0)
+            {
+                if (!TryRouteApi(create: true, key, 32, tunIndex)
+                    && !Run("route", $"add {key} mask 255.255.255.255 0.0.0.0 metric 1 if {tunIndex}", optional: true))
+                {
+                    _log($"proxy host-route {key}/32 NOT programmed — dial may fail");
+                    return EmptyLease.Instance;
+                }
+                _hostPins[key] = (1, tunIndex);
+            }
+            else
+                _hostPins[key] = (pin.Count + 1, pin.IfIndex);
+        }
+        return new HostPinLease(this, key, tunIndex);
+    }
+
+    private void ReleaseHostPin(string key, uint tunIndex)
+    {
+        lock (_pinLock)
+        {
+            if (!_hostPins.TryGetValue(key, out var pin)) return;
+            if (pin.Count <= 1)
+            {
+                _hostPins.Remove(key);
+                if (!TryRouteApi(create: false, key, 32, tunIndex))
+                    Run("route", $"delete {key} mask 255.255.255.255", optional: true);
+            }
+            else
+                _hostPins[key] = (pin.Count - 1, pin.IfIndex);
+        }
+    }
+
+    private readonly object _pinLock = new();
+    private readonly Dictionary<string, (int Count, uint IfIndex)> _hostPins = new();
+
+    private sealed class HostPinLease : IDisposable
+    {
+        private NetworkConfigurator? _owner;
+        private readonly string _key;
+        private readonly uint _tunIndex;
+        public HostPinLease(NetworkConfigurator owner, string key, uint tunIndex)
+        {
+            _owner = owner; _key = key; _tunIndex = tunIndex;
+        }
+        public void Dispose()
+        {
+            var o = _owner;
+            _owner = null;
+            o?.ReleaseHostPin(_key, _tunIndex);
+        }
+    }
+
+    private sealed class EmptyLease : IDisposable
+    {
+        public static readonly EmptyLease Instance = new();
+        public void Dispose() { }
+    }
+
     // MIB_IPFORWARD_ROW2 is 104 bytes on x64; we write only the fields we need at
     // their documented offsets and let InitializeIpForwardEntry fill the rest (infinite
     // lifetimes, protocol, …). IPv4 only — AddRoute parses IPv4 CIDRs (IPv6 is captured
@@ -487,6 +556,15 @@ public sealed class NetworkConfigurator : IDisposable
 
     public void Dispose()
     {
+        lock (_pinLock)
+        {
+            foreach (var (key, pin) in _hostPins.ToList())
+            {
+                if (!TryRouteApi(create: false, key, 32, pin.IfIndex))
+                    Run("route", $"delete {key} mask 255.255.255.255", optional: true);
+            }
+            _hostPins.Clear();
+        }
         // Undo in reverse order, best-effort.
         for (int i = _undo.Count - 1; i >= 0; i--)
         {

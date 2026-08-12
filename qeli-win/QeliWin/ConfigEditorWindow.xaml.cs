@@ -25,6 +25,14 @@ public partial class ConfigEditorWindow : Window
         InitializeComponent();
         Owner = owner;
         Icon = owner.Icon;
+        SizeToContent = SizeToContent.Manual;
+        ResizeMode = ResizeMode.CanResize;
+        MinWidth = 420;
+        MinHeight = 280;
+        var wa = SystemParameters.WorkArea;
+        MaxWidth = Math.Max(MinWidth, wa.Width);
+        MaxHeight = Math.Max(MinHeight, wa.Height);
+        if (Height > wa.Height * 0.92) Height = wa.Height * 0.92;
         _base = existing;
 
         if (existing == null)

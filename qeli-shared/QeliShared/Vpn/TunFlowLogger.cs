@@ -5,17 +5,16 @@ using System.Text;
 namespace Qeli.Shared.Vpn;
 
 /// <summary>
-/// Lightweight uplink sniffer: log new TCP destinations (+ DNS query names) from TUN packets.
-/// Deduped so the journal is readable under browse load.
+/// v2rayN-style connection log lines from TUN uplink (full-tunnel / any IP via Wintun).
 /// </summary>
 public static class TunFlowLogger
 {
     private static readonly ConcurrentDictionary<string, long> Recent = new(StringComparer.Ordinal);
     private static long _windowStartMs;
     private static int _windowCount;
-    private const int MaxPerSecond = 25;
-    private const int DedupeMs = 45_000;
-    private const int MaxRecent = 4_000;
+    private const int MaxPerSecond = 80;
+    private const int DedupeMs = 8_000;
+    private const int MaxRecent = 8_000;
 
     public static void ObserveUplink(byte[] pkt, Action<string> log)
     {
@@ -25,7 +24,6 @@ public static class TunFlowLogger
 
         byte proto = pkt[9];
         var dst = new IPAddress(pkt.AsSpan(16, 4));
-        // Skip tunnel/LAN chatter noise.
         if (Geo.GeoIpIndex.IsPrivate(dst)) return;
 
         if (proto == 6) // TCP
@@ -35,8 +33,8 @@ public static class TunFlowLogger
             byte flags = pkt[ihl + 13];
             bool syn = (flags & 0x02) != 0;
             bool ack = (flags & 0x10) != 0;
-            if (!syn || ack) return; // only connection starts
-            Emit(log, $"tunnel → {dst}:{dport}", $"{dst}:{dport}");
+            if (!syn || ack) return;
+            Emit(log, $"from tun accepted tcp:{dst}:{dport} [tunnel -> proxy]", $"tcp:{dst}:{dport}");
             return;
         }
 
@@ -44,10 +42,17 @@ public static class TunFlowLogger
         {
             if (pkt.Length < ihl + 8) return;
             int dport = (pkt[ihl + 2] << 8) | pkt[ihl + 3];
-            if (dport != 53) return;
-            if (!TryParseDnsQueryName(pkt.AsSpan(ihl + 8), out var name) || name.Length == 0)
-                return;
-            Emit(log, $"tunnel DNS → {name}", "dns:" + name);
+            if (dport == 53)
+            {
+                if (!TryParseDnsQueryName(pkt.AsSpan(ihl + 8), out var name) || name.Length == 0)
+                    name = dst.ToString();
+                Emit(log, $"from tun accepted udp:{dst}:53 ({name}) [tunnel -> proxy]", "dns:" + name);
+            }
+            else
+            {
+                // First datagram of a flow (deduped) — covers QUIC / games / etc.
+                Emit(log, $"from tun accepted udp:{dst}:{dport} [tunnel -> proxy]", $"udp:{dst}:{dport}");
+            }
         }
     }
 
@@ -57,7 +62,6 @@ public static class TunFlowLogger
         if (Recent.TryGetValue(key, out var prev) && now - prev < DedupeMs)
             return;
 
-        // sliding 1s rate cap
         long win = Interlocked.Read(ref _windowStartMs);
         if (now - win >= 1000)
         {
@@ -71,7 +75,7 @@ public static class TunFlowLogger
         if (Recent.Count > MaxRecent)
             Prune(now);
 
-        try { log(line); } catch { /* never break the tunnel for a log line */ }
+        try { log(line); } catch { }
     }
 
     private static void Prune(long now)
@@ -87,7 +91,6 @@ public static class TunFlowLogger
     {
         name = "";
         if (dns.Length < 12) return false;
-        // QDCOUNT
         int qd = (dns[4] << 8) | dns[5];
         if (qd < 1) return false;
         int i = 12;
@@ -96,7 +99,7 @@ public static class TunFlowLogger
         {
             int lab = dns[i++];
             if (lab == 0) break;
-            if ((lab & 0xC0) != 0) return false; // compression in QNAME of queries is rare; skip
+            if ((lab & 0xC0) != 0) return false;
             if (i + lab > dns.Length) return false;
             if (sb.Length > 0) sb.Append('.');
             sb.Append(Encoding.ASCII.GetString(dns.Slice(i, lab)));

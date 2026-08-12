@@ -20,6 +20,17 @@ public partial class SettingsWindow : Window
         Owner = owner;
         Icon = owner.Icon;
 
+        // Force resizable dialog even if XAML/theme defaults ever flip SizeToContent/NoResize.
+        SizeToContent = SizeToContent.Manual;
+        ResizeMode = ResizeMode.CanResize;
+        MinWidth = 420;
+        MinHeight = 280;
+        var wa = SystemParameters.WorkArea;
+        MaxWidth = Math.Max(MinWidth, wa.Width);
+        MaxHeight = Math.Max(MinHeight, wa.Height);
+        if (Height > wa.Height * 0.92) Height = wa.Height * 0.92;
+        if (Width > wa.Width * 0.92) Width = wa.Width * 0.92;
+
         var s = AppSettings.Current;
         SelectByTag(LanguageBox, s.Language);
         SelectByTag(ThemeBox, s.Theme);
@@ -35,6 +46,9 @@ public partial class SettingsWindow : Window
 
         FillRoutePresets(s.ProxyRoutePreset);
         RefreshGeoStatus();
+        PanelUrlBox.Text = s.ServerPanelUrl;
+        PanelUserBox.Text = s.ServerPanelUser;
+        PanelPassBox.Password = s.ServerPanelPassword;
 
         // Each item carries the profile's stable Id in Tag; the visible label is DisplayName.
         // Two accounts on one server share a DisplayName but never an Id, so the saved
@@ -169,6 +183,9 @@ public partial class SettingsWindow : Window
             ?? Qeli.Shared.LogTime.Default;
         s.ProxyRoutePreset = ProxyRoutePreset.Normalize(
             (RoutePresetBox.SelectedItem as System.Windows.Controls.ComboBoxItem)?.Tag as string);
+        s.ServerPanelUrl = PanelUrlBox.Text.Trim();
+        s.ServerPanelUser = PanelUserBox.Text.Trim();
+        s.ServerPanelPassword = PanelPassBox.Password;
         s.ToastsEnabled = ToastsBox.IsChecked == true;
         s.CheckForUpdates = UpdatesBox.IsChecked == true;
         s.ProbeReachability = ProbeBox.IsChecked == true;

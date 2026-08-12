@@ -2,7 +2,8 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:QeliWin"
-        Title="Qeli — Quick Easy Link IP" Height="660" Width="980" MinHeight="560" MinWidth="860"
+        Title="Qeli — Quick Easy Link IP" Height="660" Width="980"
+        MinHeight="480" MinWidth="720" ResizeMode="CanResize"
         Background="{DynamicResource Bg}" FontFamily="{DynamicResource UiFont}"
         WindowStartupLocation="CenterScreen">
     <Window.Resources>
@@ -167,12 +168,14 @@
                 </Grid>
             </Border>
 
-            <!-- New / Import — height mirrors the log header bar on the right -->
+            <!-- New / Import / Delete selected -->
             <Grid DockPanel.Dock="Bottom" Height="34" Margin="0,14,0,0">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="8"/>
                     <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="8"/>
+                    <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <Button x:Name="NewBtn" Grid.Column="0" Click="OnNew"
                         Style="{StaticResource AccentButton}" HorizontalAlignment="Stretch">
@@ -193,6 +196,14 @@
                         <TextBlock Text="{local:Loc Import}" VerticalAlignment="Center"/>
                     </StackPanel>
                 </Button>
+                <Button x:Name="DeleteSelectedBtn" Grid.Column="4" Click="OnDeleteSelected"
+                        IsEnabled="False" Padding="12,0" MinWidth="40"
+                        ToolTip="{local:Loc DeleteSelected}">
+                    <Viewbox Width="15" Height="15">
+                        <Path Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                              Data="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
+                    </Viewbox>
+                </Button>
             </Grid>
 
             <Border Background="{DynamicResource Panel}" BorderBrush="{DynamicResource PanelBorder}"
@@ -206,11 +217,16 @@
                                 <Grid>
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="Auto"/>
                                         <ColumnDefinition Width="*"/>
                                         <ColumnDefinition Width="Auto"/>
                                     </Grid.ColumnDefinitions>
 
-                                    <StackPanel Grid.Column="0" Width="44" Margin="0,0,8,0" VerticalAlignment="Center"
+                                    <CheckBox Grid.Column="0" VerticalAlignment="Center" Margin="2,0,6,0"
+                                              Click="OnProfileCheckClick" Loaded="OnProfileCheckLoaded"
+                                              ToolTip="{local:Loc DeleteSelected}"/>
+
+                                    <StackPanel Grid.Column="1" Width="44" Margin="0,0,8,0" VerticalAlignment="Center"
                                                 Background="Transparent" Cursor="Hand"
                                                 ToolTip="{local:Loc CheckReachabilityNow}"
                                                 MouseLeftButtonUp="OnProbeOne">
@@ -221,14 +237,14 @@
                                                    Foreground="{Binding Reachability, Converter={StaticResource ReachConv}}"/>
                                     </StackPanel>
 
-                                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                    <StackPanel Grid.Column="2" VerticalAlignment="Center">
                                         <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" FontSize="14"
                                                    Foreground="{DynamicResource Fg}" TextTrimming="CharacterEllipsis"/>
                                         <TextBlock Text="{Binding Endpoint}" Foreground="{DynamicResource FgDim}"
                                                    FontSize="11.5" Margin="0,2,0,0" TextTrimming="CharacterEllipsis"/>
                                     </StackPanel>
 
-                                    <Button Grid.Column="2" Style="{StaticResource IconButton}" Width="28" Height="28"
+                                    <Button Grid.Column="3" Style="{StaticResource IconButton}" Width="28" Height="28"
                                             Click="OnKebab" Content="⋯" FontSize="16" VerticalAlignment="Center">
                                         <Button.ContextMenu>
                                             <ContextMenu>
@@ -255,6 +271,8 @@
         <!-- ════ RIGHT: hero + stats + log (fills) ════ -->
         <Grid Grid.Column="2">
             <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="*"/>
@@ -294,8 +312,46 @@
                 </Grid>
             </Border>
 
+            <!-- global traffic mode: tunnel XOR local proxy — applies to ALL profiles -->
+            <Border Grid.Row="1" Style="{StaticResource StatTile}" Padding="14,12" Margin="0,14,0,0">
+                <StackPanel>
+                    <TextBlock x:Name="TrafficModeLabel" Text="{local:Loc TrafficMode}"
+                               Style="{StaticResource TileLabel}" Margin="0,0,0,8"/>
+                    <StackPanel Orientation="Horizontal">
+                        <RadioButton x:Name="ModeTunnelRadio" GroupName="TrafficMode"
+                                     Content="{local:Loc TrafficModeTunnel}"
+                                     VerticalAlignment="Center" Margin="0,0,18,0"
+                                     Checked="OnTrafficModeChanged"/>
+                        <RadioButton x:Name="ModeProxyRadio" GroupName="TrafficMode"
+                                     Content="{local:Loc TrafficModeProxy}"
+                                     VerticalAlignment="Center"
+                                     Checked="OnTrafficModeChanged"/>
+                    </StackPanel>
+                    <Grid x:Name="ProxyOptsPanel" Margin="0,10,0,0" Visibility="Collapsed">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="80"/>
+                            <ColumnDefinition Width="16"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Grid.Column="0" Text="{local:Loc FieldProxyPort}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"
+                                   Foreground="{DynamicResource FgDim}" FontSize="12"/>
+                        <TextBox x:Name="GlobalProxyPortBox" Grid.Column="1"
+                                 VerticalContentAlignment="Center" Padding="6,4"
+                                 LostFocus="OnGlobalProxyOptsChanged" KeyDown="OnGlobalProxyPortKeyDown"/>
+                        <TextBlock Grid.Column="3" Text="{local:Loc FieldProxyMode}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"
+                                   Foreground="{DynamicResource FgDim}" FontSize="12"/>
+                        <ComboBox x:Name="GlobalProxyModeBox" Grid.Column="4"
+                                  SelectionChanged="OnGlobalProxyOptsChanged"/>
+                    </Grid>
+                </StackPanel>
+            </Border>
+
             <!-- stat strip: one card, four metrics with a value + context sub-line -->
-            <Border Grid.Row="1" Style="{StaticResource StatTile}" Padding="0" Margin="0,14,0,0">
+            <Border Grid.Row="2" Style="{StaticResource StatTile}" Padding="0" Margin="0,14,0,0">
                 <Grid>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*"/>
@@ -332,8 +388,31 @@
                 </Grid>
             </Border>
 
+            <!-- server CPU / RAM + sparklines -->
+            <Border Grid.Row="3" Style="{StaticResource StatTile}" Padding="12,10" Margin="0,10,0,0">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="16"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0">
+                        <TextBlock x:Name="CpuLabel" Style="{StaticResource TileLabel}"/>
+                        <TextBlock x:Name="CpuVal" Text="—" Style="{StaticResource TileValue}" FontSize="16"/>
+                        <TextBlock x:Name="CpuSubVal" Text="" Style="{StaticResource TileSub}"/>
+                        <Canvas x:Name="CpuChart" Height="36" Margin="0,6,0,0" ClipToBounds="True"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="2">
+                        <TextBlock x:Name="MemLabel" Style="{StaticResource TileLabel}"/>
+                        <TextBlock x:Name="MemVal" Text="—" Style="{StaticResource TileValue}" FontSize="16"/>
+                        <TextBlock x:Name="MemSubVal" Text="" Style="{StaticResource TileSub}"/>
+                        <Canvas x:Name="MemChart" Height="36" Margin="0,6,0,0" ClipToBounds="True"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
             <!-- log — fills the remaining height; the most useful block grows with the window -->
-            <Border Grid.Row="2" Background="{DynamicResource Panel}" BorderBrush="{DynamicResource PanelBorder}"
+            <Border Grid.Row="4" Background="{DynamicResource Panel}" BorderBrush="{DynamicResource PanelBorder}"
                     BorderThickness="1" CornerRadius="12" Margin="0,14,0,0">
                 <DockPanel>
                     <!-- header: title (left), copy/clear + version + about (right) -->

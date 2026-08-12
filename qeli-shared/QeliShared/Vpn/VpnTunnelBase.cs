@@ -92,57 +92,22 @@ public abstract class VpnTunnelBase
     private const int PadCapInner = PadWireCeiling - 60;
 
     // Live byte counters (goodput, IP-payload bytes) for the UI speed readout.
-    // Prefer OS interface octets when available (Wintun GetIPStatistics) — they track
-    // every byte the stack hands the adapter, even if userspace accounting misses a path.
+    // Userspace-only: Wintun GetIPStatistics often stays near zero under load.
     private long _bytesUp;
     private long _bytesDown;
-    private long _ifBaseOut;
-    private long _ifBaseIn;
-    private bool _useIfStats;
 
-    /// <summary>Wintun/utun interface index for OS-level octet counters (0 = unknown).</summary>
+    /// <summary>Wintun/utun interface index (0 = unknown).</summary>
     protected uint TunIfIndex { get; set; }
 
-    public long BytesUp
-    {
-        get
-        {
-            if (_useIfStats && TryReadAdapterOctets(TunIfIndex, out long sent, out _))
-                return Math.Max(0, sent - _ifBaseOut);
-            return Interlocked.Read(ref _bytesUp);
-        }
-    }
+    public long BytesUp => Interlocked.Read(ref _bytesUp);
 
-    public long BytesDown
-    {
-        get
-        {
-            if (_useIfStats && TryReadAdapterOctets(TunIfIndex, out _, out long recv))
-                return Math.Max(0, recv - _ifBaseIn);
-            return Interlocked.Read(ref _bytesDown);
-        }
-    }
+    public long BytesDown => Interlocked.Read(ref _bytesDown);
 
-    /// <summary>Platform: read NIC BytesSent/BytesReceived for <paramref name="ifIndex"/>.</summary>
-    protected virtual bool TryReadAdapterOctets(uint ifIndex, out long bytesSent, out long bytesReceived)
-    {
-        bytesSent = bytesReceived = 0;
-        return false;
-    }
-
-    /// <summary>Reset session totals; snapshot adapter counters if the TUN index is known.</summary>
+    /// <summary>Reset session totals at tunnel-loop start.</summary>
     protected void ResetTrafficCounters()
     {
         Interlocked.Exchange(ref _bytesUp, 0);
         Interlocked.Exchange(ref _bytesDown, 0);
-        _useIfStats = false;
-        _ifBaseOut = _ifBaseIn = 0;
-        if (TunIfIndex != 0 && TryReadAdapterOctets(TunIfIndex, out long sent, out long recv))
-        {
-            _ifBaseOut = sent;
-            _ifBaseIn = recv;
-            _useIfStats = true;
-        }
     }
 
     /// <summary>When the current tunnel reached Connected (for session duration).</summary>
@@ -1152,7 +1117,7 @@ public abstract class VpnTunnelBase
         // reporting Connected, so the UI never shows a green state we are about to tear
         // down; ConnectWithRetry treats it like any other post-TUN failure. (Р2)
         EnforceDnsPolicy(hs.Config);
-        Status(VpnStatus.Connected, DescribeConnected(hs.Session.ClientIp));
+        Status(VpnStatus.Connected, DescribeConnected(serverIp.ToString()));
         StartLocalProxyIfEnabled(hs.Config, hs.Session.ClientIp);
 
         if (hs.Session.MaxStreams > 1 && !string.IsNullOrEmpty(hs.Session.SessionToken))
@@ -1295,7 +1260,7 @@ public abstract class VpnTunnelBase
         // reporting Connected, so the UI never shows a green state we are about to tear
         // down; ConnectWithRetry treats it like any other post-TUN failure. (Р2)
         EnforceDnsPolicy(hs.Config);
-        Status(VpnStatus.Connected, DescribeConnected(hs.Session.ClientIp));
+        Status(VpnStatus.Connected, DescribeConnected(serverIp.ToString()));
         StartLocalProxyIfEnabled(hs.Config, hs.Session.ClientIp);
         Log("TUN ready, entering tunnel loop");
         RunTunnelLoop(hs.Config, transport, hs.Enc, hs.Dec, isUdp,
@@ -2047,13 +2012,24 @@ public abstract class VpnTunnelBase
         {
             StopLocalProxy();
             _localProxy = new LocalProxyService();
-            _localProxy.Start(clientIp, config.ProxyListen, config.ProxyMode, Log);
+            // Split-tunnel on Windows needs per-destination /32 via TUN; full-tunnel already
+            // covers the default path so pin is unnecessary.
+            Func<IPAddress, IDisposable?>? pin = config.IsFullTunnel
+                ? null
+                : PinProxyHostViaTunnel;
+            _localProxy.Start(clientIp, config.ProxyListen, config.ProxyMode, Log, pin);
         }
         catch (Exception e)
         {
             Log($"Local proxy failed to start: {e.Message}");
         }
     }
+
+    /// <summary>
+    /// Platform hook: install a temporary host route so proxy dials exit via the TUN in
+    /// split-tunnel mode. Windows implements this; others may leave the default (null).
+    /// </summary>
+    protected virtual IDisposable? PinProxyHostViaTunnel(IPAddress destination) => null;
 
     private void StopLocalProxy()
     {
@@ -2101,15 +2077,14 @@ public abstract class VpnTunnelBase
             "turn the kill-switch off to connect anyway (leaking DNS).");
     }
 
-    /// <summary>The `extra` string reported alongside <c>Connected</c>: the client IP, plus
-    /// a degraded marker when <see cref="NetworkWarnings"/> is non-empty so the UI cannot
-    /// show an unqualified green for a half-configured tunnel. (C-17)</summary>
-    private string DescribeConnected(string clientIp)
+    /// <summary>The <c>extra</c> string alongside Connected: the server's public/exit IP
+    /// (resolved carrier address), plus a degraded marker when network setup had failures.</summary>
+    private string DescribeConnected(string serverPublicIp)
     {
         var w = NetworkWarnings;
-        if (w.Count == 0) return clientIp;
+        if (w.Count == 0) return serverPublicIp;
         foreach (var line in w) Log($"degraded: {line}");
-        return $"{clientIp} (degraded: {w.Count} network step(s) failed — see log)";
+        return $"{serverPublicIp} (degraded: {w.Count} network step(s) failed — see log)";
     }
 
     // Wake / dead-link detection knobs (shared by the single-path and bonded loops).
@@ -2336,6 +2311,8 @@ public abstract class VpnTunnelBase
                     Interlocked.Exchange(ref lastRx, Environment.TickCount64);
                     if (plaintext.Length > 0)
                     {
+                        // Control frames (0xC1 0x9B …) are not IP — never inject into TUN.
+                        if (CtrlFrame.IsCtrl(plaintext)) continue;
                         tun.SendPacket(plaintext, plaintext.Length);
                         Interlocked.Add(ref _bytesDown, plaintext.Length);
                     }
@@ -2804,7 +2781,11 @@ public abstract class VpnTunnelBase
                         Interlocked.Exchange(ref lastRx, Environment.TickCount64);
                         if (plaintext.Length > 0)
                         {
-                            lock (tunWriteLock) { tun.SendPacket(plaintext, plaintext.Length); }
+                            lock (tunWriteLock)
+                            {
+                                if (CtrlFrame.IsCtrl(plaintext)) continue;
+                                tun.SendPacket(plaintext, plaintext.Length);
+                            }
                             Interlocked.Add(ref _bytesDown, plaintext.Length);
                         }
                     }

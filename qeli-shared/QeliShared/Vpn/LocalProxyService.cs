@@ -8,6 +8,7 @@ namespace Qeli.Shared.Vpn;
 /// <summary>
 /// Local SOCKS5 / HTTP CONNECT proxy: apps connect here, outbound TCP is bound to the
 /// tunnel client IP so traffic exits via the VPN in split-tunnel mode.
+/// Log lines follow v2rayN style: <c>from tcp:peer accepted tcp:host:port [socks -> proxy|direct]</c>.
 /// </summary>
 public sealed class LocalProxyService : IDisposable
 {
@@ -17,14 +18,26 @@ public sealed class LocalProxyService : IDisposable
     private IPAddress _tunnelIp = IPAddress.None;
     private ProxyMode _mode = ProxyMode.Mixed;
     private Action<string>? _log;
+    private Func<IPAddress, IDisposable?>? _pinHostViaTunnel;
     private bool _warnedMissingGeo;
 
     private enum ProxyMode { Socks5, Http, Mixed }
 
-    public void Start(string tunnelClientIp, string listen, string mode, Action<string>? log = null)
+    /// <param name="pinHostViaTunnel">
+    /// Optional: for split-tunnel on Windows, bind-to-TUN alone is not enough — the OS
+    /// still picks the physical default route. Caller installs a temporary dest/32 via the
+    /// TUN for the lease lifetime (refcounted). Null = bind only (Linux/macOS / full-tunnel).
+    /// </param>
+    public void Start(
+        string tunnelClientIp,
+        string listen,
+        string mode,
+        Action<string>? log = null,
+        Func<IPAddress, IDisposable?>? pinHostViaTunnel = null)
     {
         Stop();
         _log = log;
+        _pinHostViaTunnel = pinHostViaTunnel;
         _warnedMissingGeo = false;
         _tunnelIp = IPAddress.Parse(tunnelClientIp);
         _mode = ParseMode(mode);
@@ -34,8 +47,7 @@ public sealed class LocalProxyService : IDisposable
         _cts = new CancellationTokenSource();
         var ct = _cts.Token;
         _acceptTask = Task.Run(() => AcceptLoop(ct), ct);
-        Log($"Local proxy on {listen} ({mode}) — outbound via tunnel IP {tunnelClientIp}; "
-            + "SOCKS/HTTP CONNECT destinations are logged here (point apps at this address)");
+        Log($"Local proxy on {listen} ({mode}) — outbound via tunnel IP {tunnelClientIp}");
     }
 
     public void Stop()
@@ -70,27 +82,30 @@ public sealed class LocalProxyService : IDisposable
     {
         using (client)
         {
+            string peer = "tcp:127.0.0.1:0";
             try
             {
+                if (client.Client.RemoteEndPoint is IPEndPoint ep)
+                    peer = $"tcp:{ep.Address}:{ep.Port}";
                 var stream = client.GetStream();
                 var lead = new byte[1];
                 if (await stream.ReadAsync(lead, ct) != 1) return;
                 int peek = lead[0];
                 if (peek == 0x05 && _mode != ProxyMode.Http)
-                    await Socks5Relay(stream, ct);
+                    await Socks5Relay(stream, peer, ct);
                 else if (_mode != ProxyMode.Socks5)
-                    await HttpRelay(stream, peek, ct);
+                    await HttpRelay(stream, peek, peer, ct);
                 else
-                    Log("Local proxy: expected SOCKS5");
+                    Log($"{peer} rejected: expected SOCKS5");
             }
             catch (Exception e)
             {
-                Log($"Local proxy session: {e.Message}");
+                Log($"{peer} session: {e.Message}");
             }
         }
     }
 
-    private async Task Socks5Relay(NetworkStream client, CancellationToken ct)
+    private async Task Socks5Relay(NetworkStream client, string peer, CancellationToken ct)
     {
         var nmethods = await ReadExact(client, 1, ct);
         if (nmethods.Length == 0) return;
@@ -104,14 +119,21 @@ public sealed class LocalProxyService : IDisposable
             return;
         }
         var (host, port) = await ReadSocks5Target(client, hdr[3], ct);
-        using var upstream = await DialViaTunnel(host, port, "socks5", ct);
+        var decision = Decide(host, port, out var targetIp);
+        Log($"{peer} accepted tcp:{host}:{port} [socks -> {decision.Tag}]");
+        if (decision.Tag == "block")
+        {
+            await client.WriteAsync(new byte[] { 0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }, ct);
+            return;
+        }
+        using var upstream = await Dial(host, port, targetIp, decision.ViaTunnel, ct);
         if (upstream == null)
         {
             await client.WriteAsync(new byte[] { 0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }, ct);
             return;
         }
         await client.WriteAsync(new byte[] { 0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }, ct);
-        await Relay(client, upstream.GetStream(), ct);
+        await Relay(client, upstream.Stream, ct);
     }
 
     private async Task<(string Host, int Port)> ReadSocks5Target(
@@ -135,7 +157,7 @@ public sealed class LocalProxyService : IDisposable
         return (host, port);
     }
 
-    private async Task HttpRelay(NetworkStream client, int firstByte, CancellationToken ct)
+    private async Task HttpRelay(NetworkStream client, int firstByte, string peer, CancellationToken ct)
     {
         var buf = new MemoryStream();
         buf.WriteByte((byte)firstByte);
@@ -154,67 +176,124 @@ public sealed class LocalProxyService : IDisposable
         var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length < 2 || !parts[0].Equals("CONNECT", StringComparison.OrdinalIgnoreCase))
         {
-            Log($"Local proxy HTTP reject method={parts.ElementAtOrDefault(0) ?? "?"} target={parts.ElementAtOrDefault(1) ?? "?"} (CONNECT only)");
+            Log($"{peer} http reject method={parts.ElementAtOrDefault(0) ?? "?"}");
             var deny = Encoding.ASCII.GetBytes("HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n");
             await client.WriteAsync(deny, ct);
             return;
         }
         var (host, port) = ParseHttpHostPort(parts[1]);
-        using var upstream = await DialViaTunnel(host, port, "http-connect", ct);
+        var decision = Decide(host, port, out var targetIp);
+        Log($"{peer} accepted tcp:{host}:{port} [http -> {decision.Tag}]");
+        if (decision.Tag == "block")
+        {
+            await client.WriteAsync(Encoding.ASCII.GetBytes("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"), ct);
+            return;
+        }
+        using var upstream = await Dial(host, port, targetIp, decision.ViaTunnel, ct);
         if (upstream == null) return;
         await client.WriteAsync(Encoding.ASCII.GetBytes("HTTP/1.1 200 Connection Established\r\n\r\n"), ct);
         var headerEnd = text.IndexOf("\r\n\r\n", StringComparison.Ordinal) + 4;
         if (headerEnd < buf.Length)
         {
             var body = buf.ToArray()[(headerEnd)..];
-            if (body.Length > 0) await upstream.GetStream().WriteAsync(body, ct);
+            if (body.Length > 0) await upstream.Stream.WriteAsync(body, ct);
         }
-        await Relay(client, upstream.GetStream(), ct);
+        await Relay(client, upstream.Stream, ct);
     }
 
-    private async Task<TcpClient?> DialViaTunnel(string host, int port, string via, CancellationToken ct)
+    private readonly record struct RouteDecision(string Tag, bool ViaTunnel);
+
+    private RouteDecision Decide(string host, int port, out IPAddress? resolvedIp)
     {
+        resolvedIp = null;
         try
         {
-            IPAddress targetIp;
             if (IPAddress.TryParse(host, out var parsed))
-                targetIp = parsed;
+                resolvedIp = parsed;
             else
             {
-                var addrs = await Dns.GetHostAddressesAsync(host, ct);
-                targetIp = addrs.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork)
-                    ?? throw new InvalidOperationException($"no IPv4 address for {host}");
+                var addrs = Dns.GetHostAddresses(host);
+                resolvedIp = addrs.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork);
             }
+        }
+        catch { /* leave null */ }
 
-            var preset = ProxyRouteConfig.PresetId;
-            bool useProxy = true;
-            if (!string.Equals(preset, ProxyRoutePreset.ProxyAll, StringComparison.Ordinal))
+        var preset = ProxyRouteConfig.PresetId;
+        bool useProxy = true;
+        if (!string.Equals(preset, ProxyRoutePreset.ProxyAll, StringComparison.Ordinal))
+        {
+            var (site, ip) = GeoAssetStore.GetOrLoad(preset);
+            if (site == null || ip == null)
             {
-                var (site, ip) = GeoAssetStore.GetOrLoad(preset);
-                if (site == null || ip == null)
+                if (!_warnedMissingGeo)
                 {
-                    if (!_warnedMissingGeo)
-                    {
-                        _warnedMissingGeo = true;
-                        Log("Local proxy: geo files missing — falling back to proxy-all (download in Settings)");
-                    }
-                    useProxy = true;
+                    _warnedMissingGeo = true;
+                    Log("geo files missing — falling back to proxy-all (download in Settings)");
                 }
-                else
-                    useProxy = ProxyRoutePreset.ShouldProxy(preset, host, targetIp, site, ip);
+                useProxy = true;
             }
+            else
+                useProxy = ProxyRoutePreset.ShouldProxy(preset, host, resolvedIp, site, ip);
+        }
 
-            var path = useProxy ? "proxy" : "direct";
-            Log($"Local proxy → {host}:{port} ({targetIp}) via {via}/{path} [{preset}]");
+        // Ads category in CN whitelist/blacklist presets → block (v2rayN-like).
+        if (!useProxy
+            && (preset == ProxyRoutePreset.BypassCn || preset == ProxyRoutePreset.GfwBlacklist))
+        {
+            var (site, _) = GeoAssetStore.GetOrLoad(preset);
+            if (site != null && site.MatchAny(host, "category-ads-all"))
+                return new RouteDecision("block", false);
+        }
+
+        return useProxy
+            ? new RouteDecision("proxy", true)
+            : new RouteDecision("direct", false);
+    }
+
+    /// <summary>Upstream TCP plus optional temporary TUN host-route lease.</summary>
+    private sealed class UpstreamConn : IDisposable
+    {
+        private readonly TcpClient _client;
+        private readonly IDisposable? _routeLease;
+        public NetworkStream Stream => _client.GetStream();
+        public UpstreamConn(TcpClient client, IDisposable? routeLease)
+        {
+            _client = client;
+            _routeLease = routeLease;
+        }
+        public void Dispose()
+        {
+            try { _client.Dispose(); } catch { }
+            try { _routeLease?.Dispose(); } catch { }
+        }
+    }
+
+    private async Task<UpstreamConn?> Dial(string host, int port, IPAddress? knownIp, bool viaTunnel, CancellationToken ct)
+    {
+        IDisposable? routeLease = null;
+        try
+        {
+            IPAddress targetIp = knownIp
+                ?? (IPAddress.TryParse(host, out var p) ? p : null)
+                ?? (await Dns.GetHostAddressesAsync(host, ct))
+                    .FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork)
+                ?? throw new InvalidOperationException($"no IPv4 address for {host}");
+
+            // Split-tunnel Windows: without a dest/32 via TUN, Connect from the tunnel IP
+            // fails (WSAEACCES) because the default route stays on the physical NIC.
+            if (viaTunnel && _pinHostViaTunnel != null)
+                routeLease = _pinHostViaTunnel(targetIp);
+
             var client = new TcpClient(AddressFamily.InterNetwork);
-            if (useProxy)
+            if (viaTunnel)
                 client.Client.Bind(new IPEndPoint(_tunnelIp, 0));
             await client.ConnectAsync(new IPEndPoint(targetIp, port), ct);
-            return client;
+            return new UpstreamConn(client, routeLease);
         }
         catch (Exception e)
         {
-            Log($"Local proxy FAIL {host}:{port}: {e.Message}");
+            try { routeLease?.Dispose(); } catch { }
+            Log($"FAIL tcp:{host}:{port}: {e.Message}");
             return null;
         }
     }

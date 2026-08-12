@@ -128,7 +128,9 @@ public static class CliRunner
             cfg.Password == "CHANGEME" && cfg.Sni == "www.microsoft.com" &&
             cfg.ServerPublicKeyHex == "7ff1c27410a4f36f5306554a9ff3bd486c2692f4e40ed57c78c18c90638b2057" &&
             cfg.Name == "Client 1");
-
+        var bundle = VpnConfig.ParseMany(link + "\n" + link.Replace(":443?", ":8443?"));
+        Check("multi-profile qeli:// bundle import",
+            bundle.Count == 2 && bundle[0].Port == 443 && bundle[1].Port == 8443);
 
         // Cross-implementation conformance: the same fixtures the Rust/Kotlin/Swift suites
         // run, so a divergence between the four qeli:// parsers fails here instead of

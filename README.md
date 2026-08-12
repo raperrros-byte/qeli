@@ -1,23 +1,54 @@
 # Qeli
 
-> **Fork notice / Изменения относительно upstream**  
-> Upstream (автор): [litvinovtd/qeli](https://github.com/litvinovtd/qeli)  
-> This fork: [raperrros-byte/qeli](https://github.com/raperrros-byte/qeli)  
-> Maintainer of this fork: Daniil Nekrasov \<raperrros@yandex.ru\>
+> **Fork notice — отличия от upstream**
 >
-> По сравнению с версией автора в этом форке добавлено и изменено:
+> Upstream (оригинальный автор): [litvinovtd/qeli](https://github.com/litvinovtd/qeli)
 >
-> - **Локальный SOCKS5 / HTTP CONNECT прокси** в клиентах (Rust CLI + C# Win/Mac):  
->   `proxy` / `proxy_listen` / `proxy_mode` — per-app трафик через туннель при split-tunnel (`gateway = false`).
-> - **Маршрутизация локального прокси как в v2rayN**: пресеты  
->   RUv1 (всё / всё кроме РФ / заблокированное) и V4 (绕过大陆 / 黑名单 / глобал),  
->   geosite.dat / geoip.dat (скачивание из Settings), решение proxy vs direct на каждое соединение.
-> - **Журнал назначений**: лог `Local proxy → host` и uplink из TUN (`tunnel → ip:port`, `tunnel DNS → …`).
-> - **Скорость в UI**: учёт байтов по OS-счётчикам адаптера Wintun; для full-tunnel metric=1 по умолчанию.
-> - **Импорт нескольких профилей** из одного `.conf` / `.ini` (несколько секций `[qeli]`).
-> - UI профиля: включение прокси, порт, режим (Win/Mac).
+> Этот форк: [raperrros-byte/qeli](https://github.com/raperrros-byte/qeli)
 >
-> Production Docker-пакет с живыми паролями/ключами **не** входит в git (см. `.gitignore`: `release/docker/deploy/`).
+> Maintained by: Daniil Nekrasov \<raperrros@yandex.ru\>
+>
+> Updated: 2026-08-12
+>
+> База сравнения — upstream `v0.7.14`. В форке добавлено (новые сверху):
+>
+> - **Режим трафика на главном экране (Windows):** туннель XOR локальный SOCKS/HTTP
+>   прокси (порт/режим) применяется сразу ко **всем** профилям; при активном
+>   соединении выполняется reconnect.
+> - **Массовое удаление профилей (Windows):** чекбоксы в списке + удаление выбранных.
+> - **Локальный SOCKS5 и HTTP CONNECT прокси** в Rust CLI и клиентах Windows/macOS.
+>   Ключи `proxy`, `proxy_listen`, `proxy_mode` дают per-app туннелирование при
+>   split-tunnel на уровне ОС (`gateway = false`).
+> - **Рабочий Windows split-proxy routing.** Для адресов через прокси временно ставятся
+>   reference-counted маршруты `/32` через Wintun на время соединения; при закрытии или
+>   disconnect они снимаются. Иначе физический default route перехватывает сокеты,
+>   привязанные к адресу туннеля.
+> - **Пресеты маршрутизации прокси в стиле v2rayN:** proxy all, bypass Russia,
+>   только заблокированные в РФ, bypass mainland China, GFW blacklist. Окно Settings
+>   скачивает `geosite.dat` / `geoip.dat`; каждое соединение классифицируется как
+>   proxy / direct / blocked.
+> - **Журнал соединений** для proxy и TUN: принятые SOCKS/HTTP цели, решения
+>   proxy/direct, TCP/UDP потоки через TUN и DNS-цели туннеля видны в логе десктопа.
+> - **Мультипрофильный импорт/экспорт.** Windows/macOS принимают несколько секций
+>   `[qeli]` или несколько `qeli://` из одного `.conf` / `.ini` / текста / буфера.
+>   Веб-панель умеет выбрать все профили пользователя, скопировать пачкой или скачать
+>   один `.conf` с учётками.
+> - **Живая телеметрия Windows:** корректные userspace счётчики байт/скорости туннеля
+>   (вместо ненадёжных счётчиков Wintun), итоги сессии, публичный IP сервера и графики
+>   CPU/RAM с panel API. CPU — процент, занятые/всего ядра и load; RAM — used/total и %.
+> - **Управление прокси в GUI:** вкл/выкл, порт, режим SOCKS5/HTTP/mixed, учётные данные
+>   панели, geo-пресеты маршрутизации.
+> - **Мгновенное применение настроек.** Сохранение Settings переподключает активный
+>   туннель, чтобы новые параметры proxy/routing вступили в силу без ручного disconnect.
+> - **Изменяемые размеры окон Windows:** Settings, редактор профиля, QR/share, About и
+>   текстовый ввод; длинные формы скроллятся, кнопки действий остаются видимыми.
+> - **Надёжность маршрутизации Windows:** full-tunnel по умолчанию с interface metric `1`,
+>   host-маршруты прокси детерминированно чистятся при teardown туннеля.
+> - **Операционные хелперы:** скрипты запуска/остановки браузера с отдельным локальным
+>   прокси и повторяемые Docker-проверки прокси.
+>
+> Прод-данные с живыми паролями/ключами в Git **не** попадают (см. `.gitignore`:
+> `release/docker/deploy/` и локальные lab-secret файлы).
 
 **Qeli** (Quick Easy Link IP) — a self-hosted VPN with its own L4 protocol and built-in
 obfuscation over TCP or UDP. It aims at resilience against passive / signature-based DPI
