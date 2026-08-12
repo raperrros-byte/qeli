@@ -44,6 +44,8 @@ public abstract class VpnTunnelBase
     // True once an established tunnel is up; used to detect a server-side drop.
     private volatile bool _wasConnected;
 
+    private LocalProxyService? _localProxy;
+
     // 1 while the firewall kill-switch is engaged (so the teardown lifts exactly what
     // Start() raised). The kill-switch is raised ONCE before the connect loop and
     // stays up across reconnects — see KillSwitchEngage/Disengage.
@@ -90,10 +92,58 @@ public abstract class VpnTunnelBase
     private const int PadCapInner = PadWireCeiling - 60;
 
     // Live byte counters (goodput, IP-payload bytes) for the UI speed readout.
+    // Prefer OS interface octets when available (Wintun GetIPStatistics) — they track
+    // every byte the stack hands the adapter, even if userspace accounting misses a path.
     private long _bytesUp;
     private long _bytesDown;
-    public long BytesUp => Interlocked.Read(ref _bytesUp);
-    public long BytesDown => Interlocked.Read(ref _bytesDown);
+    private long _ifBaseOut;
+    private long _ifBaseIn;
+    private bool _useIfStats;
+
+    /// <summary>Wintun/utun interface index for OS-level octet counters (0 = unknown).</summary>
+    protected uint TunIfIndex { get; set; }
+
+    public long BytesUp
+    {
+        get
+        {
+            if (_useIfStats && TryReadAdapterOctets(TunIfIndex, out long sent, out _))
+                return Math.Max(0, sent - _ifBaseOut);
+            return Interlocked.Read(ref _bytesUp);
+        }
+    }
+
+    public long BytesDown
+    {
+        get
+        {
+            if (_useIfStats && TryReadAdapterOctets(TunIfIndex, out _, out long recv))
+                return Math.Max(0, recv - _ifBaseIn);
+            return Interlocked.Read(ref _bytesDown);
+        }
+    }
+
+    /// <summary>Platform: read NIC BytesSent/BytesReceived for <paramref name="ifIndex"/>.</summary>
+    protected virtual bool TryReadAdapterOctets(uint ifIndex, out long bytesSent, out long bytesReceived)
+    {
+        bytesSent = bytesReceived = 0;
+        return false;
+    }
+
+    /// <summary>Reset session totals; snapshot adapter counters if the TUN index is known.</summary>
+    protected void ResetTrafficCounters()
+    {
+        Interlocked.Exchange(ref _bytesUp, 0);
+        Interlocked.Exchange(ref _bytesDown, 0);
+        _useIfStats = false;
+        _ifBaseOut = _ifBaseIn = 0;
+        if (TunIfIndex != 0 && TryReadAdapterOctets(TunIfIndex, out long sent, out long recv))
+        {
+            _ifBaseOut = sent;
+            _ifBaseIn = recv;
+            _useIfStats = true;
+        }
+    }
 
     /// <summary>When the current tunnel reached Connected (for session duration).</summary>
     public DateTime? ConnectedSince { get; private set; }
@@ -135,7 +185,8 @@ public abstract class VpnTunnelBase
             _stoppedForSecurityReason = false;
             _wasConnected = false;
             _lastNetSig = PhysicalNetSignature(); // baseline: physical net at connect (TUN excluded)
-            _bytesUp = 0; _bytesDown = 0;
+            TunIfIndex = 0;
+            ResetTrafficCounters();
             ConnectedSince = null;
             _cts = new CancellationTokenSource();
             var ct = _cts.Token;
@@ -474,6 +525,7 @@ public abstract class VpnTunnelBase
         try { _udp?.Close(); } catch { }
         _tcp = null; _udp = null;
         if (keepTun) return;  // persist-tun: keep _tun + routes alive for the next attempt
+        StopLocalProxy();
         try { _tun?.Dispose(); } catch { }
         CleanupPlatform();
         _tun = null;
@@ -1101,6 +1153,7 @@ public abstract class VpnTunnelBase
         // down; ConnectWithRetry treats it like any other post-TUN failure. (Р2)
         EnforceDnsPolicy(hs.Config);
         Status(VpnStatus.Connected, DescribeConnected(hs.Session.ClientIp));
+        StartLocalProxyIfEnabled(hs.Config, hs.Session.ClientIp);
 
         if (hs.Session.MaxStreams > 1 && !string.IsNullOrEmpty(hs.Session.SessionToken))
         {
@@ -1243,6 +1296,7 @@ public abstract class VpnTunnelBase
         // down; ConnectWithRetry treats it like any other post-TUN failure. (Р2)
         EnforceDnsPolicy(hs.Config);
         Status(VpnStatus.Connected, DescribeConnected(hs.Session.ClientIp));
+        StartLocalProxyIfEnabled(hs.Config, hs.Session.ClientIp);
         Log("TUN ready, entering tunnel loop");
         RunTunnelLoop(hs.Config, transport, hs.Enc, hs.Dec, isUdp,
             EffectiveMtu(hs.Config.Mtu, hs.Session.PushedMtu), ct);
@@ -1983,6 +2037,30 @@ public abstract class VpnTunnelBase
     }
 
     // -- TUN + network setup (platform-specific; implemented by the per-OS subclass) --
+    private void StartLocalProxyIfEnabled(VpnConfig config, string clientIp)
+    {
+        if (!config.ProxyEnabled) return;
+        if (config.IsFullTunnel)
+            Log("NOTE: proxy = true with gateway = true — prefer gateway = false so only "
+                + "apps using the local proxy go through the tunnel");
+        try
+        {
+            StopLocalProxy();
+            _localProxy = new LocalProxyService();
+            _localProxy.Start(clientIp, config.ProxyListen, config.ProxyMode, Log);
+        }
+        catch (Exception e)
+        {
+            Log($"Local proxy failed to start: {e.Message}");
+        }
+    }
+
+    private void StopLocalProxy()
+    {
+        try { _localProxy?.Dispose(); } catch { }
+        _localProxy = null;
+    }
+
     /// <summary>Open the platform TUN device, assign addressing/routes/DNS for this session
     /// and pin the server route, then store the opened device in <c>_tun</c>.</summary>
     protected abstract void SetupTun(VpnConfig config, Session session, IPAddress serverIp);
@@ -2153,6 +2231,7 @@ public abstract class VpnTunnelBase
 
         ReportTunnelMtu(transport, enc, effectiveMtu, isUdp, ct);
         ReportClientInfo(transport, enc);
+        ResetTrafficCounters(); // baseline after TUN is up so session totals start at 0
 
         // Poll the UDP RX path every WatchdogPollMs (not once per rxDead) so suspend/resume
         // and dead-session detection run promptly — the read simply times out when idle.
@@ -2198,6 +2277,7 @@ public abstract class VpnTunnelBase
                     catch (Exception) when (isUdp) { continue; } // drop-on-egress-error (UDP loss)
                     Interlocked.Add(ref _bytesUp, pkt.Length);
                     Interlocked.Exchange(ref lastTx, Environment.TickCount64); // user uplink is flowing
+                    TunFlowLogger.ObserveUplink(pkt, Log);
                     if (upStealth)
                     {
                         long remaining = upShaper.StealthPaceMs(pkt.Length);
@@ -2656,6 +2736,7 @@ public abstract class VpnTunnelBase
         ReportTunnelMtu(primary.Transport, primary.Enc,
             EffectiveMtu(config.Mtu, session.PushedMtu), isUdp: false, lct);
         ReportClientInfo(primary.Transport, primary.Enc);
+        ResetTrafficCounters();
         // Do NOT re-resolve config.ServerAddress here: in full-tunnel SetupTun has already
         // redirected the default route and DNS into the tunnel, so a hostname lookup fails
         // ("No such host is known") and tears the whole session down (issue #69). Bonded
@@ -2839,7 +2920,13 @@ public abstract class VpnTunnelBase
                     // Bonded streams are TCP, so they take the same fixed per-packet padding
                     // cap as the single-stream TCP path — Encrypt() applied the server-pushed
                     // padding_max verbatim. (Audit 2026-07-27, N2)
-                    try { s.Transport.Send(s.Enc.EncryptCapped(pkt, PadCapInner)); Interlocked.Add(ref _bytesUp, pkt.Length); Interlocked.Exchange(ref lastTx, Environment.TickCount64); }
+                    try
+                    {
+                        s.Transport.Send(s.Enc.EncryptCapped(pkt, PadCapInner));
+                        Interlocked.Add(ref _bytesUp, pkt.Length);
+                        Interlocked.Exchange(ref lastTx, Environment.TickCount64);
+                        TunFlowLogger.ObserveUplink(pkt, Log);
+                    }
                     catch (Exception e) { OnStreamDeath(s, e); }
                 }
             }

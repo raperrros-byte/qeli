@@ -21,6 +21,8 @@ public sealed class AppSettings
     public bool StartMinimized { get; set; }            // start hidden in the tray
     public bool ServiceEnabled { get; set; }            // desired: run as a Windows service
     public string? ServiceProfile { get; set; }         // profile the Windows service runs
+    // Local SOCKS/HTTP proxy routing (v2rayN-like). See Qeli.Shared.Geo.ProxyRoutePreset.
+    public string ProxyRoutePreset { get; set; } = "proxy-all";
 
     private static readonly string Dir =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "QeliWin");

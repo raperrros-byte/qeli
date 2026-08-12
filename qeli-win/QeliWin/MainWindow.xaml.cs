@@ -417,7 +417,7 @@ public partial class MainWindow : Window
     }
 
     private void OnLog(string line) =>
-        Dispatcher.Invoke(() =>
+        Dispatcher.BeginInvoke(() =>
         {
             // A line belongs to the RUNNING profile (its reconnect loop is what emits them);
             // when nothing is running it belongs to the selected profile. The stamp shape
@@ -690,14 +690,47 @@ public partial class MainWindow : Window
 
     private void OnImport(object sender, RoutedEventArgs e)
     {
-        var text = InputDialog.Show(this, Loc.T("ImportTitle"), Loc.T("ImportPrompt"), "", multiline: true);
+        // Open file first (multi-profile .conf). Cancel → paste dialog.
+        string? text = null;
+        var dlg = new Microsoft.Win32.OpenFileDialog
+        {
+            Title = Loc.T("ImportTitle"),
+            Filter = Loc.T("ImportFileFilter"),
+            CheckFileExists = true,
+            Multiselect = true,
+        };
+        if (dlg.ShowDialog(this) == true)
+        {
+            var sb = new System.Text.StringBuilder();
+            foreach (var path in dlg.FileNames)
+            {
+                sb.AppendLine(System.IO.File.ReadAllText(path));
+                sb.AppendLine();
+            }
+            text = sb.ToString();
+        }
+        else
+        {
+            text = InputDialog.Show(this, Loc.T("ImportTitle"), Loc.T("ImportPrompt"), "", multiline: true);
+        }
         if (string.IsNullOrWhiteSpace(text)) return;
         try
         {
-            var cfg = VpnConfig.Parse(text.Trim());
-            cfg.Name ??= cfg.ServerAddress;
-            _profiles.Add(cfg);
-            PersistAndSelect(cfg);
+            var list = VpnConfig.ParseMany(text);
+            if (list.Count == 0) throw new ArgumentException("no profiles found");
+            VpnConfig? last = null;
+            foreach (var cfg in list)
+            {
+                cfg.Validate();
+                cfg.Name ??= cfg.ServerAddress;
+                cfg.Id = Guid.NewGuid().ToString("N");
+                _profiles.Add(cfg);
+                last = cfg;
+            }
+            ProfileStore.Save(_profiles);
+            if (last != null) PersistAndSelect(last);
+            MessageBox.Show(this, Loc.F("ImportOk", list.Count), Loc.T("ImportTitle"),
+                MessageBoxButton.OK, MessageBoxImage.Information);
         }
         catch (Exception ex)
         {

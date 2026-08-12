@@ -2,14 +2,15 @@ using System.Windows;
 using QeliWin.Model;
 using QeliWin.Service;
 using Qeli.Shared;
+using Qeli.Shared.Geo;
 using Qeli.Shared.Model;
 
 namespace QeliWin;
 
 /// <summary>
-/// Settings dialog: toasts, Windows-service mode (+ its profile), and GUI autostart/
-/// auto-connect. Persists to <see cref="AppSettings"/>; the service install/uninstall
-/// itself is applied by MainWindow after the dialog closes (it coordinates the tunnel).
+/// Settings dialog: toasts, Windows-service mode (+ its profile), GUI autostart/
+/// auto-connect, and local-proxy routing presets. Persists to <see cref="AppSettings"/>;
+/// the service install/uninstall itself is applied by MainWindow after the dialog closes.
 /// </summary>
 public partial class SettingsWindow : Window
 {
@@ -32,6 +33,9 @@ public partial class SettingsWindow : Window
         AutoConnectBox.IsChecked = s.AutoConnect;
         StartMinBox.IsChecked = s.StartMinimized;
 
+        FillRoutePresets(s.ProxyRoutePreset);
+        RefreshGeoStatus();
+
         // Each item carries the profile's stable Id in Tag; the visible label is DisplayName.
         // Two accounts on one server share a DisplayName but never an Id, so the saved
         // service/auto-connect selection resolves to the RIGHT one (see VpnConfig.Id).
@@ -53,6 +57,52 @@ public partial class SettingsWindow : Window
     {
         var w = new SettingsWindow(owner, profiles);
         return w.ShowDialog() == true;
+    }
+
+    private void FillRoutePresets(string selectedId)
+    {
+        RoutePresetBox.Items.Clear();
+        var ru = Loc.Lang == "ru";
+        foreach (var p in ProxyRoutePreset.All)
+        {
+            RoutePresetBox.Items.Add(new System.Windows.Controls.ComboBoxItem
+            {
+                Content = ru ? p.Ru : p.En,
+                Tag = p.Id,
+            });
+        }
+        SelectByTag(RoutePresetBox, ProxyRoutePreset.Normalize(selectedId));
+    }
+
+    private void RefreshGeoStatus()
+    {
+        GeoStatusText.Text = GeoAssetStore.HasFiles
+            ? GeoAssetStore.StatusText()
+            : Loc.T("GeoNotDownloaded");
+    }
+
+    private async void OnGeoDownload(object sender, RoutedEventArgs e)
+    {
+        GeoDownloadBtn.IsEnabled = false;
+        GeoStatusText.Text = Loc.T("GeoDownloading");
+        try
+        {
+            await GeoAssetStore.DownloadAsync(msg =>
+                Dispatcher.Invoke(() => GeoStatusText.Text = msg)).ConfigureAwait(true);
+            RefreshGeoStatus();
+            MessageBox.Show(this, Loc.T("GeoDownloadOk"), Loc.T("Settings"),
+                MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        catch (Exception ex)
+        {
+            RefreshGeoStatus();
+            MessageBox.Show(this, Loc.F("GeoDownloadFail", ex.Message), Loc.T("Settings"),
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+        finally
+        {
+            GeoDownloadBtn.IsEnabled = true;
+        }
     }
 
     // Select the item whose Tag matches the saved profile Id. Fall back to matching the
@@ -117,6 +167,8 @@ public partial class SettingsWindow : Window
         s.LogTimeFormat =
             (LogTimeBox.SelectedItem as System.Windows.Controls.ComboBoxItem)?.Tag as string
             ?? Qeli.Shared.LogTime.Default;
+        s.ProxyRoutePreset = ProxyRoutePreset.Normalize(
+            (RoutePresetBox.SelectedItem as System.Windows.Controls.ComboBoxItem)?.Tag as string);
         s.ToastsEnabled = ToastsBox.IsChecked == true;
         s.CheckForUpdates = UpdatesBox.IsChecked == true;
         s.ProbeReachability = ProbeBox.IsChecked == true;
@@ -128,6 +180,9 @@ public partial class SettingsWindow : Window
         s.AutoConnectProfile = (AutoProfileBox.SelectedItem as System.Windows.Controls.ComboBoxItem)?.Tag as string;
         s.StartMinimized = StartMinBox.IsChecked == true;
         s.Save();
+
+        ProxyRouteConfig.PresetId = s.ProxyRoutePreset;
+        GeoAssetStore.Invalidate();
 
         Loc.SetLanguage(s.Language);  // live switch (updates all {l:Loc} bindings)
         ThemeManager.Apply();         // live theme switch (updates DynamicResource brushes)

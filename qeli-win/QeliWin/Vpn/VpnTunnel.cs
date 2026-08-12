@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Text.Json.Nodes;
 using Qeli.Shared.Model;
 using Qeli.Shared.Vpn;
@@ -20,6 +21,27 @@ public sealed class VpnTunnel : VpnTunnelBase
     /// <summary>DNS apply failure from the platform configurator — gates the kill-switch
     /// policy in the shared base. (Р2)</summary>
     protected override bool NetworkDnsFailed => _net?.DnsFailed ?? false;
+
+    /// <summary>OS-level Wintun octets (BytesSent = uplink into tunnel, BytesReceived = downlink).</summary>
+    protected override bool TryReadAdapterOctets(uint ifIndex, out long bytesSent, out long bytesReceived)
+    {
+        bytesSent = bytesReceived = 0;
+        if (ifIndex == 0) return false;
+        try
+        {
+            foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                var v4 = ni.GetIPProperties()?.GetIPv4Properties();
+                if (v4 == null || (uint)v4.Index != ifIndex) continue;
+                var s = ni.GetIPStatistics();
+                bytesSent = s.BytesSent;
+                bytesReceived = s.BytesReceived;
+                return true;
+            }
+        }
+        catch { /* fall back to userspace counters */ }
+        return false;
+    }
 
     // Wintun adapter creation (~10 s) started in the background at connect kickoff so it
     // overlaps the handshake (PrewarmTun) and SetupTun just consumes it. _prewarmId pins the
@@ -78,13 +100,18 @@ public sealed class VpnTunnel : VpnTunnelBase
         }
         var (tunIndex, alias) = _net.ResolveInterface(wintun.Luid);
         Log($"Wintun adapter '{alias}' (if {tunIndex}, driver {drv >> 16}.{drv & 0xFF})");
+        TunIfIndex = tunIndex;
         _tun = wintun;
 
         _net.SetAddress(alias, session.ClientIp, session.Prefix);
         int mtu = EffectiveMtu(config.Mtu, session.PushedMtu);  // explicit > pushed > 1400
         Log($"TUN MTU: {mtu}");
         _net.SetMtu(alias, mtu);
-        if (config.InterfaceMetric > 0) _net.SetMetric(wintun.Luid, alias, config.InterfaceMetric);  // OpenVPN route-metric (IPv4+IPv6)
+        // Prefer the tunnel over any competing VPN/NIC. Explicit InterfaceMetric wins;
+        // full-tunnel defaults to metric 1 so 0.0.0.0/1 routes actually carry traffic.
+        int metric = config.InterfaceMetric > 0 ? config.InterfaceMetric
+            : (config.IsFullTunnel ? 1 : 0);
+        if (metric > 0) _net.SetMetric(wintun.Luid, alias, metric);
 
         // Pin the carrier route to the server through the physical gateway BEFORE we hijack
         // the default route, so the encrypted tunnel never loops on itself. But when `local`

@@ -625,6 +625,55 @@ fn physical_dev_for(server_addr: &str) -> Option<String> {
     None
 }
 
+/// Policy routing for local proxy mode in split-tunnel: sockets bound to the tunnel
+/// IP/device must reach arbitrary destinations through the VPN without turning the
+/// whole host into full-tunnel.
+pub fn setup_proxy_policy_routes(
+    client_ip: &str,
+    ifname: &str,
+    gateway: &str,
+) -> anyhow::Result<()> {
+    const TABLE: &str = "100";
+    let output = std::process::Command::new("ip")
+        .args([
+            "rule", "add", "from", client_ip, "table", TABLE, "priority", "50",
+        ])
+        .output()?;
+    if output.status.success() {
+        note_created(&["rule", "del", "from", client_ip, "table", TABLE]);
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("File exists") {
+            anyhow::bail!(
+                "proxy: could not install policy rule from {client_ip}: {}",
+                stderr.trim()
+            );
+        }
+    }
+    for half in ["0.0.0.0/1", "128.0.0.0/1"] {
+        let output = std::process::Command::new("ip")
+            .args([
+                "route", "add", half, "via", gateway, "dev", ifname, "table", TABLE,
+            ])
+            .output()?;
+        if output.status.success() {
+            note_created(&["route", "del", half, "table", TABLE]);
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("File exists") {
+                anyhow::bail!(
+                    "proxy: could not install table-{TABLE} route {half}: {}",
+                    stderr.trim()
+                );
+            }
+        }
+    }
+    log::info!(
+        "proxy: policy routing from {client_ip} uses table {TABLE} via {gateway} dev {ifname}"
+    );
+    Ok(())
+}
+
 pub fn cleanup_routes(ifname: &str, _server_addr: &str, _exclude: &[String]) -> anyhow::Result<()> {
     // Only the routes this process put on the PHYSICAL interface (server bypass, exclude
     // bypasses, IPv6 blackholes) — see CREATED_ROUTES. Anything that was already there

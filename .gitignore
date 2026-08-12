@@ -8,6 +8,8 @@ scripts/.lab_secrets
 release/reality-tls/*-prod.conf
 *.local.conf
 /etc/qeli/
+# Local multiprofile Docker deploy pack (contains live passwords / obfs keys / client confs)
+release/docker/deploy/
 # Prod secrets / per-deployment artifacts — generated, contain creds/keys/links
 release/prod-allmodes-secrets.json
 release/prod-allmodes-pubkeys.json

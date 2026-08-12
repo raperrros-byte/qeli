@@ -123,7 +123,25 @@
                              HorizontalAlignment="Stretch"/>
         </StackPanel>
 
-        <CheckBox x:Name="LocalBox" Content="{l:Loc RouteLocal}" Margin="0,2,0,4"/>
+        <CheckBox x:Name="LocalBox" Content="{l:Loc RouteLocal}" Margin="0,2,0,10"/>
+
+        <CheckBox x:Name="ProxyBox" Content="{l:Loc FieldProxy}" Margin="0,0,0,10"
+                  IsCheckedChanged="OnProxyToggled"/>
+
+        <Grid x:Name="ProxyPanel" Margin="0,0,0,13" ColumnDefinitions="130,14,*">
+            <StackPanel Grid.Column="0">
+                <TextBlock Text="{l:Loc FieldProxyPort}" Classes="label"/>
+                <TextBox x:Name="ProxyPortBox" Text="1080"/>
+            </StackPanel>
+            <StackPanel Grid.Column="2">
+                <TextBlock Text="{l:Loc FieldProxyMode}" Classes="label"/>
+                <ComboBox x:Name="ProxyModeBox" HorizontalAlignment="Stretch">
+                    <ComboBoxItem Content="{l:Loc ProxyModeMixed}" Tag="mixed"/>
+                    <ComboBoxItem Content="{l:Loc ProxyModeSocks5}" Tag="socks5"/>
+                    <ComboBoxItem Content="{l:Loc ProxyModeHttp}" Tag="http"/>
+                </ComboBox>
+            </StackPanel>
+        </Grid>
 
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="10" Margin="0,18,0,0">
             <Button Content="{l:Loc Cancel}" Click="OnCancel" MinWidth="104"/>

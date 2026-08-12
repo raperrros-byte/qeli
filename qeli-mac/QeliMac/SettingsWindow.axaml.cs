@@ -1,15 +1,16 @@
 using Avalonia.Controls;
 using Avalonia.Interactivity;
+using Avalonia.Threading;
 using QeliMac.Model;
 using Qeli.Shared;
+using Qeli.Shared.Geo;
 using Qeli.Shared.Model;
 
 namespace QeliMac;
 
 /// <summary>
-/// Settings dialog: toasts, theme/language, launchd-daemon mode (+ its profile), and
-/// login autostart / auto-connect. Persists to <see cref="AppSettings"/>; the daemon
-/// install/uninstall itself is applied by MainWindow after the dialog closes.
+/// Settings dialog: toasts, theme/language, launchd-daemon mode (+ its profile),
+/// login autostart / auto-connect, and local-proxy routing presets.
 /// Avalonia port of qeli-win's WPF SettingsWindow.
 /// </summary>
 public partial class SettingsWindow : Window
@@ -35,6 +36,9 @@ public partial class SettingsWindow : Window
         AutoConnectBox.IsChecked = s.AutoConnect;
         StartMinBox.IsChecked = s.StartMinimized;
 
+        FillRoutePresets(s.ProxyRoutePreset);
+        RefreshGeoStatus();
+
         // Each item carries the profile's stable Id in Tag; the visible label is DisplayName.
         // Two accounts on one server share a DisplayName but never an Id, so the saved
         // service/auto-connect selection resolves to the RIGHT one (see VpnConfig.Id).
@@ -57,6 +61,50 @@ public partial class SettingsWindow : Window
         var w = new SettingsWindow(owner, profiles);
         await w.ShowDialog(owner);
         return w._saved;
+    }
+
+    private void FillRoutePresets(string selectedId)
+    {
+        RoutePresetBox.Items.Clear();
+        var ru = Loc.Lang == "ru";
+        foreach (var p in ProxyRoutePreset.All)
+        {
+            RoutePresetBox.Items.Add(new ComboBoxItem
+            {
+                Content = ru ? p.Ru : p.En,
+                Tag = p.Id,
+            });
+        }
+        SelectByTag(RoutePresetBox, ProxyRoutePreset.Normalize(selectedId));
+    }
+
+    private void RefreshGeoStatus()
+    {
+        GeoStatusText.Text = GeoAssetStore.HasFiles
+            ? GeoAssetStore.StatusText()
+            : Loc.T("GeoNotDownloaded");
+    }
+
+    private async void OnGeoDownload(object? sender, RoutedEventArgs e)
+    {
+        GeoDownloadBtn.IsEnabled = false;
+        GeoStatusText.Text = Loc.T("GeoDownloading");
+        try
+        {
+            await GeoAssetStore.DownloadAsync(msg =>
+                Dispatcher.UIThread.Post(() => GeoStatusText.Text = msg)).ConfigureAwait(true);
+            RefreshGeoStatus();
+            await Dialogs.InfoAsync(this, Loc.T("GeoDownloadOk"), Loc.T("Settings"));
+        }
+        catch (Exception ex)
+        {
+            RefreshGeoStatus();
+            await Dialogs.InfoAsync(this, Loc.F("GeoDownloadFail", ex.Message), Loc.T("Settings"));
+        }
+        finally
+        {
+            GeoDownloadBtn.IsEnabled = true;
+        }
     }
 
     // Select the item whose Tag matches the saved profile Id. Fall back to matching the
@@ -119,6 +167,8 @@ public partial class SettingsWindow : Window
         // which would be a nonsense timestamp format.
         s.LogTimeFormat = (LogTimeBox.SelectedItem as ComboBoxItem)?.Tag as string
             ?? Qeli.Shared.LogTime.Default;
+        s.ProxyRoutePreset = ProxyRoutePreset.Normalize(
+            (RoutePresetBox.SelectedItem as ComboBoxItem)?.Tag as string);
         s.ToastsEnabled = ToastsBox.IsChecked == true;
         s.CheckForUpdates = UpdatesBox.IsChecked == true;
         s.ProbeReachability = ProbeBox.IsChecked == true;
@@ -130,6 +180,9 @@ public partial class SettingsWindow : Window
         s.AutoConnectProfile = (AutoProfileBox.SelectedItem as ComboBoxItem)?.Tag as string;
         s.StartMinimized = StartMinBox.IsChecked == true;
         s.Save();
+
+        ProxyRouteConfig.PresetId = s.ProxyRoutePreset;
+        GeoAssetStore.Invalidate();
 
         Loc.SetLanguage(s.Language);  // live switch (updates all {l:Loc} bindings)
         ThemeManager.Apply();         // live theme switch (updates DynamicResource brushes)

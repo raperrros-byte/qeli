@@ -234,6 +234,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
         "route_file", "route_local", "server", "shaping", "shaping_budget", "shaping_gap_max",
         "shaping_gap_mean", "shaping_gap_min", "shaping_max_size", "shaping_min_size",
         "shaping_stealth", "shaping_stealth_mbps", "sni", "timeout", "user",
+        "proxy", "proxy_listen", "proxy_mode",
     }.Union(CarriedIniKeys).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>`[qeli]` keys no qeli client understands — i.e. misspellings. The setting they
@@ -293,6 +294,11 @@ public sealed class VpnConfig : INotifyPropertyChanged
 
     // Optional display label (UI only).
     public string? Name { get; set; }
+
+    // Local SOCKS/HTTP proxy (split-tunnel per-app mode).
+    public bool ProxyEnabled { get; init; }
+    public string ProxyListen { get; init; } = "127.0.0.1:1080";
+    public string ProxyMode { get; init; } = "mixed";  // socks5 | http | mixed
 
     /// <summary>Stable unique profile id (GUID hex). Profiles are referenced by this
     /// in app settings (service / auto-connect) instead of by DisplayName — two
@@ -356,6 +362,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
         ShapingMinSize = shMinSize, ShapingMaxSize = shMaxSize,
         ShapingStealth = shStealth, ShapingStealthRateMbps = shStealthRateMbps,
         Name = Name, Id = Id,
+        ProxyEnabled = ProxyEnabled, ProxyListen = ProxyListen, ProxyMode = ProxyMode,
     };
 
     /// <summary>Clone applying the fields the profile editor's FORM edits, preserving every
@@ -368,7 +375,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
     /// cleared; every other key keeps its marker because nothing in the form touched it.
     private static readonly string[] EditorControlledBooleanKeys =
     {
-        "quic", "gateway", "route_local", "padding", "heartbeat",
+        "quic", "gateway", "route_local", "padding", "heartbeat", "proxy",
     };
 
     /// <summary>Numeric keys the editor form supplies a real value for, so a marker on them is
@@ -393,7 +400,8 @@ public sealed class VpnConfig : INotifyPropertyChanged
         string routingMode, bool addDefaultGateway, bool routeLocalNetworks,
         int mtu, List<string> dnsServers,
         bool paddingEnabled, int paddingMin, int paddingMax,
-        bool heartbeatEnabled, long heartbeatIntervalMs, long heartbeatJitterMs) => new()
+        bool heartbeatEnabled, long heartbeatIntervalMs, long heartbeatJitterMs,
+        bool proxyEnabled = false, string proxyListen = "127.0.0.1:1080", string proxyMode = "mixed") => new()
     {
         // ── form-edited fields (from params) ──
         ServerAddress = serverAddress, Port = port, Protocol = protocol, WireMode = wireMode,
@@ -410,6 +418,9 @@ public sealed class VpnConfig : INotifyPropertyChanged
         PaddingEnabled = paddingEnabled, PaddingMin = paddingMin, PaddingMax = paddingMax,
         HeartbeatEnabled = heartbeatEnabled, HeartbeatIntervalMs = heartbeatIntervalMs, HeartbeatJitterMs = heartbeatJitterMs,
         Name = name,
+        ProxyEnabled = proxyEnabled,
+        ProxyListen = string.IsNullOrWhiteSpace(proxyListen) ? "127.0.0.1:1080" : proxyListen.Trim(),
+        ProxyMode = string.IsNullOrWhiteSpace(proxyMode) ? "mixed" : proxyMode.Trim(),
         // ── preserved from `this` (no form control) ──
         Id = Id, ConnectionTimeoutSecs = ConnectionTimeoutSecs,
         LocalAddress = LocalAddress, LocalPort = LocalPort,
@@ -618,6 +629,9 @@ public sealed class VpnConfig : INotifyPropertyChanged
         if (ShapingMaxSize != 1024) sb.AppendLine($"shaping_max_size = {ShapingMaxSize}");
         if (ShapingStealth) sb.AppendLine("shaping_stealth = true");
         if (ShapingStealthRateMbps != 2) sb.AppendLine($"shaping_stealth_mbps = {ShapingStealthRateMbps}");
+        if (ProxyEnabled) sb.AppendLine("proxy = true");
+        if (ProxyListen != "127.0.0.1:1080") sb.AppendLine($"proxy_listen = {IniSafe(ProxyListen)}");
+        if (ProxyMode != "mixed") sb.AppendLine($"proxy_mode = {IniSafe(ProxyMode)}");
         // Re-emit the keys this port accepts but does not model, verbatim and in a stable
         // order. Without this, opening a CLI or mobile profile here and saving it deleted its
         // hooks (`post_up`/`post_down`), its TOFU setting, its routing policy and the whole
@@ -703,12 +717,97 @@ public sealed class VpnConfig : INotifyPropertyChanged
     }
 
     /// <summary>
+    /// Parse one or more profiles from a paste/file: repeated <c>[qeli]</c> INI sections
+    /// and/or multiple <c>qeli://</c> links (one per line). A single legacy blob still
+    /// returns one config via <see cref="Parse"/>.
+    /// </summary>
+    public static List<VpnConfig> ParseMany(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            throw new ArgumentException("empty config");
+
+        var normalized = text.Replace("\r\n", "\n").Replace('\r', '\n');
+        var links = new List<string>();
+        foreach (var raw in normalized.Split('\n'))
+        {
+            var line = raw.Trim();
+            if (line.StartsWith("qeli://", StringComparison.OrdinalIgnoreCase))
+                links.Add(line);
+        }
+
+        // Prefer link list when the paste is link-only (no INI section header).
+        bool hasIni = normalized.Contains("[qeli]", StringComparison.OrdinalIgnoreCase);
+        if (links.Count > 0 && !hasIni)
+        {
+            var fromLinks = new List<VpnConfig>(links.Count);
+            foreach (var link in links)
+                fromLinks.Add(FromQeliUri(link));
+            return fromLinks;
+        }
+
+        var sections = SplitQeliIniSections(normalized);
+        if (sections.Count == 0)
+            return new List<VpnConfig> { FromIni(text) };
+
+        var list = new List<VpnConfig>(sections.Count);
+        foreach (var section in sections)
+            list.Add(FromIni(section));
+        return list;
+    }
+
+    /// <summary>Split a multi-profile INI into one blob per <c>[qeli]</c> section.</summary>
+    static List<string> SplitQeliIniSections(string text)
+    {
+        var lines = text.Split('\n');
+        var chunks = new List<string>();
+        StringBuilder? cur = null;
+        foreach (var raw in lines)
+        {
+            var trimmed = raw.Trim();
+            bool isQeliHeader = trimmed.Equals("[qeli]", StringComparison.OrdinalIgnoreCase);
+            if (isQeliHeader)
+            {
+                if (cur != null && cur.Length > 0)
+                    chunks.Add(cur.ToString());
+                cur = new StringBuilder();
+                cur.AppendLine("[qeli]");
+                continue;
+            }
+            cur?.AppendLine(raw);
+        }
+        if (cur != null && cur.Length > 0)
+            chunks.Add(cur.ToString());
+        return chunks;
+    }
+
+    /// <summary>How many <c>[qeli]</c> section headers appear in <paramref name="text"/>.</summary>
+    public static int CountQeliSections(string text)
+    {
+        int n = 0;
+        foreach (var raw in text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n'))
+        {
+            if (raw.Trim().Equals("[qeli]", StringComparison.OrdinalIgnoreCase))
+                n++;
+        }
+        return n;
+    }
+
+    /// <summary>
     /// Parse a flat-INI qeli client config (the current format, single [qeli] section):
     /// server=host:port, proto, user, pass, key, mode, obfs_key, sni, route_local.
     /// Matches qeli/src/config/client.rs from_ini. Full-line # / ; comments only.
     /// </summary>
     public static VpnConfig FromIni(string text)
     {
+        int qeliSections = CountQeliSections(text);
+        if (qeliSections > 1)
+        {
+            throw new ArgumentException(
+                $"INI contains {qeliSections} [qeli] sections — this is a multi-profile file. "
+                + "Use Import with a build that supports multi-profile (ParseMany), "
+                + "or import one [qeli] block at a time. Merging them into one profile "
+                + "would duplicate keys (name/server/…).");
+        }
         var q = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var dupKeys = new List<string>();
         string section = "";
@@ -947,6 +1046,9 @@ public sealed class VpnConfig : INotifyPropertyChanged
             ShapingMaxSize = RangedNum("shaping_max_size", 1024, 1, int.MaxValue),
             ShapingStealth = BoolAt("shaping_stealth", false),
             ShapingStealthRateMbps = RangedNum("shaping_stealth_mbps", 2, 1, int.MaxValue),
+            ProxyEnabled = BoolAt("proxy", false),
+            ProxyListen = Get("proxy_listen").Length > 0 ? Get("proxy_listen") : "127.0.0.1:1080",
+            ProxyMode = Get("proxy_mode").Length > 0 ? Get("proxy_mode") : "mixed",
             UnparsedBooleanKeys = badBools,
             DuplicateKeys = dupKeys,
             UnparsedNumericKeys = badNums,
@@ -1229,6 +1331,16 @@ public sealed class VpnConfig : INotifyPropertyChanged
         }
         Enum_("front", ObfsFronting, "websocket", "none");
         Enum_("routing mode", RoutingMode, "split-tunnel", "full-tunnel", "all");
+        if (ProxyEnabled)
+        {
+            Enum_("proxy_mode", ProxyMode, "socks5", "http", "mixed");
+            try { System.Net.IPEndPoint.Parse(ProxyListen); }
+            catch
+            {
+                throw new ArgumentException(
+                    $"invalid proxy_listen '{ProxyListen}' — expected host:port");
+            }
+        }
         if (ConnectionTimeoutSecs is < 1 or > 300)
             throw new ArgumentException($"'timeout' must be 1..300, got {ConnectionTimeoutSecs}");
     }

@@ -1,6 +1,7 @@
 pub mod dns;
 pub mod gateway;
 pub mod killswitch;
+pub mod proxy;
 pub mod route;
 
 use crate::crypto::{
@@ -48,6 +49,43 @@ fn pin_target(config: &crate::config::client::ClientConfig) -> String {
         .and_then(|g| *g)
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| config.server.address.clone())
+}
+
+/// Spawn a local SOCKS/HTTP proxy when `proxy = true`. Outbound dials bind to the
+/// tunnel-assigned client IP so only proxied apps use the VPN in split-tunnel mode.
+fn start_local_proxy(
+    config: &crate::config::client::ClientConfig,
+    client_ip: &str,
+    tun_name: &str,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !config.proxy.enabled {
+        return None;
+    }
+    if config.routing.add_default_gateway {
+        log::warn!(
+            "proxy = true with gateway = true: prefer gateway = false (split-tunnel) so \
+             only apps using the local proxy go through the tunnel"
+        );
+    }
+    let bind_ip: std::net::Ipv4Addr = match client_ip.parse() {
+        Ok(ip) => ip,
+        Err(e) => {
+            log::error!("local proxy: invalid tunnel client IP {client_ip}: {e}");
+            return None;
+        }
+    };
+    let listen = config.proxy.listen.clone();
+    let mode = config.proxy.mode.clone();
+    let device = tun_name.to_string();
+    log::info!(
+        "Local proxy on {listen} ({mode}) - outbound via {device} ({client_ip}); \
+         point apps at SOCKS5/HTTP proxy, use remote DNS (socks5h) to avoid leaks"
+    );
+    Some(tokio::spawn(async move {
+        if let Err(e) = proxy::serve(listen, mode, bind_ip, Some(device)).await {
+            log::error!("Local proxy stopped: {e}");
+        }
+    }))
 }
 use crate::transport::tcp::set_tcp_keepalive;
 use crate::tun::iface::TunInterface;
@@ -1474,6 +1512,8 @@ where
         }));
     }
 
+    let proxy_handle = start_local_proxy(config, &client_ip_str, &tun_name);
+
     // Distributor: FLOW-PIN TUN packets across the live bonded streams (by inner
     // 5-tuple) so each connection stays in order. Each stream's tasks own
     // encrypt/heartbeat/idle; a dead stream fires dead_rx.
@@ -1516,6 +1556,9 @@ where
     // TUN fd) stays open and `vpn0` remains busy — every reconnect then fails to
     // recreate the TUN with EBUSY ("Device or resource busy"). Aborting drops the clone.
     if let Some(h) = ramp_handle {
+        h.abort();
+    }
+    if let Some(h) = proxy_handle {
         h.abort();
     }
     // Same reasoning, now for the per-stream tasks. The writer half notices a dead
@@ -3034,6 +3077,20 @@ fn setup_tunnel(
             }
             return Err(e);
         }
+        if config.proxy.enabled
+            && !config.routing.add_default_gateway
+            && config.routing.mode != "full-tunnel"
+            && config.routing.mode != "all"
+        {
+            if let Err(e) =
+                route::setup_proxy_policy_routes(client_ip, &if_name, server_ip)
+            {
+                log::warn!(
+                    "proxy policy routing failed ({e}) - proxied connections may not reach \
+                     the internet in split-tunnel mode"
+                );
+            }
+        }
     }
     // On a full-tunnel host with dns=off, all traffic is routed through the tunnel but the
     // system resolver is left untouched — on a normal host (unlike a router with its own
@@ -3869,6 +3926,8 @@ async fn connect_and_run_udp(
         }
     }
 
+    let proxy_handle = start_local_proxy(config, &client_ip, &tun_name);
+
     loop {
         tokio::select! {
             Some(ip_packet) = tun_read_rx.recv() => {
@@ -4113,6 +4172,9 @@ async fn connect_and_run_udp(
         }
     }
 
+    if let Some(h) = proxy_handle {
+        h.abort();
+    }
     dns::restore_dns();
     tun_stop.store(true, Ordering::Relaxed); // tell the reader thread to exit
     drop(tun_read_rx);

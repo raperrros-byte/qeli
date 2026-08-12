@@ -841,12 +841,18 @@ public partial class MainWindow : Window
         if (string.IsNullOrWhiteSpace(text)) return;
         try
         {
-            // Parse detects the format and names the retired one, so the brace case
-            // reports "JSON is no longer read" instead of an INI syntax error.
-            var cfg = VpnConfig.Parse(text.Trim());
-            cfg.Name ??= cfg.ServerAddress;
-            _profiles.Add(cfg);
-            PersistAndSelect(cfg);
+            var list = VpnConfig.ParseMany(text);
+            if (list.Count == 0) throw new ArgumentException("no profiles found");
+            VpnConfig? last = null;
+            foreach (var cfg in list)
+            {
+                cfg.Name ??= cfg.ServerAddress;
+                cfg.Id = Guid.NewGuid().ToString("N");
+                _profiles.Add(cfg);
+                last = cfg;
+            }
+            if (last != null) PersistAndSelect(last);
+            await Dialogs.InfoAsync(this, Loc.F("ImportOk", list.Count), Loc.T("ImportTitle"));
         }
         catch (Exception ex)
         {

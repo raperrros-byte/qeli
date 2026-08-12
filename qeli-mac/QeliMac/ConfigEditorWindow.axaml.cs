@@ -44,6 +44,10 @@ public partial class ConfigEditorWindow : Window
             MtuBox.Text = "1500";
             DnsBox.Text = "1.1.1.1, 8.8.8.8";
             PortBox.Text = "443";
+            ProxyBox.IsChecked = false;
+            ProxyPortBox.Text = "1080";
+            SelectByTag(ProxyModeBox, "mixed");
+            UpdateProxyPanel();
         }
         else
         {
@@ -64,9 +68,36 @@ public partial class ConfigEditorWindow : Window
             MtuBox.Text = existing.Mtu > 0 ? existing.Mtu.ToString() : "auto";  // 0 = auto
             DnsBox.Text = string.Join(", ", existing.DnsServers);
             LocalBox.IsChecked = existing.RouteLocalNetworks;
+            LoadProxyFields(existing);
         }
 
         UpdateConditionalFields();
+    }
+
+    private void LoadProxyFields(VpnConfig c)
+    {
+        ProxyBox.IsChecked = c.ProxyEnabled;
+        ProxyPortBox.Text = ProxyPortOf(c.ProxyListen);
+        SelectByTag(ProxyModeBox, string.IsNullOrEmpty(c.ProxyMode) ? "mixed" : c.ProxyMode.ToLowerInvariant());
+        UpdateProxyPanel();
+    }
+
+    private static string ProxyPortOf(string listen)
+    {
+        var idx = listen.LastIndexOf(':');
+        if (idx > 0 && int.TryParse(listen[(idx + 1)..], out var p) && p is >= 1 and <= 65535)
+            return p.ToString();
+        return "1080";
+    }
+
+    private void OnProxyToggled(object? sender, RoutedEventArgs e) => UpdateProxyPanel();
+
+    private void UpdateProxyPanel()
+    {
+        if (ProxyPanel == null) return;
+        bool on = ProxyBox.IsChecked == true;
+        ProxyPanel.IsEnabled = on;
+        ProxyPanel.Opacity = on ? 1.0 : 0.45;
     }
 
     public static async Task<VpnConfig?> ShowAsync(Window owner, VpnConfig? existing)
@@ -134,6 +165,9 @@ public partial class ConfigEditorWindow : Window
         if (!int.TryParse((PortBox.Text ?? "").Trim(), out int port) || port is < 1 or > 65535)
         { await Warn(Loc.T("BadPort")); return; }
         if ((UserBox.Text ?? "").Trim().Length == 0) { await Warn(Loc.T("NeedLogin")); return; }
+        if (ProxyBox.IsChecked == true
+            && (!int.TryParse((ProxyPortBox.Text ?? "").Trim(), out int pp) || pp is < 1 or > 65535))
+        { await Warn(Loc.T("BadProxyPort")); return; }
 
         _result = BuildFromForm();
         Close();
@@ -155,6 +189,7 @@ public partial class ConfigEditorWindow : Window
             .ToList();
         var (padEnabled, padMin, padMax) = ParsePadding(TagOf(PaddingBox));
         var (hbEnabled, hbInterval, hbJitter) = ParseHeartbeat(TagOf(HeartbeatBox));
+        int proxyPort = ReadProxyPort();
 
         // Start from _base (the profile being edited / last manually-parsed config) so
         // every field with no form control survives the Save; override only what the form
@@ -183,7 +218,16 @@ public partial class ConfigEditorWindow : Window
             paddingMax: padMax,
             heartbeatEnabled: hbEnabled,
             heartbeatIntervalMs: hbInterval,
-            heartbeatJitterMs: hbJitter);
+            heartbeatJitterMs: hbJitter,
+            proxyEnabled: ProxyBox.IsChecked == true,
+            proxyListen: $"127.0.0.1:{proxyPort}",
+            proxyMode: TagOf(ProxyModeBox) ?? "mixed");
+    }
+
+    private int ReadProxyPort()
+    {
+        if (int.TryParse((ProxyPortBox.Text ?? "").Trim(), out int p) && p is >= 1 and <= 65535) return p;
+        return 1080;
     }
 
     // ── manual text editing of the config (INI / qeli://) ─────────────────────────
@@ -224,6 +268,7 @@ public partial class ConfigEditorWindow : Window
         MtuBox.Text = parsed.Mtu > 0 ? parsed.Mtu.ToString() : "auto";  // 0 = auto
         DnsBox.Text = string.Join(", ", parsed.DnsServers);
         LocalBox.IsChecked = parsed.RouteLocalNetworks;
+        LoadProxyFields(parsed);
         UpdateConditionalFields();
     }
 

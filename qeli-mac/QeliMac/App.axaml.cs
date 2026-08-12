@@ -37,6 +37,8 @@ public partial class App : Application
                 var settings = AppSettings.Current;
                 Loc.SetLanguage(settings.Language);
                 Toast.Enabled = settings.ToastsEnabled;
+                Qeli.Shared.Geo.ProxyRouteConfig.PresetId =
+                    Qeli.Shared.Geo.ProxyRoutePreset.Normalize(settings.ProxyRoutePreset);
 
                 bool autostart = desktop.Args?.Any(a => a.Equals("--autostart", StringComparison.OrdinalIgnoreCase)) == true;
                 bool minimized = autostart || settings.StartMinimized;

@@ -22,6 +22,8 @@ public sealed class AppSettings
     public bool ServiceEnabled { get; set; }            // desired: run as a launchd daemon
     public string? ServiceProfile { get; set; }         // profile the launchd daemon runs
     public string? LastProfile { get; set; }             // Id of the last-selected profile (restored on next launch, 5.1)
+    // Local SOCKS/HTTP proxy routing (v2rayN-like). See Qeli.Shared.Geo.ProxyRoutePreset.
+    public string ProxyRoutePreset { get; set; } = "proxy-all";
 
     private static readonly string Dir = Paths.UserDir;
     private static readonly string FilePath = Path.Combine(Dir, "settings.json");

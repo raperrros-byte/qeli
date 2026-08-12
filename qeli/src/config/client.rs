@@ -24,6 +24,29 @@ pub struct ClientConfig {
     /// runtime itself ignores it — it's read by the panel's client manager at boot.
     #[serde(default)]
     pub autostart: bool,
+    /// Local SOCKS/HTTP proxy: apps connect to proxy_listen, traffic exits via the tunnel.
+    #[serde(default)]
+    pub proxy: ClientProxyConfig,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct ClientProxyConfig {
+    /// Enable a local proxy listener while the tunnel is up.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bind address, default 127.0.0.1:1080.
+    #[serde(default = "default_proxy_listen")]
+    pub listen: String,
+    /// socks5 | http | mixed (SOCKS5 + HTTP CONNECT on the same port).
+    #[serde(default = "default_proxy_mode")]
+    pub mode: String,
+}
+
+fn default_proxy_listen() -> String {
+    "127.0.0.1:1080".into()
+}
+fn default_proxy_mode() -> String {
+    "mixed".into()
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -403,7 +426,8 @@ fn baseline() -> ClientConfig {
         "dns":{},
         "obfuscation":{"padding":{},"fragmentation":{},"heartbeat":{},"traffic_normalization":{},"quic":{},"awg":{}},
         "performance":{},
-        "logging":{}
+        "logging":{},
+        "proxy":{}
     }"#;
     serde_json::from_str(SKELETON).expect("baseline client config skeleton is valid")
 }
@@ -621,6 +645,14 @@ impl ClientConfig {
         // case-SENSITIVE and knew no false-spellings, so `autostart = TRUE` read as false and
         // `autostart = ture` was never recorded as unparseable. (Audit 2026-07-31, §9.)
         cfg.autostart = q.bool_or("autostart", false);
+
+        cfg.proxy.enabled = q.bool_or("proxy", cfg.proxy.enabled);
+        if let Some(s) = q.get("proxy_listen").filter(|s| !s.is_empty()) {
+            cfg.proxy.listen = s.to_string();
+        }
+        if let Some(s) = q.get("proxy_mode").filter(|s| !s.is_empty()) {
+            cfg.proxy.mode = s.to_string();
+        }
 
         if let Some(log) = doc.section("logging") {
             cfg.logging.level = log.get_or("level", "info").to_string();
@@ -947,6 +979,22 @@ impl ClientConfig {
             &self.routing.mode,
             &["split-tunnel", "full-tunnel", "all"],
         )?;
+        if self.proxy.enabled {
+            check(
+                "proxy_mode",
+                &self.proxy.mode,
+                &["socks5", "http", "mixed"],
+            )?;
+            self.proxy
+                .listen
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "invalid proxy_listen '{}' — expected host:port",
+                        self.proxy.listen
+                    )
+                })?;
+        }
         Ok(())
     }
 
@@ -1090,6 +1138,15 @@ impl ClientConfig {
         }
         if self.autostart {
             q.set("autostart", "true");
+        }
+        if self.proxy.enabled {
+            q.set("proxy", "true");
+        }
+        if self.proxy.listen != default_proxy_listen() {
+            q.set("proxy_listen", &self.proxy.listen);
+        }
+        if self.proxy.mode != default_proxy_mode() {
+            q.set("proxy_mode", &self.proxy.mode);
         }
         doc.push(q);
         // [logging]: the client PARSES this section (level / file / time_format,
@@ -1684,6 +1741,9 @@ dev_attach = true
 mtu = 1380
 mtu_probe = false
 autostart = true
+proxy = true
+proxy_listen = 127.0.0.1:1081
+proxy_mode = socks5
 
 [logging]
 level = debug
@@ -1731,6 +1791,9 @@ file = /tmp/client.log
             "mtu = 1380",
             "mtu_probe = false",
             "autostart = true",
+            "proxy = true",
+            "proxy_listen = 127.0.0.1:1081",
+            "proxy_mode = socks5",
         ];
 
         for t in qeli_tokens {

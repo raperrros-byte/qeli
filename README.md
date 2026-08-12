@@ -1,5 +1,23 @@
 # Qeli
 
+> **Fork notice / Изменения относительно upstream**  
+> Upstream (автор): [litvinovtd/qeli](https://github.com/litvinovtd/qeli)  
+> Maintainer of this fork: Daniil Nekrasov \<raperrros@yandex.ru\>
+>
+> По сравнению с версией автора в этом форке добавлено и изменено:
+>
+> - **Локальный SOCKS5 / HTTP CONNECT прокси** в клиентах (Rust CLI + C# Win/Mac):  
+>   `proxy` / `proxy_listen` / `proxy_mode` — per-app трафик через туннель при split-tunnel (`gateway = false`).
+> - **Маршрутизация локального прокси как в v2rayN**: пресеты  
+>   RUv1 (всё / всё кроме РФ / заблокированное) и V4 (绕过大陆 / 黑名单 / глобал),  
+>   geosite.dat / geoip.dat (скачивание из Settings), решение proxy vs direct на каждое соединение.
+> - **Журнал назначений**: лог `Local proxy → host` и uplink из TUN (`tunnel → ip:port`, `tunnel DNS → …`).
+> - **Скорость в UI**: учёт байтов по OS-счётчикам адаптера Wintun; для full-tunnel metric=1 по умолчанию.
+> - **Импорт нескольких профилей** из одного `.conf` / `.ini` (несколько секций `[qeli]`).
+> - UI профиля: включение прокси, порт, режим (Win/Mac).
+>
+> Production Docker-пакет с живыми паролями/ключами **не** входит в git (см. `.gitignore`: `release/docker/deploy/`).
+
 **Qeli** (Quick Easy Link IP) — a self-hosted VPN with its own L4 protocol and built-in
 obfuscation over TCP or UDP. It aims at resilience against passive / signature-based DPI
 while keeping the convenience of a classic full-tunnel TUN VPN, and ships with a web admin
