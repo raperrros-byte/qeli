@@ -2,6 +2,7 @@
 
 > **Fork notice / Изменения относительно upstream**  
 > Upstream (автор): [litvinovtd/qeli](https://github.com/litvinovtd/qeli)  
+> This fork: [raperrros-byte/qeli](https://github.com/raperrros-byte/qeli)  
 > Maintainer of this fork: Daniil Nekrasov \<raperrros@yandex.ru\>
 >
 > По сравнению с версией автора в этом форке добавлено и изменено:
