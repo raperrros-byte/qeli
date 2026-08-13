@@ -1247,7 +1247,12 @@ public partial class MainWindow : Window
         {
             var host = Selected?.ServerAddress;
             if (!string.IsNullOrWhiteSpace(host))
-                url = $"http://{host}:8080";
+            {
+                // Panel is behind nginx on the public domain (HTTPS), not :8080 loopback.
+                url = host.Contains('.') && !System.Net.IPAddress.TryParse(host.Trim('[', ']'), out _)
+                    ? $"https://{host.Trim('[', ']')}"
+                    : $"http://{host}:8080";
+            }
         }
         _serverMetrics.Configure(url, s.ServerPanelUser, s.ServerPanelPassword);
     }

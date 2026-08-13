@@ -32,8 +32,15 @@
 #     PUBLIC_HOST   Address clients connect to (IP or hostname). If omitted, the
 #                   public IP is auto-detected — pass it explicitly if your box has
 #                   separate inbound/outbound IPs or you use a domain.
-#     QELI_PROFILE  Optional. Pick the profile non-interactively (skips the prompt):
-#                   QELI_PROFILE=reality-tls | fake-tls | udp-quic. For curl|bash / automation.
+#     QELI_PROFILE  Optional. Single-profile install (legacy). If unset, ALL profiles
+#                   from server-multiprofile.conf.example are enabled (default).
+#     QELI_SINGLE_PROFILE=1
+#                   Force single-profile mode without setting QELI_PROFILE.
+#     QELI_PANEL_DOMAIN=<hostname>
+#                   Panel behind an external TLS terminator (nginx). Sets loopback
+#                   bind, tls=false, secure_cookie=true, allowed_origins=<hostname>.
+#                   With all profiles, reality-tls listens on 127.0.0.1:4430 for nginx
+#                   SNI passthrough on public :443.
 #     QELI_PORT     Optional. Pick the listen port non-interactively (default 443;
 #                   1-65535, and not 8080 which the web panel uses). udp-quic listens on UDP.
 #     QELI_BIN      Optional. Path to a prebuilt qeli binary — install from it and
@@ -61,8 +68,13 @@
 set -euo pipefail
 
 REPO="litvinovtd/qeli"
-PROFILE=""            # chosen interactively below (or non-interactively via QELI_PROFILE)
-PORT=443             # default listen port; overridable via QELI_PORT / the prompt below
+PROFILE=""            # single-profile mode only; default is all profiles
+PORT=443
+SINGLE_PROFILE=0
+if [ -n "${QELI_PROFILE:-}" ] || [ "${QELI_SINGLE_PROFILE:-0}" = "1" ]; then
+  SINGLE_PROFILE=1
+fi
+REALITY_BACKEND_PORT="${QELI_REALITY_BACKEND_PORT:-4430}"
 PANEL_PORT=8080      # web admin panel — reserved (the VPN port cannot reuse it)
 NUM_USERS=5
 USER_PREFIX="phone"
@@ -301,7 +313,7 @@ choose_profile() {
     {
       printf '\n\033[1;36m== Which server profile to install?\033[0m\n'
       printf '  1) reality-tls  — real TLS to a front site, strongest disguise   [default]\n'
-      printf '  2) fake-tls     — TLS-1.3-mimicking handshake, lighter, no front\n'
+      printf '  2) fake-tls     — TLS-1.3-mimicking handshake, lighter, no front (default port 8444)\n'
       printf '  3) udp-quic     — QUIC/HTTP3-shaped UDP (no TCP-over-TCP; good on lossy/mobile)\n'
       printf 'Choose [1/2/3] (default 1): '
     } > /dev/tty
@@ -321,12 +333,18 @@ choose_profile() {
   fi
   echo "Selected profile: ${PROFILE}"
 }
-choose_profile
 
-# ── 0b. choose the listen port (default 443) ────────────────────────────────
-# 443 mimics HTTPS and is the recommended choice; some networks prefer 8443/993/etc.
-# Priority mirrors the profile: $QELI_PORT (non-interactive) → terminal prompt →
-# default 443. The panel port (8080) is reserved and refused here.
+# Per-profile default listen port — matches server-multiprofile.conf.example layout
+# (reality-tls :443, fake-tls :8444, udp-quic :8449). QELI_PORT overrides.
+default_port_for_profile() {
+  case "$PROFILE" in
+    reality-tls) PORT=443 ;;
+    fake-tls)    PORT=8444 ;;
+    udp-quic)    PORT=8449 ;;
+    *)           PORT=443 ;;
+  esac
+}
+
 choose_port() {
   local sel="${QELI_PORT:-}"
   if [ -n "$sel" ]; then
@@ -339,7 +357,7 @@ choose_port() {
     while :; do
       printf 'Listen port [1-65535] (default %s): ' "$PORT" > /dev/tty
       read -r ans < /dev/tty || ans=""
-      [ -z "$ans" ] && break                              # empty → keep the default
+      [ -z "$ans" ] && break
       if ! _valid_port "$ans"; then
         printf 'Not a valid port (1-65535) — try again.\n' > /dev/tty; continue
       fi
@@ -353,7 +371,16 @@ choose_port() {
   fi
   echo "Selected port: ${PORT}"
 }
-choose_port
+
+if [ "$SINGLE_PROFILE" = "1" ]; then
+  choose_profile
+  default_port_for_profile
+  choose_port
+else
+  PROFILE="reality-tls"
+  PORT=443
+  echo "Profile mode: all profiles enabled (single-profile: set QELI_PROFILE or QELI_SINGLE_PROFILE=1)"
+fi
 
 # Transport of the chosen profile — udp-* profiles listen on UDP, the rest on TCP.
 # Drives the (TCP-only) outer MSS clamp below and the firewall hint at the end.
@@ -450,8 +477,12 @@ fi   # end obtain+install (from-binary vs .deb)
 command -v qeli >/dev/null || die "qeli is not on PATH after install."
 [ -f "$EXAMPLE" ] || die "$EXAMPLE missing — package too old (need >= 0.7.2)."
 
-# ── 4. build server.conf: the selected profile only, from the example ───────
-log "Configuring the ${PROFILE} profile on :${PORT}"
+# ── 4. build server.conf from the multiprofile example ───────────────────────
+if [ "$SINGLE_PROFILE" = "1" ]; then
+  log "Configuring the ${PROFILE} profile on :${PORT}"
+else
+  log "Configuring all profiles from multiprofile example"
+fi
 # Only reachable with QELI_FORCE_RECONFIG=1 (see the guard at the top). Keep the
 # previous config: it is the only copy of the identity pinning, the panel
 # password_hash and any hand-written profile this run is about to throw away.
@@ -461,23 +492,53 @@ if [ -e "$CONF" ]; then
   cp -a "$CONF" "$CONF_BAK"
   echo "  previous config backed up → ${CONF_BAK}"
 fi
-{
-  # global sections ([auth]/[logging]/[web]) — everything before the first profile
-  awk '/^\[profile:/{exit} {print}' "$EXAMPLE"
-  # only the selected profile block (header until the next [profile:)
-  awk -v p="[profile:${PROFILE}]" '$0==p{f=1;print;next} /^\[profile:/{f=0} f{print}' "$EXAMPLE"
-} > "$CONF"
-# Force the listener onto :$PORT regardless of the example's per-profile port
-# (reality-tls already ships on 443; fake-tls ships on 8444 in the example).
-sed -i "s|^bind.port = .*|bind.port = ${PORT}|" "$CONF"
-# reality-tls carries a REALITY short_id — give THIS deployment its own random one
-# (not the example sample). fake-tls has no reality_proxy, so there is nothing to do.
-if grep -q '^obf.tls.reality_proxy.short_ids' "$CONF"; then
-  SID="$(openssl rand -hex 8)"
-  sed -i "s|^obf.tls.reality_proxy.short_ids = .*|obf.tls.reality_proxy.short_ids = ${SID}|" "$CONF"
-  echo "  generated REALITY short_id: ${SID}"
+if [ "$SINGLE_PROFILE" = "1" ]; then
+  {
+    awk '/^\[profile:/{exit} {print}' "$EXAMPLE"
+    awk -v p="[profile:${PROFILE}]" '$0==p{f=1;print;next} /^\[profile:/{f=0} f{print}' "$EXAMPLE"
+  } > "$CONF"
+  sed -i "s|^bind.port = .*|bind.port = ${PORT}|" "$CONF"
+  if grep -q '^obf.tls.reality_proxy.short_ids' "$CONF"; then
+    SID="$(openssl rand -hex 8)"
+    sed -i "s|^obf.tls.reality_proxy.short_ids = .*|obf.tls.reality_proxy.short_ids = ${SID}|" "$CONF"
+    echo "  generated REALITY short_id: ${SID}"
+  fi
+else
+  cp "$EXAMPLE" "$CONF"
+  sed -i 's/^enabled = false/enabled = true/' "$CONF"
+  if [ -n "${QELI_PANEL_DOMAIN:-}" ]; then
+    awk -v rp="$REALITY_BACKEND_PORT" '
+      /^\[profile:reality-tls\]/ { in_rt=1 }
+      /^\[profile:/ && !/^\[profile:reality-tls\]/ { in_rt=0 }
+      in_rt && /^bind\.address/ { print "bind.address = 127.0.0.1"; next }
+      in_rt && /^bind\.port = 443/ { print "bind.port = " rp; print "bind.public_port = 443"; next }
+      { print }
+    ' "$CONF" > "${CONF}.new"
+    mv "${CONF}.new" "$CONF"
+    echo "  reality-tls → 127.0.0.1:${REALITY_BACKEND_PORT} (nginx SNI passthrough on :443)"
+  fi
+  RT_SID="$(openssl rand -hex 8)"
+  tmp="$(mktemp)"
+  awk -v keep_sid="$RT_SID" '
+    /^\[profile:reality-tls\]/ { in_rt=1 }
+    /^\[profile:/ { if ($0 != "[profile:reality-tls]") in_rt=0 }
+    /^obf\.tls\.reality_proxy\.short_ids/ {
+      if (in_rt) { print "obf.tls.reality_proxy.short_ids = " keep_sid; next }
+      print "obf.tls.reality_proxy.short_ids = PLACEHOLDER"; next
+    }
+    { print }
+  ' "$CONF" > "$tmp"
+  mv "$tmp" "$CONF"
+  while grep -q PLACEHOLDER "$CONF"; do
+    sid="$(openssl rand -hex 8)"
+    sed -i "0,/PLACEHOLDER/s//${sid}/" "$CONF"
+  done
+  echo "  generated REALITY short_id (reality-tls): ${RT_SID}"
+  while grep -q CHANGEME "$CONF"; do
+    key="$(openssl rand -hex 16)"
+    sed -i "0,/CHANGEME/s//${key}/" "$CONF"
+  done
 fi
-# leave routing.nat.interface unset so it auto-detects the WAN interface
 sed -i "/^routing.nat.interface/d" "$CONF"
 
 # ── 5. server identity key (created + printed; pinned automatically in the link)
@@ -587,13 +648,15 @@ MSS_APPLIED=0
 # Both the rule and its persistence are best-effort now, and a failure only warns.
 # (Audit 2026-07-27, O5)
 apply_mss_clamp(){
-  # shellcheck disable=SC2086  # $MSS_RULE is a deliberate multi-word argument list
+  local sport="$1"
+  MSS_RULE="-p tcp --sport ${sport} --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1340"
+  # shellcheck disable=SC2086
   if iptables -t mangle -C OUTPUT $MSS_RULE 2>/dev/null; then
-    echo "  MSS clamp already present on :${PORT}"; return 0
+    echo "  MSS clamp already present on :${sport}"; return 0
   fi
-  # shellcheck disable=SC2086  # same
+  # shellcheck disable=SC2086
   if iptables -t mangle -A OUTPUT $MSS_RULE 2>/dev/null; then
-    echo "  + MSS clamp 1340 on :${PORT}"; return 0
+    echo "  + MSS clamp 1340 on :${sport}"; return 0
   fi
   return 1
 }
@@ -614,18 +677,28 @@ persist_iptables(){
     echo "   add the clamp there yourself if it should survive a reboot)"
   fi
 }
-if [ "$TRANSPORT" = "tcp" ]; then
-  MSS_RULE="-p tcp --sport ${PORT} --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1340"
-  if apply_mss_clamp; then
-    MSS_APPLIED=1
-    persist_iptables
-  else
-    warn "could not install the outer MSS clamp (no mangle table on this host, or an nft
-         backend refused the rule). The install CONTINUES — this only means large
-         post-quantum ClientHellos may black-hole on LTE/CGNAT paths. Retry by hand:
-           iptables -t mangle -A OUTPUT ${MSS_RULE}"
-  fi
+MSS_APPLIED=0
+if [ "$SINGLE_PROFILE" = "0" ]; then
+  MSS_PORTS="$(awk '
+    /^\[profile:/ { in_p=1; tcp=0; next }
+    /^\[/ && !/^\[profile:/ { in_p=0 }
+    in_p && /^bind\.transport = tcp/ { tcp=1 }
+    in_p && tcp && /^bind\.port = / { print $3 }
+  ' "$CONF" | sort -u)"
 else
+  MSS_PORTS="$PORT"
+fi
+for clamp_port in $MSS_PORTS; do
+  if apply_mss_clamp "$clamp_port"; then
+    MSS_APPLIED=1
+  else
+    warn "could not install MSS clamp on :${clamp_port} — continuing"
+  fi
+done
+[ "$MSS_APPLIED" = "1" ] && persist_iptables
+if [ -z "$MSS_PORTS" ]; then
+  echo "  no TCP listen ports — skipping MSS clamp."
+elif [ "$SINGLE_PROFILE" = "1" ] && [ "$TRANSPORT" != "tcp" ]; then
   echo "  udp-quic: UDP transport has no outer TCP handshake — skipping MSS clamp."
 fi
 # /etc/sysctl.d and /etc/modules-load.d may be absent on a minimal base (no procps/
@@ -686,15 +759,26 @@ if [ -n "$PANEL_PW" ] && qeli set-web-password --password "$PANEL_PW" --config "
   # set-web-password enabled the panel + wrote username/password_hash. TLS on either
   # way: even on loopback the password should not cross an unencrypted socket that
   # any local user could read.
-  _conf_web_set tls true
-  _conf_web_set public_host "$PUBLIC_HOST"     # default host for share links/QR
-  if [ "$PANEL_PUBLIC" = "1" ]; then
-    _conf_web_set bind 0.0.0.0
-    _conf_web_set allowed_ips "$PANEL_ALLOWED"
-    PANEL_URL="https://${PUBLIC_HOST}:${PANEL_PORT}"
-  else
+  if [ -n "${QELI_PANEL_DOMAIN:-}" ]; then
     _conf_web_set bind 127.0.0.1
-    PANEL_URL="https://127.0.0.1:${PANEL_PORT}  (loopback only — tunnel in: ssh -L ${PANEL_PORT}:127.0.0.1:${PANEL_PORT} root@${PUBLIC_HOST})"
+    _conf_web_set tls false
+    _conf_web_set secure_cookie true
+    _conf_web_set public_host "$QELI_PANEL_DOMAIN"
+    _conf_web_set allowed_origins "$QELI_PANEL_DOMAIN"
+    _conf_web_set trusted_proxies "127.0.0.1"
+    PANEL_URL="https://${QELI_PANEL_DOMAIN}/  (terminate TLS in nginx; qeli listens on loopback :${PANEL_PORT})"
+  else
+    _conf_web_set tls true
+    if [ "$PANEL_PUBLIC" = "1" ]; then
+      _conf_web_set bind 0.0.0.0
+      _conf_web_set allowed_ips "$PANEL_ALLOWED"
+      _conf_web_set public_host "$PUBLIC_HOST"
+      PANEL_URL="https://${PUBLIC_HOST}:${PANEL_PORT}"
+    else
+      _conf_web_set bind 127.0.0.1
+      _conf_web_set public_host "$PUBLIC_HOST"
+      PANEL_URL="https://127.0.0.1:${PANEL_PORT}  (loopback only — tunnel in: ssh -L ${PANEL_PORT}:127.0.0.1:${PANEL_PORT} root@${PUBLIC_HOST})"
+    fi
   fi
   chown qeli:qeli "$CONF" 2>/dev/null || true
 else

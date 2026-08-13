@@ -145,10 +145,19 @@ pub async fn share_link(
     // Every profile-dependent field (wire mode, rsid, sni, obfs key, fronting, quic, awg)
     // comes from the shared builder, so this endpoint and `qeli share-link` / `add-client
     // --link` can never disagree about what a profile's clients need.
+    // Prefer an explicit `host:port` in the request; else bind.public_port (nginx /
+    // reverse-proxy front); else the listen port.
+    let (host, host_port) = match host.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            (h.to_string(), p.parse::<u16>().ok())
+        }
+        _ => (host, None),
+    };
+    let port = host_port.unwrap_or_else(|| profile.bind.client_port());
     let link = crate::config::share::ClientLink::for_profile(
         profile,
         host,
-        profile.bind.port,
+        port,
         user,
         pass,
         server_key,

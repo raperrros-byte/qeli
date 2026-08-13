@@ -100,8 +100,17 @@ ChaCha20) и `reality-tls` (настоящий Chrome-TLS 1.3, туннель в
 | Ключ obfs (PSK) | для режима obfs |
 
 `reality-tls` — полноценный клиентский режим (см. выше: настоящий Chrome-TLS 1.3
-через `qeli.dll`). REALITY-**proxy**, fragmentation, traffic-normalization,
-http2-masking, anti-fingerprinting — **серверные** механизмы, для клиента прозрачны.
+через `qeli.dll`). Профиль сервера **`reality`** (`mode=fake-tls` + `reality_sid`
+в ссылке, обычно `:8443`) тоже требует seal short_id в ClientHello — без `rsid`
+сервер отвечает как decoy (`Failed to parse hybrid ServerHello`). REALITY-proxy,
+fragmentation, traffic-normalization, http2-masking, anti-fingerprinting —
+**серверные** механизмы, для клиента прозрачны.
+
+### Метрики сервера (CPU/RAM)
+
+В Settings задайте URL панели (`https://panel.example.com`), логин и пароль admin.
+Если URL пуст и `server` в профиле — домен (не IP), клиент сам использует
+`https://{host}`. Endpoint: `/api/login` → `/api/system` (cookie session).
 
 ### Значок в трее
 

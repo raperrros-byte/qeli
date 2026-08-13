@@ -309,13 +309,13 @@ public sealed class VpnConfig : INotifyPropertyChanged
 
     [JsonIgnore]
     public string DisplayName =>
-        // A distinct label wins; otherwise fall back to "server (user)" so two accounts
-        // on the same server are DISTINGUISHABLE in the list and settings dropdowns
-        // (the bare ServerAddress collided). Imported INI configs default Name to the
-        // host, so treat Name == ServerAddress as "no distinct label" too.
+        // A distinct label wins; otherwise fall back to "mode · host (user)" so two
+        // accounts AND two wire modes on the same server are distinguishable.
+        // Imported INI configs default Name to the host, so treat Name == ServerAddress
+        // as "no distinct label" too.
         (!string.IsNullOrWhiteSpace(Name) && Name != ServerAddress)
             ? Name!
-            : $"{ServerAddress} ({Username})";
+            : $"{WireMode} · {ServerAddress} ({Username})";
 
     [JsonIgnore]
     public string Endpoint => $"{ServerAddress}:{Port} · {Protocol.ToUpperInvariant()} · {WireMode}";

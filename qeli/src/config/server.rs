@@ -126,6 +126,11 @@ pub struct BindConfig {
     pub address: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Port advertised in `qeli://` share links / QR. `0` = use [`Self::port`].
+    /// Set this when the process listens on a private port behind a reverse proxy
+    /// (e.g. nginx stream on `:443` → `bind.port = 4430`, `bind.public_port = 443`).
+    #[serde(default)]
+    pub public_port: u16,
     #[serde(default = "default_transport")]
     pub transport: String,
     /// Extra listeners beyond the primary `address:port` above, sharing this profile's ONE
@@ -135,6 +140,17 @@ pub struct BindConfig {
     /// profile for the other. INI key `listen` (repeatable).
     #[serde(default)]
     pub listen: Vec<String>,
+}
+
+impl BindConfig {
+    /// Port clients should dial — `public_port` when set, else the listen port.
+    pub fn client_port(&self) -> u16 {
+        if self.public_port != 0 {
+            self.public_port
+        } else {
+            self.port
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]

@@ -225,6 +225,7 @@ time_format = datetime
 [profile:tcp]
 bind.address = 0.0.0.0
 bind.port = 443
+# bind.public_port = 443   # optional: port in qeli:// when listen ≠ public (nginx SNI)
 bind.transport = tcp
 tun.name = vpn0
 tun.address = 10.9.0.1
@@ -1692,6 +1693,11 @@ listen = 203.0.113.5:443
 ```
 
 Каждый `listen` = голый `addr:port` на **том же транспорте**, что у профиля (`bind.transport`).
+Профиль — ОДИН транспорт; для другого транспорта заведи отдельный профиль.
+
+`bind.public_port` (опц.) — порт в `qeli://` / QR, когда процесс слушает другой порт за
+reverse-proxy (nginx stream SNI): `bind.port = 4430`, `bind.public_port = 443`. `0`/пусто =
+брать `bind.port`.
 **Профиль — один транспорт**; для TCP+UDP заводи отдельные профили (per-listener транспорта нет —
 строка с суффиксом типа `addr:port udp` игнорируется как некорректная). Панель: профиль → «Extra
 listeners». Кривая строка → в лог; занятый порт → «address already in use» в лог, остальные

@@ -1750,6 +1750,10 @@ listen = 203.0.113.5:443
 
 Each `listen` is a bare `addr:port` on the SAME transport as the profile (`bind.transport`). A
 profile is ONE transport — use a separate profile for the other (a per-listener transport is not
+
+`bind.public_port` (optional) — port written into `qeli://` / QR when the process listens on a
+different port behind a reverse proxy (nginx stream SNI): `bind.port = 4430`,
+`bind.public_port = 443`. Empty/`0` = use `bind.port`.
 supported; a `addr:port udp` suffix is ignored as malformed). Panel: profile → "Extra listeners". A
 malformed spec is ignored (logged); a busy port logs "address already in use" and the others keep
 running.

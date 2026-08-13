@@ -394,6 +394,9 @@ fn profile_to(p: &ProfileConfig) -> Section {
     // bind
     put_str(&mut s, "bind.address", &p.bind.address);
     put(&mut s, "bind.port", p.bind.port);
+    if p.bind.public_port != 0 {
+        put(&mut s, "bind.public_port", p.bind.public_port);
+    }
     put_str(&mut s, "bind.transport", &p.bind.transport);
     for l in &p.bind.listen {
         put_str(&mut s, "listen", l);
@@ -684,6 +687,7 @@ fn profile_from(s: &Section) -> ProfileConfig {
     // bind
     p.bind.address = s.str_or("bind.address", &base.bind.address).to_string();
     p.bind.port = s.parse_or("bind.port", base.bind.port);
+    p.bind.public_port = s.parse_or("bind.public_port", base.bind.public_port);
     p.bind.transport = s.str_or("bind.transport", &base.bind.transport).to_string();
     // Extra listeners (#12): each `listen` line is one address:port [transport] spec.
     p.bind.listen = s.all("listen").iter().map(|l| l.to_string()).collect();

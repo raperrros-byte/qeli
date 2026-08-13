@@ -8,10 +8,18 @@
 >
 > Maintained by: Daniil Nekrasov \<raperrros@yandex.ru\>
 >
-> Updated: 2026-08-12
+> Updated: 2026-08-13
 >
 > База сравнения — upstream `v0.7.14`. В форке добавлено (новые сверху):
 >
+> - **Клиент Win/mac: REALITY seal для профиля `reality` (:8443).** Профиль
+>   `mode=fake-tls` + `reality_sid` вставляет AEAD-токен в ClientHello `session_id`
+>   (как Rust-клиент). Без этого сервер считает пробу и отдаёт ответ decoy →
+>   `Failed to parse hybrid ServerHello`.
+> - **Метрики панели по HTTPS-домену.** Если `ServerPanelUrl` пуст и хост — домен
+>   (не IP), клиент берёт `https://{host}` вместо устаревшего `http://{host}:8080`.
+> - **Чистая переустановка lab:** [`scripts/deploy/clean-reinstall-lab.sh`](scripts/deploy/clean-reinstall-lab.sh)
+>   (wipe conf/users/identity → `.deb` → nginx SNI → пользователь + share-links).
 > - **Режим трафика на главном экране (Windows):** туннель XOR локальный SOCKS/HTTP
 >   прокси (порт/режим) применяется сразу ко **всем** профилям; при активном
 >   соединении выполняется reconnect.
@@ -44,11 +52,136 @@
 >   текстовый ввод; длинные формы скроллятся, кнопки действий остаются видимыми.
 > - **Надёжность маршрутизации Windows:** full-tunnel по умолчанию с interface metric `1`,
 >   host-маршруты прокси детерминированно чистятся при teardown туннеля.
-> - **Операционные хелперы:** скрипты запуска/остановки браузера с отдельным локальным
->   прокси и повторяемые Docker-проверки прокси.
+> - **Сервер: все профили по умолчанию.** `install-qeli-server.sh` без `QELI_PROFILE`
+>   включает весь multiprofile (reality-tls, fake-tls, udp-quic, obfs, …). Один профиль —
+>   legacy через `QELI_PROFILE=…` или `QELI_SINGLE_PROFILE=1`.
+> - **Сервер: nginx stream SNI на :443.** Панель на домене и reality-tls на одном порту:
+>   nginx `ssl_preread` → панель `127.0.0.1:8080`, остальной SNI → `127.0.0.1:4430`.
+>   Скрипт деплоя: [`scripts/deploy/nginx-panel-sni.sh`](scripts/deploy/nginx-panel-sni.sh).
+> - **Сервер: allowlist панели в nginx `geo`.** После stream qeli видит peer `127.0.0.1` —
+>   фильтр IP только в nginx, не в `web.allowed_ips`.
+> - **Сервер: `bind.public_port`.** Порт в `qeli://` ссылках, когда listen за nginx
+>   (например listen `4430`, public `443`).
+> - **Импорт: имя профиля в label.** Share/export всегда пишет имя профиля в fragment,
+>   Windows/macOS показывают `WireMode · host (user)`, если label пустой.
 >
-> Прод-данные с живыми паролями/ключами в Git **не** попадают (см. `.gitignore`:
-> `release/docker/deploy/` и локальные lab-secret файлы).
+> Прод-данные с живыми паролями/ключами/IP в Git **не** попадают (см. `.gitignore` и
+> [`scripts/lab_secrets.example`](scripts/lab_secrets.example)).
+>
+> ---
+>
+> ## Быстрый старт — сервер (форк)
+>
+> Нужно: **VPS Debian 12/13** (root), открытые порты в firewall, клиент Windows/macOS/Android.
+>
+> | Что | Зачем |
+> |-----|--------|
+> | Docker на ПК | собрать `.deb` локально |
+> | Домен + TLS-сертификат | только для варианта **с nginx** (панель на `:443`) |
+> | `scripts/.lab_secrets` | локально: IP, пароли SSH/панели (шаблон — `lab_secrets.example`) |
+>
+> ### Шаг 1. Собрать `.deb` (на своём ПК)
+>
+> ```bash
+> # Linux / macOS — из корня репозитория
+> docker run --rm -v "$PWD:/w" -w /w rust:1.88-bookworm bash -c '
+>   set -euo pipefail
+>   export PATH=/usr/local/cargo/bin:$PATH DEBIAN_FRONTEND=noninteractive
+>   apt-get update -qq && apt-get install -y --no-install-recommends make dpkg-dev binutils xz-utils >/dev/null
+>   make -C qeli/debian deb
+>   make -C qeli/debian stage BINARY=../target/release/qeli \
+>     DEB_DIR=/tmp/qeli_pkg/qeli_0.7.14_amd64 BUILD_DIR=/tmp/qeli_pkg
+>   find /tmp/qeli_pkg -type d -exec chmod 755 {} \;
+>   find /tmp/qeli_pkg -type f -exec chmod 644 {} \;
+>   dpkg-deb --root-owner-group -Zxz --build /tmp/qeli_pkg/qeli_0.7.14_amd64 /w/qeli/debian/qeli_0.7.14_amd64.deb
+> '
+> ```
+>
+> Windows: те же команды, путь `c:/projects/home/qeli:/w` — см.
+> [`scripts/AGENT_DEB_BUILD_DEPLOY.md`](scripts/AGENT_DEB_BUILD_DEPLOY.md).
+>
+> ### Шаг 2a. Установка **без nginx** (простой вариант)
+>
+> Подходит для lab / когда панель не нужна на `:443`. **reality-tls** слушает `:443` напрямую.
+>
+> ```bash
+> scp qeli/debian/qeli_*_amd64.deb install-qeli-server.sh root@SERVER:/tmp/
+> ssh root@SERVER
+> echo "qeli qeli/run-as select root" | debconf-set-selections
+>
+> QELI_DEB=/tmp/qeli_*_amd64.deb \
+> QELI_RUN_AS=root \
+> bash /tmp/install-qeli-server.sh SERVER_PUBLIC_IP
+> ```
+>
+> По умолчанию поднимаются **все профили**. Панель — loopback `:8080`:
+>
+> ```bash
+> ssh -L 8080:127.0.0.1:8080 root@SERVER
+> # браузер: https://127.0.0.1:8080  (логин/пароль из вывода инсталлятора)
+> ```
+>
+> Панель снаружи (осторожно): `QELI_PANEL_PUBLIC=1 QELI_PANEL_ALLOWED_IPS=<YOUR_CIDR>`.
+>
+> Один профиль: `QELI_PROFILE=reality-tls bash /tmp/install-qeli-server.sh …`
+>
+> Если `systemctl` падает с `Permission denied` — замените unit:
+> [`scripts/deploy/qeli-systemd-lab.service`](scripts/deploy/qeli-systemd-lab.service).
+>
+> ### Шаг 2b. Установка **с nginx** (панель на домене + reality-tls на :443)
+>
+> Когда на одном `:443` нужны и **HTTPS-панель** (по домену), и **reality-tls**.
+>
+> 1. DNS: `panel.example.com` → IP сервера.
+> 2. Установите qeli (шаг 2a, можно с `QELI_FORCE_RECONFIG=1` при повторе).
+> 3. Загрузите PEM (fullchain + key) и запустите деплой nginx:
+>
+> ```bash
+> scp /path/to/wildcard.pem root@SERVER:/tmp/qeli-panel.pem
+> scp scripts/deploy/nginx-panel-sni.sh root@SERVER:/tmp/
+> ssh root@SERVER
+> PANEL_DOMAIN=panel.example.com \
+> PANEL_ALLOW_CIDRS=203.0.113.0/24,10.9.0.0/16 \
+> TLS_CERT_PEM=/tmp/qeli-panel.pem \
+> bash /tmp/nginx-panel-sni.sh
+> ```
+>
+> Что делает скрипт:
+> - nginx stream на `:443` (SNI → панель или reality-tls);
+> - `[profile:reality-tls]` → `127.0.0.1:4430` + `bind.public_port = 443`;
+> - `[web]` → `127.0.0.1:8080`, TLS, `allowed_ips` **пустой** (фильтр в nginx `geo`);
+> - все профили `enabled = true`.
+>
+> Чистая переустановка (wipe + nginx + один VPN-пользователь):
+>
+> ```bash
+> PANEL_DOMAIN=panel.example.com \
+> PANEL_ALLOW_CIDRS=203.0.113.0/24,10.9.0.0/16 \
+> TLS_CERT_PEM=/tmp/qeli-panel.pem \
+> PANEL_PASSWORD='…' \
+> bash /tmp/clean-reinstall-lab.sh
+> ```
+>
+> При `QELI_RUN_AS=root` после install: `chown -R root:root /etc/qeli /var/log/qeli`
+> (иначе `users.conf` mode `600` у `qeli:` → Permission denied).
+>
+> Пример конфига nginx: [`scripts/deploy/nginx-stream-qeli-sni.conf.example`](scripts/deploy/nginx-stream-qeli-sni.conf.example).
+>
+> Подробно: [`scripts/AGENT_DEB_BUILD_DEPLOY.md`](scripts/AGENT_DEB_BUILD_DEPLOY.md) §3.
+>
+> ### Шаг 3. Клиент
+>
+> 1. Скачайте/соберите клиент: Windows — `qeli-win/dist/QeliWin.exe` (или `dist-build/`).
+> 2. Импортируйте `qeli://` из `/etc/qeli/client-links/` на сервере или из панели
+>    (для профиля `reality` на `:8443` в ссылке **обязателен** `rsid=`).
+> 3. Подключитесь (для reality-tls хост = домен/`SERVER_PUBLIC_IP`, порт `443`).
+> 4. Метрики CPU/RAM: Settings → Panel URL `https://panel.example.com`, admin + пароль.
+>
+> Документация: [docs/ru/GETTING-STARTED.md](docs/ru/GETTING-STARTED.md) ·
+> [docs/ru/PANEL.md](docs/ru/PANEL.md).
+>
+> Дополнительно: portable ABI — `make -C qeli/debian deb-portable` (zig + cargo-zigbuild).
+> Runbook для агента/Windows: [`scripts/AGENT_DEB_BUILD_DEPLOY.md`](scripts/AGENT_DEB_BUILD_DEPLOY.md).
 
 **Qeli** (Quick Easy Link IP) — a self-hosted VPN with its own L4 protocol and built-in
 obfuscation over TCP or UDP. It aims at resilience against passive / signature-based DPI

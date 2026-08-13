@@ -528,8 +528,13 @@
             </div>
             <div>
               <label class="field-label">Port</label>
-              <p class="field-desc">Port 443 blends with HTTPS traffic</p>
+              <p class="field-desc">Port the process listens on (443 blends with HTTPS)</p>
               <input class="inp" type="number" min="1" max="65535" x-model.number="cfg.profiles[activeTab].bind.port" @input="markDirty()">
+            </div>
+            <div>
+              <label class="field-label">Public port (share links)</label>
+              <p class="field-desc">Port clients dial — set when behind nginx/SNI (e.g. listen 4430, public 443). Empty/0 = same as Port</p>
+              <input class="inp" type="number" min="0" max="65535" x-model.number="cfg.profiles[activeTab].bind.public_port" @input="markDirty()" placeholder="0">
             </div>
           </div>
           <div>

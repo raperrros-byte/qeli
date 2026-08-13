@@ -1055,7 +1055,7 @@ fn add_client(
             .iter()
             .map(|b| format!("{:02x}", b))
             .collect();
-        let port = host_port.unwrap_or(profile.bind.port);
+        let port = host_port.unwrap_or_else(|| profile.bind.client_port());
         // Profile-dependent fields come from the shared builder (see
         // `ClientLink::for_profile`) — the panel's /api/share and `share-link` use the
         // same one, so the three cannot drift apart.
@@ -1210,7 +1210,7 @@ fn share_link(
         }
         _ => (host, None),
     };
-    let port = host_port.unwrap_or(profile.bind.port);
+    let port = host_port.unwrap_or_else(|| profile.bind.client_port());
 
     let users_file = server_cfg.auth.users_file.clone();
     let db = config::users::UsersDb::load(&users_file)

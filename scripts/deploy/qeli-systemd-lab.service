@@ -1,0 +1,26 @@
+# Minimal systemd unit for lab VPS where the packaged unit fails with
+# Permission denied (ProtectSystem / capability sandbox).
+# Install: cp qeli-systemd-lab.service /etc/systemd/system/qeli.service
+#          systemctl daemon-reload && systemctl enable --now qeli
+
+[Unit]
+Description=Qeli VPN server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/qeli server --config /etc/qeli/server.conf
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN
+NoNewPrivileges=false
+DeviceAllow=/dev/net/tun rwm
+PrivateDevices=false
+
+[Install]
+WantedBy=multi-user.target

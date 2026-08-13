@@ -967,6 +967,27 @@ public abstract class VpnTunnelBase
         return Convert.FromHexString(clean);
     }
 
+    /// <summary>When reality_sid + pinned server key are present, seal the REALITY token
+    /// into the fake-tls ClientHello session_id (profile "reality" on :8443).</summary>
+    private static byte[]? TrySealRealitySessionId(VpnConfig config, KeyExchange.KeyPair clientKeyPair)
+    {
+        var sidHex = config.RealityShortId?.Trim();
+        var keyHex = config.ServerPublicKeyHex?.Trim();
+        if (string.IsNullOrEmpty(sidHex) || string.IsNullOrEmpty(keyHex)) return null;
+        try
+        {
+            var realityPub = Convert.FromHexString(new string(keyHex.Where(Uri.IsHexDigit).ToArray()));
+            if (realityPub.Length != 32) return null;
+            var shortId = RealitySession.ShortIdFromHex(sidHex);
+            return RealitySession.SealSessionId(
+                realityPub, clientKeyPair.PrivateKey, clientKeyPair.PublicKeyBytes, shortId);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     // ── connection setup ──────────────────────────────────────────────────────
 
     /// <summary>OpenVPN `local` / `lport`: bind the carrier socket to a fixed local
@@ -1541,8 +1562,9 @@ public abstract class VpnTunnelBase
         using var mlkem = MlKem.Generate(); // hybrid PQ: ML-KEM-768 keypair (server requires it)
 
         string sni = config.Sni ?? PickSni(config.ServerAddress);
+        var realitySessionId = TrySealRealitySessionId(config, clientKeyPair);
         var clientHello = TlsHandshake.BuildClientHelloPq(
-            clientKeyPair.PublicKeyBytes, mlkem.EncapsulationKey, sni, padToMin);
+            clientKeyPair.PublicKeyBytes, mlkem.EncapsulationKey, sni, padToMin, realitySessionId);
         transport.Send(clientHello, longHeader: true);
         Log($"ClientHello sent ({clientHello.Length}B, hybrid X25519+ML-KEM)");
 
@@ -2614,8 +2636,9 @@ public abstract class VpnTunnelBase
         var clientKeyPair = ke.GenerateKeyPair();
         using var mlkem = MlKem.Generate(); // hybrid PQ, same as the primary handshake
         string sni = config.Sni ?? PickSni(config.ServerAddress);
+        var realitySessionId = TrySealRealitySessionId(config, clientKeyPair);
         var clientHello = TlsHandshake.BuildClientHelloPq(
-            clientKeyPair.PublicKeyBytes, mlkem.EncapsulationKey, sni, 0);
+            clientKeyPair.PublicKeyBytes, mlkem.EncapsulationKey, sni, 0, realitySessionId);
         transport.Send(clientHello, longHeader: true);
 
         var serverHelloRecord = transport.RecvRecord();

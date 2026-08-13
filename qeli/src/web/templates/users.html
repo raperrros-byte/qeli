@@ -682,7 +682,13 @@ function usersPage() {
             user: this.share.user,
           };
           const label = this.share.label.trim();
-          if (label) payload.label = selected.length > 1 ? `${label} — ${profile}` : label;
+          // Always put the profile name in the link fragment so imported clients
+          // show distinct titles (not just "host (user)" for every mode).
+          if (label) {
+            payload.label = selected.length > 1 ? `${label} — ${profile}` : label;
+          } else {
+            payload.label = profile;
+          }
           // One reset updates the user's password for every profile. Only the first request
           // may perform it; subsequent links recover the newly persisted password.
           if (allowReset && i === 0) payload.allow_reset = 'true';

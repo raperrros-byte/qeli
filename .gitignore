@@ -4,6 +4,17 @@ keystore.properties
 *.keystore
 scripts/lab_env.sh
 scripts/.lab_secrets
+scripts/.lab_secrets.*
+!scripts/lab_secrets.example
+scripts/_tmp_*
+scripts/**/*.pem
+scripts/**/*.key
+qeli/debian/qeli_*.deb
+qeli/debian/build/
+# Local Windows client publish outputs (exe locks / binaries)
+qeli-win/dist-build/
+qeli-win/dist-new/
+qeli-win/dist/
 # Real deployment configs (only *placeholder* templates are tracked; fill copies locally)
 release/reality-tls/*-prod.conf
 *.local.conf

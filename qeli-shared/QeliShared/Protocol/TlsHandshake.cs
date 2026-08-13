@@ -61,7 +61,7 @@ public static class TlsHandshake
     /// fake-tls / obfs / UDP paths use <see cref="BuildClientHelloPq"/> because the
     /// server now requires the X25519MLKEM768 share for the hybrid tunnel.</summary>
     public static byte[] BuildClientHello(byte[] keyShare, string sni = "www.cloudflare.com", int padToMin = 0)
-        => BuildClientHelloInner(keyShare, null, sni, padToMin);
+        => BuildClientHelloInner(keyShare, null, sni, padToMin, null);
 
     /// <summary>Hybrid post-quantum ClientHello: carries the real ML-KEM-768
     /// encapsulation key in an X25519MLKEM768 (0x11ec) key_share alongside the classic
@@ -69,8 +69,12 @@ public static class TlsHandshake
     /// <c>build_client_hello_pq</c>. The caller keeps the matching <c>MlKem</c> handle
     /// to decapsulate the server's ciphertext.</summary>
     public static byte[] BuildClientHelloPq(byte[] x25519Pub, byte[] mlKemEk,
-        string sni = "www.cloudflare.com", int padToMin = 0)
+        string sni = "www.cloudflare.com", int padToMin = 0, byte[]? realitySessionId = null)
     {
+        // REALITY session_id must be sealed into legacy_session_id — the native builder
+        // does not accept it yet, so use the managed path when present.
+        if (realitySessionId is { Length: 32 })
+            return BuildClientHelloInner(x25519Pub, mlKemEk, sni, padToMin, realitySessionId);
         // Prefer the shared Rust builder (qeli.dll) so every client emits the identical
         // fake-tls hello (GREASE / per-connection shuffle / ALPN). Fall back to the
         // managed builder if the native export is unavailable (e.g. an older bundled
@@ -91,13 +95,16 @@ public static class TlsHandshake
         }
         catch (DllNotFoundException) { /* qeli.dll missing → managed builder */ }
         catch (EntryPointNotFoundException) { /* old qeli.dll w/o the export → managed */ }
-        return BuildClientHelloInner(x25519Pub, mlKemEk, sni, padToMin);
+        return BuildClientHelloInner(x25519Pub, mlKemEk, sni, padToMin, null);
     }
 
-    private static byte[] BuildClientHelloInner(byte[] x25519Pub, byte[]? mlKemEk, string sni, int padToMin)
+    private static byte[] BuildClientHelloInner(byte[] x25519Pub, byte[]? mlKemEk, string sni, int padToMin,
+        byte[]? realitySessionId)
     {
         bool pq = mlKemEk != null;
-        var sessionId = new byte[32]; RandomNumberGenerator.Fill(sessionId);
+        var sessionId = realitySessionId is { Length: 32 }
+            ? realitySessionId.ToArray()
+            : RandomNumberGenerator.GetBytes(32);
         var randomBytes = new byte[32]; RandomNumberGenerator.Fill(randomBytes);
         int greaseFirst = GreaseValue();
         int greaseLast = GreaseValue();
