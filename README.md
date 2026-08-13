@@ -64,6 +64,8 @@
 >   (например listen `4430`, public `443`).
 > - **Импорт: имя профиля в label.** Share/export всегда пишет имя профиля в fragment,
 >   Windows/macOS показывают `WireMode · host (user)`, если label пустой.
+> - **Сервер: Docker.** Multiprofile в контейнере (`release/docker/`), порты 443/8443–8451;
+>   с nginx на хосте — `:443` у nginx, не у контейнера. См. шаг 2c.
 >
 > Прод-данные с живыми паролями/ключами/IP в Git **не** попадают (см. `.gitignore` и
 > [`scripts/lab_secrets.example`](scripts/lab_secrets.example)).
@@ -169,6 +171,59 @@
 >
 > Подробно: [`scripts/AGENT_DEB_BUILD_DEPLOY.md`](scripts/AGENT_DEB_BUILD_DEPLOY.md) §3.
 >
+> ### Шаг 2c. Docker на сервере
+>
+> Альтернатива `.deb`: qeli в контейнере с `NET_ADMIN` + `/dev/net/tun`. Удобно для
+> lab, CI и multiprofile без systemd. Подробности: [`release/docker/README.md`](release/docker/README.md).
+>
+> **Сборка образа** (из корня репо, на ПК или на VPS):
+>
+> ```bash
+> docker buildx build -f release/docker/Dockerfile -t qeli:latest --load .
+> ```
+>
+> **Multiprofile (все 10 профилей)** — скопируйте пример в volume и опубликуйте порты:
+>
+> ```bash
+> mkdir -p data/server/etc data/server/lib
+> docker run --rm -v "$PWD/data/server/etc:/etc/qeli" qeli:latest sh -c \
+>   'cp /usr/share/qeli/server-multiprofile.conf.example /etc/qeli/server.conf && : > /etc/qeli/users.conf'
+>
+> docker run -d --name qeli-server \
+>   --cap-add NET_ADMIN --cap-add NET_RAW --cap-add NET_BIND_SERVICE \
+>   --device /dev/net/tun \
+>   --sysctl net.ipv4.ip_forward=1 \
+>   -v "$PWD/data/server/etc:/etc/qeli" \
+>   -v "$PWD/data/server/lib:/var/lib/qeli" \
+>   -e QELI_CONFIG=/etc/qeli/server.conf \
+>   -p 443:443/tcp -p 8443:8443/tcp -p 8444:8444/tcp -p 8445:8445/tcp \
+>   -p 8446:8446/tcp -p 8447:8447/tcp -p 8451:8451/tcp \
+>   -p 8448:8448/udp -p 8449:8449/udp -p 8450:8450/udp \
+>   -p 8080:8080/tcp \
+>   qeli:latest server
+> ```
+>
+> Пользователь и ссылки:
+>
+> ```bash
+> docker exec qeli-server qeli add-client daniil --config /etc/qeli/server.conf --link --host SERVER_PUBLIC_IP
+> docker exec qeli-server qeli set-web-password --password '…' --config /etc/qeli/server.conf
+> docker restart qeli-server
+> ```
+>
+> **Панель:** в `[web]` задайте `bind = 0.0.0.0`, `password_hash` (через `set-web-password`),
+> опубликуйте `-p 8080:8080`. Логи: `docker logs -f qeli-server`.
+>
+> **Docker + nginx на хосте (панель на домене):** nginx stream держит `:443` на **хосте**,
+> контейнер **не** публикует `443:443`. Внутри контейнера `reality-tls` слушает `:4430`,
+> `bind.public_port = 443`; снаружи nginx проксирует SNI → `127.0.0.1:4430` (проброс
+> `-p 4430:4430` или `network_mode: host`). Остальные профили — `-p 8443:8443` и т.д.
+> Скрипт nginx: [`scripts/deploy/nginx-panel-sni.sh`](scripts/deploy/nginx-panel-sni.sh)
+> (редактирует `/etc/qeli/server.conf` на хосте — для Docker монтируйте тот же volume).
+>
+> **compose:** `docker compose -f release/docker/docker-compose.yml up -d` (один профиль
+> по умолчанию; для multiprofile замените `server.conf` в `./data/server/etc/`).
+>
 > ### Шаг 3. Клиент
 >
 > 1. Скачайте/соберите клиент: Windows — `qeli-win/dist/QeliWin.exe` (или `dist-build/`).
@@ -183,121 +238,76 @@
 > Дополнительно: portable ABI — `make -C qeli/debian deb-portable` (zig + cargo-zigbuild).
 > Runbook для агента/Windows: [`scripts/AGENT_DEB_BUILD_DEPLOY.md`](scripts/AGENT_DEB_BUILD_DEPLOY.md).
 
-**Qeli** (Quick Easy Link IP) — a self-hosted VPN with its own L4 protocol and built-in
-obfuscation over TCP or UDP. It aims at resilience against passive / signature-based DPI
-while keeping the convenience of a classic full-tunnel TUN VPN, and ships with a web admin
-panel.
-
-**Документация на русском → [docs/ru/index.md](docs/ru/index.md)** ·
-**Documentation in English → [docs/eng/index.md](docs/eng/index.md)**
+> Runbook для агента/Windows: [`scripts/AGENT_DEB_BUILD_DEPLOY.md`](scripts/AGENT_DEB_BUILD_DEPLOY.md).
 
 ---
 
-## What it is
+**Qeli** (Quick Easy Link IP) — self-hosted VPN со своим L4-протоколом, встроенной
+обфускацией (TCP/UDP) и веб-панелью. Цель — устойчивость к пассивному и
+сигнатурному DPI при удобстве классического TUN VPN.
 
-- **A TUN VPN, not a per-application proxy**: routing and DNS are handled at the OS level,
-  so every application is covered without being configured. Full-tunnel and split-tunnel are
-  both first-class — phones default to full-tunnel, the CLI and desktop clients to split.
-- **Wire modes**: `plain` · `fake-tls` (TLS 1.3 mimicry) · `obfs` (ChaCha20 stream +
-  WebSocket fronting) · `reality` / `reality-tls` (real TLS 1.3 carries the tunnel) ·
-  QUIC-masking for UDP.
-- **Post-quantum handshake**: hybrid X25519 + ML-KEM-768, ChaCha20-Poly1305 data plane.
-- **Web admin panel** with `qeli://` link / QR issuance, Argon2id login, native HTTPS.
-- **Server**: Linux (TUN/TAP). **Clients**: Linux CLI · Windows · macOS · Android ·
-  Keenetic / OpenWrt routers — plus iOS, which is feature-complete but has never been run
-  on a device and ships nothing yet ([details](qeli-ios/README.md)).
+**Документация:** [RU](docs/ru/index.md) · [EN](docs/eng/index.md)
 
-## Works under active DPI
+## Что это
 
-Qeli is built for networks where ordinary VPN protocols (WireGuard, OpenVPN, IKEv2) are
-fingerprinted and blocked — Iran, China (the Great Firewall) and Russia (TSPU). The
-`reality-tls` mode performs a genuine TLS 1.3 handshake against a real third-party site, so
-the connection looks like ordinary HTTPS to that site and resists both active probing and
-SNI-based blocking; traffic shaping adds idle cover traffic so the flow does not read as a
-bulk download to statistical DPI.
+- **TUN VPN**, не per-app proxy: маршруты и DNS на уровне ОС; full- и split-tunnel.
+- **Wire modes:** `plain` · `fake-tls` · `obfs` · `reality` / `reality-tls` · UDP+QUIC.
+- **Post-quantum:** hybrid X25519 + ML-KEM-768, ChaCha20-Poly1305.
+- **Панель:** `qeli://` / QR, Argon2id, HTTPS.
+- **Сервер:** Linux (TUN), деплой `.deb` · **Docker** · nginx SNI. **Клиенты:** CLI,
+  Windows, macOS, Android, Keenetic/OpenWrt; iOS — в репо, без релиза
+  ([qeli-ios/README.md](qeli-ios/README.md)).
 
-> In spirit a self-hosted alternative to Xray / V2Ray / sing-box (REALITY/VLESS) setups, but
-> with its own protocol, native GUI clients and a post-quantum handshake.
+## Под активным DPI
 
-## Quick start
+`reality-tls` — настоящий TLS 1.3 к decoy-сайту; traffic shaping маскирует idle.
+Профиль **`reality`** (`:8443`, fake-tls + REALITY proxy) требует `rsid` в ссылке —
+см. fork-notice выше.
 
-**One command on a clean Linux server (Debian/Ubuntu), as root:**
+## Деплой сервера (форк)
 
-```bash
-curl -fsSLO https://raw.githubusercontent.com/litvinovtd/qeli/main/install-qeli-server.sh
-```
+| Способ | Когда |
+|--------|--------|
+| `.deb` + `install-qeli-server.sh` (шаги 1–2a в блоке выше) | production VPS, systemd |
+| nginx SNI + панель на домене (шаг 2b) | `:443` = панель + reality-tls |
+| Docker (шаг 2c) | lab, multiprofile, без systemd |
+| [`clean-reinstall-lab.sh`](scripts/deploy/clean-reinstall-lab.sh) | wipe + nginx + пользователь |
 
-Review it, then run `bash install-qeli-server.sh`. Download-then-run (rather than
-`curl … | bash`) exists so the script can be read before it executes as root; the installer
-itself verifies the `.deb` against its SHA256.
+Upstream one-liner (`curl …/litvinovtd/qeli/…`) ставит **upstream** `.deb` с GitHub
+Releases — для форка собирайте `.deb` локально (шаг 1) или образ из **этого** репо.
 
-The script installs the `.deb` from [Releases](https://github.com/litvinovtd/qeli/releases),
-asks for the profile and the listen port (default `443`), writes a config with full-tunnel
-NAT, creates users and prints ready-to-use `qeli://` links. Three profiles are offered:
+Пошагово: [docs/ru/GETTING-STARTED.md](docs/ru/GETTING-STARTED.md) ·
+[docs/eng/GETTING-STARTED.md](docs/eng/GETTING-STARTED.md) ·
+[CONFIG RU](docs/ru/CONFIG.md) · [PANEL RU](docs/ru/PANEL.md).
 
-| Profile | When to pick it |
-|---------|-----------------|
-| `reality-tls` | The default the installer provisions. Real TLS 1.3 over TCP:443 — survives active probing. |
-| `fake-tls` | Cheaper on CPU; enough against passive/signature DPI. |
-| `udp-quic` | A UDP path with QUIC-shaped datagrams — useful where TCP:443 is throttled, reset or otherwise degraded. |
+Проблемы: [docs/ru/TROUBLESHOOTING.md](docs/ru/TROUBLESHOOTING.md) ·
+[docs/eng/TROUBLESHOOTING.md](docs/eng/TROUBLESHOOTING.md).
 
-For a non-interactive run set the answers up front:
-`QELI_PROFILE=reality-tls|fake-tls|udp-quic` and/or `QELI_PORT=<1-65535>`.
+## Структура репозитория
 
-Then install a client from Releases and paste or scan the link.
-
-**Prefer to do it step by step?**
-
-1. Install the server and create the first user — **[Getting started (EN)](docs/eng/GETTING-STARTED.md)** ·
-   **[Установка с нуля (RU)](docs/ru/GETTING-STARTED.md)**.
-2. Configure it — **[CONFIG (EN)](docs/eng/CONFIG.md)** · **[CONFIG (RU)](docs/ru/CONFIG.md)**.
-3. Issue a `qeli://` link or QR from the web panel and import it into a client —
-   **[PANEL (EN)](docs/eng/PANEL.md)** · **[PANEL (RU)](docs/ru/PANEL.md)**.
-
-Something went wrong? → **[Troubleshooting (EN)](docs/eng/TROUBLESHOOTING.md)** ·
-**[Диагностика (RU)](docs/ru/TROUBLESHOOTING.md)**.
-
-## Repository layout
-
-| Path | What it is |
+| Путь | Назначение |
 |------|------------|
-| `qeli/` | Rust daemon: server, client CLI, protocol core, web panel |
-| `qeli-win/`, `qeli-mac/` | Desktop GUI clients (C#/.NET, shared core in `qeli-shared/`) — [Windows](qeli-win/README.md) · [macOS](qeli-mac/README.md) |
-| `qeli-android/` | Android client (Kotlin) — [README](qeli-android/README.md) |
-| `qeli-ios/` | iOS client (Swift), feature-complete but untested on a device — [README](qeli-ios/README.md) · [MDM](qeli-ios/MDM/README.md) |
-| `qeli-openwrt/` | Router build (Keenetic / OpenWrt) — [README](qeli-openwrt/README.md) |
-| `docs/` | Documentation — start at [docs/ru/index.md](docs/ru/index.md) / [docs/eng/index.md](docs/eng/index.md) |
-| `release/` | Packaging: [Docker](release/docker/README.md), deb, release artefacts |
-| `site/` | Project website |
+| `qeli/` | Rust: сервер, CLI, протокол, панель |
+| `qeli-win/`, `qeli-mac/` | Desktop GUI — [Win](qeli-win/README.md) · [macOS](qeli-mac/README.md) |
+| `qeli-android/` | Android — [README](qeli-android/README.md) |
+| `qeli-shared/` | Общее ядро C# (клиенты + REALITY seal) |
+| `scripts/deploy/` | nginx SNI, clean-reinstall, lab systemd unit |
+| `scripts/AGENT_DEB_BUILD_DEPLOY.md` | Runbook сборки `.deb` и деплоя |
+| `release/docker/` | **Docker-образ** сервера/клиента — [README](release/docker/README.md) |
+| `docs/` | Документация RU/EN |
 
-## Status
+## Статус
 
-Pre-1.0 / beta — the data plane is stable and covered by unit + end-to-end tests, but the
-protocol may still change between minor versions. Release builds are published on the
-**GitHub Releases** page and are not committed to git. The client **native cores** are the
-exception: `libqeli.so` / `qeli.dll` / `libqeli.dylib` (plus third-party `wintun.dll`) are
-committed under `native-libs/` and mirrored into each client tree, so the platform CI jobs
-need only their own toolchain. Their hashes are pinned in `native-libs/SHA256SUMS` and
-checked by the `native-libs` CI gate. This is an explicit trade-off against reproducibility
-— see [THREAT-MODEL §4](docs/eng/THREAT-MODEL.md#4-assurance-status) ·
-[Модель угроз §4](docs/ru/THREAT-MODEL.md#4-уровень-проверенности).
+Pre-1.0 / beta. Релизы форка: [GitHub Releases](https://github.com/raperrros-byte/qeli/releases)
+(если опубликованы) или локальная сборка `.deb` / Docker из `main`.
 
-- Changes: **[CHANGELOG.md](CHANGELOG.md)**
-- Security policy: **[SECURITY.md](SECURITY.md)**
-- Contributing: **[CONTRIBUTING.md](CONTRIBUTING.md)**
-- Licensing: **[LICENSE](LICENSE)** · **[LICENSING.md](LICENSING.md)**
+Native cores (`libqeli.so`, `qeli.dll`, …) — в `native-libs/` с pin в `SHA256SUMS`.
 
-This is a monorepo with **per-directory licences**: the core and server (`qeli/`) are
-**AGPL-3.0-only**, the clients (`qeli-android/`, `qeli-win/`, `qeli-mac/`, `qeli-ios/`) are
-**MPL-2.0**.
-The full map, including the `libqeli`/AGPL note, is in [LICENSING.md](LICENSING.md).
-Contributions use a DCO sign-off, no CLA — see [CONTRIBUTING.md](CONTRIBUTING.md).
+- [CHANGELOG.md](CHANGELOG.md) · [SECURITY.md](SECURITY.md) · [CONTRIBUTING.md](CONTRIBUTING.md)
+- Лицензии: core/server **AGPL-3.0**, клиенты **MPL-2.0** — [LICENSING.md](LICENSING.md)
 
 ---
 
-<sub>**Keywords:** self-hosted VPN, anti-censorship VPN, censorship circumvention, anti-DPI,
-DPI bypass, deep packet inspection, REALITY, Reality TLS, TLS camouflage, SNI,
-active-probing resistant, traffic obfuscation, fake-TLS, obfs, QUIC VPN, post-quantum VPN,
-ML-KEM-768, X25519, ChaCha20-Poly1305, Rust VPN, Android VPN, iOS VPN, Windows VPN, macOS
-VPN, Keenetic, OpenWrt, WireGuard alternative, Xray / V2Ray / sing-box alternative, VPN for
-Iran, VPN for China / Great Firewall, VPN for Russia / TSPU.</sub>
+<sub>**Keywords:** self-hosted VPN, anti-censorship VPN, anti-DPI, REALITY, fake-TLS,
+obfs, QUIC VPN, post-quantum VPN, Rust VPN, Docker VPN, nginx SNI, WireGuard alternative,
+Xray / V2Ray / sing-box alternative.</sub>
