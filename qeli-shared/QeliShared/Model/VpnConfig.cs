@@ -728,6 +728,17 @@ public sealed class VpnConfig : INotifyPropertyChanged
         return InvalidRawValues.Count == 0 ? text : RestoreInvalidLines(text);
     }
 
+    /// <summary>Keys owned by desktop/mobile platform adapters or the local SOCKS/HTTP proxy.
+    /// They belong in the portable INI for save/export, but must not cross the Rust transport-core
+    /// boundary: strict parse treats unread names as typos and the FFI core does not run the
+    /// local proxy or per-app filter.</summary>
+    private static readonly HashSet<string> TransportCoreExcludedKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "allow_lan", "apps", "apps_mode", "dev_node", "metric", "name", "persist_tun", "route_file",
+        "reconnect", "reconnect_base_delay", "reconnect_max_delay", "reconnect_retries",
+        "proxy", "proxy_listen", "proxy_mode",
+    };
+
     /// <summary>Canonical profile passed to the Rust transport owner. The ordinary exported
     /// INI stays sparse, but values whose historical GUI defaults differ from Rust defaults
     /// are made explicit at this boundary.</summary>
@@ -765,6 +776,12 @@ public sealed class VpnConfig : INotifyPropertyChanged
         Ensure("shaping_max_size", ShapingMaxSize.ToString());
         Ensure("shaping_stealth", ShapingStealth ? "true" : "false");
         Ensure("shaping_stealth_mbps", ShapingStealthRateMbps.ToString());
+        lines = lines.Where(line =>
+        {
+            int eq = line.IndexOf('=');
+            if (eq <= 0) return true;
+            return !TransportCoreExcludedKeys.Contains(line[..eq].Trim());
+        }).ToList();
         return string.Join("\n", lines);
     }
 

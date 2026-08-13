@@ -87,7 +87,8 @@ if [ -f "${SCRIPT_DIR}/qeli-systemd-lab.service" ]; then
 fi
 
 log "Fix ownership (service runs as root on lab)"
-chown -R root:root /etc/qeli /var/log/qeli 2>/dev/null || true
+chown -R root:root /etc/qeli /var/log/qeli /var/lib/qeli 2>/dev/null || true
+chmod 755 /etc/qeli
 chmod 600 /etc/qeli/users.conf 2>/dev/null || true
 
 systemctl enable qeli nginx

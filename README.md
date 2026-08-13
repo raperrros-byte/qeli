@@ -116,6 +116,13 @@
 > bash /tmp/install-qeli-server.sh SERVER_PUBLIC_IP
 > ```
 >
+> **DNS на сервере:** установка `.deb` **не меняет** `/etc/resolv.conf` — postinst только
+> создаёт каталоги и пользователя `qeli`, клиент не стартует. `systemd-resolved` в пакете
+> только **Suggests** (не ставится сам); `install-qeli-server.sh` использует
+> `apt install --no-install-recommends`. Не ставьте с `apt install --install-suggests`.
+> DNS на хосте меняется только при **`qeli client`** с `dns = tunnel` (на сервере это не
+> нужно). Для CLI-клиента на другой машине при NetworkManager/dnsmasq — `dns = off`.
+>
 > По умолчанию поднимаются **все профили**. Панель — loopback `:8080`:
 >
 > ```bash
@@ -224,13 +231,112 @@
 > **compose:** `docker compose -f release/docker/docker-compose.yml up -d` (один профиль
 > по умолчанию; для multiprofile замените `server.conf` в `./data/server/etc/`).
 >
-> ### Шаг 3. Клиент
+> ### Шаг 3. Клиент (Windows / macOS / Android)
 >
 > 1. Скачайте/соберите клиент: Windows — `qeli-win/dist/QeliWin.exe` (или `dist-build/`).
 > 2. Импортируйте `qeli://` из `/etc/qeli/client-links/` на сервере или из панели
 >    (для профиля `reality` на `:8443` в ссылке **обязателен** `rsid=`).
 > 3. Подключитесь (для reality-tls хост = домен/`SERVER_PUBLIC_IP`, порт `443`).
 > 4. Метрики CPU/RAM: Settings → Panel URL `https://panel.example.com`, admin + пароль.
+>
+> ### Шаг 3a. Linux CLI-клиент
+>
+> Headless Linux, VPS как клиент, роутер (Entware) — через бинарник `qeli client` или Docker.
+> Полный справочник ключей: [`qeli/config/client.conf`](qeli/config/client.conf),
+> walkthrough: [docs/ru/GETTING-STARTED.md §8.2](docs/ru/GETTING-STARTED.md#82-linux-cli-клиент).
+>
+> #### Установка
+>
+> **`.deb` на хосте** (после сборки из шага 1):
+>
+> ```bash
+> sudo dpkg -i qeli_*_amd64.deb
+> sudo cp /usr/share/qeli/client.conf.example /etc/qeli/client.conf
+> ```
+>
+> **Docker** (без установки пакета на хост):
+>
+> ```bash
+> docker pull ghcr.io/litvinovtd/qeli:latest   # или локально: docker build … -t qeli:latest
+> mkdir -p ~/qeli-client/etc
+> ```
+>
+> #### Конфиг из `qeli://`
+>
+> Ссылку из панели (`Share` / `client-links/`) переведите в INI. Пример для **reality-tls**
+> (домен + nginx на `:443`):
+>
+> ```ini
+> [qeli]
+> server = panel.example.com:443
+> proto = tcp
+> user = alice
+> pass = YOUR_PASSWORD
+> key = SERVER_STATIC_PUBKEY_HEX
+> mode = reality-tls
+> sni = www.microsoft.com
+> reality_sid = 276095fae873f177
+> gateway = true
+> dns = tunnel
+>
+> [logging]
+> level = info
+> ```
+>
+> Соответствие полей ссылки: `host:port` → `server`; логин/пароль → `user`/`pass`;
+> `proto`, `mode`, `key`, `sni`, `rsid` → `reality_sid`. Ключи `gateway`, `dns`, `proxy`,
+> `route_local`, `kill_switch` в ссылке **не** передаются — только в файле.
+>
+> | Ключ | Значение |
+> |------|----------|
+> | `gateway = true` | full-tunnel (весь IPv4 через VPN; на сервере нужен NAT) |
+> | `gateway = false` | split-tunnel (только маршруты сервера + `route = …`) |
+> | `dns = tunnel` | DNS через туннель (рекомендуется на bare metal) |
+> | `dns = off` | не трогать `/etc/resolv.conf` (**обязательно в Docker-клиенте**) |
+> | `proxy = true` | локальный SOCKS5/HTTP вместо TUN (per-app routing) |
+>
+> Профиль **`reality`** (`:8443`, fake-tls + REALITY) — в ссылке обязателен `rsid=`, в INI
+> это `reality_sid`. Без него сервер отдаёт decoy TLS → handshake fail.
+>
+> #### Проверка и запуск (bare metal)
+>
+> ```bash
+> qeli check-config --client --config /etc/qeli/client.conf   # rc=0 = OK
+> sudo qeli client --config /etc/qeli/client.conf               # нужен root (TUN, маршруты)
+> ```
+>
+> Ожидаемые строки в логе: `Auth OK, assigned IP: 10.9.0.x`, `TUN vpn0 is up`.
+> Ctrl+C — disconnect, маршруты снимаются.
+>
+> #### Запуск в Docker
+>
+> Entrypoint образа: `docker run … qeli:latest client`. В контейнере **`dns = off`**
+> (bind-mount `/etc/resolv.conf` ломает `dns = tunnel`).
+>
+> ```bash
+> docker run --rm --name qeli-client \
+>   --cap-add NET_ADMIN --device /dev/net/tun \
+>   --sysctl net.ipv4.ip_forward=1 \
+>   -v "$PWD/client.conf:/etc/qeli/client.conf:ro" \
+>   qeli:latest client
+> ```
+>
+> Проверка конфига без старта туннеля:
+>
+> ```bash
+> docker run --rm --entrypoint /usr/local/bin/qeli \
+>   -v "$PWD/client.conf:/etc/qeli/client.conf:ro" \
+>   qeli:latest check-config --client --config /etc/qeli/client.conf
+> ```
+>
+> Диагностика из другого терминала (пока контейнер работает):
+>
+> ```bash
+> docker exec qeli-client ping -c 3 10.9.0.1    # шлюз VPN
+> docker exec qeli-client ping -c 3 1.1.1.1     # egress через NAT сервера
+> ```
+>
+> Подробнее про Docker-клиент: [`release/docker/README.md`](release/docker/README.md) §2d, §5.
 >
 > Документация: [docs/ru/GETTING-STARTED.md](docs/ru/GETTING-STARTED.md) ·
 > [docs/ru/PANEL.md](docs/ru/PANEL.md).

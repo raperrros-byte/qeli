@@ -271,7 +271,10 @@ internal class TransportCore private constructor(private var handle: Long) : Aut
             } finally {
                 bytes.fill(0)
             }
-            check(nativeHandle != 0L) { "transport core rejected the configuration" }
+            check(nativeHandle != 0L) {
+                "transport core rejected the profile (invalid INI — check mode/proto/key; " +
+                    "geo exclude routes must not be in the Rust config)"
+            }
             try {
                 requireSuccess(nativeSetDeviceId(nativeHandle, deviceId), "setDeviceId")
                 return TransportCore(nativeHandle)

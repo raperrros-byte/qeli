@@ -1,10 +1,10 @@
 package com.qeli.geo
 
+import java.util.TreeMap
+
 enum class GeoDomainType { Plain, Regex, RootDomain, Full }
 
 data class GeoDomainRule(val type: GeoDomainType, val value: String)
-
-import java.util.TreeMap
 
 /** Loaded subset of geosite.dat for selected tags. */
 class GeoSiteIndex {
@@ -20,6 +20,41 @@ class GeoSiteIndex {
         return false
     }
 
+    /** True when [host] ends with `.<suffix>` or equals [suffix] (e.g. `.ru`, `.su`). */
+    fun matchesDirectTld(hostRaw: String, suffixes: Collection<String>): Boolean {
+        if (hostRaw.isBlank() || suffixes.isEmpty()) return false
+        val host = hostRaw.trim().trimEnd('.').lowercase()
+        for (suffix in suffixes) {
+            val tld = suffix.trim().trim('.').lowercase()
+            if (tld.isEmpty()) continue
+            if (host == tld || host.endsWith(".$tld")) return true
+        }
+        return false
+    }
+
+    /**
+     * Concrete domain names from loaded geosite rules (skips TLD-only wildcards like `ru`).
+     * Used to pre-resolve A records into TUN exclude routes at connect time.
+     */
+    fun collectResolvableDomains(limit: Int): List<String> {
+        require(limit > 0) { "limit must be positive" }
+        val out = LinkedHashSet<String>()
+        for (rules in byTag.values) {
+            for (rule in rules) {
+                val candidate = when (rule.type) {
+                    GeoDomainType.Full -> rule.value
+                    GeoDomainType.RootDomain -> rule.value
+                    else -> continue
+                }.trim().trimEnd('.').lowercase()
+                if (candidate.isEmpty()) continue
+                if (!candidate.contains('.')) continue
+                out += candidate
+                if (out.size >= limit) return out.toList()
+            }
+        }
+        return out.toList()
+    }
+
     private fun matchOne(host: String, rule: GeoDomainRule): Boolean {
         val v = rule.value.trim().lowercase()
         if (v.isEmpty()) return false
@@ -32,6 +67,9 @@ class GeoSiteIndex {
     }
 
     companion object {
+        fun matchesDirectTld(hostRaw: String, suffixes: Collection<String>): Boolean =
+            GeoSiteIndex().matchesDirectTld(hostRaw, suffixes)
+
         fun load(path: java.io.File, tags: Collection<String>): GeoSiteIndex {
             val want = tags.map { it.lowercase() }.toHashSet()
             val bytes = path.readBytes()

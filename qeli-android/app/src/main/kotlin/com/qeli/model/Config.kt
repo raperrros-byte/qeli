@@ -556,8 +556,19 @@ data class VpnConfig(
         }
     }
 
-    /** Canonical INI passed to the shared Rust transport core. */
-    fun toTransportCoreIni(label: String? = null): String = toIni(label)
+    /** Canonical INI passed to the shared Rust transport core. Platform-owned keys stay in
+     * [toIni] for save/export but must not cross JNI: strict parse treats unread names as
+     * typos and the FFI core does not run per-app filtering or local proxy. */
+    fun toTransportCoreIni(label: String? = null): String {
+        val excluded = TRANSPORT_CORE_EXCLUDED_KEYS
+        return toIni(label).lineSequence()
+            .filter { line ->
+                val eq = line.indexOf('=')
+                eq <= 0 || line.substring(0, eq).trim().lowercase() !in excluded
+            }
+            .joinToString("\n")
+            .let { text -> if (text.endsWith("\n")) text else "$text\n" }
+    }
 
     /**
      * Credential-free strict profile for the native UDP reachability diagnostic. The probe
@@ -591,6 +602,13 @@ data class VpnConfig(
          * a typo as "off", disabling probing on a config the desktop client accepts.
          */
         private val MTU_PROBE_OFF = setOf("false", "0", "no", "off")
+
+        /** Keys preserved in portable INI but owned by Android platform adapters, not Rust FFI. */
+        private val TRANSPORT_CORE_EXCLUDED_KEYS = setOf(
+            "allow_lan", "apps", "apps_mode", "dev_node", "metric", "name", "persist_tun",
+            "route_file", "reconnect", "reconnect_base_delay", "reconnect_max_delay",
+            "reconnect_retries", "include", "exclude", "proxy", "proxy_listen", "proxy_mode",
+        )
 
         // ── imported-value ranges (Audit 2026-07-27, C6) ─────────────────────────
         // The SERVER-pushed mtu was already range-checked (QeliService.parseOk clamps to

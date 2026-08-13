@@ -24,7 +24,7 @@ object ProxyRoutePreset {
     /** Site + IP tags to load from geosite.dat / geoip.dat for [presetId]. */
     fun tagsFor(presetId: String): Pair<List<String>, List<String>> =
         when (normalize(presetId)) {
-            BYPASS_RU -> listOf("category-ru", "ru", "geolocation-ru", "private") to
+            BYPASS_RU -> listOf("category-ru", "ru", "geolocation-ru", "su", "private") to
                 listOf("ru", "private")
             RU_BLOCKED -> listOf("ru-blocked", "category-ru-blocked", "ru-blocked-community", "geolocation-!cn") to
                 listOf("ru-blocked", "private")

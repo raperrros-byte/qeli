@@ -13,6 +13,7 @@ using System.Windows.Threading;
 using QeliWin.Model;
 using QeliWin.Service;
 using QeliWin.Vpn;
+using Qeli.Shared;
 using Qeli.Shared.Model;
 using Qeli.Shared.Vpn;
 

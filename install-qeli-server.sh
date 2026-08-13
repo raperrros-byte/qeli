@@ -493,10 +493,12 @@ else
 fi
 
 # ── 3. install the package (pulls iptables / iproute2) ──────────────────────
-# --no-install-recommends: the package Recommends systemd-resolved (only useful
-# for the CLIENT's resolvectl path). A server doesn't need it, and letting apt
-# pull it in repoints /etc/resolv.conf to the systemd stub mid-install, which can
-# transiently break DNS (e.g. the public-IP lookup below). Skip it on servers.
+# --no-install-recommends: the package Suggests systemd-resolved (only useful
+# for the CLIENT's resolvectl path). A server doesn't need it, and `apt install
+# --install-suggests` can pull it in and repoint /etc/resolv.conf to the systemd
+# stub mid-install, which can transiently break DNS (e.g. the public-IP lookup
+# below). Skip suggests on servers; plain `apt install ./qeli.deb` is safe too
+# (Suggests are not installed unless explicitly requested).
 log "Installing the package"
 apt-get install -y --no-install-recommends "$TMP_DEB" || { dpkg -i "$TMP_DEB" || true; apt-get install -y --no-install-recommends -f; }
 [ "$CLEANUP_DEB" -eq 1 ] && rm -f "$TMP_DEB"

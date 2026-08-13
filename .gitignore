@@ -6,6 +6,8 @@ scripts/lab_env.sh
 scripts/.lab_secrets
 scripts/.lab_secrets.*
 !scripts/lab_secrets.example
+scripts/test-cli-client.conf
+scripts/cli-test-etc/
 scripts/_tmp_*
 scripts/**/*.pem
 scripts/**/*.key

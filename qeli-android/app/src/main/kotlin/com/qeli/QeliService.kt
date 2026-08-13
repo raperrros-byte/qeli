@@ -465,15 +465,18 @@ class VpnServiceImpl : VpnService() {
         // what prevents "Disconnect then Connect" from overlapping two scopes/TUNs.
         stopping = false
         userRequestedDisconnect = false
-        val effective = applyGeoExcludes(config)
-        activeConfig = effective
+        // Geo bypass CIDRs apply only to Android VpnService excludeRoute — they must NOT
+        // be serialized into the Rust transport-core INI (thousands of entries exceed
+        // MAX_CONFIG_BYTES / blow up strict parse → qeli_client_new -2).
+        val tunConfig = applyGeoExcludes(config)
+        activeConfig = tunConfig
         nativeFatalError = null
         var initialCoreEvents: List<TransportCoreEvent> = emptyList()
         transportCore = runCatching {
             val stableDeviceId = deviceId()
             val core = try {
                 TransportCore.create(
-                    effective.toTransportCoreIni(),
+                    config.toTransportCoreIni(),
                     deviceId = stableDeviceId,
                     platformCapabilities = TransportCore.PLATFORM_ROUTES or
                         TransportCore.PLATFORM_DNS or
@@ -519,11 +522,11 @@ class VpnServiceImpl : VpnService() {
                     ", state=${core.state()}, lifecycle events drained"
             )
         }
-        broadcastLog("Service started: ${effective.protocol.uppercase()}/${effective.wireMode}" +
-            if (effective.isUdp && effective.quicEnabled) "+QUIC" else "")
+        broadcastLog("Service started: ${tunConfig.protocol.uppercase()}/${tunConfig.wireMode}" +
+            if (tunConfig.isUdp && tunConfig.quicEnabled) "+QUIC" else "")
         broadcastLog(
-            "Connecting to ${logValue(effective.serverAddress)}:${effective.port} " +
-                "as user '${logValue(effective.username)}'"
+            "Connecting to ${logValue(tunConfig.serverAddress)}:${tunConfig.port} " +
+                "as user '${logValue(tunConfig.username)}'"
         )
         try {
             val pm = getSystemService(POWER_SERVICE) as PowerManager
@@ -553,7 +556,7 @@ class VpnServiceImpl : VpnService() {
         // can call stopVpn before teardown has a runner to join.
         val runner = coroutineScope!!.launch(start = CoroutineStart.LAZY) {
             try {
-                connectWithRetry(effective)
+                connectWithRetry(config)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 // normal teardown — ignore
             } catch (e: Exception) {
@@ -988,17 +991,39 @@ class VpnServiceImpl : VpnService() {
         addresses.drop(offset) + addresses.take(offset)
     }
 
-    /** Merge geoip bypass CIDRs into excludeRoutes for bypass-ru / bypass-cn presets. */
+    /** Merge geo bypass routes into excludeRoutes for bypass-ru / bypass-cn presets. */
     private fun applyGeoExcludes(config: VpnConfig): VpnConfig {
         val prefs = getSharedPreferences(MainActivity.PREFS_STATE, MODE_PRIVATE)
         val preset = com.qeli.geo.ProxyRoutePreset.normalize(
             prefs.getString(MainActivity.PREF_GEO_PRESET, com.qeli.geo.ProxyRoutePreset.PROXY_ALL))
+        if (preset == com.qeli.geo.ProxyRoutePreset.PROXY_ALL) return config
+        if (!com.qeli.geo.GeoAssetStore.hasFiles(this)) {
+            broadcastLog("Geo routing ($preset): geosite/geoip not downloaded — bypass disabled")
+            return config
+        }
         val geo = try {
-            com.qeli.geo.GeoAssetStore.tunExcludeCidrs(this, preset, max = 200)
-        } catch (_: Exception) { emptyList() }
-        if (geo.isEmpty()) return config
-        broadcastLog("Geo routing ($preset): excluding ${geo.size} CIDR(s) from tunnel")
-        return config.copy(excludeRoutes = (config.excludeRoutes + geo).distinct())
+            com.qeli.geo.GeoAssetStore.tunExcludeCidrs(this, preset)
+        } catch (error: Exception) {
+            broadcastLog("Geo routing ($preset): geoip load failed — ${error.message}")
+            emptyList()
+        }
+        val domainIps = try {
+            com.qeli.geo.GeoDirectResolver.resolveBypassIps(this, preset) { broadcastLog(it) }
+        } catch (error: Exception) {
+            broadcastLog("Geo routing ($preset): domain pre-resolve failed — ${error.message}")
+            emptyList()
+        }
+        val merged = (config.excludeRoutes + geo + domainIps).distinct()
+        if (merged.size == config.excludeRoutes.size) {
+            broadcastLog("Geo routing ($preset): no bypass routes produced")
+            return config
+        }
+        broadcastLog(
+            "Geo routing ($preset): ${geo.size} geoip CIDR(s), " +
+                "${domainIps.size} domain IP(s), " +
+                ".ru/.su TLD direct via geoip + geosite",
+        )
+        return config.copy(excludeRoutes = merged)
     }
 
     private suspend fun connectWithRetry(config: VpnConfig) {
@@ -1425,7 +1450,7 @@ class VpnServiceImpl : VpnService() {
         underlyingNets.clear()
         networkSignatures.clear()
         if (cb != null) {
-            try { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) } catch (_: Exception) {}
+        try { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) } catch (_: Exception) {}
         }
     }
 
@@ -1468,33 +1493,33 @@ class VpnServiceImpl : VpnService() {
 
         teardownJob = teardownScope.launch {
             teardownAndWait()
-            try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (_: Exception) {}
-            wakeLock = null
-            // NB: do NOT reset userRequestedDisconnect here — the retry loop may still
-            // be unwinding and must see it as true so it does not reconnect. It is
-            // reset in startVpn() on the next explicit Connect.
-            liveIp = ""
-            liveConnectedAt = 0L
+        try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (_: Exception) {}
+        wakeLock = null
+        // NB: do NOT reset userRequestedDisconnect here — the retry loop may still
+        // be unwinding and must see it as true so it does not reconnect. It is
+        // reset in startVpn() on the next explicit Connect.
+        liveIp = ""
+        liveConnectedAt = 0L
             // Clear the negotiated snapshot only after native teardown; until then the
             // system still owns a live VPN generation and its routes/DNS snapshot.
-            liveDns = ""
-            liveMtu = 0
-            liveStreams = 1
-            liveRoutes = 0
-            liveLockdown = false
-            livePushed = PushedFacts()
-            pushedRoutesInstalled = -1
-            liveBytesUp = 0L
-            liveBytesDown = 0L
+        liveDns = ""
+        liveMtu = 0
+        liveStreams = 1
+        liveRoutes = 0
+        liveLockdown = false
+        livePushed = PushedFacts()
+        pushedRoutesInstalled = -1
+        liveBytesUp = 0L
+        liveBytesDown = 0L
 
             withContext(Dispatchers.Main.immediate) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
+        stopForeground(STOP_FOREGROUND_REMOVE)
                 if (finalError == null) {
-                    broadcastStatus(STATUS_DISCONNECTED)
+        broadcastStatus(STATUS_DISCONNECTED)
                 } else {
                     broadcastStatus(STATUS_ERROR, finalError)
                 }
-                stopSelf()
+        stopSelf()
             }
         }
     }
@@ -1746,7 +1771,7 @@ class VpnServiceImpl : VpnService() {
                 } else if (withIpv6) {
                     addAddress("fd00:71e1::1", 128)
                     if (pre13Ipv6Excludes.isEmpty()) {
-                        addRoute("::", 0)
+                    addRoute("::", 0)
                     } else {
                         val complement = RouteComplements.ipv6(pre13Ipv6Excludes)
                             ?: throw IllegalArgumentException(
@@ -1782,6 +1807,8 @@ class VpnServiceImpl : VpnService() {
             // clean per-route exclusion, so we log and skip.
             if (config.excludeRoutes.isNotEmpty()) {
                 if (Build.VERSION.SDK_INT >= 33) {
+                    var installed = 0
+                    var failed = 0
                     for (cidr in config.excludeRoutes) {
                         try {
                             val slash = cidr.indexOf('/')
@@ -1793,9 +1820,16 @@ class VpnServiceImpl : VpnService() {
                             val address = android.system.Os.inet_pton(family, addr)
                                 ?: throw IllegalArgumentException("not an IP literal")
                             excludeRoute(android.net.IpPrefix(address, prefix))
-                            broadcastLog("exclude $cidr from tunnel")
-                        } catch (e: Exception) { broadcastLog("bad exclude route $cidr: ${e.message}") }
+                            installed++
+                        } catch (e: Exception) {
+                            failed++
+                            if (failed <= 3) broadcastLog("bad exclude route $cidr: ${e.message}")
+                        }
                     }
+                    broadcastLog(
+                        "exclude routes: $installed installed" +
+                            if (failed > 0) ", $failed skipped" else "",
+                    )
                 } else if (config.isFullTunnel) {
                     // Pre-13 full-tunnel excludes were already applied as a complement route
                     // split in the routing decision above — they HAVE to be, because a route
@@ -1878,8 +1912,8 @@ class VpnServiceImpl : VpnService() {
             if (!seen.add(route.cidr)) continue
             if (excluded.any { cidrOverlaps(it, route.cidr) }) {
                 broadcastLog("core plan route REFUSED: ${route.cidr} overlaps `exclude`")
-                continue
-            }
+                    continue
+                }
             if (!builder.addCidrRoute(route.cidr)) continue
             if (route.cidr in pushedCidrs) pushedInstalled++
             val detail = buildString {

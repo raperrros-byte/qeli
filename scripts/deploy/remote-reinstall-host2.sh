@@ -17,7 +17,7 @@ apk add -q openssh-client sshpass
 SCP=(sshpass -p "$PASS" scp -o StrictHostKeyChecking=no)
 SSH=(sshpass -p "$PASS" ssh -o StrictHostKeyChecking=no "root@${HOST}")
 
-"${SCP[@]}" /w/qeli/debian/qeli_0.7.14_amd64.deb "root@${HOST}:/tmp/"
+"${SCP[@]}" /w/qeli/debian/qeli_0.7.15_amd64.deb "root@${HOST}:/tmp/"
 "${SCP[@]}" /w/install-qeli-server.sh "root@${HOST}:/tmp/"
 "${SCP[@]}" /w/scripts/deploy/nginx-panel-sni.sh "root@${HOST}:/tmp/"
 "${SCP[@]}" /w/scripts/deploy/clean-reinstall-lab.sh "root@${HOST}:/tmp/"
@@ -25,16 +25,21 @@ SSH=(sshpass -p "$PASS" ssh -o StrictHostKeyChecking=no "root@${HOST}")
 if [ -n "${TLS_CERT_PEM:-}" ] && [ -f "$TLS_CERT_PEM" ]; then
   "${SCP[@]}" "$TLS_CERT_PEM" "root@${HOST}:/tmp/qeli-panel.pem"
 else
-  echo "WARN: set TLS_CERT_PEM to a local PEM path before scp" >&2
+  echo "WARN: TLS_CERT_PEM not set — will reuse /etc/qeli/*.pem on server" >&2
 fi
 
 "${SSH[@]}" bash -s <<EOF
 set -euo pipefail
 chmod +x /tmp/clean-reinstall-lab.sh /tmp/nginx-panel-sni.sh /tmp/install-qeli-server.sh
+if [ ! -f /tmp/qeli-panel.pem ] && [ -f /etc/qeli/web-tls-cert.pem ]; then
+  cat /etc/qeli/web-tls-cert.pem /etc/qeli/web-tls-key.pem > /tmp/qeli-panel.pem
+  chmod 600 /tmp/qeli-panel.pem
+fi
 export PANEL_DOMAIN=${DOMAIN}
 export PANEL_ALLOW_CIDRS=${ALLOW}
 export TLS_CERT_PEM=/tmp/qeli-panel.pem
 export PANEL_PASSWORD=${PANEL_PASS}
+export QELI_DEB=/tmp/qeli_0.7.15_amd64.deb
 export SCRIPT_DIR=/tmp
 bash /tmp/clean-reinstall-lab.sh
 EOF

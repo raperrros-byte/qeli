@@ -1,6 +1,7 @@
 package com.qeli.geo
 
 import android.content.Context
+import android.os.Build
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -63,13 +64,22 @@ object GeoAssetStore {
         return site to ip
     }
 
-    /** CIDRs to exclude from TUN for bypass presets (capped for VpnService limits). */
-    fun tunExcludeCidrs(ctx: Context, presetId: String, max: Int = 200): List<String> {
+    /**
+     * CIDRs to exclude from TUN for bypass presets.
+     * Aggregates geoip blocks and caps the route table on older Android builds.
+     */
+    fun tunExcludeCidrs(ctx: Context, presetId: String, maxRoutes: Int = tunExcludeRouteBudget()): List<String> {
         val codes = ProxyRoutePreset.tunBypassIpCodes(presetId)
         if (codes.isEmpty()) return emptyList()
         val (_, ipIdx) = getOrLoad(ctx, presetId)
-        return ipIdx?.cidrsFor(codes, max) ?: emptyList()
+        val raw = ipIdx?.allCidrsFor(codes) ?: return emptyList()
+        if (raw.isEmpty()) return emptyList()
+        return CidrAggregator.prioritizeForCoverage(raw, maxRoutes)
     }
+
+    /** Route budget for geo excludes; pre-Android-13 complement splits are much tighter. */
+    fun tunExcludeRouteBudget(): Int =
+        if (Build.VERSION.SDK_INT >= 33) 4096 else 160
 
     private fun downloadOne(urls: List<String>, dest: File, label: String, log: (String) -> Unit) {
         var last: Exception? = null

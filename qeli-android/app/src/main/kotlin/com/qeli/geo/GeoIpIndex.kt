@@ -1,5 +1,7 @@
 package com.qeli.geo
 
+import java.util.TreeMap
+
 data class Ipv4Cidr(val network: Int, val prefix: Int) {
     fun toCidrString(): String {
         val a = (network ushr 24) and 0xff
@@ -17,14 +19,12 @@ data class Ipv4Cidr(val network: Int, val prefix: Int) {
     }
 }
 
-import java.util.TreeMap
-
 /** Loaded subset of geoip.dat for selected country codes. */
 class GeoIpIndex {
     private val byCode = TreeMap<String, MutableList<Ipv4Cidr>>(String.CASE_INSENSITIVE_ORDER)
 
-    fun cidrsFor(codes: Collection<String>, max: Int = 256): List<String> {
-        val out = ArrayList<String>(max)
+    fun cidrsFor(codes: Collection<String>, max: Int = Int.MAX_VALUE): List<String> {
+        val out = ArrayList<String>()
         for (code in codes) {
             val list = byCode[code] ?: continue
             for (c in list) {
@@ -34,6 +34,8 @@ class GeoIpIndex {
         }
         return out
     }
+
+    fun allCidrsFor(codes: Collection<String>): List<String> = cidrsFor(codes)
 
     fun matchAny(ipBytes: ByteArray, vararg codes: String): Boolean {
         if (ipBytes.size != 4) return false
