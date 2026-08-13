@@ -743,11 +743,23 @@ public abstract class VpnTunnelBase
         {
             NativeTransportCore.SetDeviceId(handle, DeviceId());
             NativeTransportCore.Start(handle);
+            // Prefer profile dns_servers / server push. GUI defaults are full-tunnel + dns=tunnel;
+            // when the server profile has dns.enabled=false and no push_servers, the shared core
+            // refuses with "no resolver is available". Public resolvers via the tunnel are a last
+            // resort so those modes still connect (queries go through the VPN — not a DNS leak).
+            string[] fallbackDns =
+                string.Equals(config.DnsMode, "tunnel", StringComparison.OrdinalIgnoreCase)
+                && (config.DnsServers == null || config.DnsServers.Count == 0)
+                    ? new[] { "1.1.1.1", "8.8.8.8" }
+                    : Array.Empty<string>();
+            if (fallbackDns.Length > 0)
+            {
+                Log("No DNS from server/profile — using public resolvers via tunnel: "
+                    + string.Join(", ", fallbackDns));
+            }
             string runtimeInput = JsonSerializer.Serialize(new
             {
-                // An empty list is intentional: use explicit dns_servers or the authenticated
-                // server push. Never select a public third-party resolver behind the user's back.
-                fallback_dns_servers = Array.Empty<string>(),
+                fallback_dns_servers = fallbackDns,
                 carrier_addresses = carrierAddresses
             });
             runner = Task.Run(() => NativeTransportCore.Run(handle, runtimeInput));

@@ -337,9 +337,21 @@ final class QeliNativeTunnelEngine: @unchecked Sendable {
     }
 
     private func runtimeInput(carrierAddresses: [String]) throws -> String {
-        // Explicit dns_servers or the authenticated server push are the only DNS sources.
+        // Prefer profile dns_servers / server push. GUI defaults are full-tunnel + dns=tunnel;
+        // when the server profile has dns.enabled=false, the shared core refuses with rc=-10.
+        // Public resolvers via the tunnel are a last resort (queries go through the VPN).
+        let fallbackDns: [String] =
+            config.dnsMode == "tunnel" && config.dnsServers.isEmpty
+            ? ["1.1.1.1", "8.8.8.8"]
+            : []
+        if !fallbackDns.isEmpty {
+            sharedStore.appendLog(
+                "No DNS from server/profile — using public resolvers via tunnel: "
+                    + fallbackDns.joined(separator: ", ")
+            )
+        }
         let envelope: [String: Any] = [
-            "fallback_dns_servers": [String](),
+            "fallback_dns_servers": fallbackDns,
             "carrier_addresses": carrierAddresses,
         ]
         let data = try JSONSerialization.data(withJSONObject: envelope, options: [])

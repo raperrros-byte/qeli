@@ -829,8 +829,23 @@ class VpnServiceImpl : VpnService() {
             core.stop()
             core.start()
         }
-        // Explicit dns_servers or the authenticated server push are the only sources.
-        val fallbackDns = emptyList<String>()
+        // Prefer profile dns_servers / server push. When the profile asks for tunnel DNS
+        // (the mobile default with full-tunnel) but the server profile has dns.enabled=false
+        // and no push_servers, the shared core refuses with rc=-10. Public resolvers via
+        // the tunnel are a last resort so those modes still connect; they are NOT a DNS leak
+        // (queries go through the VPN). Skip when the user set dns=off/system or listed servers.
+        val fallbackDns = if (
+            config.dnsMode.equals("tunnel", ignoreCase = true) && config.dnsServers.isEmpty()
+        ) {
+            listOf("1.1.1.1", "8.8.8.8").also {
+                broadcastLog(
+                    "No DNS from server/profile — using public resolvers via tunnel: " +
+                        it.joinToString()
+                )
+            }
+        } else {
+            emptyList()
+        }
         val carrierAddresses = resolvePhysicalCarrierAddresses(config, carrierGeneration)
         debugLog("Physical carrier candidates: ${carrierAddresses.joinToString(", ")}")
         nativeFatalError = null
