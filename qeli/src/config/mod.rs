@@ -3,6 +3,7 @@ pub mod server;
 // declarative API surface or used only by tests / the Android port.
 #[allow(dead_code)]
 pub mod client;
+pub mod client_profiles;
 pub mod format;
 mod server_ini;
 #[allow(dead_code)]

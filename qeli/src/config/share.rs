@@ -474,6 +474,107 @@ fn from_hex(b: u8) -> Option<u8> {
     }
 }
 
+/// File-only client keys the panel can add when exporting a Linux CLI `client.conf`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientIniExportOptions {
+    pub gateway: bool,
+    pub route_local: bool,
+    pub kill_switch: bool,
+    /// `tunnel` or `off`.
+    pub dns_mode: String,
+}
+
+impl Default for ClientIniExportOptions {
+    fn default() -> Self {
+        Self {
+            gateway: false,
+            route_local: false,
+            kill_switch: false,
+            dns_mode: "tunnel".into(),
+        }
+    }
+}
+
+impl ClientIniExportOptions {
+    fn parse_bool(params: &std::collections::HashMap<String, String>, key: &str) -> bool {
+        params
+            .get(key)
+            .is_some_and(|value| value == "true" || value == "1")
+    }
+
+    pub fn from_share_params(params: &std::collections::HashMap<String, String>) -> Self {
+        let gateway = Self::parse_bool(params, "gateway");
+        Self {
+            gateway,
+            route_local: Self::parse_bool(params, "route_local"),
+            // Kill-switch is meaningful only in full-tunnel mode.
+            kill_switch: Self::parse_bool(params, "kill_switch") && gateway,
+            dns_mode: match params.get("dns").map(String::as_str) {
+                Some("off") => "off".into(),
+                _ => "tunnel".into(),
+            },
+        }
+    }
+}
+
+/// Build a self-contained flat INI for the headless/Linux client from a share link.
+pub fn client_ini_from_link(link: &ClientLink, opts: &ClientIniExportOptions) -> String {
+    use crate::config::client::ClientConfig;
+
+    let mut cfg = ClientConfig::from_link(link);
+    cfg.routing.add_default_gateway = opts.gateway;
+    cfg.routing.route_local_networks = opts.route_local;
+    cfg.routing.kill_switch = opts.kill_switch;
+    cfg.dns.mode = opts.dns_mode.clone();
+
+    let mut ini = cfg.to_ini_string();
+    ini = ensure_ini_kv(&ini, "dns", &opts.dns_mode);
+    if opts.gateway {
+        ini = ensure_ini_kv(&ini, "gateway", "true");
+    }
+    if opts.route_local {
+        ini = ensure_ini_kv(&ini, "route_local", "true");
+    }
+    if opts.kill_switch {
+        ini = ensure_ini_kv(&ini, "kill_switch", "true");
+    }
+    if !ini.contains("[logging]") {
+        if !ini.ends_with('\n') {
+            ini.push('\n');
+        }
+        ini.push('\n');
+        ini.push_str("[logging]\nlevel = info\n");
+    }
+    ini
+}
+
+fn ensure_ini_kv(ini: &str, key: &str, value: &str) -> String {
+    let prefix = format!("{key} =");
+    if ini.lines().any(|line| {
+        let trimmed = line.trim_start();
+        !trimmed.starts_with('#') && trimmed.starts_with(&prefix)
+    }) {
+        return ini.to_string();
+    }
+    let marker = "\n[logging]";
+    if let Some(pos) = ini.find(marker) {
+        let mut out = String::with_capacity(ini.len() + key.len() + value.len() + 8);
+        out.push_str(&ini[..pos]);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!("{key} = {value}\n"));
+        out.push_str(&ini[pos..]);
+        return out;
+    }
+    let mut out = ini.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("{key} = {value}\n"));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -754,6 +855,47 @@ mod conformance {
                 "case '{name}': this link MUST be rejected, but it parsed: {uri}"
             );
         }
+    }
+
+    #[test]
+    fn client_ini_export_includes_file_only_keys() {
+        let link = ClientLink {
+            host: "vpn.example.com".into(),
+            port: 443,
+            user: "alice".into(),
+            pass: "secret".into(),
+            proto: "tcp".into(),
+            mode: "reality-tls".into(),
+            server_key: "0a33d308295d5dc49bff020ca8a73e86b3f6797cbcc7d3aa440eee754729223a".into(),
+            sni: Some("www.microsoft.com".into()),
+            reality_sid: Some("276095fae873f177".into()),
+            obfs_key: None,
+            fronting: None,
+            quic: false,
+            awg: false,
+            jc: 0,
+            jmin: 0,
+            jmax: 0,
+            mtu: 0,
+            label: Some("reality-tls".into()),
+        };
+        let ini = client_ini_from_link(
+            &link,
+            &ClientIniExportOptions {
+                gateway: true,
+                route_local: false,
+                kill_switch: true,
+                dns_mode: "tunnel".into(),
+            },
+        );
+        assert!(ini.contains("server = vpn.example.com:443"));
+        assert!(ini.contains("mode = reality-tls"));
+        assert!(ini.contains("reality_sid = 276095fae873f177"));
+        assert!(ini.contains("gateway = true"));
+        assert!(ini.contains("dns = tunnel"));
+        assert!(ini.contains("kill_switch = true"));
+        assert!(ini.contains("[logging]"));
+        assert!(ini.contains("level = info"));
     }
 
     #[test]

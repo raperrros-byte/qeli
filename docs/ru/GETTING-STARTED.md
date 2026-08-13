@@ -717,8 +717,15 @@ dns         = tunnel
 ```
 
 ```bash
+qeli client ls --config /etc/qeli/client.conf
+sudo qeli client --config /etc/qeli/client.conf --profile reality-tls
 sudo qeli client --config /etc/qeli/client.conf
 ```
+
+Один файл может содержать **несколько профилей** (экспорт INI из панели Users → Share):
+блоки `# Profile: <имя>` + `[qeli]`. Общая секция `[logging]` в начале файла применяется ко
+всем профилям. Если профилей несколько — `--profile` обязателен. `qeli client ls` печатает
+таблицу (SERVER / PROTO / MODE / USER / SNI / …).
 
 > При H-1 (дефолт) `key` обязателен и должен быть **реальным** (не нулевым). Если на
 > сервере `bind_static_to_session = false`, можно работать по TOFU (нулевой `key`).

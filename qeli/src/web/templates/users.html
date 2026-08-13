@@ -133,7 +133,7 @@
             <td class="tbl-td text-slate-400 text-xs" x-text="u.max_sessions > 0 ? u.max_sessions : 'default'"></td>
             <td class="tbl-td text-right">
               <div class="flex items-center justify-end gap-1.5">
-                <button class="btn btn-ghost btn-sm" @click="openShare(u)" title="Share / QR">
+                <button class="btn btn-ghost btn-sm" @click="openShare(u)" title="Share / Export">
                   <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M4 4h6v6H4V4zm10 0h6v6h-6V4zM4 14h6v6H4v-6zm10 3h3m-3 3h6m0-6v3"/></svg>
                 </button>
                 <button class="btn btn-ghost btn-sm" @click="openEdit(u)" title="Edit">
@@ -445,7 +445,7 @@
     <div class="modal" @click.stop style="max-width:560px">
       <div class="flex items-center justify-between px-6 pt-5 pb-4 border-b border-[#21314e]">
         <div>
-          <h3 class="text-base font-semibold text-white">Share connection (QR)</h3>
+          <h3 class="text-base font-semibold text-white">Export client config</h3>
           <p class="text-xs text-slate-500 mt-0.5" x-text="'@' + share.user"></p>
         </div>
         <button class="text-slate-500 hover:text-white" @click="closeModal()">
@@ -487,10 +487,71 @@
           </div>
         </div>
 
-        <!-- Legacy user with no recoverable password — offer a reset. -->
-        <div x-show="share.needsReset" class="p-3 rounded-lg text-xs" style="background:#422006;color:#fbbf24;border:1px solid rgba(255,176,32,.35)">
-          <div class="mb-2" x-text="share.resetMsg"></div>
-          <button class="btn btn-warn btn-sm" @click="generateShare(true)" :disabled="share.loading">Reset password &amp; issue config</button>
+        <div>
+          <label class="block text-xs font-medium text-slate-400 mb-1.5">Output format</label>
+          <div class="grid grid-cols-2 gap-2">
+            <label class="flex items-start gap-2 px-2.5 py-2 rounded-lg cursor-pointer text-xs" style="background:var(--bg-2);border:1px solid var(--line)">
+              <input type="radio" class="mt-0.5" value="link" x-model="share.format">
+              <span>
+                <span class="text-slate-200 block">qeli:// link + QR</span>
+                <span class="text-slate-500">Mobile / desktop apps</span>
+              </span>
+            </label>
+            <label class="flex items-start gap-2 px-2.5 py-2 rounded-lg cursor-pointer text-xs" style="background:var(--bg-2);border:1px solid var(--line)">
+              <input type="radio" class="mt-0.5" value="ini" x-model="share.format">
+              <span>
+                <span class="text-slate-200 block">client.conf (INI)</span>
+                <span class="text-slate-500">Linux CLI / Docker</span>
+              </span>
+            </label>
+          </div>
+        </div>
+
+        <div x-show="share.format === 'ini'" class="space-y-2 p-3 rounded-lg" style="background:var(--bg-2);border:1px solid var(--line)">
+          <p class="text-xs font-medium text-slate-300">Linux client options</p>
+          <p class="text-[11px] text-slate-500">These keys are not carried in qeli:// links — set them here for a ready-to-use file.</p>
+          <label class="flex items-start gap-2.5 text-xs cursor-pointer">
+            <input type="checkbox" class="mt-0.5" x-model="share.gateway">
+            <span>
+              <span class="text-slate-200 block">Full-tunnel (gateway = true)</span>
+              <span class="text-slate-500">Route all IPv4 traffic through the VPN. Requires NAT on the server profile (routing.nat.enabled).</span>
+            </span>
+          </label>
+          <label class="flex items-start gap-2.5 text-xs cursor-pointer">
+            <input type="checkbox" class="mt-0.5" x-model="share.dnsTunnel">
+            <span>
+              <span class="text-slate-200 block">DNS through tunnel (dns = tunnel)</span>
+              <span class="text-slate-500">Use tunnel DNS via systemd-resolved. Uncheck for dns = off (Docker / external DNS manager).</span>
+            </span>
+          </label>
+          <label class="flex items-start gap-2.5 text-xs cursor-pointer">
+            <input type="checkbox" class="mt-0.5" x-model="share.routeLocal">
+            <span>
+              <span class="text-slate-200 block">Private LAN routes (route_local = true)</span>
+              <span class="text-slate-500">Also route RFC1918 (10/8, 172.16/12, 192.168/16) through the tunnel — may break local LAN access.</span>
+            </span>
+          </label>
+          <label class="flex items-start gap-2.5 text-xs cursor-pointer" :class="!share.gateway ? 'opacity-50' : ''">
+            <input type="checkbox" class="mt-0.5" x-model="share.killSwitch" :disabled="!share.gateway">
+            <span>
+              <span class="text-slate-200 block">Kill switch (kill_switch = true)</span>
+              <span class="text-slate-500">Block non-tunnel egress while connected (full-tunnel only, Linux iptables).</span>
+            </span>
+          </label>
+        </div>
+
+        <!-- Legacy user with no recoverable password — enter current password or reset. -->
+        <div x-show="share.needsReset" class="p-3 rounded-lg text-xs space-y-3" style="background:#422006;color:#fbbf24;border:1px solid rgba(255,176,32,.35)">
+          <div x-text="share.resetMsg"></div>
+          <div>
+            <label class="block text-xs font-medium mb-1.5" style="color:#fde68a">Current VPN password</label>
+            <input class="inp w-full" type="password" x-model="share.manualPassword" placeholder="Enter once — password is not changed" autocomplete="off">
+            <p class="text-[11px] mt-1.5" style="color:#fcd34d">For users created before re-issue support: enter their current password to generate a config without resetting it. The server stores an encrypted copy for next time.</p>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <button class="btn btn-primary btn-sm" @click="generateShare()" :disabled="share.loading || !share.manualPassword.trim()">Generate with password</button>
+            <button class="btn btn-warn btn-sm" @click="resetShare()" :disabled="share.loading">Reset password &amp; issue config</button>
+          </div>
         </div>
 
         <div x-show="share.error" class="p-3 rounded-lg bg-red-900/30 border border-red-700 text-red-300 text-xs" x-text="share.error"></div>
@@ -501,23 +562,30 @@
           New password: <span class="font-mono text-white" x-text="share.newPassword"></span> — the user's previous config no longer works.
         </div>
 
-        <!-- Result: one QR for a single profile, plus an importable multi-profile bundle. -->
+        <!-- Result: QR for a single qeli:// profile, or INI blocks for Linux CLI. -->
         <div x-show="share.bundle" class="space-y-3">
-          <div x-show="share.uris.length === 1 && share.qr" class="flex justify-center p-4 rounded-lg bg-white" x-html="share.qr"></div>
+          <div x-show="share.format === 'link' && share.uris.length === 1 && share.qr" class="flex justify-center p-4 rounded-lg bg-white" x-html="share.qr"></div>
           <div>
-            <label class="block text-xs font-medium text-slate-400 mb-1.5">Combined client config</label>
-            <textarea class="inp w-full font-mono text-xs" rows="6" readonly :value="share.bundle" @focus="$event.target.select()"></textarea>
+            <label class="block text-xs font-medium text-slate-400 mb-1.5" x-text="share.format === 'ini' ? 'client.conf (INI)' : 'Combined client config'"></label>
+            <textarea class="inp w-full font-mono text-xs" :rows="share.format === 'ini' ? 14 : 6" readonly :value="share.bundle" @focus="$event.target.select()"></textarea>
             <div class="flex gap-2 mt-2">
               <button class="btn btn-ghost flex-1" @click="copyBundle()">Copy all</button>
               <button class="btn btn-success flex-1" @click="downloadBundle()">Download .conf</button>
             </div>
-            <p class="text-xs text-amber-400 mt-1.5">The file contains credentials. Import the file or paste all lines into the qeli client.</p>
+            <p class="text-xs text-amber-400 mt-1.5" x-show="share.format === 'ini'"
+               x-text="qeliT('Contains credentials in cleartext. Save as /etc/qeli/client.conf, run chmod 600, then sudo qeli client.')"></p>
+            <p class="text-xs text-amber-400 mt-1.5" x-show="share.format !== 'ini'">
+              The file contains credentials. Import the file or paste all lines into the qeli client.
+            </p>
+            <p class="text-xs text-slate-500 mt-1" x-show="share.format === 'ini' && share.profilesSelected.length > 1">
+              Multiple profiles selected — each block is a separate file. Save one block per profile.
+            </p>
           </div>
         </div>
       </div>
       <div class="px-6 pb-5 flex gap-2 justify-end border-t border-[#21314e] pt-4">
         <button class="btn btn-ghost" @click="closeModal()">Close</button>
-        <button class="btn btn-primary" @click="generateShare()" :disabled="share.loading || !share.host || !share.profilesSelected.length">
+        <button class="btn btn-primary" @click="generateShare()" :disabled="share.loading || !share.host || !share.profilesSelected.length || (share.needsReset && !share.manualPassword.trim())">
           <div x-show="share.loading" class="w-3.5 h-3.5 rounded-full border-2 border-white border-t-transparent animate-spin"></div>
           Generate config
         </button>
@@ -547,7 +615,7 @@ function usersPage() {
     modalError: '',
     form: {},
     groupForm: {},
-    share: { availableProfiles: [], profilesSelected: [], uris: [], bundle: '' },
+    share: { availableProfiles: [], profilesSelected: [], uris: [], bundle: '', format: 'link' },
     selected: [],
     usage: [],
     usageByUser: {},
@@ -743,7 +811,7 @@ function usersPage() {
       this.modalSaving = false;
       this.form = {};
       this.groupForm = {};
-      this.share = { availableProfiles: [], profilesSelected: [], uris: [], bundle: '' };
+      this.share = { availableProfiles: [], profilesSelected: [], uris: [], bundle: '', format: 'link' };
     },
 
     toggleProfile(name) {
@@ -765,6 +833,12 @@ function usersPage() {
         availableProfiles: allowed,
         profilesSelected: allowed.map(p => p.name),
         host, label: '',
+        format: 'link',
+        gateway: true,
+        dnsTunnel: true,
+        routeLocal: false,
+        killSwitch: false,
+        manualPassword: '',
         uris: [], bundle: '', qr: '', error: '', loading: false,
         needsReset: false, resetMsg: '', reset: false, newPassword: '',
       };
@@ -781,6 +855,12 @@ function usersPage() {
       this.share.profilesSelected = this.share.availableProfiles.map(p => p.name);
     },
 
+    resetShare() {
+      this.share.manualPassword = '';
+      this.share.error = '';
+      this.generateShare(true);
+    },
+
     // No password input: the server decrypts the stored copy. For a legacy user
     // with none, the server replies needs_reset → we offer a reset (allowReset).
     async generateShare(allowReset = false) {
@@ -791,16 +871,27 @@ function usersPage() {
       try {
         const selected = [...this.share.profilesSelected];
         const uris = [];
+        const inis = [];
         let singleQr = '';
         let reset = false;
         let newPassword = '';
+        const exportFormat = this.share.format === 'ini' ? 'ini' : 'link';
         for (let i = 0; i < selected.length; i++) {
           const profile = selected[i];
           const payload = {
             profile,
             host: this.share.host.trim(),
             user: this.share.user,
+            format: exportFormat,
           };
+          if (exportFormat === 'ini') {
+            if (this.share.gateway) payload.gateway = 'true';
+            if (this.share.routeLocal) payload.route_local = 'true';
+            if (this.share.killSwitch && this.share.gateway) payload.kill_switch = 'true';
+            payload.dns = this.share.dnsTunnel ? 'tunnel' : 'off';
+          }
+          const manualPassword = this.share.manualPassword.trim();
+          if (!allowReset && manualPassword) payload.password = manualPassword;
           const label = this.share.label.trim();
           // Always put the profile name in the link fragment so imported clients
           // show distinct titles (not just "host (user)" for every mode).
@@ -826,13 +917,24 @@ function usersPage() {
             }
             return;
           }
-          uris.push(r.uri);
-          if (selected.length === 1) singleQr = r.qr_svg || '';
+          if (exportFormat === 'ini') {
+            inis.push({ profile, text: r.ini || '' });
+          } else {
+            uris.push(r.uri);
+            if (selected.length === 1) singleQr = r.qr_svg || '';
+          }
           reset = reset || !!r.reset;
           newPassword = r.new_password || newPassword;
         }
         this.share.uris = uris;
-        this.share.bundle = uris.join('\n') + '\n';
+        if (exportFormat === 'ini') {
+          this.share.bundle = inis.map(({ profile, text }) => {
+            if (selected.length === 1) return text;
+            return `# Profile: ${profile}\n# Save as: qeli-${this.share.user}-${profile}.conf\n\n${text}`;
+          }).join('\n');
+        } else {
+          this.share.bundle = uris.join('\n') + '\n';
+        }
         this.share.qr = singleQr;
         this.share.needsReset = false;
         this.share.reset = reset;
@@ -858,8 +960,13 @@ function usersPage() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       const safeUser = String(this.share.user || 'user').replace(/[^a-zA-Z0-9._-]+/g, '_');
+      const singleProfile = this.share.profilesSelected.length === 1
+        ? String(this.share.profilesSelected[0]).replace(/[^a-zA-Z0-9._-]+/g, '_')
+        : 'profiles';
       a.href = url;
-      a.download = `qeli-${safeUser}-profiles.conf`;
+      a.download = this.share.format === 'ini'
+        ? `qeli-${safeUser}-${singleProfile}.conf`
+        : `qeli-${safeUser}-profiles.conf`;
       document.body.appendChild(a);
       a.click();
       a.remove();

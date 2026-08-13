@@ -468,7 +468,7 @@ class VpnServiceImpl : VpnService() {
         // Geo bypass CIDRs apply only to Android VpnService excludeRoute — they must NOT
         // be serialized into the Rust transport-core INI (thousands of entries exceed
         // MAX_CONFIG_BYTES / blow up strict parse → qeli_client_new -2).
-        val tunConfig = applyGeoExcludes(config)
+        val tunConfig = applyGeoRouting(config)
         activeConfig = tunConfig
         nativeFatalError = null
         var initialCoreEvents: List<TransportCoreEvent> = emptyList()
@@ -991,39 +991,69 @@ class VpnServiceImpl : VpnService() {
         addresses.drop(offset) + addresses.take(offset)
     }
 
-    /** Merge geo bypass routes into excludeRoutes for bypass-ru / bypass-cn presets. */
-    private fun applyGeoExcludes(config: VpnConfig): VpnConfig {
+    /** Apply geo preset to Android VpnService routing (exclude or include CIDRs). */
+    private fun applyGeoRouting(config: VpnConfig): VpnConfig {
         val prefs = getSharedPreferences(MainActivity.PREFS_STATE, MODE_PRIVATE)
         val preset = com.qeli.geo.ProxyRoutePreset.normalize(
             prefs.getString(MainActivity.PREF_GEO_PRESET, com.qeli.geo.ProxyRoutePreset.PROXY_ALL))
-        if (preset == com.qeli.geo.ProxyRoutePreset.PROXY_ALL) return config
+        if (preset == com.qeli.geo.ProxyRoutePreset.PROXY_ALL) {
+            return config.copy(androidGeoSplitTunnel = false)
+        }
         if (!com.qeli.geo.GeoAssetStore.hasFiles(this)) {
-            broadcastLog("Geo routing ($preset): geosite/geoip not downloaded — bypass disabled")
-            return config
+            broadcastLog("Geo routing ($preset): geosite/geoip not downloaded — routing disabled")
+            return config.copy(androidGeoSplitTunnel = false)
         }
-        val geo = try {
-            com.qeli.geo.GeoAssetStore.tunExcludeCidrs(this, preset)
+        if (Build.VERSION.SDK_INT < 33 &&
+            com.qeli.geo.ProxyRoutePreset.usesBypassExcludes(preset)) {
+            broadcastLog(
+                "Geo routing ($preset): reliable bypass needs Android 13+ (API 33 excludeRoute). " +
+                    "On this device geo split may not apply.",
+            )
+        }
+
+        return try {
+            when {
+                com.qeli.geo.ProxyRoutePreset.usesIncludeRoutes(preset) -> {
+                    val geo = com.qeli.geo.GeoAssetStore.tunIncludeCidrs(this, preset)
+                    val domainIps = com.qeli.geo.GeoDirectResolver.resolveIncludeIps(this, preset) {
+                        broadcastLog(it)
+                    }
+                    val merged = (config.includeRoutes + geo + domainIps).distinct()
+                    if (merged.size == config.includeRoutes.size) {
+                        broadcastLog("Geo routing ($preset): no include routes produced")
+                        return config.copy(androidGeoSplitTunnel = false)
+                    }
+                    broadcastLog(
+                        "Geo routing ($preset): split-tunnel — ${geo.size} geoip CIDR(s), " +
+                            "${domainIps.size} domain IP(s) via VPN",
+                    )
+                    config.copy(includeRoutes = merged, androidGeoSplitTunnel = true)
+                }
+
+                com.qeli.geo.ProxyRoutePreset.usesBypassExcludes(preset) -> {
+                    val geo = com.qeli.geo.GeoAssetStore.tunExcludeCidrs(this, preset)
+                    val domainIps = com.qeli.geo.GeoDirectResolver.resolveBypassIps(this, preset) {
+                        broadcastLog(it)
+                    }
+                    val merged = (config.excludeRoutes + geo + domainIps).distinct()
+                    if (merged.size == config.excludeRoutes.size) {
+                        broadcastLog("Geo routing ($preset): no bypass routes produced")
+                        return config.copy(androidGeoSplitTunnel = false)
+                    }
+                    broadcastLog(
+                        "Geo routing ($preset): ${geo.size} geoip CIDR(s), " +
+                            "${domainIps.size} domain IP(s) direct, " +
+                            ".ru/.su TLD via geoip + geosite",
+                    )
+                    config.copy(excludeRoutes = merged, androidGeoSplitTunnel = false)
+                }
+
+                else -> config.copy(androidGeoSplitTunnel = false)
+            }
         } catch (error: Exception) {
-            broadcastLog("Geo routing ($preset): geoip load failed — ${error.message}")
-            emptyList()
+            broadcastLog("Geo routing ($preset): failed — ${error.message}")
+            config.copy(androidGeoSplitTunnel = false)
         }
-        val domainIps = try {
-            com.qeli.geo.GeoDirectResolver.resolveBypassIps(this, preset) { broadcastLog(it) }
-        } catch (error: Exception) {
-            broadcastLog("Geo routing ($preset): domain pre-resolve failed — ${error.message}")
-            emptyList()
-        }
-        val merged = (config.excludeRoutes + geo + domainIps).distinct()
-        if (merged.size == config.excludeRoutes.size) {
-            broadcastLog("Geo routing ($preset): no bypass routes produced")
-            return config
-        }
-        broadcastLog(
-            "Geo routing ($preset): ${geo.size} geoip CIDR(s), " +
-                "${domainIps.size} domain IP(s), " +
-                ".ru/.su TLD direct via geoip + geosite",
-        )
-        return config.copy(excludeRoutes = merged)
     }
 
     private suspend fun connectWithRetry(config: VpnConfig) {
@@ -1688,52 +1718,61 @@ class VpnServiceImpl : VpnService() {
         val prefixLength = plan.prefixLength
         val tunnelMtu = plan.mtu
         val fullTunnel = plan.fullTunnel
+        val useFullTunnel = fullTunnel && !config.androidGeoSplitTunnel
         return Builder().apply {
             setMtu(tunnelMtu)
             addAddress(tunnelAddress, prefixLength)
 
-            if (fullTunnel) {
+            if (useFullTunnel) {
                 // LAN bypass: per-profile allow_lan OR the global Settings toggle. When on,
                 // the local/private ranges are carved out of the tunnel so Wi-Fi/LAN devices
                 // stay reachable directly (no need to disconnect the VPN).
                 val allowLan = config.allowLan ||
                     getSharedPreferences(MainActivity.PREFS_STATE, Context.MODE_PRIVATE)
                         .getBoolean(MainActivity.PREF_ALLOW_LAN, false)
+                val ipv4Excludes = buildList {
+                    if (allowLan) addAll(LAN_BYPASS_EXCLUDES)
+                    addAll(config.excludeRoutes.filterNot { ':' in it })
+                }.distinct()
                 // User excludes that must be handled HERE rather than by excludeRoute():
                 // below API 33 the only way to exclude is to never route it in, and a route
                 // cannot be removed once added — so the decision has to happen before any
                 // `0.0.0.0/0`. (C-22)
-                val pre13Ipv4Excludes = if (Build.VERSION.SDK_INT < 33)
-                    config.excludeRoutes.filterNot { ':' in it } else emptyList()
+                val pre13Ipv4Excludes = if (Build.VERSION.SDK_INT < 33) ipv4Excludes else emptyList()
                 val pre13Ipv6Excludes = if (Build.VERSION.SDK_INT < 33)
                     config.excludeRoutes.filter { ':' in it } else emptyList()
                 when {
-                    allowLan && Build.VERSION.SDK_INT >= 33 -> {
+                    Build.VERSION.SDK_INT >= 33 -> {
                         addRoute("0.0.0.0", 0)
-                        for (cidr in LAN_BYPASS_EXCLUDES) {
+                        var installed = 0
+                        var failed = 0
+                        for (cidr in ipv4Excludes) {
                             try {
                                 val slash = cidr.indexOf('/')
+                                val addr = if (slash < 0) cidr else cidr.substring(0, slash)
+                                val prefix = if (slash < 0) RouteComplements.hostPrefix(addr)
+                                    else cidr.substring(slash + 1).toIntOrNull() ?: continue
                                 excludeRoute(android.net.IpPrefix(
-                                    android.system.Os.inet_pton(
-                                        android.system.OsConstants.AF_INET,
-                                        cidr.substring(0, slash)),
-                                    cidr.substring(slash + 1).toInt()))
-                            } catch (e: Exception) { broadcastLog("bad LAN-exclude $cidr: ${e.message}") }
+                                    android.system.Os.inet_pton(android.system.OsConstants.AF_INET, addr),
+                                    prefix))
+                                installed++
+                            } catch (e: Exception) {
+                                failed++
+                                if (failed <= 3) broadcastLog("bad exclude route $cidr: ${e.message}")
+                            }
                         }
-                        broadcastLog("LAN bypass ON — local networks reachable directly")
+                        broadcastLog(buildString {
+                            append("full tunnel: 0.0.0.0/0 with $installed exclude(s)")
+                            if (allowLan) append(" (LAN bypass)")
+                            if (failed > 0) append(", $failed skipped")
+                        })
                     }
-                    // Pre-13 with user excludes: one complement covering BOTH the LAN
-                    // ranges (when the bypass is on) and the user's excludes. Computing
-                    // them separately would let the second set re-add what the first
-                    // carved out.
                     pre13Ipv4Excludes.isNotEmpty() -> {
-                        val carveOut =
-                            (if (allowLan) LAN_BYPASS_EXCLUDES else emptyList()) + pre13Ipv4Excludes
-                        val complement = complementRoutes(carveOut)
+                        val complement = complementRoutes(pre13Ipv4Excludes)
                         when {
                             complement == null -> {
                                 broadcastLog("WARNING: could not build a pre-13 route split for " +
-                                    "${carveOut.size} exclude(s) — they are NOT excluded and " +
+                                    "${pre13Ipv4Excludes.size} exclude(s) — they are NOT excluded and " +
                                     "will go through the tunnel")
                                 addRoute("0.0.0.0", 0)
                             }
@@ -1743,7 +1782,7 @@ class VpnServiceImpl : VpnService() {
                             else -> {
                                 for (cidr in complement) addCidrRoute(cidr)
                                 broadcastLog("pre-13 route split: ${complement.size} prefixes, " +
-                                    "excluding ${carveOut.joinToString(", ")}")
+                                    "excluding ${pre13Ipv4Excludes.joinToString(", ")}")
                             }
                         }
                     }
@@ -1785,9 +1824,15 @@ class VpnServiceImpl : VpnService() {
                     allowFamily(android.system.OsConstants.AF_INET6)
                 }
             } else {
-                // The tunnel subnet itself is always reachable in split mode. Use the
-                // authenticated prefix from the canonical plan rather than assuming /24.
+                // Split mode: tunnel subnet + explicit includes (profile or geo preset).
                 addRoute(subnetBase(tunnelAddress, prefixLength), prefixLength)
+                var included = 0
+                for (cidr in config.includeRoutes) {
+                    if (addCidrRoute(cidr)) included++
+                }
+                if (config.androidGeoSplitTunnel) {
+                    broadcastLog("geo split-tunnel: $included include route(s) via VPN")
+                }
             }
 
             // Subnets the server advertised (`route = …` on the profile / per-user) are a
@@ -1799,17 +1844,24 @@ class VpnServiceImpl : VpnService() {
                 plan.routes,
                 pushedCidrs = plan.pushedRoutes.toHashSet(),
                 excluded = config.excludeRoutes,
-                fullTunnel = fullTunnel,
+                fullTunnel = useFullTunnel,
             )
 
             // Split-tunnel exclude (parity with Rust/win/mac): carve these destinations out
             // of the tunnel. VpnService.Builder.excludeRoute is API 33+; older Android has no
-            // clean per-route exclusion, so we log and skip.
+            // clean per-route exclusion, so we log and skip. IPv4 excludes on a full tunnel
+            // are applied in the routing block above (API 33+).
             if (config.excludeRoutes.isNotEmpty()) {
                 if (Build.VERSION.SDK_INT >= 33) {
-                    var installed = 0
-                    var failed = 0
-                    for (cidr in config.excludeRoutes) {
+                    val pending = if (useFullTunnel) {
+                        config.excludeRoutes.filter { ':' in it }
+                    } else {
+                        config.excludeRoutes
+                    }
+                    if (pending.isNotEmpty()) {
+                        var installed = 0
+                        var failed = 0
+                        for (cidr in pending) {
                         try {
                             val slash = cidr.indexOf('/')
                             val addr = if (slash < 0) cidr else cidr.substring(0, slash)
@@ -1826,11 +1878,12 @@ class VpnServiceImpl : VpnService() {
                             if (failed <= 3) broadcastLog("bad exclude route $cidr: ${e.message}")
                         }
                     }
-                    broadcastLog(
-                        "exclude routes: $installed installed" +
-                            if (failed > 0) ", $failed skipped" else "",
-                    )
-                } else if (config.isFullTunnel) {
+                        broadcastLog(
+                            "exclude routes: $installed installed" +
+                                if (failed > 0) ", $failed skipped" else "",
+                        )
+                    }
+                } else if (useFullTunnel) {
                     // Pre-13 full-tunnel excludes were already applied as a complement route
                     // split in the routing decision above — they HAVE to be, because a route
                     // cannot be removed once `0.0.0.0/0` is in the builder. Nothing to do

@@ -301,8 +301,10 @@
 > #### Проверка и запуск (bare metal)
 >
 > ```bash
-> qeli check-config --client --config /etc/qeli/client.conf   # rc=0 = OK
-> sudo qeli client --config /etc/qeli/client.conf               # нужен root (TUN, маршруты)
+> qeli client ls --config /etc/qeli/client.conf           # таблица профилей в bundle
+> qeli check-config --client --config /etc/qeli/client.conf   # rc=0 = OK (все профили)
+> sudo qeli client --config /etc/qeli/client.conf --profile reality-tls
+> sudo qeli client --config /etc/qeli/client.conf               # один профиль в файле
 > ```
 >
 > Ожидаемые строки в логе: `Auth OK, assigned IP: 10.9.0.x`, `TUN vpn0 is up`.

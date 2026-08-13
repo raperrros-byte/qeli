@@ -25,9 +25,12 @@ use std::path::PathBuf;
     version
 )]
 struct Cli {
-    /// Client config (flat-INI, `[qeli]` section). Default suits Entware layout.
+    /// Client config (flat-INI, `[qeli]` section, or a multi-profile bundle). Default suits Entware layout.
     #[arg(short, long, default_value = "/opt/etc/qeli/client.conf")]
     config: PathBuf,
+    /// Profile to connect (required when the config file defines several).
+    #[arg(long)]
+    profile: Option<String>,
 }
 
 /// Read the `[logging]` section (level + optional file) so logs land where the
@@ -110,5 +113,5 @@ async fn main() -> anyhow::Result<()> {
         anyhow::anyhow!("config path is not valid UTF-8: {}", cli.config.display())
     })?;
     log::info!("Starting qeli client with config: {}", cli.config.display());
-    qeli::client::run_client(config_str).await
+    qeli::client::run_client(config_str, cli.profile.as_deref()).await
 }

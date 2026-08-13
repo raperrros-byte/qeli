@@ -43,8 +43,23 @@ object ProxyRoutePreset {
         when (normalize(presetId)) {
             BYPASS_RU -> listOf("ru", "private")
             BYPASS_CN -> listOf("cn", "private")
-            // ru-blocked / gfw: only listed destinations go via VPN — needs domain proxy;
-            // on TUN we keep full tunnel (no bulk excludes).
             else -> emptyList()
         }
+
+    /** geoip codes whose CIDRs are routed **into** the tunnel (proxy-only presets). */
+    fun tunIncludeIpCodes(presetId: String): List<String> =
+        when (normalize(presetId)) {
+            RU_BLOCKED -> listOf("ru-blocked")
+            else -> emptyList()
+        }
+
+    /** Bulk geoip excludes for full-tunnel bypass presets. */
+    fun usesBypassExcludes(presetId: String): Boolean =
+        tunBypassIpCodes(presetId).isNotEmpty()
+
+    /** Split-tunnel: only listed destinations enter the VPN. */
+    fun usesIncludeRoutes(presetId: String): Boolean =
+        tunIncludeIpCodes(presetId).isNotEmpty() ||
+            normalize(presetId) == RU_BLOCKED ||
+            normalize(presetId) == GFW_BLACKLIST
 }

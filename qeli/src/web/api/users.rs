@@ -43,6 +43,29 @@ pub(crate) fn hash_and_enc(pw: &str) -> Result<(String, Option<String>), String>
     Ok((hash, enc))
 }
 
+/// Like [`hash_and_enc`], but re-issue paths require a stored encrypted copy.
+pub(crate) fn hash_and_enc_required(pw: &str) -> Result<(String, String), String> {
+    let (hash, enc) = hash_and_enc(pw)?;
+    enc.ok_or_else(|| {
+        "could not encrypt password for re-issue — check /var/lib/qeli/panel-secret.key \
+         permissions (service must be able to read/write the panel key)"
+            .into()
+    })
+    .map(|enc| (hash, enc))
+}
+
+/// Verify a VPN user's plaintext password against a stored Argon2 PHC hash.
+pub(crate) fn verify_vpn_password(plaintext: &str, password_hash: &str) -> bool {
+    use argon2::PasswordHash;
+    use argon2::PasswordVerifier;
+    match PasswordHash::new(password_hash) {
+        Ok(parsed) => argon2::Argon2::default()
+            .verify_password(plaintext.as_bytes(), &parsed)
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// Generate a strong random alphanumeric password (unambiguous alphabet).
 pub(crate) fn gen_password(len: usize) -> String {
     use rand::prelude::*;

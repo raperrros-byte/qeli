@@ -77,6 +77,19 @@ object GeoAssetStore {
         return CidrAggregator.prioritizeForCoverage(raw, maxRoutes)
     }
 
+    /** CIDRs routed into the tunnel for proxy-only presets (ru-blocked, gfw-blacklist). */
+    fun tunIncludeCidrs(ctx: Context, presetId: String, maxRoutes: Int = tunIncludeRouteBudget()): List<String> {
+        val codes = ProxyRoutePreset.tunIncludeIpCodes(presetId)
+        if (codes.isEmpty()) return emptyList()
+        val (_, ipIdx) = getOrLoad(ctx, presetId)
+        val raw = ipIdx?.allCidrsFor(codes) ?: return emptyList()
+        if (raw.isEmpty()) return emptyList()
+        return CidrAggregator.prioritizeForCoverage(raw, maxRoutes)
+    }
+
+    fun tunIncludeRouteBudget(): Int =
+        if (Build.VERSION.SDK_INT >= 33) 2048 else 120
+
     /** Route budget for geo excludes; pre-Android-13 complement splits are much tighter. */
     fun tunExcludeRouteBudget(): Int =
         if (Build.VERSION.SDK_INT >= 33) 4096 else 160

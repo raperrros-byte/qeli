@@ -548,11 +548,17 @@ impl ClientPlatform for LinuxCoreAdapter {
 }
 
 #[cfg(target_os = "linux")]
-pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
+pub async fn run_client(config_path: &str, profile: Option<&str>) -> anyhow::Result<()> {
     // SIGUSR1 dumps the packet trace, when one is armed (no-op otherwise).
     tokio::spawn(trace::watch());
 
-    let config_content = std::fs::read_to_string(config_path)?;
+    let file_content = std::fs::read_to_string(config_path)?;
+    let (profile_name, config_content) =
+        crate::config::client_profiles::resolve_client_profile(&file_content, profile)?;
+    if std::env::var("QELI_CLIENT_PROFILE").is_err() {
+        std::env::set_var("QELI_CLIENT_PROFILE", &profile_name);
+    }
+    log::info!("Using client profile '{profile_name}'");
     // STRICT: a misspelled key name and an unreadable value both used to fail open here —
     // only `check-config` reported them, while the real start substituted defaults in silence.
     // See `config::parse_client_config_strict`. (Audit 2026-08-01, §4/§5.)

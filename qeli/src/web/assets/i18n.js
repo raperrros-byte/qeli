@@ -253,6 +253,7 @@
       'Enable': 'Включить',
       'Disable': 'Отключить',
       'Share / QR': 'Поделиться / QR',
+      'Share / Export': 'Поделиться / экспорт',
       'Edit': 'Изменить',
       'Delete': 'Удалить',
       'Confirm': 'Подтвердить',
@@ -356,6 +357,31 @@
       'Allowed networks (CIDR)': 'Разрешённые сети (CIDR)',
       'Save Group': 'Сохранить группу',
       'Share connection (QR)': 'Ссылка подключения (QR)',
+      'Export client config': 'Экспорт конфига клиента',
+      'Output format': 'Формат выдачи',
+      'qeli:// link + QR': 'Ссылка qeli:// + QR',
+      'Mobile / desktop apps': 'Мобильные / desktop-приложения',
+      'client.conf (INI)': 'client.conf (INI)',
+      'Linux CLI / Docker': 'Linux CLI / Docker',
+      'Linux client options': 'Параметры Linux-клиента',
+      'These keys are not carried in qeli:// links — set them here for a ready-to-use file.':
+        'Эти ключи не передаются в qeli:// — задайте их здесь для готового файла.',
+      'Full-tunnel (gateway = true)': 'Full-tunnel (gateway = true)',
+      'Route all IPv4 traffic through the VPN. Requires NAT on the server profile (routing.nat.enabled).':
+        'Весь IPv4-трафик через VPN. На профиле сервера нужен NAT (routing.nat.enabled).',
+      'DNS through tunnel (dns = tunnel)': 'DNS через туннель (dns = tunnel)',
+      'Use tunnel DNS via systemd-resolved. Uncheck for dns = off (Docker / external DNS manager).':
+        'DNS через туннель (systemd-resolved). Снимите галочку для dns = off (Docker / внешний DNS).',
+      'Private LAN routes (route_local = true)': 'Маршруты частных сетей (route_local = true)',
+      'Also route RFC1918 (10/8, 172.16/12, 192.168/16) through the tunnel — may break local LAN access.':
+        'Также заворачивать RFC1918 (10/8, 172.16/12, 192.168/16) в туннель — может сломать доступ к локальной LAN.',
+      'Kill switch (kill_switch = true)': 'Kill switch (kill_switch = true)',
+      'Block non-tunnel egress while connected (full-tunnel only, Linux iptables).':
+        'Блокировать выход мимо туннеля при подключении (только full-tunnel, Linux iptables).',
+      'Contains credentials in cleartext. Save as /etc/qeli/client.conf, run chmod 600, then sudo qeli client.':
+        'Содержит учётные данные открытым текстом. Сохраните как /etc/qeli/client.conf, выполните chmod 600, затем sudo qeli client.',
+      'Multiple profiles selected — each block is a separate file. Save one block per profile.':
+        'Выбрано несколько профилей — каждый блок отдельный файл. Сохраните по одному блоку на профиль.',
       'This only builds a connection link/QR for an': 'Это лишь создаёт ссылку/QR подключения для',
       'existing': 'существующего',
       'user — it does': 'пользователя — это',
@@ -381,6 +407,11 @@
       ', and it does': ', и это',
       'change the password.': 'меняет пароль.',
       'Reset password & issue config': 'Сбросить пароль и выдать конфиг',
+      'Current VPN password': 'Текущий VPN-пароль',
+      'Enter once — password is not changed': 'Введите один раз — пароль не меняется',
+      'For users created before re-issue support: enter their current password to generate a config without resetting it. The server stores an encrypted copy for next time.':
+        'Для пользователей, созданных до поддержки перевыпуска: введите текущий пароль, чтобы сгенерировать конфиг без сброса. Сервер сохранит зашифрованную копию для следующих раз.',
+      'Generate with password': 'Сгенерировать с паролем',
       'No stored password for this user — reset to issue a config?': 'Для этого пользователя нет сохранённого пароля — сбросить, чтобы выдать конфиг?',
       'Password was reset.': 'Пароль сброшен.',
       'New password:': 'Новый пароль:',

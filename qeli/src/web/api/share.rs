@@ -18,7 +18,8 @@ use std::sync::Arc;
 /// returned — the user's old config then stops working.
 ///
 /// `POST /api/share` body:
-/// `{"profile":"tcp","host":"vpn.example.com","user":"alice","label":"My VPN","allow_reset":"true"}`
+/// `{"profile":"tcp","host":"vpn.example.com","user":"alice","label":"My VPN","allow_reset":"true",
+///   "format":"link|ini|both","gateway":"true","route_local":"false","kill_switch":"false","dns":"tunnel|off"}`
 pub async fn share_link(
     State(state): State<Arc<ServerState>>,
     _guard: auth::AuthGuard,
@@ -81,14 +82,24 @@ pub async fn share_link(
         return Json(super::err_json("user query param required"));
     }
     let allow_reset = params.get("allow_reset").map(String::as_str) == Some("true");
+    let supplied_password = if allow_reset {
+        None
+    } else {
+        params
+            .get("password")
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
 
-    // Resolve the password without admin input: decrypt the stored copy, else
-    // (legacy / decrypt failure) reset on demand. `reset` is reported back so the
-    // UI can warn that the old config was invalidated.
-    let enc = {
+    // Resolve the password without admin input: decrypt the stored copy, else accept a
+    // one-time admin-supplied password (legacy users with no password_enc), else reset
+    // on demand. `reset` is reported back so the UI can warn that the old config was
+    // invalidated.
+    let (password_hash, enc) = {
         let users = state.users_db.read().await;
         match users.users.iter().find(|u| u.username == user) {
-            Some(u) => u.password_enc.clone(),
+            Some(u) => (u.password_hash.clone(), u.password_enc.clone()),
             None => return Json(super::err_json(format!("user '{}' not found", user))),
         }
     };
@@ -98,19 +109,51 @@ pub async fn share_link(
     let (pass, was_reset) = match recovered {
         Some(p) => (p, false),
         None => {
-            if !allow_reset {
+            if let Some(supplied) = supplied_password {
+                if !super::users::verify_vpn_password(&supplied, &password_hash) {
+                    return Json(super::err_json(
+                        "Supplied password does not match this user's stored hash",
+                    ));
+                }
+                // Backfill password_enc so the next Share/QR works without re-entry.
+                let enc2 = match crate::crypto::secret::encrypt_password(&supplied) {
+                    Ok(enc2) => enc2,
+                    Err(e) => {
+                        return Json(super::err_json(format!(
+                            "password verified but could not store encrypted copy for re-issue: {e}"
+                        )));
+                    }
+                };
+                let users_file = state.config.auth.users_file.clone();
+                let mut users = state.users_db.write().await;
+                match crate::config::users::UsersDb::update_locked(&users_file, |db| {
+                    if let Some(u) = db.users.iter_mut().find(|u| u.username == user) {
+                        u.password_enc = Some(enc2);
+                    }
+                }) {
+                    Ok((fresh, ())) => *users = fresh,
+                    Err(e) => {
+                        log::warn!("share/backfill: could not persist password_enc: {e}");
+                        return Json(super::err_json(format!(
+                            "password verified but could not save encrypted copy: {e}"
+                        )));
+                    }
+                }
+                (supplied, false)
+            } else if !allow_reset {
                 return Json(json!({
                     "ok": false,
                     "needs_reset": true,
-                    "error": "No recoverable password for this user (created before re-issue was enabled, or the key changed). Reset to issue a new config — the user's old config will stop working.",
+                    "needs_password": true,
+                    "error": "No recoverable password for this user (created before re-issue was enabled, or the key changed). Enter the user's current VPN password below, or reset to issue a new config — the user's old config will stop working after a reset.",
                 }));
-            }
-            // Reset: new password, persisted (hash + encrypted copy), worker reloaded.
-            let new_pw = super::users::gen_password(20);
-            let (hash, enc2) = match super::users::hash_and_enc(&new_pw) {
-                Ok(v) => v,
-                Err(e) => return Json(super::err_json(e)),
-            };
+            } else {
+                // Reset: new password, persisted (hash + encrypted copy), worker reloaded.
+                let new_pw = super::users::gen_password(20);
+                let (hash, enc2) = match super::users::hash_and_enc_required(&new_pw) {
+                    Ok(v) => v,
+                    Err(e) => return Json(super::err_json(e)),
+                };
             {
                 let users_file = state.config.auth.users_file.clone();
                 let mut users = state.users_db.write().await;
@@ -121,7 +164,7 @@ pub async fn share_link(
                 match crate::config::users::UsersDb::update_locked(&users_file, |db| {
                     if let Some(u) = db.users.iter_mut().find(|u| u.username == user) {
                         u.password_hash = hash;
-                        u.password_enc = enc2;
+                        u.password_enc = Some(enc2);
                     }
                 }) {
                     Ok((fresh, ())) => *users = fresh,
@@ -135,6 +178,7 @@ pub async fn share_link(
                 let _ = tx.send(crate::server::WorkerCmd::ReloadUsers).await;
             }
             (new_pw, true)
+            }
         }
     };
 
@@ -163,16 +207,31 @@ pub async fn share_link(
     );
 
     let uri = link.to_uri();
-    let qr_svg = render_qr_svg(&uri);
-    Json(json!({
+    let export_format = params.get("format").map(String::as_str).unwrap_or("link");
+    let ini_opts = crate::config::share::ClientIniExportOptions::from_share_params(&params);
+    let ini = crate::config::share::client_ini_from_link(&link, &ini_opts);
+    let mut body = json!({
         "ok": true,
-        "uri": uri,
-        "qr_svg": qr_svg,
         "reset": was_reset,
         // Surface the freshly-generated password only when we reset, so the admin
         // can record it (it's also embedded in the URI).
         "new_password": if was_reset { Some(link.pass.clone()) } else { None },
-    }))
+    });
+    match export_format {
+        "ini" => {
+            body["ini"] = json!(ini);
+        }
+        "both" => {
+            body["uri"] = json!(uri);
+            body["qr_svg"] = json!(render_qr_svg(&uri));
+            body["ini"] = json!(ini);
+        }
+        _ => {
+            body["uri"] = json!(uri);
+            body["qr_svg"] = json!(render_qr_svg(&uri));
+        }
+    }
+    Json(body)
 }
 
 /// Render a `qeli://` URI to a self-contained SVG QR code (no JS/CDN needed —

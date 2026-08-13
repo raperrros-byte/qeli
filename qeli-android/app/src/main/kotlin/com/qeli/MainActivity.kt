@@ -283,6 +283,8 @@ sni = www.microsoft.com
         binding.btnTheme.setOnClickListener { QeliApp.setDark(this, !QeliApp.isDark(this)) }
         binding.btnSettings.setOnClickListener { showSettingsDialog() }
 
+        setupGeoRouting()
+
         // Reuses the existing per-app picker rather than a second entry point for the same
         // setting; it edits the ACTIVE profile, which is what the card describes.
         binding.connectionInfoRow.setOnClickListener { showProtectionDetails() }
@@ -438,6 +440,97 @@ sni = www.microsoft.com
 
     private fun current(): Profile? = profiles.getOrNull(activeIndex)
 
+    private var geoSpinnerInitializing = false
+
+    private fun setupGeoRouting() {
+        val presets = com.qeli.geo.ProxyRoutePreset.ALL
+        val labels = presets.map {
+            if (QeliApp.language(this) == "ru") it.labelRu else it.labelEn
+        }
+        val adapter = android.widget.ArrayAdapter(this, android.R.layout.simple_spinner_item, labels).apply {
+            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        }
+        binding.spinnerGeoPreset.adapter = adapter
+        geoSpinnerInitializing = true
+        val current = com.qeli.geo.ProxyRoutePreset.normalize(
+            getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
+                .getString(PREF_GEO_PRESET, com.qeli.geo.ProxyRoutePreset.PROXY_ALL))
+        val idx = presets.indexOfFirst { it.id == current }.coerceAtLeast(0)
+        binding.spinnerGeoPreset.setSelection(idx, false)
+        geoSpinnerInitializing = false
+
+        binding.spinnerGeoPreset.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (geoSpinnerInitializing) return
+                val picked = presets[position].id
+                val prefs = getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
+                val prev = com.qeli.geo.ProxyRoutePreset.normalize(
+                    prefs.getString(PREF_GEO_PRESET, com.qeli.geo.ProxyRoutePreset.PROXY_ALL))
+                if (picked == prev) return
+                prefs.edit().putString(PREF_GEO_PRESET, picked).apply()
+                renderGeoRouting()
+                if (isConnected || isConnecting) {
+                    Toast.makeText(this@MainActivity, getString(R.string.reconnecting_geo), Toast.LENGTH_SHORT).show()
+                    connect()
+                }
+            }
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+
+        binding.btnGeoDownload.setOnClickListener {
+            binding.btnGeoDownload.isEnabled = false
+            binding.btnGeoDownload.text = getString(R.string.geo_downloading)
+            lifecycleScope.launch {
+                try {
+                    withContext(Dispatchers.IO) {
+                        com.qeli.geo.GeoAssetStore.download(this@MainActivity) { msg ->
+                            runOnUiThread { binding.tvGeoStatus.text = msg }
+                        }
+                    }
+                    renderGeoRouting()
+                    Toast.makeText(this@MainActivity, R.string.geo_download_ok, Toast.LENGTH_SHORT).show()
+                    if (isConnected || isConnecting) {
+                        Toast.makeText(this@MainActivity, getString(R.string.reconnecting_geo), Toast.LENGTH_SHORT).show()
+                        connect()
+                    }
+                } catch (e: Exception) {
+                    Toast.makeText(this@MainActivity,
+                        getString(R.string.geo_download_fail, e.message ?: ""), Toast.LENGTH_LONG).show()
+                } finally {
+                    binding.btnGeoDownload.isEnabled = true
+                    binding.btnGeoDownload.text = getString(R.string.geo_download)
+                }
+            }
+        }
+        renderGeoRouting()
+    }
+
+    private fun renderGeoRouting() {
+        val preset = com.qeli.geo.ProxyRoutePreset.normalize(
+            getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
+                .getString(PREF_GEO_PRESET, com.qeli.geo.ProxyRoutePreset.PROXY_ALL))
+        binding.tvGeoStatus.text = getString(
+            R.string.geo_status,
+            com.qeli.geo.GeoAssetStore.statusText(this),
+        )
+        val warning = when {
+            preset != com.qeli.geo.ProxyRoutePreset.PROXY_ALL &&
+                !com.qeli.geo.GeoAssetStore.hasFiles(this) ->
+                getString(R.string.geo_warning_no_files)
+            preset != com.qeli.geo.ProxyRoutePreset.PROXY_ALL &&
+                android.os.Build.VERSION.SDK_INT < 33 &&
+                com.qeli.geo.ProxyRoutePreset.usesBypassExcludes(preset) ->
+                getString(R.string.geo_warning_api)
+            else -> null
+        }
+        if (warning != null) {
+            binding.tvGeoWarning.text = warning
+            binding.tvGeoWarning.visibility = View.VISIBLE
+        } else {
+            binding.tvGeoWarning.visibility = View.GONE
+        }
+    }
+
     /** Settings dialog: auto-connect toggles + profile backup/restore. */
     private fun showSettingsDialog() {
         val prefs = getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
@@ -460,51 +553,6 @@ sni = www.microsoft.com
         val cbFailover = android.widget.CheckBox(this).apply {
             text = getString(R.string.profile_failover)
             isChecked = prefs.getBoolean(PREF_FAILOVER, false)
-        }
-        val tvGeo = android.widget.TextView(this).apply {
-            text = getString(R.string.geo_route_preset)
-            setPadding(0, dp(8), 0, dp(4))
-        }
-        val geoPresets = com.qeli.geo.ProxyRoutePreset.ALL
-        val geoIds = geoPresets.map { it.id }
-        val currentGeo = com.qeli.geo.ProxyRoutePreset.normalize(
-            prefs.getString(PREF_GEO_PRESET, com.qeli.geo.ProxyRoutePreset.PROXY_ALL))
-        val rgGeo = android.widget.RadioGroup(this)
-        val geoButtons = geoPresets.map { e ->
-            android.widget.RadioButton(this).apply {
-                id = View.generateViewId()
-                text = if (QeliApp.language(this@MainActivity) == "ru") e.labelRu else e.labelEn
-            }.also { rgGeo.addView(it) }
-        }
-        rgGeo.check(geoButtons[geoIds.indexOf(currentGeo).coerceAtLeast(0)].id)
-        val tvGeoStatus = android.widget.TextView(this).apply {
-            text = getString(R.string.geo_status, com.qeli.geo.GeoAssetStore.statusText(this@MainActivity))
-            setPadding(0, dp(4), 0, dp(4))
-        }
-        val btnGeoDl = outlined().apply {
-            text = getString(R.string.geo_download)
-            setOnClickListener {
-                isEnabled = false
-                text = getString(R.string.geo_downloading)
-                lifecycleScope.launch {
-                    try {
-                        withContext(Dispatchers.IO) {
-                            com.qeli.geo.GeoAssetStore.download(this@MainActivity) { msg ->
-                                runOnUiThread { tvGeoStatus.text = msg }
-                            }
-                        }
-                        tvGeoStatus.text = getString(R.string.geo_status,
-                            com.qeli.geo.GeoAssetStore.statusText(this@MainActivity))
-                        Toast.makeText(this@MainActivity, R.string.geo_download_ok, Toast.LENGTH_SHORT).show()
-                    } catch (e: Exception) {
-                        Toast.makeText(this@MainActivity,
-                            getString(R.string.geo_download_fail, e.message ?: ""), Toast.LENGTH_LONG).show()
-                    } finally {
-                        isEnabled = true
-                        text = getString(R.string.geo_download)
-                    }
-                }
-            }
         }
         // Interface language. Applied via AppCompatDelegate, which recreates this Activity —
         // so it is handled on Save and nothing else in the dialog needs to know about it.
@@ -571,7 +619,6 @@ sni = www.microsoft.com
             orientation = android.widget.LinearLayout.VERTICAL
             setPadding(dp(20), dp(12), dp(20), 0)
             addView(cbLaunch); addView(cbBoot); addView(cbLan); addView(cbFailover)
-            addView(tvGeo); addView(rgGeo); addView(tvGeoStatus); addView(btnGeoDl)
             addView(tvLang); addView(rgLang)
             addView(tvLogFmt); addView(rgLogFmt)
             addView(tvLogLevel); addView(rgLogLevel)
@@ -593,15 +640,11 @@ sni = www.microsoft.com
                 val pickedLogLevel = logLevels.getOrElse(
                     logLevelButtons.indexOfFirst { it.id == rgLogLevel.checkedRadioButtonId },
                 ) { DEFAULT_LOG_LEVEL }
-                val pickedGeo = geoIds.getOrElse(
-                    geoButtons.indexOfFirst { it.id == rgGeo.checkedRadioButtonId },
-                ) { com.qeli.geo.ProxyRoutePreset.PROXY_ALL }
                 prefs.edit()
                     .putBoolean(PREF_AUTO_CONNECT_LAUNCH, cbLaunch.isChecked)
                     .putBoolean(PREF_AUTO_CONNECT_BOOT, cbBoot.isChecked)
                     .putBoolean(PREF_ALLOW_LAN, cbLan.isChecked)
                     .putBoolean(PREF_FAILOVER, cbFailover.isChecked)
-                    .putString(PREF_GEO_PRESET, pickedGeo)
                     .putString(PREF_LOG_TIME_FORMAT, pickedLogFmt)
                     .putString(PREF_LOG_LEVEL, pickedLogLevel)
                     .apply()
@@ -903,6 +946,7 @@ sni = www.microsoft.com
         val ms = reach[activeIndex]
         applyReach(binding.activeReachDot, binding.tvActiveReach, p, ms)
         renderConnectionInfo()
+        renderGeoRouting()
     }
 
     /**

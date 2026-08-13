@@ -65,6 +65,11 @@ data class VpnConfig(
     // default (a full tunnel normally carries everything). Distinct from — and the
     // inverse of — route_local_networks. Android extra; the desktop/CLI client ignores it.
     val allowLan: Boolean = false,
+    /**
+     * Android-only: geo preset forces split-tunnel (ru-blocked / gfw-blacklist).
+     * Not serialized to INI or Rust transport core.
+     */
+    val androidGeoSplitTunnel: Boolean = false,
     // ── dns ──
     // Explicit resolvers reached through the tunnel. Empty means that authenticated server
     // push may supply the list; if neither source does, Android leaves the system resolver

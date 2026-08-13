@@ -31,6 +31,12 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum ClientAction {
+    /// List profiles from the config as a table
+    Ls,
+}
+
+#[derive(Subcommand)]
 enum Commands {
     /// Run in server mode
     Server {
@@ -57,8 +63,22 @@ enum Commands {
         #[arg(long)]
         client: bool,
     },
-    /// Run in client mode
+    /// Run in client mode (or `qeli client ls` to list profiles)
+    ///
+    /// When the config file contains several profiles (panel Share bundle), pass
+    /// `--profile <name>`. List them with `qeli client ls`.
     Client {
+        #[arg(short, long, default_value = "/etc/qeli/client.conf", global = true)]
+        config: PathBuf,
+        /// Profile to connect (required when the config file defines several).
+        #[arg(long)]
+        profile: Option<String>,
+        #[command(subcommand)]
+        action: Option<ClientAction>,
+    },
+    /// List profile names from a client config (one per line; for scripts)
+    #[command(name = "client-profiles")]
+    ClientProfiles {
         #[arg(short, long, default_value = "/etc/qeli/client.conf")]
         config: PathBuf,
     },
@@ -278,6 +298,72 @@ enum Commands {
     },
 }
 
+/// Report unread/retired/GUI-only keys and bad values for one parsed INI document.
+fn report_ini_findings(path: &str, doc: &config::format::IniDoc, client: bool) -> usize {
+    use config::GUI_ONLY_CLIENT_KEYS;
+    use config::RETIRED_KEYS;
+
+    let mut problems = 0usize;
+
+    let (gui_only, rest): (Vec<_>, Vec<_>) = doc
+        .unread_keys()
+        .into_iter()
+        .partition(|(_, k)| client && GUI_ONLY_CLIENT_KEYS.contains(k));
+    let (retired, unknown): (Vec<_>, Vec<_>) = rest
+        .into_iter()
+        .partition(|(_, k)| RETIRED_KEYS.contains(k));
+
+    if !gui_only.is_empty() {
+        println!(
+            "{path}: {} key(s) used only by the Windows/macOS clients (ignored here):",
+            gui_only.len()
+        );
+        for (section, key) in &gui_only {
+            println!("  {section} {key}");
+        }
+    }
+
+    if !retired.is_empty() {
+        println!(
+            "{path}: {} key(s) retired in 0.7.12 — they never had any effect:",
+            retired.len()
+        );
+        for (section, key) in &retired {
+            println!("  {section} {key}");
+        }
+        println!("Safe to delete; leaving them changes nothing either way.");
+    }
+
+    if !unknown.is_empty() {
+        problems += unknown.len();
+        eprintln!(
+            "{path}: {} key(s) that nothing reads — check the spelling:",
+            unknown.len()
+        );
+        for (section, key) in &unknown {
+            eprintln!("  {section} {key}");
+        }
+        eprintln!(
+            "An unknown key is not an error: it is simply ignored, and the setting \
+             keeps its default."
+        );
+    }
+
+    let bad_values = doc.bad_values();
+    if !bad_values.is_empty() {
+        problems += bad_values.len();
+        eprintln!(
+            "{path}: {} value(s) present but not understood — the default was used instead:",
+            bad_values.len()
+        );
+        for msg in &bad_values {
+            eprintln!("  {msg}");
+        }
+    }
+
+    problems
+}
+
 /// Read just the `logging` section from a config file so the logger can be set
 /// up before the rest of the config is parsed. Falls back to (info, stderr) on
 /// any error — the real parse later will surface config problems.
@@ -361,7 +447,7 @@ async fn main() -> anyhow::Result<()> {
     // Configure logging from the config's `logging` section (level + optional
     // file) so server/client logs land where the operator expects.
     let (level, log_file, time_format) = match &cli.command {
-        Commands::Server { config } | Commands::Worker { config } | Commands::Client { config } => {
+        Commands::Server { config } | Commands::Worker { config } | Commands::Client { config, .. } => {
             peek_logging(config)
         }
         _ => ("info".to_string(), None, "datetime".to_string()),
@@ -400,14 +486,34 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Client { config } => {
-            log::info!("Starting client with config: {}", config.display());
-            #[cfg(target_os = "linux")]
-            {
-                let config_str = config.to_str().ok_or_else(|| {
-                    anyhow::anyhow!("config path is not valid UTF-8: {}", config.display())
-                })?;
-                client::run_client(config_str).await?;
+        Commands::Client {
+            config,
+            profile,
+            action,
+        } => match action {
+            Some(ClientAction::Ls) => {
+                print_client_profiles_table(&config)?;
+            }
+            None => {
+                log::info!("Starting client with config: {}", config.display());
+                #[cfg(target_os = "linux")]
+                {
+                    let config_str = config.to_str().ok_or_else(|| {
+                        anyhow::anyhow!("config path is not valid UTF-8: {}", config.display())
+                    })?;
+                    client::run_client(config_str, profile.as_deref()).await?;
+                }
+            }
+        },
+
+        Commands::ClientProfiles { config } => {
+            let path = config.display().to_string();
+            let text = std::fs::read_to_string(&config)
+                .map_err(|e| anyhow::anyhow!("cannot read {}: {}", path, e))?;
+            let profiles = config::client_profiles::split_client_profiles(&text)
+                .map_err(|e| anyhow::anyhow!("{}: {}", path, e))?;
+            for profile in profiles {
+                println!("{}", profile.name);
             }
         }
 
@@ -505,32 +611,54 @@ async fn main() -> anyhow::Result<()> {
             let text = std::fs::read_to_string(&config)
                 .map_err(|e| anyhow::anyhow!("cannot read {}: {}", path, e))?;
 
-            // Parse the document ourselves rather than going through
-            // parse_*_config(), because the unread-key report needs the same
-            // IniDoc the config was built from.
-            let doc = config::format::IniDoc::parse(&text)
-                .map_err(|e| anyhow::anyhow!("{}: {}", path, e))?;
-
             let mut problems = 0usize;
+
             if client {
-                let cfg = config::client::ClientConfig::from_ini(&doc)
+                let profiles = config::client_profiles::split_client_profiles(&text)
                     .map_err(|e| anyhow::anyhow!("{}: {}", path, e))?;
-                // The same enum checks `run_client` runs, so this command and a real start
-                // agree — mirroring what the server branch below already does.
-                cfg.validate()
-                    .map_err(|e| anyhow::anyhow!("{}: {}", path, e))?;
+                if profiles.len() > 1 {
+                    let names: Vec<_> = profiles.iter().map(|p| p.name.as_str()).collect();
+                    println!(
+                        "{}: {} client profile(s): {}",
+                        path,
+                        profiles.len(),
+                        names.join(", ")
+                    );
+                }
+
+                for spec in &profiles {
+                    let label = if profiles.len() > 1 {
+                        format!("{path} [profile {}]", spec.name)
+                    } else {
+                        path.clone()
+                    };
+
+                    if spec.body.trim().starts_with("qeli://") {
+                        let link = config::share::ClientLink::from_uri(spec.body.trim())
+                            .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+                        let cfg = config::client::ClientConfig::from_link(&link);
+                        cfg.validate()
+                            .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+                        continue;
+                    }
+
+                    let doc = config::format::IniDoc::parse(&spec.body)
+                        .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+                    let cfg = config::client::ClientConfig::from_ini(&doc)
+                        .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+                    cfg.validate()
+                        .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+
+                    problems += report_ini_findings(&label, &doc, true);
+                }
             } else {
+                let doc = config::format::IniDoc::parse(&text)
+                    .map_err(|e| anyhow::anyhow!("{}: {}", path, e))?;
+
                 let cfg = config::server::ServerConfig::from_ini(&doc)
                     .map_err(|e| anyhow::anyhow!("{}: {}", path, e))?;
-                // The same schema checks the data-plane worker runs at startup,
-                // so `check-config` and a real start agree.
                 #[cfg(target_os = "linux")]
                 server::validate_profiles(&cfg)?;
-                // Pre-flight the addressing against THIS host, so `check-config` on the
-                // server answers the question that matters before a first start: would
-                // this config cut me off the box? Reported (not `?`) because the verdict
-                // is host-specific — checking a server's config from a laptop compares it
-                // against the laptop's networking, where a "collision" means nothing.
                 #[cfg(target_os = "linux")]
                 if let Err(e) = server::preflight::run(&cfg) {
                     problems += 1;
@@ -538,92 +666,8 @@ async fn main() -> anyhow::Result<()> {
                 }
                 #[cfg(not(target_os = "linux"))]
                 let _ = &cfg;
-            }
 
-            // Keys nothing read: not a parse error, never surfaced at runtime,
-            // and the reason a misspelling silently keeps the default.
-            //
-            // A client config is shared with the Windows/macOS clients, which have
-            // their own parser and implement a few keys this binary does not. Those
-            // are perfectly valid here — reporting them as typos would be a lie —
-            // so they are listed separately and do not fail the check.
-            use config::GUI_ONLY_CLIENT_KEYS;
-
-            // Keys removed in 0.7.12 because they never had any effect. An existing
-            // config may still carry them, and calling those a "typo" would send the
-            // operator hunting for a spelling mistake that isn't there. Name them for
-            // what they are, and don't fail the check — deleting the line is optional
-            // tidying, not a fix.
-            use config::RETIRED_KEYS;
-            // NB: `[logging] format` is deliberately absent. It is still parsed into
-            // the config (it just isn't applied), so it never lands in unread_keys and
-            // could never be reported here — listing it would promise a message that
-            // can't happen. It is marked "not implemented" in CONFIG.md instead.
-
-            let (gui_only, rest): (Vec<_>, Vec<_>) = doc
-                .unread_keys()
-                .into_iter()
-                .partition(|(_, k)| client && GUI_ONLY_CLIENT_KEYS.contains(k));
-            let (retired, unknown): (Vec<_>, Vec<_>) = rest
-                .into_iter()
-                .partition(|(_, k)| RETIRED_KEYS.contains(k));
-
-            if !gui_only.is_empty() {
-                println!(
-                    "{}: {} key(s) used only by the Windows/macOS clients (ignored here):",
-                    path,
-                    gui_only.len()
-                );
-                for (section, key) in &gui_only {
-                    println!("  {} {}", section, key);
-                }
-            }
-
-            if !retired.is_empty() {
-                println!(
-                    "{}: {} key(s) retired in 0.7.12 — they never had any effect:",
-                    path,
-                    retired.len()
-                );
-                for (section, key) in &retired {
-                    println!("  {} {}", section, key);
-                }
-                println!("Safe to delete; leaving them changes nothing either way.");
-            }
-
-            if !unknown.is_empty() {
-                problems += unknown.len();
-                eprintln!(
-                    "{}: {} key(s) that nothing reads — check the spelling:",
-                    path,
-                    unknown.len()
-                );
-                for (section, key) in &unknown {
-                    eprintln!("  {} {}", section, key);
-                }
-                eprintln!(
-                    "An unknown key is not an error: it is simply ignored, and the setting \
-                     keeps its default."
-                );
-            }
-
-            // Values that were PRESENT but not understood. `unread_keys` above only finds
-            // misspelled key NAMES; a key spelled correctly whose VALUE is junk was read,
-            // so it never appears there — it only produced a log line the worker emits at
-            // runtime, which `check-config` never saw. That is how a config containing
-            // `kill_switch = ture` passed with "OK" and rc=0 while the kill-switch was
-            // silently off. Reported and counted as a problem now. (S-15)
-            let bad_values = doc.bad_values();
-            if !bad_values.is_empty() {
-                problems += bad_values.len();
-                eprintln!(
-                    "{}: {} value(s) present but not understood — the default was used instead:",
-                    path,
-                    bad_values.len()
-                );
-                for msg in &bad_values {
-                    eprintln!("  {msg}");
-                }
+                problems += report_ini_findings(&path, &doc, false);
             }
 
             if problems == 0 {
@@ -1467,6 +1511,143 @@ fn print_blocked_list(resp: &str) {
             fmt_secs(b["unblock_in_secs"].as_u64().unwrap_or(0)),
         );
     }
+}
+
+fn print_client_profiles_table(config: &PathBuf) -> anyhow::Result<()> {
+    let path = config.display().to_string();
+    let text = std::fs::read_to_string(config)
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {}", path, e))?;
+    let profiles = config::client_profiles::split_client_profiles(&text)
+        .map_err(|e| anyhow::anyhow!("{}: {}", path, e))?;
+    if profiles.is_empty() {
+        println!("No profiles in {path}");
+        return Ok(());
+    }
+
+    #[derive(Default)]
+    struct Row {
+        name: String,
+        server: String,
+        proto: String,
+        mode: String,
+        user: String,
+        sni: String,
+        sid: String,
+        dev: String,
+        gateway: String,
+        dns: String,
+        quic: String,
+        awg: String,
+        error: Option<String>,
+    }
+
+    let yn = |v: bool| if v { "yes" } else { "no" };
+    let dash = |s: &str| {
+        let t = s.trim();
+        if t.is_empty() {
+            "-".to_string()
+        } else {
+            t.to_string()
+        }
+    };
+
+    let mut rows: Vec<Row> = Vec::with_capacity(profiles.len());
+    for spec in profiles {
+        let mut row = Row {
+            name: spec.name.clone(),
+            ..Row::default()
+        };
+        let cfg = if spec.body.trim().starts_with("qeli://") {
+            config::share::ClientLink::from_uri(spec.body.trim())
+                .map(|link| config::client::ClientConfig::from_link(&link))
+                .map_err(|e| e.to_string())
+        } else {
+            config::parse_client_config(&spec.body).map_err(|e| e.to_string())
+        };
+        match cfg {
+            Ok(c) => {
+                row.server = format!("{}:{}", c.server.address, c.server.port);
+                row.proto = c.server.protocol;
+                row.mode = c.obfuscation.mode;
+                row.user = c.auth.username;
+                row.sni = dash(c.obfuscation.sni.as_deref().unwrap_or(""));
+                row.sid = dash(c.obfuscation.reality_short_id.as_deref().unwrap_or(""));
+                row.dev = dash(&c.tun.name);
+                row.gateway = yn(c.routing.add_default_gateway).to_string();
+                row.dns = dash(&c.dns.mode);
+                row.quic = yn(c.obfuscation.quic.enabled).to_string();
+                row.awg = yn(c.obfuscation.awg.enabled).to_string();
+            }
+            Err(e) => row.error = Some(e),
+        }
+        rows.push(row);
+    }
+
+    let headers = [
+        "PROFILE", "SERVER", "PROTO", "MODE", "USER", "SNI", "SID", "DEV", "GATEWAY", "DNS",
+        "QUIC", "AWG",
+    ];
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for row in &rows {
+        if row.error.is_some() {
+            widths[0] = widths[0].max(row.name.len());
+            continue;
+        }
+        let cols = [
+            row.name.as_str(),
+            row.server.as_str(),
+            row.proto.as_str(),
+            row.mode.as_str(),
+            row.user.as_str(),
+            row.sni.as_str(),
+            row.sid.as_str(),
+            row.dev.as_str(),
+            row.gateway.as_str(),
+            row.dns.as_str(),
+            row.quic.as_str(),
+            row.awg.as_str(),
+        ];
+        for (i, col) in cols.iter().enumerate() {
+            widths[i] = widths[i].max(col.len());
+        }
+    }
+
+    let print_hdr = |cols: &[&str]| {
+        let line: Vec<String> = cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{:<width$}", c, width = widths[i]))
+            .collect();
+        println!("{}", line.join("  "));
+    };
+    print_hdr(&headers);
+    println!("{}", "─".repeat(widths.iter().sum::<usize>() + 2 * (widths.len() - 1)));
+
+    for row in &rows {
+        if let Some(err) = &row.error {
+            println!(
+                "{:<width$}  ERROR: {err}",
+                row.name,
+                width = widths[0]
+            );
+            continue;
+        }
+        print_hdr(&[
+            row.name.as_str(),
+            row.server.as_str(),
+            row.proto.as_str(),
+            row.mode.as_str(),
+            row.user.as_str(),
+            row.sni.as_str(),
+            row.sid.as_str(),
+            row.dev.as_str(),
+            row.gateway.as_str(),
+            row.dns.as_str(),
+            row.quic.as_str(),
+            row.awg.as_str(),
+        ]);
+    }
+    Ok(())
 }
 
 fn print_list_clients(resp: &str) -> anyhow::Result<()> {

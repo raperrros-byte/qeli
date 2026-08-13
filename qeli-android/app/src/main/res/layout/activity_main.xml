@@ -329,6 +329,74 @@
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
+            <!-- Geo routing preset (main screen) -->
+            <com.google.android.material.card.MaterialCardView
+                android:id="@+id/geoRoutingCard"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                app:cardBackgroundColor="@color/surface"
+                app:cardCornerRadius="18dp"
+                app:cardElevation="0dp"
+                app:strokeColor="@color/outline"
+                app:strokeWidth="1dp"
+                android:layout_marginBottom="14dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:padding="16dp">
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/geo_route_preset"
+                        android:textSize="10sp"
+                        android:textAllCaps="true"
+                        android:letterSpacing="0.08"
+                        android:textColor="@color/text_secondary" />
+
+                    <Spinner
+                        android:id="@+id/spinnerGeoPreset"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="6dp"
+                        android:minHeight="44dp" />
+
+                    <TextView
+                        android:id="@+id/tvGeoStatus"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="6dp"
+                        android:textSize="12sp"
+                        android:textColor="@color/text_secondary"
+                        tools:text="Geo files: not downloaded" />
+
+                    <TextView
+                        android:id="@+id/tvGeoWarning"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:textSize="12sp"
+                        android:textColor="@color/status_connecting"
+                        android:visibility="gone"
+                        tools:text="Download geo files to enable routing"
+                        tools:visibility="visible" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnGeoDownload"
+                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:minHeight="40dp"
+                        android:text="@string/geo_download"
+                        android:textColor="@color/primary"
+                        app:strokeColor="@color/outline"
+                        app:cornerRadius="12dp" />
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
+
             <!-- Live session stats (uptime + traffic) — shown only when connected -->
             <com.google.android.material.card.MaterialCardView
                 android:id="@+id/statsCard"

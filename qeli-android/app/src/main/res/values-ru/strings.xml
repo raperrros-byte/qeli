@@ -124,6 +124,9 @@
     <string name="geo_downloading">Загрузка…</string>
     <string name="geo_download_ok">Гео-файлы загружены</string>
     <string name="geo_download_fail">Ошибка загрузки гео: %1$s</string>
+    <string name="geo_warning_no_files">Скачайте geosite/geoip для этого пресета</string>
+    <string name="geo_warning_api">Стабильный geo-bypass нужен Android 13+</string>
+    <string name="reconnecting_geo">Переподключение для применения гео-маршрутизации…</string>
     <string name="share_title">Поделиться «%1$s»</string>
     <string name="share_chooser">Поделиться профилем</string>
     <string name="copy">Копировать</string>

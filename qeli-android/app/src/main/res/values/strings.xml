@@ -112,6 +112,9 @@
     <string name="geo_downloading">Downloading…</string>
     <string name="geo_download_ok">Geo files downloaded</string>
     <string name="geo_download_fail">Geo download failed: %1$s</string>
+    <string name="geo_warning_no_files">Download geosite/geoip to apply this preset</string>
+    <string name="geo_warning_api">Reliable geo bypass requires Android 13+</string>
+    <string name="reconnecting_geo">Reconnecting to apply geo routing…</string>
     <string name="share_title">Share “%1$s”</string>
     <string name="share_chooser">Share profile</string>
     <string name="copy">Copy</string>

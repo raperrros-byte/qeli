@@ -22,15 +22,33 @@ object GeoDirectResolver {
         Thread(runnable, "qeli-geo-dns").apply { isDaemon = true }
     }
 
+    /** Pre-resolve domains to /32 routes that bypass the tunnel (bypass-ru). */
     fun resolveBypassIps(
         ctx: Context,
         presetId: String,
         log: (String) -> Unit = {},
+    ): List<String> = resolveDomainIps(ctx, presetId, forBypass = true, log)
+
+    /** Pre-resolve blocked domains to /32 routes through the tunnel (ru-blocked, gfw). */
+    fun resolveIncludeIps(
+        ctx: Context,
+        presetId: String,
+        log: (String) -> Unit = {},
+    ): List<String> = resolveDomainIps(ctx, presetId, forBypass = false, log)
+
+    private fun resolveDomainIps(
+        ctx: Context,
+        presetId: String,
+        forBypass: Boolean,
+        log: (String) -> Unit,
     ): List<String> {
         val preset = ProxyRoutePreset.normalize(presetId)
-        if (preset != ProxyRoutePreset.BYPASS_RU && preset != ProxyRoutePreset.RU_BLOCKED) {
-            return emptyList()
+        val wantsDomains = when {
+            forBypass -> preset == ProxyRoutePreset.BYPASS_RU
+            else -> preset == ProxyRoutePreset.RU_BLOCKED ||
+                preset == ProxyRoutePreset.GFW_BLACKLIST
         }
+        if (!wantsDomains) return emptyList()
         val (site, _) = GeoAssetStore.getOrLoad(ctx, presetId)
         if (site == null) return emptyList()
 
@@ -54,7 +72,8 @@ object GeoDirectResolver {
             }
         }
         if (ips.isNotEmpty()) {
-            log("Geo DNS: pre-resolved ${ips.size} direct IP(s) from ${domains.size} domain(s)")
+            val mode = if (forBypass) "direct" else "via VPN"
+            log("Geo DNS: pre-resolved ${ips.size} IP(s) ($mode) from ${domains.size} domain(s)")
         }
         return ips.toList()
     }
