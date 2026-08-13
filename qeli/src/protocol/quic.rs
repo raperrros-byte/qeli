@@ -69,6 +69,20 @@ pub fn wrap_quic_long(
     packet_number: u32,
     packet_type: u8,
 ) -> Vec<u8> {
+    let mut packet = Vec::new();
+    wrap_quic_long_into(data, connection_id, packet_number, packet_type, &mut packet);
+    packet
+}
+
+/// Caller-provided variant of [`wrap_quic_long`]. The output allocation is retained
+/// across calls, which is useful for sequential UDP data-plane sends.
+pub fn wrap_quic_long_into(
+    data: &[u8],
+    connection_id: &[u8; 4],
+    packet_number: u32,
+    packet_type: u8,
+    packet: &mut Vec<u8>,
+) {
     // RFC 9000 §17.2 long header + RFC 9001 §17.2.2 Initial fields. The long
     // packet type lives in bits 4-5; the low 2 bits are the packet-number
     // length minus one. We always emit a 4-byte packet number (0b11), a zero
@@ -76,33 +90,47 @@ pub fn wrap_quic_long(
     // (though unencrypted) QUIC v1 Initial rather than a truncated long header.
     let flags = QUIC_LONG_HEADER_FLAG | ((packet_type & 0x03) << 4) | 0x03;
     let pn_len = 4usize;
-    let mut header = Vec::with_capacity(QUIC_LONG_HEADER_EMITTED + data.len());
-    header.push(flags);
-    header.extend_from_slice(&QUIC_VERSION_V1.to_be_bytes());
-    header.push(4);
-    header.extend_from_slice(connection_id);
-    header.push(0); // SCID length = 0
-    header.push(0); // Token Length varint = 0
+    packet.clear();
+    packet.reserve(QUIC_LONG_HEADER_EMITTED + data.len());
+    packet.push(flags);
+    packet.extend_from_slice(&QUIC_VERSION_V1.to_be_bytes());
+    packet.push(4);
+    packet.extend_from_slice(connection_id);
+    packet.push(0); // SCID length = 0
+    packet.push(0); // Token Length varint = 0
 
     // Length = packet number + payload, shortest correct varint (see push_varint).
-    if !push_varint(&mut header, (pn_len + data.len()) as u64) {
+    if !push_varint(packet, (pn_len + data.len()) as u64) {
         // >= 2^30 bytes in one datagram is not reachable from any transport we speak;
         // emit the payload unmasked rather than a packet whose Length field lies.
-        return data.to_vec();
+        packet.clear();
+        packet.extend_from_slice(data);
+        return;
     }
-    header.extend_from_slice(&packet_number.to_be_bytes());
-    header.extend_from_slice(data);
-    header
+    packet.extend_from_slice(&packet_number.to_be_bytes());
+    packet.extend_from_slice(data);
 }
 
 pub fn wrap_quic_short(data: &[u8], connection_id: &[u8; 4], packet_number: u32) -> Vec<u8> {
+    let mut packet = Vec::new();
+    wrap_quic_short_into(data, connection_id, packet_number, &mut packet);
+    packet
+}
+
+/// Caller-provided variant of [`wrap_quic_short`].
+pub fn wrap_quic_short_into(
+    data: &[u8],
+    connection_id: &[u8; 4],
+    packet_number: u32,
+    packet: &mut Vec<u8>,
+) {
     let flags = QUIC_SHORT_HEADER_FLAG | 0x03;
-    let mut header = Vec::with_capacity(QUIC_SHORT_HEADER_MIN + data.len());
-    header.push(flags);
-    header.extend_from_slice(connection_id);
-    header.extend_from_slice(&packet_number.to_be_bytes());
-    header.extend_from_slice(data);
-    header
+    packet.clear();
+    packet.reserve(QUIC_SHORT_HEADER_MIN + data.len());
+    packet.push(flags);
+    packet.extend_from_slice(connection_id);
+    packet.extend_from_slice(&packet_number.to_be_bytes());
+    packet.extend_from_slice(data);
 }
 
 /// Decode a QUIC variable-length integer (RFC 9000 §16), advancing `offset`.
@@ -122,7 +150,7 @@ fn read_varint(buf: &[u8], offset: &mut usize) -> Option<u64> {
     Some(value)
 }
 
-pub fn unwrap_quic(packet: &[u8]) -> Result<QuicPacket, QuicError> {
+fn unwrap_quic_ref(packet: &[u8]) -> Result<QuicPacketRef<'_>, QuicError> {
     if packet.is_empty() {
         return Err(QuicError::TooShort);
     }
@@ -193,9 +221,9 @@ pub fn unwrap_quic(packet: &[u8]) -> Result<QuicPacket, QuicError> {
         let packet_number = u32::from_be_bytes(pn_bytes);
         offset += pn_len;
 
-        let payload = packet[offset..].to_vec();
+        let payload = &packet[offset..];
 
-        Ok(QuicPacket {
+        Ok(QuicPacketRef {
             is_long: true,
             packet_type,
             version,
@@ -229,9 +257,9 @@ pub fn unwrap_quic(packet: &[u8]) -> Result<QuicPacket, QuicError> {
         let packet_number = u32::from_be_bytes(pn_bytes);
         offset = pn_end;
 
-        let payload = packet[offset..].to_vec();
+        let payload = &packet[offset..];
 
-        Ok(QuicPacket {
+        Ok(QuicPacketRef {
             is_long: false,
             packet_type: 0,
             version: QUIC_VERSION_V1,
@@ -240,6 +268,26 @@ pub fn unwrap_quic(packet: &[u8]) -> Result<QuicPacket, QuicError> {
             payload,
         })
     }
+}
+
+/// Parse a QUIC-shaped envelope and borrow its payload from `packet`.
+///
+/// The client UDP data plane copies this view directly into a checked-out pooled record, avoiding
+/// the allocating [`unwrap_quic`] compatibility API on every received datagram.
+pub fn unwrap_quic_payload(packet: &[u8]) -> Result<&[u8], QuicError> {
+    Ok(unwrap_quic_ref(packet)?.payload)
+}
+
+pub fn unwrap_quic(packet: &[u8]) -> Result<QuicPacket, QuicError> {
+    let parsed = unwrap_quic_ref(packet)?;
+    Ok(QuicPacket {
+        is_long: parsed.is_long,
+        packet_type: parsed.packet_type,
+        version: parsed.version,
+        connection_id: parsed.connection_id,
+        packet_number: parsed.packet_number,
+        payload: parsed.payload.to_vec(),
+    })
 }
 
 /// Cheap first-packet classifier: does this datagram look like a QUIC v1 long-header
@@ -271,6 +319,15 @@ pub struct QuicPacket {
     pub connection_id: [u8; 4],
     pub packet_number: u32,
     pub payload: Vec<u8>,
+}
+
+struct QuicPacketRef<'a> {
+    is_long: bool,
+    packet_type: u8,
+    version: u32,
+    connection_id: [u8; 4],
+    packet_number: u32,
+    payload: &'a [u8],
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -405,6 +462,44 @@ mod tests {
         assert_eq!(parsed.connection_id, cid);
         assert_eq!(parsed.packet_number, 100);
         assert_eq!(parsed.payload, data);
+    }
+
+    #[test]
+    fn payload_view_borrows_long_and_short_envelopes() {
+        let cid = [0x10, 0x20, 0x30, 0x40];
+        let data = vec![0xA5; 1400];
+        for wrapped in [
+            wrap_quic_long(&data, &cid, 7, 0x00),
+            wrap_quic_short(&data, &cid, 8),
+        ] {
+            let payload = unwrap_quic_payload(&wrapped).unwrap();
+            assert_eq!(payload, data);
+            let start = wrapped.as_ptr() as usize;
+            let end = start + wrapped.len();
+            let payload_start = payload.as_ptr() as usize;
+            assert!((start..end).contains(&payload_start));
+        }
+    }
+
+    #[test]
+    fn caller_owned_wrappers_match_and_reuse_storage() {
+        let cid = [0x31, 0x32, 0x33, 0x34];
+        let data = vec![0xAB; 1400];
+        let expected_short = wrap_quic_short(&data, &cid, 7);
+        let expected_long = wrap_quic_long(&data, &cid, 8, 0);
+        let mut packet = Vec::with_capacity(QUIC_LONG_HEADER_EMITTED + data.len());
+
+        wrap_quic_short_into(&data, &cid, 7, &mut packet);
+        assert_eq!(packet, expected_short);
+        let allocation = packet.as_ptr();
+
+        wrap_quic_long_into(&data, &cid, 8, 0, &mut packet);
+        assert_eq!(packet, expected_long);
+        assert_eq!(
+            packet.as_ptr(),
+            allocation,
+            "QUIC allocation must be reused"
+        );
     }
 
     #[test]

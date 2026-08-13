@@ -1,31 +1,28 @@
 # qeli-mac
 
-Нативный macOS-клиент для VPN **qeli** (Quick Easy Link IP). Порт Windows-приложения
-(`qeli-win`, C#/WPF) на **C# / .NET 10 + Avalonia UI**. Полностью повторяет протокол:
-фейк-TLS 1.3 рукопожатие, X25519, HKDF-SHA256, ChaCha20-Poly1305, auth-proof v2 с
-привязкой к транскрипту, padding/heartbeat, обфускация `obfs`, маскировка под QUIC для
-UDP. Крипто/протокол перенесены **байт-в-байт** из qeli-win и Android-клиента —
-совместимы с тем же Rust-сервером `qeli`.
+Нативный macOS-клиент для VPN **qeli** (Quick Easy Link IP): C# / .NET 10 + Avalonia
+как platform/UI слой и общее Rust transport-ядро через ABI 1.10. Rust владеет
+DNS/connect, handshake, crypto, TCP/UDP/QUIC/Reality, heartbeat/shaping, bonding и
+utun payload; C# управляет lifecycle/reconnect, созданием интерфейса,
+маршрутами/DNS/pf, trust и UI.
 
 Режим **`reality-tls`** (полноценный REALITY) несёт туннель внутри *настоящего*
 браузерного TLS 1.3 (byte-exact Chrome ClientHello, JA4 `t13d1516h2_8daaf6152771`):
 qeli-протокол работает **вложенно** внутри этой TLS-сессии, на проводе DPI видит только
-реальный Chrome-handshake. Внешний TLS-слой реализован тем же чистым Rust-ядром
-`realtls` (`qeli/src/protocol/realtls/`) через FFI — одна нативная либа на все клиенты
-(Rust, Android `.so`, Windows `qeli.dll`, macOS `libqeli.dylib`).
+реальный Chrome-handshake. Весь transport, включая внешний TLS-слой, выполняет то же
+Rust-ядро через whole-client FFI — одна нативная либа на все клиенты (Rust, Android
+`.so`, Windows `qeli.dll`, macOS `libqeli.dylib`).
 
 ## Технологии
 
 | Компонент             | Чем реализовано                                                       |
 |-----------------------|----------------------------------------------------------------------|
 | TUN-устройство        | macOS `utun` (PF_SYSTEM kernel-control, P/Invoke в libc)             |
-| X25519                | BouncyCastle (`Org.BouncyCastle.Math.EC.Rfc7748`)                    |
-| ChaCha20-Poly1305     | BouncyCastle (managed, без зависимости от ОС)                        |
-| ChaCha20 (`obfs`)     | BouncyCastle `ChaCha7539Engine`                                      |
-| HKDF / HMAC / SHA-256 | `System.Security.Cryptography`                                       |
+| Transport/crypto      | Rust `libqeli.dylib`, ABI 1.10 (`qeli_client_run` + native utun fd)  |
+| Conformance/diagnostics | .NET wire/KAT и reachability tools; production fallback отсутствует |
 | GUI                   | Avalonia UI 11 (.NET 10) — кросс-платформенный аналог WPF             |
 | Логотип / иконки / трей | SkiaSharp (пути, градиенты, текст → PNG)                            |
-| Маршруты / DNS / IP   | `route` / `ifconfig` / `networksetup` (с автоматическим откатом)     |
+| Маршруты / DNS / IP   | global: `route`/`ifconfig`/`networksetup`; per-app: transparent+DNS Network Extension |
 | Меню-бар (трей)       | Avalonia `TrayIcon` + `NativeMenu`                                   |
 | Служба / автозапуск   | launchd: LaunchDaemon (root, до входа) и LaunchAgent (при логине)    |
 
@@ -34,11 +31,9 @@ qeli-протокол работает **вложенно** внутри это�
 ```
 qeli-mac/
 ├── QeliMac/
-│   ├── Crypto/        KeyExchange, KeyDerivation, PacketCipher   ← перенос 1:1 из qeli-win
-│   ├── Protocol/      TlsHandshake, PacketCodec, ObfsStream, Quic ← перенос 1:1
-│   ├── Model/         VpnConfig (JSON / qeli:// / INI), AppSettings, ProfileStore, Paths
-│   ├── Vpn/           UtunDevice (utun), NetworkConfigurator, VpnTunnel, RealTls (P/Invoke realtls)
-│   ├── native/        libqeli.dylib — нативное REALITY-ядро (universal arm64+x86_64)
+│   ├── Model/         VpnConfig (INI / qeli://), AppSettings, ProfileStore, Paths
+│   ├── Vpn/           UtunDevice lifecycle, NetworkConfigurator, ABI 1.10 adapter
+│   ├── native/        libqeli.dylib — whole-client core (universal arm64+x86_64)
 │   ├── Service/       ServiceState, ServiceManager (launchd daemon), ServiceHost
 │   ├── Styles/        Controls.axaml — стили кнопок/инпутов/списка (палитра темы)
 │   ├── App.axaml(.cs) точка входа Avalonia (тема, старт)
@@ -53,7 +48,9 @@ qeli-mac/
 ├── Info.plist.in      шаблон Info.plist для .app
 ├── build_dylib.sh     сборка libqeli.dylib из ../qeli (Mac: cargo+lipo; Linux: cargo-zigbuild)
 ├── build_app.sh       сборка Qeli.app (dylib + publish + .icns + бандл + ad-hoc подпись)
-└── README.md
+├── per-app/           Swift system extension + controller, XcodeGen project и build gate
+├── README.md
+└── ../qeli-shared/    lifecycle/model + retained conformance diagnostics
 ```
 
 ## Сборка (в лабе — Linux, либо на Mac)
@@ -75,7 +72,7 @@ qeli-mac/
 - Иконка `.icns` рендерится **в самом приложении** (`genicns`, SkiaSharp) —
   macOS-утилиты `sips`/`iconutil` больше **не нужны**.
 
-`build_app.sh` при первом запуске соберёт нативное REALITY-ядро `libqeli.dylib`
+`build_app.sh` при первом запуске соберёт нативное whole-client ядро `libqeli.dylib`
 (вызовом `build_dylib.sh`), если его ещё нет и рядом лежат Rust-исходники `../qeli`:
 на Mac — `cargo` + `lipo`, в лабе на Linux — `cargo-zigbuild` в universal2 (Zig несёт
 macOS libSystem-стабы, полный Xcode SDK не нужен). Готовая либа лежит в
@@ -87,6 +84,20 @@ macOS libSystem-стабы, полный Xcode SDK не нужен). Готов�
 (codesign/rcodesign) → упаковка в `dist/Qeli-macos-<arch>.tar.gz` (tar сохраняет
 бит исполняемости и симлинки). Бандл self-contained: рантайм .NET, Avalonia, Skia и
 macOS-CoreCLR — внутри, установка .NET на целевой машине не нужна.
+
+Кросс-сборка в лабе полностью пригодна для обычного `apps_mode = all`, но Apple не разрешает
+рабочий Network Extension с ad-hoc подписью. Для per-app-релиза нужен Mac с Xcode/XcodeGen,
+Developer ID Application, provisioning profiles для host и system extension и разрешённые
+`app-proxy-provider-systemextension` + `dns-proxy-systemextension` entitlement. На таком хосте
+передайте `QELI_MAC_SIGN_IDENTITY`, `QELI_MAC_HOST_PROFILE` и
+`QELI_MAC_EXTENSION_PROFILE` в `build_app.sh`: скрипт соберёт extension, вложит его в
+`Contents/Library/SystemExtensions`, подпишет вложения изнутри наружу и проверит bundle.
+Для публичного релиза дополнительно задайте `QELI_MAC_NOTARY_PROFILE` — имя keychain-profile,
+созданного `xcrun notarytool store-credentials`: скрипт отправит временный ZIP в Apple,
+дождётся результата и выполнит `stapler staple/validate` до упаковки `.tar.gz`.
+Ad-hoc сборка намеренно не содержит helper и отклоняет per-app-профиль fail-closed.
+Per-app режим требует macOS 13 или новее; обычный `apps_mode = all` сохраняет прежний
+минимум macOS приложения.
 
 На Mac полученный архив:
 
@@ -139,9 +150,20 @@ qeli-win. Есть два способа держать туннель:
 настройки — там же в `settings.json`. Файлы обмена с демоном — в
 `/Library/Application Support/Qeli/`.
 
-Импорт: кнопка **Импорт** → вставьте `qeli://`-ссылку или **INI** (`[qeli]`-секция);
-JSON тоже принимается (легаси). Кнопки **Новый/Изм.** открывают форму редактора с
-выпадающими списками (Wire-режим, SNI, QUIC, паддинг, heartbeat и т.д.).
+Импорт: кнопка **Импорт** → вставьте `qeli://`-ссылку или **INI** (`[qeli]`-секция).
+Кнопки **Новый/Изм.** открывают прокручиваемую форму с логическими разделами подключения,
+транспорта, сети и приложений; полный INI доступен через явную кнопку **«Редактировать INI»**.
+
+### Раздельный туннель по приложениям
+
+`apps_mode = include` направляет в VPN только указанные code-signing identifier (обычно
+bundle ID, например `com.apple.Safari`), `exclude` — все приложения, кроме указанных.
+Подписанное system extension объединяет `NETransparentProxyProvider` для TCP/UDP и
+`NEDNSProxyProvider` для DNS. Выбранные сокеты привязываются через публичные
+`IP_BOUND_IF`/`IPV6_BOUND_IF` к активному qeli `utun`, после чего трафик обрабатывает то же
+Rust-ядро ABI 1.10. Невыбранные потоки остаются на системном маршруте/DNS. Во время reconnect
+выбранные потоки закрыты fail-closed. Flow API не даёт per-app ICMP; глобальный pf
+`kill_switch` в per-app-профиле не включается, иначе он заблокировал бы bypass-приложения.
 
 ## Соответствие qeli-win
 
@@ -156,7 +178,8 @@ JSON тоже принимается (легаси). Кнопки **Новый/�
 | Автозапуск через `schtasks` (ONLOGON)    | launchd LaunchAgent (`…autostart`)                |
 | Тема/accent из реестра                   | `defaults read -g AppleInterfaceStyle / AppleAccentColor` |
 | `requireAdministrator` (UAC)             | root (sudo) либо демон от root                    |
-| REALITY-ядро `qeli.dll` (P/Invoke)       | `libqeli.dylib` (universal, тот же C-ABI realtls) |
+| Whole-client `qeli.dll` (ABI 1.10)       | `libqeli.dylib` (universal, тот же ABI 1.10)      |
+| WinDivert per-app capture                | transparent + DNS Network Extension               |
 
 Палитра, темизация (светлая/тёмная + accent), тосты, поиск профилей, индикатор
 доступности сервера, спидометр/график трафика, QR-шеринг, локализация (English/Русский,
@@ -166,8 +189,8 @@ JSON тоже принимается (легаси). Кнопки **Новый/�
 
 ```bash
 QeliMac selftest                         # крипто/кодек/парсинг (без сети, без root) — все PASS
-QeliMac handshake <link|json|file>       # TCP/UDP + полное рукопожатие, печатает выданный IP
-sudo QeliMac connect <link|json|file> [сек]  # поднимает полный туннель на N секунд (нужен root)
+QeliMac handshake <link|ini|file>        # TCP/UDP + полное рукопожатие, печатает выданный IP
+sudo QeliMac connect <link|ini|file> [сек]   # поднимает полный туннель на N секунд (нужен root)
 QeliMac genassets <dir>                  # рендер брендовых PNG (использует build_app.sh для .icns)
 ```
 

@@ -144,10 +144,22 @@ enum Commands {
     AddClient {
         /// Username for the new client
         username: String,
-        /// Password (plaintext). If omitted, a strong random one is generated
-        /// and printed once — it cannot be recovered later (only the hash is stored).
+        /// Password (plaintext). VISIBLE TO EVERY LOCAL USER in /proc/<pid>/cmdline and in
+        /// the shell history — prefer --password-stdin, or omit it entirely and let a
+        /// strong random one be generated and printed once (it cannot be recovered later;
+        /// only the hash is stored).
         #[arg(short, long)]
         password: Option<String>,
+        /// Read the password from stdin (first line), so it never appears in the process
+        /// list. `echo -n 's3cret' | qeli add-client alice --password-stdin`.
+        ///
+        /// Process arguments on Linux are world-readable through /proc, and both this and
+        /// `set-web-password` accepted the secret only that way — so any unprivileged local
+        /// account polling /proc during a `sudo qeli add-client … --password …` captured a
+        /// VPN credential, or the panel admin password. They also land in auditd's execve
+        /// records and in whatever collects them. (Audit 2026-08-04.)
+        #[arg(long, conflicts_with = "password")]
+        password_stdin: bool,
         /// Restrict this client to these profiles (comma-separated). Empty = all profiles.
         #[arg(long)]
         profiles: Option<String>,
@@ -207,10 +219,15 @@ enum Commands {
         /// Admin username for the panel login.
         #[arg(long, default_value = "admin")]
         username: String,
-        /// Password (plaintext). If omitted, a strong random one is generated and
-        /// printed once — only the Argon2id hash is stored in the config.
+        /// Password (plaintext). VISIBLE TO EVERY LOCAL USER in /proc/<pid>/cmdline —
+        /// prefer --password-stdin, or omit it and let a strong random one be generated
+        /// and printed once (only the Argon2id hash is stored in the config).
         #[arg(short, long)]
         password: Option<String>,
+        /// Read the password from stdin (first line) so it never reaches the process list.
+        /// See the note on `add-client --password-stdin`. (Audit 2026-08-04.)
+        #[arg(long, conflicts_with = "password")]
+        password_stdin: bool,
         /// Only set credentials; do NOT flip web.enabled = true.
         #[arg(long)]
         no_enable: bool,
@@ -669,6 +686,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::AddClient {
             username,
             password,
+            password_stdin,
             profiles,
             static_ip,
             max_sessions,
@@ -677,6 +695,7 @@ async fn main() -> anyhow::Result<()> {
             host,
             config,
         } => {
+            let password = read_password_arg(password, password_stdin)?;
             #[cfg(target_os = "linux")]
             {
                 add_client(
@@ -708,9 +727,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::SetWebPassword {
             username,
             password,
+            password_stdin,
             no_enable,
             config,
         } => {
+            let password = read_password_arg(password, password_stdin)?;
             #[cfg(target_os = "linux")]
             {
                 set_web_password(username, password, !no_enable, config)?;
@@ -914,6 +935,35 @@ fn set_service_user(user: String, unit: String, dry_run: bool) -> anyhow::Result
     Ok(())
 }
 
+/// Resolve the password for `add-client` / `set-web-password`.
+///
+/// `--password-stdin` reads the FIRST LINE of stdin, so the secret never appears in
+/// `/proc/<pid>/cmdline`, in `ps`, in the shell history, or in auditd's execve record — all
+/// of which `--password <value>` puts it in, readable by every local account. A trailing
+/// newline is stripped (so `echo -n` and `echo` both work) and nothing else is trimmed: a
+/// password may legitimately begin or end with a space.
+///
+/// `None` from both means "generate one", which is the existing behaviour and the safest
+/// default. (Audit 2026-08-04.)
+fn read_password_arg(password: Option<String>, from_stdin: bool) -> anyhow::Result<Option<String>> {
+    if !from_stdin {
+        return Ok(password);
+    }
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| anyhow::anyhow!("--password-stdin: cannot read stdin: {e}"))?;
+    while line.ends_with('\n') || line.ends_with('\r') {
+        line.pop();
+    }
+    if line.is_empty() {
+        anyhow::bail!("--password-stdin: stdin was empty — pipe the password in, e.g. `printf %s 's3cret' | qeli …`");
+    }
+    Ok(Some(line))
+}
+
 /// Implement `qeli add-client`: append a user to the users file (Argon2-hashed
 /// password) and optionally emit a `qeli://` share link for QR import.
 #[cfg(target_os = "linux")]
@@ -936,6 +986,34 @@ fn add_client(
         .map_err(|e| anyhow::anyhow!("cannot read server config {}: {}", config.display(), e))?;
     let server_cfg: config::server::ServerConfig = config::parse_server_config(&cfg_str)?;
     let users_file = server_cfg.auth.users_file.clone();
+
+    // Resolve and validate the optional link target before hashing or appending the user. An
+    // unusable IPv6 endpoint must not leave behind an account after the command ultimately
+    // fails to produce a client configuration.
+    let prepared_link = if link {
+        let raw_host = host.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--link requires --host (the server's public address)")
+        })?;
+        let profile_index = match link_profile.as_deref() {
+            Some(name) => server_cfg
+                .profiles
+                .iter()
+                .position(|profile| profile.name == name)
+                .ok_or_else(|| anyhow::anyhow!("profile '{}' not found", name))?,
+            None => {
+                if server_cfg.profiles.is_empty() {
+                    anyhow::bail!("no profiles defined in {}", config.display());
+                }
+                0
+            }
+        };
+        let profile = &server_cfg.profiles[profile_index];
+        let (host, port) = config::share::supported_public_endpoint(raw_host, profile.bind.client_port())
+            .map_err(anyhow::Error::msg)?;
+        Some((profile_index, host, port))
+    } else {
+        None
+    };
 
     // Load the existing users DB, or start an empty one when the file doesn't exist yet
     // (first user on a fresh install). Read only — the actual append happens under the
@@ -1027,27 +1105,8 @@ fn add_client(
     eprintln!("Reload/restart qeli for the new user to take effect.");
 
     // Optional qeli:// share link (QR-friendly) for one-shot phone import.
-    if link {
-        let host = host.ok_or_else(|| {
-            anyhow::anyhow!("--link requires --host (the server's public address)")
-        })?;
-        let (host, host_port) = match host.rsplit_once(':') {
-            Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => {
-                (h.to_string(), p.parse::<u16>().ok())
-            }
-            _ => (host, None),
-        };
-        let profile = match link_profile {
-            Some(name) => server_cfg
-                .profiles
-                .iter()
-                .find(|p| p.name == name)
-                .ok_or_else(|| anyhow::anyhow!("profile '{}' not found", name))?,
-            None => server_cfg
-                .profiles
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("no profiles defined in {}", config.display()))?,
-        };
+    if let Some((profile_index, host, port)) = prepared_link {
+        let profile = &server_cfg.profiles[profile_index];
         let kp = server::load_or_generate_profile_key(profile)?;
         let server_key: String = kp
             .public
@@ -1055,7 +1114,6 @@ fn add_client(
             .iter()
             .map(|b| format!("{:02x}", b))
             .collect();
-        let port = host_port.unwrap_or_else(|| profile.bind.client_port());
         // Profile-dependent fields come from the shared builder (see
         // `ClientLink::for_profile`) — the panel's /api/share and `share-link` use the
         // same one, so the three cannot drift apart.
@@ -1204,13 +1262,10 @@ fn share_link(
                 "no host: pass --host <addr> or set web.public_host (the server's public address)"
             )
         })?;
-    let (host, host_port) = match host.rsplit_once(':') {
-        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => {
-            (h.to_string(), p.parse::<u16>().ok())
-        }
-        _ => (host, None),
-    };
-    let port = host_port.unwrap_or_else(|| profile.bind.client_port());
+    // Validate before password recovery/reset. A malformed or unsupported endpoint must never
+    // rotate a user's credentials and only then discover that no usable link can be emitted.
+    let (host, port) = config::share::supported_public_endpoint(&host, profile.bind.client_port())
+        .map_err(anyhow::Error::msg)?;
 
     let users_file = server_cfg.auth.users_file.clone();
     let db = config::users::UsersDb::load(&users_file)
@@ -1435,13 +1490,13 @@ fn print_list_clients(resp: &str) -> anyhow::Result<()> {
     }
 
     // Таблица вывода
-    // CLIENT is appended LAST so the existing columns keep their positions for anyone
-    // who already parses this output.
+    // New observability columns are appended so existing column positions stay stable for
+    // anyone who already parses this output.
     println!(
-        "{:<14} {:<12} {:<22} {:<9} {:<10} {:<10} {:<9} {:<20}",
-        "USERNAME", "IP", "SOURCE", "UPTIME", "SENT", "RECV", "BW LIMIT", "CLIENT"
+        "{:<14} {:<12} {:<22} {:<9} {:<10} {:<10} {:<9} {:<20} {:<8}",
+        "USERNAME", "IP", "SOURCE", "UPTIME", "SENT", "RECV", "BW LIMIT", "CLIENT", "DROPS"
     );
-    println!("{}", "─".repeat(113));
+    println!("{}", "─".repeat(122));
 
     for c in clients {
         let username = c["username"].as_str().unwrap_or("-");
@@ -1451,6 +1506,7 @@ fn print_list_clients(resp: &str) -> anyhow::Result<()> {
         let bytes_sent = c["bytes_sent"].as_u64().unwrap_or(0);
         let bytes_recv = c["bytes_recv"].as_u64().unwrap_or(0);
         let bw = c["bandwidth_limit_mbps"].as_u64().unwrap_or(0);
+        let dropped = c["dropped"].as_u64().unwrap_or(0);
         // Self-reported by the client and validated server-side (`protocol::ctrl`); "-" is
         // a client that predates the report, one that has not sent it yet, or one whose
         // report was refused. Shown as a label — it proves nothing about what is actually
@@ -1471,8 +1527,8 @@ fn print_list_clients(resp: &str) -> anyhow::Result<()> {
         };
 
         println!(
-            "{:<14} {:<12} {:<22} {:<9} {:<10} {:<10} {:<9} {:<20}",
-            username, ip, peer, uptime, sent, recv, bw_str, client
+            "{:<14} {:<12} {:<22} {:<9} {:<10} {:<10} {:<9} {:<20} {:<8}",
+            username, ip, peer, uptime, sent, recv, bw_str, client, dropped
         );
     }
 

@@ -8,6 +8,7 @@ client's routing table + its warnings. Answers "when does route push NOT work".
 import os, sys, io, time, re
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import paramiko
+import ssh_hostkey
 
 PW = os.environ.get("QELI_LAB_PASS", "")
 SRV = ("10.66.116.10", "root", PW)
@@ -27,7 +28,7 @@ TARGET = "172.16.20.0/24"
 
 
 def conn(h):
-    c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    c = paramiko.SSHClient(); ssh_hostkey.harden(c)
     c.connect(h[0], username=h[1], password=h[2], timeout=20, look_for_keys=False, allow_agent=False)
     return c
 
@@ -79,7 +80,6 @@ bind.port = {PORT}
 bind.transport = tcp
 tun.name = {TUNIF}
 tun.address = {NET}.1
-tun.netmask = 255.255.255.0
 tun.mtu = 1400
 pool.cidr = {NET}.0/24
 pool.exclude = {NET}.1

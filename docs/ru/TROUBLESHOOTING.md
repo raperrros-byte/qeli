@@ -1,6 +1,6 @@
 # Qeli — диагностика подключения и справочник по ошибкам
 
-> **Документация описывает 0.7.13** — последний выпущенный релиз. Что именно установлено
+> **Документация описывает 0.7.14** — последний выпущенный релиз. Что именно установлено
 > у вас, покажет `qeli --version`.
 
 Подробный практический гайд: как включить debug, как читать лог по стадиям
@@ -243,7 +243,7 @@ t_us,dir,site,size,seq
 | `profile '<n>': obf.heartbeat.data_size_bytes (<b>) must be <= <max>` | heartbeat-пакет крупнее допустимого размера записи | уменьшить `obf.heartbeat.data_size_bytes` |
 | `profile '<n>': pool.cidr '<c>': <ошибка>` | пул не разбирается как CIDR (нет префикса, мусор, слишком узкий) | привести к виду `10.9.0.0/24` |
 | `profile '<n>': invalid tun.address '<a>': … — expected a plain IPv4 address (e.g. 10.9.0.1)` | адрес с префиксом/маской или опечатка | оставить голый IPv4 |
-| `profile '<n>': invalid tun.netmask '<m>': … — expected a dotted mask …` | маска не в точечном виде (`/24` вместо `255.255.255.0`) | записать маску точками |
+| `profile '<n>': tun.address <a> is not a usable host inside pool.cidr <c>` | шлюз вне подсети VPN либо совпадает с адресом сети/broadcast | выбрать пригодный адрес внутри `pool.cidr`; его префикс — единственная настройка маски |
 
 Не фатальные (профиль стартует), уровень WARN — просто предупреждают о
 бессмысленной/слабой настройке: `obf.multipath.enabled has no effect on a UDP
@@ -271,7 +271,6 @@ worker'а, а отказ службы целиком — и это намере�
 | `profile '<n>': pool.cidr <c> contains this host's DEFAULT GATEWAY <gw>…` | пул накрывает шлюз | сменить пул |
 | `profile '<n>': pool.cidr <c> contains <a>, the address of interface '<if>'…` | пул накрывает собственный адрес хоста | сменить пул |
 | `profile '<n>': pool.cidr <c> overlaps the existing route <r> on interface '<if>'…` | пул пересекается с уже маршрутизируемой сетью (LAN, сеть провайдера) | сменить пул |
-| `profile '<n>': the tunnel subnet <s> (tun.address … / netmask …) overlaps the existing route <r>…` | подсеть туннеля шире пула и задевает чужой маршрут | сузить маску или сменить диапазон |
 | `profile '<n>': pool.cidr <c> overlaps profile '<other>' pool <o>…` | два профиля делят диапазон | развести (`10.9.0.0/24`, `10.9.1.0/24`, …) |
 
 Свои сети смотрите через `ip route` и `ip -4 addr`. Проверить конфиг **до** запуска:
@@ -441,14 +440,15 @@ ClientHello; key_share ≠ 32 Б; AEAD session_id не открылся **или
 
 ### 5.3 Liveness / реконнект (почему рвётся и переподключается)
 
-Общая модель: `rxDead = max(3×heartbeat_interval, 30s)`. При обрыве downlink'а
-клиент рвёт линк и переподключается. Backoff экспоненциальный (cap 60с), ретраи
-бесконечные по умолчанию.
+RX-watchdog считает только записи, прошедшие framing, проверку длины и AEAD-аутентификацию.
+Для heartbeat порог равен `max(3×(interval+jitter), 30с)`, для shaping —
+`max(3×(idle_gap_max+1с), 30с)`. При потере аутентифицированного downlink клиент рвёт линк
+и переподключается. Если оба механизма выключены, RX-watchdog отсутствует. Backoff
+экспоненциальный (потолок 60с), ретраи по умолчанию бесконечны.
 
 | Строка | Что значит |
 |---|---|
-| `uplink active but no downlink for >8s — reconnecting` | шлём вверх, но снизу тишина >8с ⇒ мёртвая сессия (смена сети / NAT-rebind / засыпание). L2-детектор |
-| `no data from server for >Ns` | нет данных от сервера дольше `rxDead` (RX-watchdog). L3 |
+| `no authenticated data from server for >Ns` | до вычисленного порога `rxDead` не пришла валидная heartbeat/cover/data-запись. Сырая или поддельная UDP-датаграмма сессию живой не удерживает |
 | `resumed after ~Ns suspend — reconnecting` | хост спал (стенные часы прыгнули ≫ монотонных) — немедленный реконнект. L1 |
 | `Network changed — reconnecting` / `<reason> — reconnecting` | сменилась физическая сеть (Wi-Fi↔Ethernet/LTE) — проактивный `ForceReconnect`. Сопутствующая ошибка сокета (`recvfrom EBADF` / EBADF) **намеренно гасится** и в лог не идёт как `ERR:` |
 | `Reconnect attempt N in Xs` | обычный backoff-ретрай |
@@ -509,8 +509,8 @@ iptables -t mangle -L OUTPUT -n -v | grep TCPMSS   # проверить, что 
 
 ### 6.2 `Failed to parse ServerHello` на UDP-реконнекте
 
-**Симптом:** первый коннект удачен, затем `uplink active but no downlink…` →
-реконнект → `Failed to parse ServerHello` несколько раз; на сервере видно
+**Симптом:** первый коннект удачен, затем watchdog/событие сети инициирует реконнект →
+`Failed to parse ServerHello` несколько раз; на сервере видно
 повторную аутентификацию с **нового** source-порта и `UDP writer … kicked`.
 
 **Причина:** UDP-реконнект с новым source-портом (NAT-ремап, особенно
@@ -567,8 +567,8 @@ tunnel (another active/always-on VPN, or VpnService not ready)` — почти �
 
 **Симптом:** клиент и сервер в **одной подсети** (например, оба `192.168.50.0/24`).
 Хендшейк проходит полностью — `Server identity verified`, `Auth OK`, `TUN ready` — но
-трафик не идёт: `uplink active but no downlink for >8s` или сервер рвёт idle-сессию
-через ~20с (`Удаленный хост принудительно разорвал` / на сервере — реап неактивной
+трафик не идёт: срабатывает аутентифицированный RX-watchdog (если включён
+heartbeat/shaping) или сервер рвёт idle-сессию через ~20с (`Удаленный хост принудительно разорвал` / на сервере — реап неактивной
 сессии) → бесконечный реконнект. **Тот же профиль с другой сети (интернет / другая
 подсеть) работает** — это и есть главный признак.
 
@@ -621,22 +621,21 @@ sudo systemctl restart qeli
 ls -la /etc/qeli/
 ```
 
-### 6.10 `resolvectl is not installed` / systemd-resolved не является резолвером
+### 6.10 Клиент отказывается менять DNS: systemd-resolved не является резолвером
 
-**Симптом:** в клиентском логе — предупреждение про `resolvectl`, и оно **не исчезает
-после установки systemd-resolved**.
+**Симптом:** подключение с `dns = tunnel` останавливается с сообщением
+`refusing to replace /etc/resolv.conf with tunnel DNS`.
 
 **Причина.** Клиент выбирает путь настройки DNS не по наличию бинарника, а по тому, кто
 на этой машине **фактически резолвит**: указывает ли `/etc/resolv.conf` на stub
 systemd-resolved. Если служба поставлена, но не включена, либо `resolv.conf` остался
 обычным файлом (типовое состояние после удаления `resolvconf` на Ubuntu), то
-`resolvectl dns` молча ничего не сделает — поэтому клиент правит `/etc/resolv.conf`
-напрямую. До 0.7.13 сообщение гласило «resolvectl unavailable», что отправляло
-администратора ставить пакет — то есть чинить единственное, что не было сломано.
+`resolvectl dns` молча ничего не сделает.
 
-**Исправлено** в 0.7.13: сообщение теперь различает два случая и говорит, что именно
-проверялось. Само по себе оно **не является ошибкой** — прямая правка `/etc/resolv.conf`
-работает. Если нужен именно per-link путь через systemd-resolved:
+Начиная с 0.7.15 qeli намеренно **не подменяет постоянный `/etc/resolv.conf`**: после
+`SIGKILL`, сбоя питания или удаления клиента в нём мог остаться адрес исчезнувшего туннеля
+и отключить DNS всей машины. Старые backup-файлы по-прежнему восстанавливаются при старте,
+но новые не создаются. Включите безопасную per-link настройку:
 ```bash
 sudo systemctl enable --now systemd-resolved
 sudo ln -sf ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
@@ -645,6 +644,8 @@ sudo ln -sf ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 ```bash
 ls -l /etc/resolv.conf
 ```
+Если DNS уже управляет NetworkManager, dnsmasq или платформа OpenWrt, оставьте это управление
+ей и задайте `dns = off` в профиле qeli.
 
 ### 6.11 После сохранения настроек в панели службу приходится рестартить руками
 
@@ -671,7 +672,7 @@ ls -l /etc/polkit-1/rules.d/49-qeli.rules
 docker restart <имя-контейнера>
 ```
 
-### 6.12 Windows: долгое восстановление после сна
+### 6.12 Клиенты: долгое восстановление после сна или разблокировки телефона
 
 **Симптом:** после выхода из сна туннель поднимается около минуты; иногда за это время
 туннель пропадает совсем и трафик идёт мимо VPN.
@@ -697,10 +698,30 @@ connect и на чтения хендшейка отсчитывался `Connec
 оно ставилось за проверкой «туннель ещё подключён», а после сна туннель к моменту события
 Resume уже мёртв. Отдельных действий не требуется — нужна актуальная сборка 0.7.13.
 
+**Закрытие мобильного и headless-сценария в 0.7.15.** Android wake lock не даёт уснуть CPU,
+но не сохраняет Wi-Fi association или NAT mapping, а тот же объект Android `Network` может
+пережить смену DHCP/link. Теперь сервис сравнивает capabilities, адреса, маршруты и DNS этой
+сети, а после включения экрана коротко ждёт готовности физического IPv4-пути и заменяет native
+generation, сохраняя TUN. iOS после `PacketTunnelProvider.wake()` тоже заменяет установленную
+generation, а не только пишет событие в лог. Windows Service и macOS launch daemon сами опрашивают
+отфильтрованную сигнатуру физической сети: GUI-callback не владеет headless-туннелем. На Android
+и iOS одновременно допускается только один незавершённый блокирующий resolver call, поэтому
+повторные реконнекты не накапливают DNS-потоки.
+
+Ручное отключение в 0.7.15 — тоже асинхронная граница. Android показывает `Отключение`, пока
+Rust runner не завершился и не закрыл все дубликаты TUN-дескрипторов; только после этого сервис
+публикует `Отключено` и разрешает новое подключение. Для DNS это существенно: запуск новой
+generation при ещё живом старом TUN мог оставить системный resolver Android на дескрипторе, у
+которого уже нет data plane. Если после ручного отключения пропадает DNS, нужен лог от
+`Отключение` до следующего `Подключено`; предупреждение о teardown дольше 5 секунд укажет на
+native-владельца дескриптора, который не остановился вовремя.
+
 Проверить по логу (вкладка **Журнал** → **Copy log**): после пробуждения должна появляться
 строка `Network settling — short attempt budget 5s for the next 30s`. Если она есть, а
 восстановление всё равно долгое — время уходит в другом месте, и такой лог от пробуждения
-до `Connected` нужен целиком.
+до `Connected` нужен целиком. На мобильной 0.7.15 в этом интервале также ожидаются
+`Device woke` / `Device wake: replacing...` (iOS) либо
+`Device woke after ... screen-off — reconnecting` (Android).
 
 ### 6.13 Панель за reverse-proxy: 404 либо выброс в корень
 
@@ -773,6 +794,37 @@ curl -s https://вашдомен.ru/qeli/login | grep -o '<base href="[^"]*"'
 Ожидается `<base href="/qeli/">`. Если `/` — в логе сервера ищите строку
 `panel: ignoring X-Forwarded-Prefix from … not covered by web.trusted_proxies`: она прямо
 называет адрес, который надо внести в список.
+
+### 6.14 macOS: после удаления Qeli остался DNS `10.9.0.1`
+
+`/etc/resolv.conf` в macOS генерируется системой; не исправляйте его вручную. Сначала
+посмотрите recovery-журнал — в `previousServers` могут быть ваши собственные DNS, которые
+нужно вернуть вместо `empty`:
+
+```bash
+sudo cat "/Library/Application Support/Qeli/dns-override.json" 2>/dev/null
+sudo launchctl bootout system/ru.qeli.app.daemon 2>/dev/null || true
+sudo launchctl bootout system/ru.autocash.qeli.daemon 2>/dev/null || true
+sudo rm -f /Library/LaunchDaemons/ru.qeli.app.daemon.plist
+sudo rm -f /Library/LaunchDaemons/ru.autocash.qeli.daemon.plist
+networksetup -listallnetworkservices
+sudo networksetup -setdnsservers "Wi-Fi" empty
+sudo dscacheutil -flushcache
+sudo killall -HUP mDNSResponder
+networksetup -getdnsservers "Wi-Fi"
+scutil --dns
+```
+
+Замените `Wi-Fi` точным именем активной службы. Если `previousServers` содержит адреса,
+передайте их команде `-setdnsservers` вместо `empty`. Только после успешной проверки можно
+удалить старый журнал:
+
+```bash
+sudo rm -f "/Library/Application Support/Qeli/dns-override.json"
+```
+
+В 0.7.15 daemon хранит намерение Connect отдельно от установки, проверяет настоящий
+`launchctl bootout` и не подтверждает Disconnect, пока исходный DNS не восстановлен.
 
 ---
 
@@ -853,6 +905,11 @@ adb shell appops set com.qeli ACTIVATE_VPN allow   # если поддержив
 - Kill-switch остался после краша? Windows:
   `Remove-NetFirewallRule -Group qeli_ks; Set-NetFirewallProfile -All -DefaultOutboundAction Allow`;
   macOS: перезапустить/`pfctl -d` (сообщение «Found a stale kill-switch…» само чинит при следующем старте).
+- `kill-switch is owned by another live Qeli process` означает, что второй Windows-туннель
+  пытается захватить общесистемное состояние firewall. Сначала остановите другой клиент/сервис.
+- `[SECURITY] kill-switch disengage failed; egress remains blocked` — fail-closed режим:
+  recovery state и владение сохранены, чтобы тот же процесс (или следующий запуск) повторил
+  полное восстановление трёх профилей firewall. Не удаляйте recovery state вручную.
 
 ---
 

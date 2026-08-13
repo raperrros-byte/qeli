@@ -4,7 +4,927 @@
 (Rust-демон, клиенты Windows / macOS / Android). Бинарные артефакты публикуются во
 вкладке **GitHub Releases** (в git не коммитятся — см. `.gitignore`).
 
-## [0.7.14] — не выпущен
+## [0.7.15] — не выпущен
+
+- Подготовлено единое двуязычное описание GitHub Release `0.7.15`: сначала английская, затем
+  русская версия с обязательными действиями перед обновлением, ключевыми изменениями общего
+  Rust transport core, per-app routing, lifecycle/DNS, панели и безопасности, результатами
+  release gate и точной таблицей 16 локально собранных артефактов. Файл
+  `release/RELEASE_NOTES_0.7.15.md` готов для передачи в `gh release --notes-file`, но тег,
+  GitHub Release и ассеты по-прежнему намеренно не опубликованы.
+- DNS lifecycle и серверный TUN read path приведены к каноническому `rustfmt`, поэтому
+  полный release gate снова проходит форматирование без изменения исполняемой логики.
+- Тестовая строка-маркер legacy DNS recovery теперь компилируется только вместе с тестами.
+  Это убирает предупреждение release-сборки после перехода Linux/OpenWrt на lifecycle-safe DNS,
+  не меняя поведение рабочего бинарника.
+- Настройки Windows и macOS переработаны в изменяемое по размеру окно с вкладками «Основное»,
+  «Подключение», «Автозапуск» и «Фоновый режим»: содержимое прокручивается, кнопки действий
+  остаются видимыми, а высота ограничивается рабочей областью текущего экрана. Редактор
+  профиля теперь также ограничен экраном и собран в одну прокручиваемую страницу с логическими
+  секциями. Неочевидная кнопка `<>` заменена явной **«Редактировать INI»**. В форму добавлены
+  таймаут, политика реконнекта, persist-TUN, режим DNS, MTU-probe и kill switch; `MTU = 0`
+  показан как документированный автоматический режим, а новый профиль по умолчанию принимает
+  аутентифицированный DNS-push сервера. README и CLI больше не называют JSON форматом профиля.
+
+- macOS больше не подтверждает Disconnect, пока исходный DNS физической сетевой службы не
+  восстановлен: ошибки `networksetup` повторяются и поднимаются до UI/службы, а recovery-журнал
+  сохраняется до успешного отката. Состояние подключения launchd теперь хранится отдельно от
+  установки демона, поэтому ручной Disconnect переживает перезагрузку. Удаление/перемещение
+  работающего `Qeli.app` обнаруживается демоном, который отключает туннель и возвращает DNS до
+  завершения процесса; uninstall ждёт реального `bootout` и проверяет DNS перед удалением plist.
+  Per-app Network Extension теперь получает короткую lease от отдельного guardian-процесса:
+  после crash, power loss или удаления app устаревшие DNS/transparent proxy автоматически
+  переходят в fail-open и больше не привязывают запросы к исчезнувшему utun.
+- Windows-служба, как и macOS daemon, отделяет автостарт процесса от сохранённого желания
+  подключаться: ручной Disconnect переживает reboot, а удаление исполняемого файла заставляет
+  службу очистить туннель. Сброс DNS временного Wintun выполняется до закрытия адаптера,
+  повторяется и больше не маскирует незавершённый teardown как `Disconnected`.
+- Linux/OpenWrt больше не устанавливает туннельный DNS прямой постоянной записью в
+  `/etc/resolv.conf`: новые подключения используют только lifecycle-safe per-link API
+  systemd-resolved, а при другом владельце DNS требуют `dns = off`. Recovery старых снимков
+  сохранён, поэтому обновление сначала чинит следы предыдущих версий.
+
+- Сервер теперь сам устанавливает узкие `iptables INPUT`-разрешения UDP/TCP для DNS каждого
+  профиля: точные TUN, client pool, адрес и порт resolver. При `INPUT DROP` неудача
+  применения правила теперь останавливает профиль вместо выдачи клиенту недоступного DNS.
+  Правила маркируются профилем и удаляются при restart/teardown. Это исправляет обнаруженный
+  на проде разрыв между новыми пулами `10.9.7.0/24`–`10.9.9.0/24` и устаревшим host firewall.
+- Android больше не сообщает ложное `Disconnected`, пока native transport ещё владеет
+  дубликатами TUN fd: отмена теперь прерывает DNS/connect/handshake, аварийный `Drop` ждёт
+  завершения обоих TUN worker, а сервис публикует отдельное состояние `Disconnecting` и
+  разрешает следующий Connect только после полного освобождения маршрутов и DNS. Это закрывает
+  поломку DNS устройства и неработающий второй connect после ручного Disconnect.
+- IPv4-only data plane отбрасывает захваченные Android IPv6-пробы на клиенте до шифрования,
+  поэтому они больше не создают сотни ложных `forged source` на сервере и не занимают очередь
+  полезного трафика. Серверный source-guard теперь пишет в debug-лог фактически заявленный
+  IPv4/IPv6 source либо `<malformed>`, что отделяет системные IPv6-пробы от подмены IPv4.
+
+### Дополнительное укрепление перед релизом
+
+- Зафиксирован чистый лабораторный benchmark-кандидат `0.7.15`: 604 Rust-теста прошли,
+  все TCP-режимы подключились без потерь ping и session drops, а UDP во всех режимах был
+  без потерь до 400 Мбит/с. В репозиторий добавлены исходные JSON-результаты, отдельный
+  прогон QUIC 100–1000 Мбит/с и сравнительный отчёт с `0.7.14`; отчёт также явно сохраняет
+  обнаруженные риски — выброс padding при 500 Мбит/с и увеличившийся RSS — для проверки
+  перед публикацией, а не скрывает их итоговой сводкой.
+- Конфигурационные операции панели получили единый транзакционный контур. Form/JSON/Raw
+  редакторы передают SHA-256-ревизию точного INI и отказываются затирать более новую
+  правку из другой вкладки или с SSH; непосредственно перед rename файл проверяется ещё
+  раз. Перед каждой изменяющей записью создаётся приватный снимок, хранятся десять
+  последних, а History позволяет провалидировать и восстановить их с сохранением текущего
+  состояния как обратного снимка. Переход между raw/structured и уход со страницы защищены
+  от потери несохранённых правок, перед записью показывается список изменённых путей/строк.
+  Quick Start теперь выполняет build + validate + snapshot + write одной серверной операцией,
+  поэтому больше нет окна last-writer-wins между отдельными GET/PUT.
+- Добавлена страница **Transport Health**: по каждому входящему профилю она объединяет
+  фактические сессии/потоки/трафик/drop-счётчики с безопасной проекцией bind, TUN/MTU,
+  маршрутов, DNS, masking, multipath, буферов и лимитов и выводит операционные предупреждения.
+  Исходящий Linux-клиент публикует приватный структурированный status-sidecar с состоянием,
+  retry, согласованным `NetworkPlan` и TX/RX/UDP-счётчиками; вкладка Client показывает его
+  через Details и использует лог-парсер только как fallback для старого процесса. Ключи,
+  пароли и session material в диагностический контракт не попадают.
+- Transport Health получил однозначные подписи сводных показателей и пояснения направлений
+  трафика. Локализация теперь загружается до первой оценки Alpine, поэтому подписи не остаются
+  пустыми. Подробности профиля открываются в отдельной правой панели (на мобильном — в нижнем
+  листе), не растягивая всю строку карточек в CSS Grid.
+- Windows, macOS, Android и iOS снова пишут в журнал имя пользователя и endpoint при начале
+  подключения и подтверждают пользователя после AUTH. В настройки всех приложений добавлен
+  режим журнала **Краткий / Подробная диагностика**. Периодическая UDP-телеметрия больше не
+  выводится при каждом изменении счётчика: размер буфера сообщается один раз, его рост — по
+  событию, а реальные kernel/internal drops агрегируются и ограничиваются по частоте; подробный
+  режим сохраняет rate-limited счётчики для диагностики.
+- UI-панели получил общие segmented/code-editor/status/diagnostic/switch-компоненты;
+  переключатели Notifications и Logs теперь доступны с клавиатуры. RU-словарь дополнен
+  для новых workflow и диагностики, переводится также `aria-label`, удалены дубли ключей.
+  CI запрещает неоформленные native select/search, недоступные clickable-div и новые
+  `qeliT`/контрольные строки без перевода; добавлен opt-in visual-regression сценарий на
+  72 комбинации страниц RU/EN × dark/light × desktop/mobile.
+- Пользовательский `bandwidth.limit_mbps` теперь симметрично действует на TCP и UDP в
+  обоих направлениях. Upload и download получили независимые session-wide token buckets:
+  заданная скорость доступна одновременно в каждом направлении, но multipath-потоки внутри
+  одного направления делят общий лимит и не умножают его. UDP upload проходит через
+  ограниченную per-client pacing-очередь, поэтому медленный пользователь не блокирует общий
+  receive-loop остальных клиентов; при `0` сохраняется прямой быстрый путь без ограничения.
+- Карточки активных профилей на Dashboard снова компактны и укладываются до шести в ряд на широком
+  экране; сетка адаптивно переходит на 4/3/2/1 колонку. Выпадающие списки и поля поиска во всей панели
+  получили единый нативно-независимый стиль, а опции поиска, сортировки и пагинации теперь корректно
+  переключаются между русской и английской локалями.
+- Веб-панель теперь остаётся управляемой при большом числе подключений и учётных записей:
+  Dashboard и Users отображают только выбранную страницу по 25/50/100 строк вместо создания
+  всего DOM-списка, длинные таблицы прокручиваются горизонтально, добавлены поиск, фильтры,
+  сортировка и постраничная навигация. Страница Users показывает актуальный статус online/offline
+  и число одновременных сессий, обновляет его каждые 10 секунд только в видимой вкладке, а массовое
+  выделение действует на текущую страницу. `/api/usage` также снова отдаёт накопленное число
+  подключений пользователя, которое интерфейс уже умел показывать. Новые элементы локализованы на
+  русский и английский.
+- Мобильный QR-сканер больше не растягивает камеру на весь вертикальный экран: Android
+  открывает адаптивный dialog с квадратным preview, а iOS — компактный sheet с такой же
+  квадратной областью. Оба варианта сохраняют ориентацию устройства, ограничивают размер на
+  планшетах и оставляют явную кнопку отмены.
+- Долгоживущий transport больше не остаётся в ложном `Connected`: закрытие клиентского
+  TUN reader разрывает TCP/UDP generation, фатальная ошибка любой очереди серверного TUN
+  перезапускает только затронутый профиль с bounded backoff, а остановка worker сначала
+  отменяет все profile supervisor и только затем очищает NAT/hooks. Умершие дополнительные
+  multipath-потоки восстанавливаются до заданной/adaptive ширины без повторного JOIN-index;
+  TCP получил общий suspend detector. При выключенных heartbeat и shaping больше нет скрытых
+  90/120-секундных idle timeout: применяется только явно заданная idle policy. Сервер больше
+  не принимает UDP-профиль с одновременно выключенными heartbeat/shaping и
+  `idle_timeout_secs=0`, иначе исчезнувший клиент удерживал бы IP и слот бессрочно.
+- UDP RX-liveness теперь обновляется только после успешных framing, length и AEAD-проверок:
+  посторонняя датаграмма больше не удерживает сессию живой. Удалён ложный восьмисекундный
+  реконнект при допустимом одностороннем uplink. Deadline учитывает реальный cadence:
+  heartbeat вместе с jitter либо максимальную паузу shaping, с тройным запасом и полом 30с.
+  Одинаковая формула применяется клиентом и сервером для TCP и UDP. Включённый shaping
+  требует `budget_bytes_per_sec >= max_size`, чтобы запланированная cover-запись действительно
+  могла накопить токены и поддерживать liveness.
+- Reconnect теперь учитывает реальную смену физического пути: Windows/macOS сравнивают адреса,
+  prefix, gateway и DNS перед повторным использованием `persist_tun`, пересобирая bypass routes
+  и resolver state после Wi-Fi/Ethernet/DHCP/sleep; headless Windows Service и macOS daemon
+  теперь доставляют эти изменения активному туннелю. Android отслеживает capabilities/link
+  properties того же `Network` и после разблокировки заменяет зависшую native generation,
+  когда физический IPv4-путь готов; iOS делает то же после короткого wake-settle. Android и
+  iOS допускают не более одного незавершённого блокирующего системного DNS lookup, а Rust
+  алгоритмически делит оставшийся TCP connect deadline между ещё не проверенными A-record,
+  поэтому один black-holed адрес не блокирует остальные.
+- DNS NetworkPlan стал fail-closed и одинаковым на платформах: split-tunnel добавляет `/32`
+  route каждому tunnel resolver, full-tunnel с `dns=tunnel` и без доступного resolver отклоняется,
+  а IPv6 resolver отклоняется с явной ошибкой до появления IPv6 inner data plane. iOS
+  устанавливает `matchDomains=[""]`. При несовпадении pinned server identity iOS full-tunnel
+  сохраняет NetworkExtension/TUN как blackhole вместо снятия маршрутов и fail-open выхода в
+  физическую сеть.
+- Усилен desktop security-контур. macOS daemon открывает root-owned state directory через
+  `O_NOFOLLOW`, работает с дочерними файлами через проверенные fd/`openat`, выполняет bounded
+  same-descriptor read и атомарные `renameat`+`fsync`; одноразовый несохранённый service key
+  больше не возвращается. Пользовательский profile key перенесён с доверия к
+  `/usr/bin/security` на прямой Security.framework ACL подписанного Qeli с crash-safe журналом
+  миграции старого элемента без ротации: после сбоя между удалением и записью ключ восстанавливается,
+  а несовпадение ключей отклоняется. Windows kill-switch дополняет crash-persistent WFP rules
+  ядерным WinDivert DROP-gate, поэтому существующие явные Allow-правила не обходят allow-list во
+  время работы клиента; фильтр не копирует carrier packets в userspace и не затрагивает throughput.
+  Общесистемные owner-marker и operation mutex исключают одновременное управление firewall
+  двумя процессами, а снятие блокировки транзакционно восстанавливает Domain/Private/Public и
+  сохраняет recovery state при любой ошибке вместо ложного сообщения об успехе и fail-open выхода.
+- CI закрепляет минимальные `contents: read` permissions, использует Cargo `--locked`, делает
+  fuzz-smoke блокирующим и проверяет также flat INI, `qeli://` и pre-auth WebSocket HTTP head.
+  Добавлен `cargo-deny` gate для duplicate/source policy. Пять отслеживаемых исторических
+  production deploy-скриптов окончательно выведены из эксплуатации и проверяются как
+  неисполняемые; остальные 115 Python-сценариев переведены с `AutoAddPolicy` на общий
+  known_hosts/`RejectPolicy` helper с единственным явным opt-in для заново созданной лабы.
+- Поставляемый Wintun теперь закреплён не только SHA-256, но и upstream-версией 0.14.1;
+  Windows CI проверяет FileVersion и валидную Authenticode-подпись WireGuard LLC обеих
+  canonical/embedded копий до сборки клиента.
+- Windows per-app больше не превращает fail-closed `Drop` неизвестного процесса в IPv6 bypass
+  при `apps_mode = exclude`. Непервые outbound IPv4-фрагменты без affinity удерживаются в
+  ограниченном короткоживущем буфере до первого фрагмента, после чего вся датаграмма следует
+  одной политике; если первый фрагмент не принят транспортом, накопленный хвост отбрасывается.
+- Quick Start лениво перебирает все 69 888 private `/24` из RFC 1918 (`10/8`, `172.16/12` и
+  `192.168/16`): дешёвая проверка пересечений выполняется без большого временного списка, а
+  полная runtime-валидация и preflight — ровно один раз для выбранного кандидата. Поэтому маршрут
+  хоста на весь `10/8` не блокирует автоматическое создание профиля, но запуск больше не делает
+  десятки тысяч дорогих копирований конфигурации. Генератор, устанавливаемые примеры и RU/EN
+  документация больше не дублируют автоматически зарезервированный `tun.address` в `pool.exclude`.
+- Команды установки и проверки provenance в RU/EN документации исправлены с 0.7.13 на
+  текущий стабильный релиз 0.7.14; version-sync теперь контролирует также имена, URL и команды
+  release-артефактов. README показывает все 10 Quick Start режимов, а benchmark-документация
+  отделяет историческое описание от канонического прогона qeli 0.7.13 от 2026-07-28.
+- Привилегированный macOS-тракт вызывает `/usr/sbin/sysctl` по абсолютному пути, а из `IpPool`
+  удалены неиспользуемые копии server TUN address и prefix length.
+- Удалён дублирующий `tun.netmask`: `pool.cidr` теперь единственный источник IPv4-префикса
+  для серверного TUN, всех клиентских NetworkPlan и DHCP. Панель больше не показывает отдельную
+  маску, поэтому профиль с `pool.cidr = 10.20.0.0/16` не может настроить интерфейс как `/24`;
+  `tun.address` валидируется как пригодный адрес внутри пула и, даже если это не `.1`, автоматически
+  исключается из AUTH/DHCP-выдачи. Автоматический DHCP выбирает непрерывный диапазон без адреса
+  сервера, а явный диапазон с ним отклоняется. Старый ключ принимается при чтении
+  INI для совместимости, игнорируется с предупреждением и не записывается обратно.
+- IPv4/IPv6 `include`/`exclude` теперь применяются одинаково: Windows/macOS используют family-aware
+  route API и заранее определяют отдельный физический путь для IPv6 bypass, iOS формирует
+  `NEIPv4Route` и `NEIPv6Route`, Android трактует bare IPv6 как один хост `/128`, а не как `/32`.
+  Явный IPv6 include остаётся fail-closed в текущем IPv4 inner data plane и больше не утекает наружу.
+- Windows per-app тракт из [PR #112](https://github.com/litvinovtd/qeli/pull/112) приведён к
+  общему MTU-контракту: WinDivert получает итоговый MTU, ограничивает TCP MSS, дробит разрешённые
+  IPv4-пакеты, возвращает приложению ICMP Fragmentation Needed для DF и reverse-NAT'ит входящие
+  ICMP ошибки по вложенному 5-tuple. Общее UDP-ядро больше не пытается молча отправить inner packet
+  крупнее TUN MTU и разрывает неисправный carrier при реальной ошибке `send`, а статистика WinDivert
+  отдельно показывает MTU drops, фрагментацию и ICMP feedback.
+- Windows per-app DNS теперь выбирает resolver стабильно на весь TCP/UDP flow, а DNS source NAT
+  живёт столько же, сколько сам flow. Разные исходные DNS-адреса одного сокета получают отдельные
+  NAT identity и восстанавливаются без last-writer-wins. Открытый TCP mapping не ограничен
+  произвольным TTL: после короткого grace flow сверяется с актуальной системной таблицей владельцев,
+  поэтому действительно idle SSH/DB соединение сохраняется, а пропущенный FIN/RST очищается.
+  UDP сохраняет короткий TTL; неоднозначный UDP owner при `SO_REUSEADDR` обрабатывается безопасно,
+  IPv6 extension headers разбираются, а IPv6 `exclude` больше не игнорируется.
+- macOS per-app helper подтверждает реально подключённый transparent provider после `start/update` и
+  не сообщает ложный `ACTIVE` при выгруженном extension. DNS provider оставляет системный resolver
+  без изменений при пустом `dns_servers`, использует весь список resolver'ов с TCP fallback/UDP
+  affinity и применяет apps include/exclude policy; IPv6 exclusions работают. Настроенный tunnel
+  DNS всегда привязывается к текущему utun, включая RFC1918 resolver, а UDP reverse mapping
+  восстанавливает исходный endpoint по resolver и DNS transaction ID. Монитор app-group state и
+  live-update `true → true` закрывают relays прошлого поколения, поэтому они не удерживают удалённый
+  utun, прежний DNS или старую apps/route policy. Swift system
+  extension, helper и policy tests добавлены в обычный macOS CI, а не только в подписанную сборку.
+  Сборочная схема использует корректные XcodeGen tool targets, а relay явно выбирает типы
+  NetworkExtension и совместимый с macOS 13 UDP API, поэтому весь per-app комплект собирается
+  текущим Xcode.
+- `include`/`exclude` теперь строго валидируются как числовые IPv4/IPv6 CIDR в C#, Android и iOS;
+  Android не выполняет DNS lookup для route-адресов и отказывается запускать `apps_mode=include`,
+  если ни одно выбранное приложение не установлено, вместо неявного захвата всех приложений.
+  Устаревшие JSON deployment/lab скрипты отключены, а комментарий `client.conf` уточняет границу
+  между компактным `qeli://`, file-only настройками и параметрами, которые обязан заранее знать клиент.
+- Windows per-app flow table ограничена 65 536 записями и освобождает TCP state по RST либо
+  короткому closing TTL. Пара FIN не удаляет NAT до завершающего ACK: mapping остаётся стабильным
+  до closing TTL. Коллизии одинакового local port с разных локальных IP получают
+  отдельный tunnel-side NAT port с восстановлением исходного адреса/порта; системные TCP/UDP/PID
+  таблицы при classification miss обновляются немедленно на coalesced worker, а неизвестный owner
+  не отправляется в VPN даже в exclude-mode. Ранние IPv6 outbound и IPv4 inbound фрагменты
+  удерживаются в коротком bounded buffer до первого фрагмента; affinity использует стабильный
+  next-header после Fragment Header и полный 32-битный fragment ID. Добавлены счётчики
+  buffered/released/buffer-drops.
+- Android 9–12 строит отдельный минимальный IPv6 complement для `exclude`, вместо передачи IPv6 CIDR
+  в IPv4-only расчёт и последующей установки `::/0`. Неполный complement отклоняется fail-closed.
+  Все сценарии исторического `test/` и оставшиеся опасные root-SSH/source-mutation скрипты старого
+  `vpn-obfuscated`/JSON/systemd контура теперь завершаются до SSH/команд и указывают поддерживаемые
+  INI/lab инструменты; тест фиксирует этот запрет. Из active troubleshooting и release fixtures
+  удалены последние упоминания отдельного `tun.netmask`.
+
+- Разблокированы мобильные release-gates: Android теперь обращается к
+  `VpnService.isAlwaysOn`/`isLockdownEnabled` только на API 29+, сохраняя fail-closed
+  трактовку Android 9; общий `ReconnectPolicy` перенесён в iOS target membership,
+  поэтому Packet Tunnel extension компилируется вместе с политикой reconnect.
+- Повторный Launch одного Quick Start режима больше не ротирует `reality short_id` или
+  `obfs_key` и не сбрасывает ручные настройки профиля: существующий профиль только
+  включается и перезапускается. Диалог теперь заранее различает создание новых и
+  сохранение действующих credentials; поведение синхронно описано в RU/EN документации.
+- Windows/macOS и iOS повторно разрешают hostname перед каждой reconnect generation,
+  принимают изменившийся полный набор A-записей и при временной ошибке DNS используют
+  последний рабочий набор. Desktop kill-switch обновляет server allowlist до выбора
+  нового IP, не снимая fail-closed защиту; `persist_tun` для hostname пересоздаёт host
+  routes, чтобы новый DDNS-адрес не ушёл в старый туннель.
+
+- Обновлён Rust dependency lock: `rustls` 0.23.41 → 0.23.43 с дополнительными проверками
+  согласованности TLS/QUIC и защитой арифметики ticket/binder, `tokio` 1.52.3 → 1.53.1,
+  `serde` 1.0.228 → 1.0.229 и `thiserror` 2.0.18 → 2.0.19 с переходом derive-макросов на
+  `syn` 3, `webpki-roots` 1.0.8 → 1.0.9 с актуальным набором корневых CA Mozilla.
+- Весь согласованный набор Avalonia для macOS-клиента (`Avalonia`, Desktop, Themes.Fluent,
+  Fonts.Inter, Diagnostics и Headless) обновлён с 11.3.18 до patch-релиза 11.3.19 и проверен
+  Release-сборкой, полным self-test и PacketCodec benchmark gate.
+- Supply-chain actions в CI обновлены и по-прежнему закреплены полными проверенными SHA:
+  `actions/setup-java` 5.7.0, `actions/attest-build-provenance` 3.2.0,
+  `Swatinem/rust-cache` 2.9.2 и `gradle/actions/wrapper-validation` 4.4.3.
+- iOS теперь реально применяет `reconnect`, `reconnect_retries`, `reconnect_base_delay` и
+  `reconnect_max_delay`: временный обрыв native transport или packet pump создаёт новую
+  generation после backoff, сохраняя NetworkExtension TUN fail-closed. Невалидный NetworkPlan,
+  неподдерживаемый DNS port и несовпадение ключа остаются terminal errors.
+- Android разрешает hostname через `currentNetwork.getAllByName`, а desktop/iOS сохраняют все
+  A-record до перехвата DNS маршрутом. Общее ядро пробует все IPv4 для TCP, а для UDP ротирует
+  их между reconnect generation; DNS-loop в сохранённом TUN устранён.
+- Активный UDP path-MTU probe доведён до Windows, macOS и iOS через нативные DF socket options;
+  все пять клиентов теперь исполняют `mtu_probe` для UDP + auto MTU.
+- Quick Start строит профиль на сервере и ищет свободную private `/24`, прогоняя каждый
+  кандидат через schema и host route/address preflight. Save, raw save, restart и прямой
+  worker start выполняют ту же проверку до остановки рабочего VPN.
+- Панель сохраняет fixed/auto признак `perf.udp.recv_buffer_size`; сервер получил общий бюджет
+  всех UDP socket buffers — не более 12,5% `MemAvailable`, с учётом всех
+  profile/listener/queue и удвоенного Linux accounting. Статистика показывает сумму фактически
+  выданных буферов, а не максимум одного worker.
+- CLI, панель и installer единообразно отклоняют IPv6 public endpoint до появления IPv6 data
+  plane; проверка выполняется до создания или сброса пароля.
+- Rust CLI/панель теперь, как Android, iOS и desktop, принимают pinned `key` только как ровно
+  64 hex-символа и не все нули. Текстовый placeholder больше не проходит `check-config`, чтобы
+  ошибочная конфигурация останавливалась до запуска транспорта, а не при декодировании handshake.
+- OpenWrt feed перепривязан к актуальному qeli-дереву (`9ecb807`) и получил настоящий
+  `PKG_MIRROR_HASH`, рассчитанный OpenWrt SDK по immutable git-архиву 0.7.15; пакет больше не
+  собирает прежний transport под новой версией.
+- CI-покрытие расширено на `client.conf`, `client-reality.conf`, `client-maxobf.conf`, отдельный
+  `users.conf` и все 10 серверных Quick Start profile. Лабораторный gate теперь синхронизирует
+  сами `qeli/tests`, проверяемый REALITY-шаблон и выполняет `cargo fmt --check` до сборки,
+  поэтому не может прогнать оставшуюся на лабе
+  старую копию integration-теста против старого release input.
+
+### Архитектура клиентов — общее Rust-ядро
+
+- Основой Windows per-app split tunneling послужил
+  [PR #112 — feat(win): Windows per-app split tunneling via WinDivert](https://github.com/litvinovtd/qeli/pull/112).
+  Перед включением в `dev` его полезные части адаптированы к текущему общему Rust transport,
+  единому ABI и конфигурационному контракту вместо сохранения отдельной реализации протокола.
+  Для macOS реализован функциональный аналог без WinDivert: подписанное Network Extension
+  классифицирует потоки по code-signing identifier приложения и направляет выбранные TCP/UDP/DNS
+  соединения в тот же Rust transport. Таким образом, `apps_mode = include/exclude` и `apps`
+  имеют одинаковый пользовательский смысл на обоих desktop-клиентах, хотя платформенный перехват
+  различается: WinDivert/PID+endpoint на Windows и transparent/DNS providers на macOS.
+- Windows и macOS теперь применяют переносимые `apps_mode`/`apps`, а не только сохраняют
+  их. На Windows обычный профиль сохраняет zero-copy Wintun, а per-app-профиль использует
+  встроенный WinDivert, PID/endpoint-классификацию, DNS destination NAT и fragment affinity,
+  передавая выбранные пакеты в то же Rust-ядро ABI 1.10. На macOS выбранные TCP/UDP/DNS
+  потоки классифицирует подписанное system extension с transparent- и DNS-provider и
+  привязывает их к qeli utun через `IP_BOUND_IF`; невыбранные приложения сохраняют системный
+  маршрут и DNS. Оба desktop-адаптера удерживают выбранный трафик fail-closed при reconnect.
+  Mac-сборка без Developer ID Network Extension намеренно отклоняет per-app-профиль; per-app
+  ICMP не заявлен. GUI, INI и `qeli://` получили общий валидируемый round-trip этих ключей;
+  оба desktop-редактора умеют выбирать установленные приложения, а macOS сохраняет настоящий
+  code-signing identifier из `codesign` и требует macOS 13+ для per-app режима. Mac release
+  pipeline подписывает все вложенные Mach-O изнутри наружу и поддерживает обязательные для
+  публичной поставки `notarytool` + stapling через keychain-profile.
+- WinDivert 2.2.2 x64 DLL/SYS сверены по SHA-256 с официальным GitHub release archive;
+  canonical и embedded-копии контролирует `native-libs/verify.sh`. В publish рядом с обоими
+  Windows exe выходит полный официальный LGPLv3/GPLv3/GPLv2 `LICENSE` и provenance `NOTICE`.
+  На остановке classifier пишет счётчики captured/tunnelled/bypass, policy/down/queue drops
+  и unmatched replies, чтобы диагностика потерь per-app data-plane не зависела от догадок.
+- Закрыт конфигурационный контур рефакторинга: все пять клиентов распознают единый контракт
+  из 73 ключей, а transport-owned `timeout`, socket settings, padding/heartbeat/shaping,
+  `local`/`lport`, DNS и TOFU-политика доходят до общего Rust-ядра без скрытых platform
+  defaults. Android/iOS больше не удаляют известные ключи другой платформы при сохранении;
+  `gateway` передаётся в ядро явно, публичный fallback DNS удалён. Добавлена двуязычная
+  проверяемая таблица каждого ключа «0.7.14 → 0.7.15»:
+  `docs/{ru,eng}/CLIENT-CONFIG-MATRIX.md`.
+- Устранено расхождение socket-buffer policy после переноса клиентов в общее ядро:
+  `recv_buffer_size`/`send_buffer_size` снова применяются только к UDP carrier, а TCP
+  сохраняет системный autotuning. Дефолтный UDP receive buffer 4 МиБ не уменьшен.
+  Отказ ОС принять best-effort `SO_RCVBUF`/`SO_SNDBUF` теперь пишется в предупреждение,
+  но не обрывает подключение — так же, как в клиентах до рефакторинга.
+- Общий Rust transport получил bounded UDP receive-buffer controller вместо одного
+  жёсткого размера. При отсутствующем `recv_buffer_size` клиент и каждый server worker
+  начинают с 4 МиБ и могут вырасти 4→8→16 МиБ по точному per-socket kernel overflow
+  (`/proc/net/udp{,6}` на Linux/Android, когда доступен) либо измеренному rate/stall budget; сетевые
+  sequence gaps не считаются доказательством локально малого буфера, уменьшения на живом
+  сокете нет. Явное значение остаётся fixed override (`0` = настройка ОС), ручные UDP
+  send/receive значения ограничены 64 МиБ на сокет. Additive ABI 1.10 дописывает к прежнему
+  64-байтовому stats prefix четыре `u64`: kernel drops, внутренние bounded-queue drops,
+  число увеличений и фактически выданный `SO_RCVBUF`. Android, iOS, Windows и macOS
+  показывают их change-only в журнале подключения.
+- Введённый в ABI 1.8 packet seam завершает перенос production transport на iOS; текущий
+  platform adapter работает по additive ABI 1.10. Новый
+  `QeliNativeTunnelEngine` оставляет Swift только `NEPacketTunnelNetworkSettings`, Keychain
+  trust/device ID, lifecycle/statistics и bounded batch-копирование между `packetFlow` и
+  `qeli_client_tun_push/pull`; Rust владеет DNS/connect, всеми handshake/crypto,
+  TCP/UDP/QUIC/Reality, reconnect, heartbeat/shaping, MTU и bonding. Восемь старых Swift
+  runtime-файлов (`QeliTunnelEngine`, handshake/transport/runtime) удалены: 4 046 строк
+  wire/runtime-дубля заменены компактным platform adapter без собственной реализации протокола.
+- Для iOS зафиксирован memory budget packet bridge: два пула по 32 × 65 535 байт =
+  4 194 240 байт core-owned packet storage; три переиспользуемых Swift caller-buffer дают
+  ещё не более 768 КиБ. Очереди ограничены 128 элементами и не создают fallback allocation.
+  `aarch64-apple-ios` whole-client core успешно прошёл `cargo check`; XCFramework и Xcode
+  simulator теперь собираются в CI, а physical-device interop остаётся обязательным gate.
+  UI-валидация размера AUTH использует зафиксированный Rust wire scalar (1114 байт), поэтому
+  production PacketTunnel больше не зависит от исключённого legacy Swift `Protocol/`; KAT
+  отдельно проверяет, что UI-limit не расходится с прежним cross-language fixture.
+- ABI 1.8 также добавляет handle-free `qeli_client_udp_probe` и capability
+  `QELI_CORE_UDP_DIAGNOSTIC`. Windows, macOS и iOS больше не строят PQ ClientHello,
+  fragmentation, QUIC или obfs для reachability в C#/Swift: они передают strict профиль
+  общему Rust first-flight builder. C# `Protocol/`/`Crypto/` и Swift conformance primitives
+  остаются только для KAT/регрессионных тестов и исключены из production iOS Packet Tunnel.
+- Additive поля ABI 1.8 `NetworkPlan` отдельно передают подтверждённые сервером pushed routes
+  и effective post-push padding/heartbeat/shaping для UI. iOS больше не смешивает их с
+  client/local routes и отклоняет весь план до ACK, если хотя бы один маршрут нельзя применить
+  как `NEIPv4Route`, либо адрес/prefix/MTU выходят за поддерживаемые границы; частично
+  установленный план не объявляется успешным. Uplink сохраняет точную семантику accepted-prefix
+  и отклоняет некорректный размер пакета вместо пропуска/зацикливания; сброс native-счётчика не
+  превращается в переполнение показанной скорости.
+- После переноса transport в Rust восстановлен полный журнал подключения во всех клиентах.
+  Общее ядро теперь прикладывает к authenticated `NetworkPlan` один и тот же безопасный набор
+  строк для Linux, Android, Windows, macOS и iOS: исходный server push и итоговое решение по
+  адресу/prefix/gateway, MTU и path-MTU, DNS с портом, каждому принятому маршруту и числу
+  отклонённых, padding, heartbeat, traffic normalization, shaping и fixed/adaptive multipath.
+  Для каждого параметра различаются «не прислан», `IGNORED`, `REJECTED`, `ACCEPTED` и
+  фактический platform `APPLIED`/`REJECTED`; причины DNS/NetworkPlan ошибок снова сразу видны в
+  UI-журнале, а не только в нативном stderr. Пароли, ключи и session token в эти строки не
+  попадают. Android заодно снова читает отдельные `pushed_routes`/`data_plane`, поэтому карточка
+  соединения не считает client routes серверными и показывает negotiated padding/heartbeat/
+  shaping. Platform DNS fallback теперь проходит через общую Rust-политику и не может повторно
+  включить DNS после `dns = off/system`.
+- Additive ABI 1.7 переключает активный transport Windows и macOS на то же Rust-ядро,
+  которое уже обслуживает Linux/Android. Rust теперь владеет DNS/connect, carrier sockets,
+  hybrid handshake, transport crypto, TCP/UDP/QUIC/Reality, heartbeat/shaping и
+  fixed/adaptive bonding. Общий C# `VpnTunnelBase` оставляет только lifecycle/reconnect,
+  persisted trust/device ID, применение `NetworkPlan`, UI/statistics и lifecycle platform Wintun/utun.
+  Ошибка загрузки, ABI/capability negotiation или plan ACK обрабатывается fail-closed;
+  managed transport fallback на активном пути не включается.
+- Desktop TC-5 cleanup физически удалил dormant runtime-дубль из C#: `VpnTunnelBase.cs`
+  сокращён с 3 287 до 1 126 строк, удалён отдельный 139-строчный `RealTls` P/Invoke
+  wrapper — чистое сокращение на 2 300 строк. В общем .NET-проекте остаются только
+  cross-language wire/KAT; production transport и reachability на них не
+  ссылается и managed fallback больше не существует.
+- ABI 1.7 добавляет `QELI_CORE_TUN_PACKET_IO`, `QELI_PLATFORM_TUN_PACKET_BATCH` и
+  generation-scoped `qeli_client_tun_push/pull`. Пакеты передаются в caller-owned
+  contiguous buffers с массивом длин; packet/batch ограничены 65 535 байтами/64 элементами,
+  reusable pools и очереди имеют жёсткий memory bound и backpressure без fallback allocation.
+  Stale generation, malformed batch и IO до положительного `NetworkPlan` ACK отклоняются.
+  Как и Android, desktop adapters отрицательно подтверждают DNS plan с портом не 53, который
+  системные Windows/macOS resolvers не умеют применить, вместо ложного успешного ACK.
+  Desktop `NetworkPlan` также несёт IP фактически подключённого carrier, поэтому bypass route
+  не выполняет второе DNS-разрешение и не может выбрать другой адрес round-robin hostname.
+- Промежуточный desktop packet seam ABI 1.7 больше не выделяет и не копирует временный
+  `byte[]` на каждый пакет:
+  общий C# pump переиспользует один caller-owned uplink buffer и передаёт downlink прямо из
+  Rust batch по `offset+length`; Wintun копировал диапазон сразу в ring. TC-1.2 закрыт без
+  изменения ABI 1.8; затем TC-2.2/TC-2.3 полностью убрали desktop payload из C#.
+- TC-2.2 переносит macOS utun payload целиком в Rust без повышения ABI. C# `UtunDevice`
+  теперь отвечает только за открытие fd, имя интерфейса и lifecycle; перед положительным
+  `NetworkPlan` ACK общий adapter передаёт ядру generation-scoped CLOEXEC-дубликат через
+  существующий ABI 1.1 `qeli_client_set_tun_fd`. Общий fd-pump снимает/добавляет четырёхбайтовый
+  address-family prefix utun, пишет prefix+payload через `writev` без временного `Vec` и работает
+  на неблокирующих reader/writer fd, чтобы stop/reconnect не зависал на пустом utun. Локальные
+  gate: Windows/macOS Release build 0 warnings/errors, оба selftest `ALL PASS`; новый ABI 1.9
+  universal2 dylib пересобран и включён в macOS-пакет. Live macOS full-tunnel остаётся
+  аппаратным release gate, потому что на Linux-лабе нет utun/macOS runtime.
+- Additive ABI 1.9 завершает TC-2.3 и переносит Wintun session/rings в Rust. Новый
+  `QELI_PLATFORM_TUN_WINTUN` + `QELI_CORE_WINTUN_IO` контракт принимает фактическое имя
+  созданного C# интерфейса через generation-scoped `qeli_client_set_wintun_adapter` до
+  положительного `NetworkPlan` ACK. Rust через уже загруженный проверенный `wintun.dll`
+  открывает независимый adapter handle, запускает session, единолично владеет read event и
+  обоими rings; C# сохраняет creator handle только для interface lifetime и network cleanup.
+  Uplink не копируется из receive ring: RAII packet удерживает указатель и session owner до
+  `WintunReleaseReceivePacket`; downlink копируется из bounded decrypt pool прямо в
+  `WintunAllocateSendPacket`. Stop сначала закрывает очереди и join-ит reader/writer и только
+  затем вызывает `WintunEndSession`, поэтому прежний managed UAF-класс удалён вместе с
+  `ReceivePacket`/`SendPacket`, session handle и конкурентным `Dispose`.
+- ABI 1.9 локально прошёл 330/330 Rust tests, Windows/macOS strict Clippy, macOS x64/arm64
+  cross-check, оба desktop Release build без warnings/errors и оба selftest `ALL PASS`.
+  Собранная локально release `qeli.dll` сообщает ABI `0x00010009`, capabilities `0xfe7` и
+  содержит все 20/20 объявленных `qeli_client_*` exports. Release scripts обновлены с 19 до
+  20 exports для Windows/macOS/Android. Все tracked native libraries пересобраны штатным
+  lab-набором как ABI 1.9; живой Windows handshake получил полный `NetworkPlan`. Admin Wintun
+  data-plane и live Mac utun full-tunnel остаются платформенными gate.
+- TC-0.3/TC-4.3 закрыты постоянным release-mode `PacketCodec` benchmark gate. Новый
+  opt-in Rust binary `packet-codec-bench` выполняет 1400-байтовый encrypt/decrypt round-trip,
+  проверяет точное содержимое и запрещает рост caller-owned record buffer после warm-up.
+  Общий C# `PacketCodecBenchmark` доступен как `packetbench` в Windows/macOS клиентах и
+  дополнительно измеряет managed allocations на round-trip. Linux Rust и оба desktop CI jobs
+  запускают эти измерители с консервативными anti-regression floors; JSON-строка в логе
+  сохраняет фактическую скорость/allocations для тренда, но не подменяет lab throughput.
+- Совместимость со строгим Rust 1.97 Clippy восстановлена удалением избыточного `i64 as i64`
+  в platform-neutral календарном fallback без изменения результата вычислений.
+- iOS-клиент приведён к строгим правилам capture semantics Xcode 26/Swift 6: фоновые transport,
+  packet и stats tasks явно обращаются к захваченному `self`, поэтому simulator gate снова
+  компилирует `QeliNativeTunnelEngine` после обновления toolchain.
+- Windows/macOS/Android нативные библиотеки теперь собираются с
+  `--no-default-features --features transport-core-ffi`, а не с
+  Reality-only профилем и без неиспользуемого server/web stack. ABI 1.10 export gate ожидает
+  6 `qeli_realtls_*` + 20
+  `qeli_client_*` экспортов в Windows x64 DLL и universal macOS dylib (arm64+x86_64).
+  Предыдущий lab-сценарий для ABI 1.8 реально загружал встроенную Windows DLL, выполнял Rust
+  fake-TLS handshake и получал authenticated `NetworkPlan`; после пересборки native artifacts
+  он повторён для ABI 1.10 вместе с полным Wintun data plane.
+- Additive ABI 1.6 завершает переключение Android payload на общее Rust-ядро:
+  `qeli_client_run`/`nativeRunTransport` блокирующе выполняет одну generation, а capability
+  `QELI_CORE_NATIVE_DATA_PLANE` не позволяет приложению принять старую shadow-библиотеку.
+  Rust теперь владеет connect, handshake, шифрованием, TUN read/write и live packet/byte
+  counters; Kotlin обслуживает только `VpnService.protect`, persisted trust,
+  `NetworkPlan`/TUN, UI, статистику и reconnect. Ошибка загрузки/negotiation native core
+  обрабатывается fail-closed, Kotlin payload fallback не включается.
+- Общий Android runtime использует те же зрелые sessions/pumps, что Linux: TCP fake-TLS,
+  plain, obfs и Reality-TLS; UDP fake-TLS/obfs с fragmentation/retransmit, QUIC wrapper,
+  active MTU probe, heartbeat, shaping, padding/normalization; fixed и adaptive TCP bonding.
+  Для secondary streams каждый socket отдельно проходит platform `protect` до connect.
+- Long-running ABI owner получил generation-safe registry lease: `run` не удерживает registry
+  mutex во время platform ACK/TUN ожиданий, `free` не создаёт UAF и не переиспользует живой
+  handle, а `stop/free` сначала выставляет cancellation и будит packet loop даже при заполненной
+  event queue. TCP/UDP используют устойчивый cancellation interval, который не перезапускается
+  каждым готовым пакетом и потому не голодает под непрерывной нагрузкой. Live counters атомарно
+  сливаются в итоговую статистику generation.
+- Лабораторная Android-матрица реально передала обратный TUN-трафик с 0% ping loss для TCP
+  fake-TLS/plain/obfs, UDP fake-TLS/obfs, UDP+QUIC и Reality-TLS; MTU report дошёл до сервера,
+  heartbeat/shaping профиль сохранил трафик, adaptive bonding вырос до четырёх защищённых
+  carrier streams под download-only нагрузкой. Специализированные сценарии переведены с
+  удалённого JSON на текущий flat-INI и теперь возвращают ненулевой код при отсутствии
+  native ownership/auth/ping/JOIN. Reality-сценарий синхронизирует часы snapshot-эмулятора,
+  потому что anti-replay token имеет допустимое окно 120 секунд.
+- Gate рефакторинга: полный Rust library/binary/integration suite, минимальный
+  `transport-core-ffi` профиль 333 passed/1 ignored, default `clippy -D warnings`, Android
+  86/86 JVM tests, warning-free NDK release для arm64-v8a/x86_64, 6 Reality C exports,
+  19 whole-client C exports и 17 TransportCore JNI exports. Debug APK с финальными `.so`
+  имеет 23 289 752 байта; подписанный v2/R8 release APK — 8 275 224 байта
+  (`versionName=0.7.15`, `versionCode=718`, arm64-v8a+x86_64). Lab-helper теперь сохраняет ненулевой код
+  `cargo fmt/test/clippy/check` через shell pipelines и имеет отдельные `transport`/`ioscheck`
+  /`routercheck` режимы, поэтому ошибка компиляции или client-only warning больше не может
+  выглядеть как зелёный gate. Linux release sync включает `debian/` и `config/`, portable
+  ELF и `.deb` загружаются одним version-derived helper вместо устаревшего абсолютного пути.
+- Локально подготовлен, но не опубликован кандидат `release/dist/v0.7.15`: подписанный Android
+  APK, два Windows single-file варианта (повторно собраны после добавления desktop per-app
+  routing), ad-hoc signed universal2 macOS ZIP, portable glibc-2.28+jemalloc Linux ELF и `.deb`,
+  четыре OpenWrt и два Keenetic client-only бинарника, OpenWrt integration archive, полные
+  `WinDivert-LICENSE.txt`/`WinDivert-NOTICE.txt` и `SHA256SUMS` для 16 payload-ассетов. GitHub
+  Release, тег и публикация ассетов намеренно не выполнялись.
+- Android теперь правильно считает применённые pushed routes из строкового массива активного
+  `NetworkPlan`. Финальный platform-adapter применяет типизированный канонический список напрямую;
+  совместимый legacy object-parser удалён, а UI получает число маршрутов только после успешного
+  `VpnService.Builder.establish()`.
+- На границе Android → Rust устранено расхождение исторических defaults: Android считал
+  профиль без `gateway` полным туннелем, а единая Rust-схема — split-tunnel. Adapter теперь
+  явно передаёт `gateway = true` для Android full-tunnel default; split-профиль по-прежнему
+  передаёт `gateway = false`. Реальный lab e2e больше не может принять план другого режима.
+- Additive ABI 1.5 переводит Android с пассивного shadow-контракта на реальную публикацию
+  `NetworkPlan`: `qeli_client_publish_handshake_network` принимает ограниченный JSON с
+  аутентифицированным `OK:`-ответом, итоговым MTU и явным platform DNS fallback. Rust повторно
+  разбирает недоверенные DNS/routes, назначает generation и публикует единый план. Android
+  применяет из него адрес, prefix, MTU, full/split routing, routes и DNS, передаёт ядру
+  `CLOEXEC`-дубликат TUN fd и только затем подтверждает generation. Отрицательный ACK закрывает
+  native fd и переводит ядро в `Failed`; stale/double ACK отклоняется.
+- Android исполняет общий `kill_switch` через системный Always-on VPN lockdown. Ключ теперь
+  читается/сохраняется моделью профиля и доходит до Rust `NetworkPlan`; adapter заявляет
+  `QELI_PLATFORM_KILL_SWITCH` только после двухфакторной предзапусковой проверки: Qeli является
+  текущим подготовленным VPN-провайдером, а защищённая `Settings.Secure`-политика lockdown
+  включена. После `Builder.establish()` adapter дополнительно требует live owner-результаты
+  `isAlwaysOn` + `isLockdownEnabled` непосредственно перед положительным ACK. Если пользователь
+  не включил «Блокировать соединения без VPN», full-tunnel не стартует без защиты и сообщает
+  точную настройку; Android 9 отклоняется из-за отсутствия live owner API.
+  Нестандартный DNS-порт по-прежнему отклоняется внутри отрицательного ACK/retire-контура.
+  Платформенные per-app правила, IPv6 capture, LAN bypass и `exclude` остаются
+  Android-операциями поверх канонического Rust-плана.
+- ABI 1.5 ввёл control-plane TUN ownership без второго reader; ABI 1.6 активировал общий Rust
+  packet pump. Из `QeliService.kt` физически удалены старые Kotlin handshake, packet codec,
+  TCP/UDP/Reality transports, MTU/QUIC pumps и bonding: файл сокращён с 3 921 до 1 443 строк
+  (2 536 удалённых строк при 58 строках адаптерной переработки). Сервис оставляет только Android
+  lifecycle, `protect`, trust, `NetworkPlan`/TUN, UI/statistics и reconnect; скрытого Kotlin
+  payload fallback больше нет.
+- Android TC-3.1 завершён физически: pre-connect UDP reachability probe перенесён в handle-free
+  `TransportCore` JNI и использует тот же Rust hybrid-PQ ClientHello flight, fragmentation,
+  QUIC и obfs, что рабочий UDP transport. В JNI передаётся credential-free профиль без
+  user/password; lab проверяет отдельный ответ probe до `Connect`, затем независимо полный
+  UDP+QUIC tunnel и 0% ping loss. Удалены Kotlin `protocol/*`, transport-crypto, `RealTls`,
+  `MlKem`, `TrafficShaper`, четыре дублирующих wire-conformance test suites и 14 legacy JNI
+  wrappers — ещё 2 491 строк production Kotlin и 857 строк JVM-дублей. `BackupCrypto` сохранён
+  как отдельная функция импорта/экспорта. Обе `.so` уменьшились примерно на 20 КиБ; APK — до
+  23 237 892 байта после ABI 1.7.
+- Защищённый platform carrier теперь можно передать в общий `transport_core::carrier`, который
+  под единым `connection_timeout` выполняет IPv4 DNS resolution и неблокирующий TCP/UDP
+  `connect`, проверяет отложенную TCP-ошибку через writable readiness и возвращает готовый
+  Tokio socket общему handshake-owner. ABI 1.6 использует этот путь для primary и каждого
+  bonded carrier; второго параллельного Kotlin-сеанса нет.
+- Проверка доверия в общем TCP-handshake стала асинхронной. Additive ABI 1.4 добавляет
+  `ServerIdentity` с JSON `server_id/public_key`, capabilities
+  `QELI_CORE_SERVER_IDENTITY_ACK`/`QELI_PLATFORM_SERVER_IDENTITY` и коррелированный
+  `qeli_client_server_identity_result`. Событие предназначено только для ключа, владение которым
+  уже доказано криптографическим server-auth proof: Android сверяет его со своим persisted
+  `qeli_known_hosts`, синхронно записывает неизвестный ключ только после proof и fail-closed
+  отклоняет замену или ошибку persistence. ACK/отказ/stop/free покрыты
+  oneshot/stale/cancel тестами; Android использует ту же
+  bounded queue и не заводит callback или второй dispatcher.
+- Основной аутентифицированный TCP-handshake (`plain` и hybrid fake-TLS/
+  X25519MLKEM768) перенесён из Linux-клиента в платформонезависимый
+  `transport_core::session`. Device ID и проверка доверия к статическому ключу теперь
+  явные входы: Linux сохраняет прежний pinned/TOFU adapter, а Android сможет использовать
+  уже существующее защищённое хранилище без второй identity. Формат провода, derivation
+  ключей и таймаут handshake не изменены.
+- Расчёт `NetworkPlan` после `Auth OK` также вынесен в общее ядро: приоритет и проверка
+  DNS, фильтрация недоверенных pushed routes, include/local/custom routes, full-tunnel и
+  kill-switch теперь принимаются одним кодом до платформенного ACK. Linux-модули оставлены
+  исполнителями системных операций и делегируют планирование ядру.
+- Additive ABI 1.3 добавляет capability `QELI_CORE_DEVICE_ID_INPUT` и
+  `qeli_client_set_device_id`: принимаются только 16 ненулевых байт до `start()`, значение
+  копируется во владение ядра и очищается при замене/free. Android передаёт тот же persisted
+  device ID; временные JNI/Kotlin-копии очищаются. ABI 1.6 использует его в единственном
+  активном native handshake, без конкурирующей identity или второго сеанса.
+
+- Главный Android TCP/UDP e2e приведён к текущему flat-INI и защищённому хранилищу профилей:
+  тест очищает только данные lab-приложения, проходит реальную миграцию профиля, находит Connect
+  по UI вместо устаревших координат и завершается ошибкой без `Auth OK` и обратного ping через TUN.
+  Временные UDP-профиль и тестовый пользователь создаются изолированно и гарантированно удаляются.
+  Это исключает ложный зелёный результат, когда старый JSON-профиль был отвергнут клиентом,
+  lab-учётная запись изменилась или соединение вообще не запускалось.
+- Android передаёт явный список резолверов в общее Rust-ядро под единым ключом `dns_servers`,
+  сохраняя прежний `dns = <ip>` только для совместимости собственного backup/import. Ранее строгий
+  parser ядра считал Android-форму недопустимым DNS-режимом и отключал shadow-core на валидном профиле.
+- Начата поэтапная миграция клиентов на единое транспортное Rust-ядро. Первый совместимый
+  слой вводит общий строгий разбор flat-INI и `qeli://`, явную машину состояний, ограниченную
+  очередь событий и версионированный C ABI с generation-checked `u64` handles. События
+  копируются в буферы вызывающей стороны; недостаточный буфер не извлекает событие из очереди.
+- C ABI 1.0 прошёл freeze-review до подключения платформенных адаптеров. Header теперь задаёт
+  правила major/minor compatibility, ownership и concurrency, compile-time проверяет layout и
+  инициализирует caller-owned размер output-структур. Ядро сохраняет этот размер, пишет только
+  общий известный префикс и не потребляет событие при короткой структуре, поэтому будущие поля
+  можно добавлять без переполнения памяти старого клиента. Panic внутри операции над handle
+  возвращается как `QELI_CLIENT_PANIC` и инвалидирует только этот generation, а не маскируется
+  под stale handle.
+- Добавлен первый ресурсный срез Android/macOS TUN backend: additive ABI 1.1 экспортирует
+  `qeli_client_set_tun_fd(handle, generation, fd)`. Ядро принимает fd только для ожидающего
+  network-plan поколения, атомарно создаёт собственный `CLOEXEC`-дубликат и не забирает
+  ownership исходного descriptor у платформы. При заявленной `QELI_PLATFORM_TUN_FD`
+  положительный ACK теперь невозможен до attach; stale generation отклоняется, а reject,
+  stop, replacement и free закрывают только native-дубликат. Packet reader этим вызовом ещё
+  не запускается: действующий Android Kotlin data plane остаётся единственным читателем до
+  отдельного JNI handoff, поэтому wire format и скорость не меняются.
+- Additive ABI 1.2 добавляет fail-closed запрос `SocketProtect`: Rust публикует в той же
+  bounded queue JSON-событие `{"fd": N}`, а его одноразовый `event.sequence` служит request
+  ID для `qeli_client_socket_protect_result`. Владелец сокета сохраняет fd открытым до ACK и
+  ждёт результат через oneshot без busy polling; неизвестный, повторный или отменённый ACK
+  возвращает `QELI_CLIENT_STALE_REQUEST`. Android shadow-сервис теперь заявляет
+  `QELI_PLATFORM_SOCKET_PROTECT` вместе с фоновым dispatcher: он опрашивает ту же core-очередь
+  с адаптивной паузой 20–250 мс, вызывает `VpnService.protect(fd)` до пяти раз с интервалом
+  100 мс и подтверждает точный sequence ID. Некорректные и неожиданные события отключают только
+  shadow-core, не затрагивая Kotlin data plane. Producer теперь реальный: при `start()` Rust
+  создаёт неблокирующий IPv4 TCP/UDP carrier, держит fd открытым до ACK и только после успешного
+  `protect()` сохраняет сокет для будущего async handshake; reject переводит shadow-core в
+  `Failed`, а stop/free закрывают pending/protected fd. Вторая event-очередь или callback не
+  добавлялись.
+- Android `VpnService` подключён к текущему ABI 1.4 в shadow-режиме через generation-safe JNI
+  adapter: каждый запуск создаёт общий Rust `ClientCore`, прогоняет экспортированный flat-INI
+  через strict parser, переводит lifecycle в `Connecting` и гарантированно выполняет
+  stop/free при teardown. Временные UTF-8 byte arrays с паролем обнуляются по обе стороны
+  JNI. Kotlin теперь через тот же замороженный C ABI опрашивает единственную bounded event
+  queue и при старте проверяет реальные `Created → Connecting`: JNI кодирует фиксированный
+  48-байтный little-endian header, сохраняет двухпроходную семантику «малый буфер не
+  потребляет событие» и ограничивает payload 1 МиБ. Adapter проверяет ABI 1.5 и обязательные
+  capability bits, заявляет `TUN_FD` и выполняет generation-scoped network-plan handoff, но
+  пока не подключает/не использует открытый core wire socket и не читает пакеты:
+  проверенный Kotlin data plane остаётся единственным владельцем payload до общего packet pump.
+  Все Android native build scripts теперь включают
+  `transport-core-ffi`, а основной сборщик требует для arm64/x86_64 ровно 6 прежних RealTLS,
+  15 whole-client C и 14 `TransportCore` JNI exports. Проверено 84/84 JVM-тестами и
+  debug/release-minify APK.
+- Общие handshake building blocks больше не скрыты в Linux-клиенте: строгий разбор недоверенного
+  `AuthOK`, effective MTU, server-proof/static-session проверка и AUTH plaintext вынесены в
+  `transport_core::session`. Device ID передаётся в AUTH builder явно, чтобы Android runtime
+  использовал существующий persisted ID, а не создавал вторую identity.
+- Ядро больше не может считать туннель запущенным сразу после handshake: план адреса, MTU,
+  маршрутов, DNS и kill-switch переводит его в `AwaitingNetwork`, а переход в `Running`
+  требует ACK платформы с той же generation. Отказ платформы переводит соединение в
+  `Failed`, то есть неподдержанная защитная настройка не может быть принята молча.
+- Linux-клиент стал первым реальным адаптером общего lifecycle API: конфигурацию разбирает
+  `ClientCore`, TCP и UDP после handshake публикуют один generation-scoped `NetworkPlan`,
+  платформа поднимает TUN/маршруты/DNS и лишь затем подтверждает план. Каждая новая сессия и
+  reconnect проходят через `Created/Stopped → Connecting → AwaitingNetwork → Running`, а
+  очередь событий опрашивается тем же способом, который предусмотрен для внешнего C ABI.
+- Формат плана уточнён по результатам первого адаптера: маршрут несёт не только CIDR, но и
+  gateway/metric, DNS — address/port, отдельно передаётся tunnel gateway. Ошибка обязательного
+  pushed/include/local/custom route или применения непустого DNS-плана больше не оставляет
+  «частично работающий» туннель: generation отклоняется и сеть откатывается. Пустой DNS-план
+  по-прежнему сохраняет системный resolver, поэтому профиль без DNS push не ломается.
+- Общий fd-backed TUN backend стал первым data-plane срезом ядра и теперь собирается для Android:
+  TCP и UDP Linux-клиента больше не содержат
+  две копии `libc::read/write/close`, а используют один bounded packet pump, который владеет
+  `OwnedFd`, reader/writer workers, TAP framing и явным shutdown. Ошибочный выход поднимает
+  общий stop token, а штатный teardown ждёт освобождения обоих fd. После положительного plan ACK
+  ядро one-shot передаёт packet workers два собственных дескриптора (read/write); Android ещё не
+  включает этот handoff. Handshake/codec пока остаются прежними, поэтому формат провода не изменён.
+- Uplink TUN reader больше не создаёт новый `Vec` для каждого пакета. Он читает в заранее
+  выделенный пул размером не более 4 МиБ на соединение, передаёт `TunPacket` без копии через
+  TCP flow distributor или UDP encrypt path и возвращает allocation через `Drop` сразу после
+  формирования wire record — до pacing/socket await. Исчерпание пула создаёт backpressure,
+  а не скрытую fallback-аллокацию. Пять packet/lifecycle тестов проверяют TUN, TAP, memory
+  budget, bounded idle shutdown и повторное использование того же буфера после исчерпания пула.
+- Uplink wire record также больше не требует нового `Vec` на каждый пакет: новый
+  `PacketCodec::encrypt_packet_into` пишет в caller-owned storage и оставляет capacity у
+  последовательного TCP/UDP writer. Rust-клиент выделяет два record-буфера один раз на
+  соединение (реальный пакет и cover, который может уйти раньше него); UDP-QUIC так же
+  переиспользует отдельный caller-owned envelope. Старые allocating entry points сохранены для
+  handshake/control и совместимости, а три теста подтверждают байт-в-байт прежний wire format,
+  reuse allocation и очистку stale record после ошибки.
+- Normalization и padding также переведены на caller-owned storage. Клиентские TCP/UDP writers
+  переиспользуют отдельные scratch-буферы для нормализованного пакета и padding реального,
+  cover и heartbeat-трафика; сервер переиспользует padding в TCP/UDP handlers и общем
+  server→client forwarder. Совместимые allocating-обёртки сохранены для негорячих путей. Два
+  теста проверяют сохранение capacity, очистку stale padding и неизменность исходного префикса
+  после normalization; wire format не изменён.
+- Исходящие зашифрованные records сервера теперь также ограничены RAII-пулом не более 4 МиБ
+  на аутентифицированную сессию. Вместимость слота рассчитывается из реального максимума
+  `tun.mtu`, heartbeat и traffic shaping конкретного профиля, а не из абсолютного wire-предела:
+  при MTU 1400 это 2 906 слотов вместо 251. Один пул разделяют все bonded TCP-потоки; до
+  успешного AUTH он не выделяется, поэтому half-open TCP/UDP-сессии не расходуют бюджет.
+  Общий forwarder шифрует сразу в pooled storage, точный предварительный расчёт record size
+  запрещает `Vec` незаметно вырасти сверх лимита, а bounded writer-очередь сохраняет владение
+  до фактической записи в сокет. Исчерпание даёт учитываемый drop без fallback-аллокации.
+  Recycling переведён с async mutex + mpsc на короткий общий stack + semaphore; это вернуло
+  fake-TLS download из диапазона 605–638 к 680–702 Мбит/с. Тест проверяет точный memory budget,
+  исчерпание и возврат того же allocation после `Drop`; формат провода не изменён.
+- Серверный client→TUN путь больше не проходит через две очереди и async bridge. Dedicated
+  TUN writer читает исходную bounded Tokio-очередь напрямую через `blocking_recv`; stop-флаг
+  с wake-пакетом сохраняет ограниченный teardown. Промежуточная 256-слотовая очередь сбрасывала
+  bursts: диагностический UDP-прогон при 400 Мбит/с показал 164 потерянных iperf-пакета и ровно
+  164 внутренних drop. После удаления bridge прикладные session drops равны нулю.
+- Тот же client→TUN путь больше не выделяет plaintext `Vec` на пакет. TCP получает slot из
+  отдельного 32-МиБ пула до socket read, читает framing прямо в него, расшифровывает на месте и
+  передаёт allocation через исходную очередь до фактической TUN write. UDP берёт slot без
+  ожидания, копирует в него borrowed record и также расшифровывает in-place; исчерпание пула
+  даёт учитываемый в `DROPS` datagram drop без fallback allocation и без остановки heartbeat loop.
+- Обратный server TUN→client путь больше не делает `raw.to_vec()` на каждый пакет. Все TUN
+  queues профиля читают прямо в общий RAII-пул с целевым бюджетом 32 МиБ и минимум одним slot
+  на очередь; allocation проходит lookup/ACL/MTU/шифрование и возвращается после forwarder.
+  Исчерпание останавливает следующий kernel read (backpressure), не создаёт fallback allocation
+  и не сбрасывает уже прочитанный пакет; отдельный shutdown signal будит reader, ожидающий pool.
+  UDP receive loop также передаёт исходный datagram как borrowed slice, а QUIC unwrap возвращает
+  borrowed payload: две промежуточные per-datagram копии удалены. Тест закрепляет расчёт бюджета
+  для стандартного 64-КиБ buffer и крайнего числа очередей; wire format не изменён.
+- Downlink codec теперь расшифровывает record **на месте**: `decrypt_packet_in_place` удаляет
+  framing/nonce/counter/padding/tag внутри исходного `Vec`, а TCP inline/pipeline и UDP client
+  передают тот же allocation в TUN writer. При ошибке буфер очищается без потери capacity;
+  replay counter по-прежнему фиксируется только после успешных AEAD и padding-проверок. Два
+  новых теста проверяют TLS/raw reuse и fail-closed очистку. Это убирает второй plaintext `Vec`
+  на каждый downlink-пакет; входной record теперь предоставляет bounded pool.
+- Downlink record больше не выделяется на каждый пакет. Общий RAII-пул ограничивает суммарную
+  запрошенную capacity 4 МиБ на Linux connection generation: 251 слот вместимостью
+  `TLS_RECORD_HEADER + MAX_RECORD_SIZE`. `read_record_into` читает TCP framing прямо в выданный
+  слот, а borrowed `unwrap_quic_payload` копирует UDP-QUIC payload без промежуточного `Vec`.
+  Allocation остаётся pooled через decrypt, reality pipeline и очередь TUN writer и возвращается
+  только после записи либо drop. При исчерпании TCP применяет backpressure до чтения следующего
+  record, а UDP сбрасывает datagram, не блокируя heartbeat/liveness `select!`; fallback allocation
+  не создаётся. Шесть новых lifecycle/parser тестов проверяют жёсткий предел, повторное
+  использование allocation, возврат после TUN write, partial-body EOF и borrowed QUIC view.
+- Новый C ABI для остальных клиентов пока включается отдельно через `transport-core-ffi`.
+  Feature теперь семантически включает `client`, поэтому минимальный Linux ABI profile
+  компилирует реальный whole-client transport и не превращает его API в ложный `dead_code`.
+  CI отдельно тестирует ABI, собирает минимальный cdylib без default-features с обязательным
+  `panic=unwind` и запускает для этой конфигурации clippy.
+- Временная копия пароля и obfs PSK, возникающая при разборе `qeli://`, очищается сразу после
+  переноса в конфигурацию ядра; при освобождении handle ядро также zeroize-ит хранимые пароль,
+  password-command и obfs PSK.
+- Штатные lab-helper’ы синхронизируют вместе с Rust-кодом публичные C-заголовки, проверяют
+  SSH host key через общий hardened policy и возвращают настоящий код `cargo test`, не код
+  завершающего `tail`. Лабораторная проверка больше не может незаметно пройти на смешанном
+  дереве или замаскировать упавшие тесты.
+- Network-namespace e2e больше не исчерпывает production pre-auth limiter собственными
+  многократными reconnect-сценариями, а трёхрежимный sanity на время теста останавливает
+  штатную systemd-службу: временный сервер не сталкивается с её портом/TUN после respawn.
+  Ожидание TUN в multi-instance kill-switch сценарии опрашивает интерфейс каждые 100 мс,
+  поэтому тест не пропускает его короткое существование перед намеренным отказом от уже занятой
+  другим экземпляром full-tunnel `/1` route и не даёт ложный красный результат.
+- Benchmark/sanity теперь отказываются запускать UDP-тест при `net.core.rmem_max` ниже
+  запрошенных qeli 4 МиБ, показывают потери/пакеты и дельты kernel receive-buffer и session
+  drops для каждой ступени. `list-clients` выводит существовавший в control API счётчик `DROPS`,
+  а sanity принимает список режимов для короткого целевого повтора. Installer и lab/deploy
+  helpers согласованно задают `rmem/wmem_max = 16 МиБ`, defaults 4 МиБ и backlog; это устраняет
+  прежний фактически выданный UDP receive buffer 208 КиБ.
+- Общий atomic writer явно учитывает отсутствие Unix mode bits на Windows, поэтому
+  Windows native-core cross-build проходит без ложного `unused variable` warning.
+
+### Безопасность — транспорт и межплатформенный протокол
+
+- WebSocket-маскировка теперь использует стабильный путь, полученный из PSK через
+  HKDF-SHA256. Сервер отвечает `101` только на правильный путь, а остальные запросы получают
+  обычный nginx-подобный `404` с корректным `Date`. Это убирает активный признак qeli и
+  синхронизировано между Rust, Android, iOS и C#.
+- Во всех WebSocket-портах добавлены корректные Pong-ответы, ограничение очереди управляющих
+  кадров и лимиты pre-auth чтения. Исправлен Rust write-path, который мог вернуть `Ok(0)` при
+  ожидающем Pong и оборвать рабочий туннель. Android больше не принимает кадры в 64 раза
+  крупнее предела отправителя, а `Host` согласован с адресом подключения или настроенным SNI.
+- Android и C# больше не кодируют «окно replay ещё не инициализировано» отрицательным
+  счётчиком. Значения `u64` с установленным старшим битом сравниваются без знака и не могут
+  отключить replay-защиту. В общий conformance-набор добавлены векторы для `2^63` и
+  `2^64 - 1`.
+- Kotlin и C# теперь кодируют QUIC varint в минимальной форме и не обрезают длину молча;
+  генератор cover-трафика C# использует системный CSPRNG вместо предсказуемого
+  `System.Random`.
+- Рукописный TLS отклоняет X25519 low-order points и записи больше лимита RFC 8446 как в
+  handshake, так и после него. FFI-сборки получили обязательную feature-проверку
+  `ffi-cdylib`: release-библиотека не соберётся с `panic=abort`, при котором `catch_unwind`
+  не защищает Android, Windows, macOS и iOS от удалённого падения процесса.
+
+### Безопасность — клиентские политики и локальная система
+
+- Android исполняет `allow_unpinned_tofu = false` и отказывается от неприкреплённого ключа.
+  `kill_switch = true` теперь является полноценной fail-closed политикой: профиль проходит
+  round-trip без потери, а подключение возможно только при проверенном системном Always-on VPN
+  lockdown, который продолжает блокировать трафик после падения процесса и при реконнекте.
+- Импорт профилей Windows/macOS теперь запускает семантическую валидацию. C# больше не
+  превращает повреждённый или укороченный pin в TOFU, а ссылки `reality-tls`/`obfs` без
+  обязательных параметров отклоняются на границе импорта.
+- Сервер не может расширить split-tunnel клиента до default route или вернуть через push
+  диапазон, который пользователь исключил. Проверка действует в Rust и Android; генерация
+  share-link больше не заявляет `reality-tls`, когда reality proxy выключен.
+- systemd-resolved получает catch-all домен `~.` для `dns = tunnel`; серверный DNS push в
+  split-tunnel принимается только для адреса, достижимого внутри туннельной сети. Запуск
+  второго клиента больше не откатывает DNS живого первого туннеля.
+- Валидируются размер TUN-буфера и его соответствие MTU. Конфиг с открытыми правами получает
+  предупреждение, стабильный device id создаётся с режимом `0600`, а TUN-дескрипторы
+  дублируются с `CLOEXEC` и не утекают в hooks/iptables/resolvectl. Signal teardown получает
+  тот же hook environment, что и обычное завершение; poisoned mutex восстанавливается с
+  предупреждением вместо каскадной паники.
+- Trust-check hook-конфига открывает файл с `O_NOFOLLOW`, проверяет дескриптор и не следует
+  подменённому symlink. CLI получил `add-client --password-stdin` и
+  `set-web-password --password-stdin`, чтобы секреты не попадали в argv, `/proc`, shell
+  history и auditd.
+
+### Безопасность — сервер, DHCP и изоляция сессий
+
+- DHCP по умолчанию привязывается к адресу TUN-профиля, а явный wildcard bind отклоняется.
+  Публичный `giaddr` больше не превращает сервер в отражатель; DISCOVER резервирует адрес на
+  30 секунд вместо суток, а stale lease сверяется с общим пулом перед повторным ACK.
+- DNS-прокси создаёт новый случайный upstream transaction id и проверяет не только id, но и
+  question ответа до кэширования, закрывая межпользовательское отравление общего кэша.
+- IPv4-only source guard теперь fail-closed для IPv6 и коротких пакетов. Client isolation
+  учитывает не только pool IP, но и подсети `iroute`; освобождение адресов при TCP/UDP
+  eviction выполняется под тем же lock, что и следующая аллокация, поэтому две живые сессии
+  больше не получают один tunnel IP.
+- Replay старого UDP AUTH не продлевает сессию бесконечно. Нулевые параметры pre-auth rate
+  limiter отклоняются, TUN-очереди сервера получают `CLOEXEC`, DHCP collision/preflight
+  используют фактический bind, а reality ClientHello parser покрыт hostile-input тестами на
+  отсутствие panic и бесконечного цикла.
+- Публичный пример `users.conf` содержит намеренно непригодный Argon2id hash, чтобы копирование
+  sample-конфига не создавало учётную запись с опубликованным паролем. Sidecar lock-файлы
+  открываются без symlink-follow, проверяются как single-link regular files и меняют владельца
+  через `fchown` уже проверенного дескриптора.
+
+### Безопасность — web-панель и backup
+
+- Ключ обратимого шифрования пользовательских паролей перенесён из `/etc/qeli` в
+  `/var/lib/qeli`: незашифрованный backup больше не содержит одновременно ciphertext и ключ.
+  Старый ключ читается и безопасно мигрирует без потери существующих `password_enc`.
+  Русская и английская документация backup/restore теперь явно различает панельный архив
+  `/etc/qeli` и полный ручной backup с `/var/lib/qeli`, включая последствия потери ключа.
+- Logout увеличивает персистентное поколение сессий и отзывает все выданные cookies, а не
+  только удаляет cookie текущего браузера. Добавлены тесты подписи, срока действия, смены
+  пароля, passwordless-режима, TTL clamp и constant-time сравнения.
+- CSRF-проверка loopback origin требует совпадения порта. Restore использует реальный путь
+  запущенного server config и дополнительно ищет все `/etc/qeli/...` ссылки в hook-командах,
+  не позволяя backup перезаписать код, который затем выполнится с повышенными правами.
+
+### Безопасность — Windows и macOS
+
+- Windows запускает `netsh`, `route`, `schtasks` и PowerShell только по абсолютным путям из
+  System32. Установка LocalSystem-сервиса проверяет DACL бинарника и всех родителей, а native
+  DLL при elevated-запуске извлекается в защищённый `%ProgramData%`, не в пользовательский
+  `%LOCALAPPDATA%`.
+- URL обновления принимается только как HTTPS на хосте проекта, поэтому удалённый JSON не
+  может передать ShellExecute произвольную схему, UNC или чужой домен.
+- macOS root daemon проверяет владельца и mode каталога состояния и файла handoff. Ошибка
+  AES-GCM tag больше не трактуется как legacy plaintext ни для профилей GUI, ни для daemon
+  profile: повреждённый или подменённый ciphertext отклоняется и не пере-зашифровывается как
+  доверенный.
+- macOS сохраняет исходные DNS физического network service в атомарном root-only journal до
+  вызова `networksetup`. После SIGKILL/native crash следующий привилегированный запуск
+  восстанавливает DNS до подключения, не принимает оставшийся tunnel resolver за исходный,
+  не откатывает DNS живого второго процесса и сохраняет более новое ручное изменение.
+
+### Установка, обновление, OpenWrt и сборка релиза
+
+- Installer начинает с `umask 077`, удаляет временные `.deb` и распакованные деревья при
+  любом выходе и передаёт сгенерированные пароли через stdin. Updater перенёс rollback cache
+  из доступного сервисному пользователю `/var/lib/qeli/packages` в root-only
+  `/var/cache/qeli`, проверяет owner/type/mode и не следует symlink.
+- OpenWrt init-script проверяет имя интерфейса перед изменением firewall UCI. ACL LuCI явно
+  документирует, что общий `setInitAction` управляет всеми init scripts и не является
+  least-privilege разрешением только для qeli.
+- Android CI проверяет целостность Gradle wrapper. Все штатные FFI-build scripts включают
+  `ffi-cdylib` и `panic=unwind`; Python-скрипты сборки на лабе проверяют SSH host key и
+  требуют явного `QELI_LAB_TRUST_NEW_HOST=1` только для первичного доверия новой VM.
+- Финальные нативные ядра Android, Windows и macOS пересобраны из одного source digest
+  0.7.15 с ABI 1.10 и полным набором 6 Reality + 20 ClientCore экспортов (Android также 17
+  JNI). Независимые A/B-пары побайтно совпали на обеих лабах; canonical/consumed copies,
+  `native-libs/SHA256SUMS`, machine-readable evidence и source provenance синхронизированы.
+  Финальный повторный прогон 2026-08-13 закреплён за clean source commit `508da77` и digest
+  `71a08ebb…`: Android arm64/x86_64, Windows x64 и macOS universal2 снова прошли A/B gate.
+  OpenWrt feed финально закреплён на `df03094`, а `PKG_MIRROR_HASH=e6d5f45b…`
+  получен из version-specific tarball настоящего OpenWrt SDK 23.05.5; отдельные OpenWrt
+  aarch64/x86_64/mipsel/armv7 и Keenetic aarch64/mipsel cross-build матрицы прошли полностью.
+- Native build-процесс больше не может сертифицировать случайный или однократный результат.
+  Оба lab-скрипта требуют чистый закоммиченный Rust source, сами синхронизируют его на `.10`/
+  `.11`, проверяют закреплённые Rust/Zig/NDK/cargo-ndk, строят `--locked` двумя независимыми
+  проходами с `SOURCE_DATE_EPOCH`, path remap и отключённым incremental, сравнивают A/B SHA256
+  и полный набор экспортов и лишь затем атомарно заменяют обе копии библиотек. Для desktop и
+  Android записывается machine-readable evidence; `provenance.py --update` теперь fail-closed
+  отклоняет обновление, пока evidence обеих лаб не совпадает с source digest и финальными
+  файлами. Живой A/B-прогон всех четырёх библиотек выполнен, release gate зелёный.
+- Общая чувствительная часть этих рецептов больше не продублирована: единый fail-closed
+  lab-harness владеет SSH/SFTP, ограниченным source-sync, удалённым SHA256 и атомарной заменой
+  canonical/consumed copies. Отдельная общая оркестрация всегда запускает оба чистых прохода
+  `a`/`b`. Тридцать пять локальных/CI-тестов проверяют в том числе отказ до любой записи при
+  подмене SFTP payload, запрет пути назначения вне репозитория и невозможность незаметно
+  превратить A/B-рецепт в однократную сборку.
+- Контракт конфигурации после унификации транспорта закреплён исходниковым тестом: Rust,
+  Android, Windows, macOS и iOS распознают один и тот же набор из 73 ключей. Платформенные
+  различия сохранены явно: UI моделирует только применимые поля, остальные валидные ключи
+  переносит без потери при open/save. После Android lockdown-интеграции в общей схеме не
+  осталось ни одного молча неподдерживаемого security-key: `kill_switch` моделируется и
+  подтверждается только при фактически включённой системной защите.
+- Воспроизводимый desktop-рецепт дополнительно закрепляет cargo-zigbuild 0.23.0, GNU ld 2.44
+  и apple-codesign 0.29.0. Для macOS исправлены два источника недетерминизма Zig 0.13:
+  pass-specific `LC_ID_DYLIB` заменён на `@rpath/libqeli.dylib`, content-derived `LC_UUID`
+  и стандартный `LOCAL` GOT-index выставляются до детерминированной ad-hoc подписи. Строгий
+  структурный gate отклоняет неизвестные indirect symbols и неполную подпись universal2.
+- Lab-рецепты идемпотентно устанавливают точные Rust targets и после сохранения каждого
+  конечного артефакта освобождают его Cargo target-кэш. Это позволило выполнить независимый
+  desktop A/B-цикл на `.10` с 2,2 ГБ свободного места без изменения `/opt/qeli-src/target`.
+- Живой Android ABI 1.9 e2e на эмуляторе после перезагрузки лабы прошёл пять вариантов:
+  TCP fake-TLS/plain/obfs и UDP fake-TLS/obfs. Во всех случаях Rust применил полный
+  `NetworkPlan`, клиент вывел MTU, DNS, routes, padding, heartbeat, normalization, shaping и
+  multipath, а обратный ping дал 3/3 и 0% потерь. E2E сам поднимает штатный AVD и восстанавливает
+  исходные server/users config побайтно. Windows ABI 1.9 live-handshake отдельно подтвердил
+  тот же журнал и выдачу tunnel IP.
+- Android source-sync больше не делает отдельный SSH `mkdir` для каждого файла, а macOS
+  universal packager подписывает и проверяет все Mach-O одной удалённой транзакцией. Оба
+  изменения сокращают время локальной release-оркестрации без ослабления fail-closed gate.
+  Неизменившиеся крупные macOS self-contained tar.gz повторно используются на лабе только
+  после сравнения с локальным SHA256, а не загружаются заново по медленному SFTP. Итоговый
+  артефакт тоже не скачивается, если его verified remote SHA256 уже совпадает со всеми
+  локальными назначениями.
+- Wrapper validation обновлён на актуальный SHA официального `gradle/actions@v4`: прежний
+  pin не знал checksum штатного Gradle 9.6.1 JAR и делал Android CI красным до начала
+  сборки. Windows release-рецепт теперь использует отдельные publish-каталоги и
+  переименовывает только итоговые EXE; глобальный `AssemblyName` наследовался проектом
+  `QeliShared` и останавливал restore с `Ambiguous project name`.
+- Русская и английская документация обновлены под новые параметры, права файлов, поведение
+  сессий, импорта профилей, DNS/routes и безопасные процедуры установки/эксплуатации.
+- Единый двуязычный `CONTRIBUTING.md` — сначала на английском, затем на русском — теперь
+  пошагово описывает подготовку PR: разработка от `dev`, отдельная ветка и логические
+  DCO-коммиты, rebase, локальные проверки, выбор base/compare на GitHub, содержимое test plan
+  и требования к происхождению сторонних бинарников. CHANGELOG и пользовательская
+  документация для автора PR прямо отмечены как добровольные — при необходимости их
+  дополняет мейнтейнер перед релизом.
+- Канонический логотип приложения вынесен в общий каталог `assets/branding`, добавлен в
+  главный GitHub README, а для карточек ссылок подготовлен фирменный Social Preview
+  1280×640. Общий ассет совпадает с уже используемым iOS-логотипом и визуальным знаком
+  Windows, macOS, Android и web-панели.
+
+## [0.7.14] — 2026-08-03
 
 ### Исправлено — редактор профиля мог загнать в тупик и терял режим DNS
 
@@ -3732,7 +4652,7 @@ AuthOK. Крипто-состояние не трогается, кэш ServerHe
 пакете (pre-auth, в режиме udp-quic без obfs; obfs-режим иммунен). Не краш процесса, но
 принудительный реконнект; при потоке — DoS. Varint переведён в `long` + bounds-check (Rust уже был
 безопасен). ([Quic.cs](qeli-shared/QeliShared/Protocol/Quic.cs),
-[Quic.kt](qeli-android/app/src/main/kotlin/com/qeli/protocol/Quic.kt))
+[quic.rs](qeli/src/protocol/quic.rs))
 
 ### Исправлено — фрейминг/MTU: паритет ограничений и корректный размер под DF
 
@@ -3773,7 +4693,7 @@ QUIC-стандарта), но комментарий утверждал, что
 добавлен cap `MAX_CHUNK`, так буфер сборки ограничен `MAX_FRAGS*MAX_CHUNK`, а не `MAX_FRAGS*65535`.
 ([udp_handler.rs](qeli/src/server/udp_handler.rs),
 [UdpFrag.cs](qeli-shared/QeliShared/Protocol/UdpFrag.cs),
-[UdpFrag.kt](qeli-android/app/src/main/kotlin/com/qeli/protocol/UdpFrag.kt))
+[udp_frag.rs](qeli/src/protocol/udp_frag.rs))
 
 ### Безопасность — имя профиля могло протащить lifecycle-hook (обход запрета → выполнение команд)
 
@@ -4550,7 +5470,7 @@ full-tunnel: `/24` специфичнее `0.0.0.0/1`+`128.0.0.0/1`). Same-LAN �
   естественная UDP-потеря; мёртвая связь ловится RX-таймаутом), (3) Android перестал глотать
   реальную причину обрыва — теперь она пишется в лог, а не «closed cleanly».
   ([QeliService.kt](qeli-android/app/src/main/kotlin/com/qeli/QeliService.kt),
-  [PacketCodec.kt](qeli-android/app/src/main/kotlin/com/qeli/protocol/PacketCodec.kt),
+  [packet.rs](qeli/src/protocol/packet.rs),
   [VpnTunnelBase.cs](qeli-shared/QeliShared/Vpn/VpnTunnelBase.cs),
   [PacketCodec.cs](qeli-shared/QeliShared/Protocol/PacketCodec.cs))
 - **udp-quic: `ArrayIndexOutOfBoundsException: length=4; index=4` в tunnel loop (Android + C#).**
@@ -4792,7 +5712,7 @@ hardening ядра/панели, CI/packaging, docs). Проверено: `cargo
   Live-e2e на лабе: udp-obfs + udp-fake-tls+QUIC + baseline — **3/3 PASS** (Auth OK + ping).
   ([udp_frag.rs](qeli/src/protocol/udp_frag.rs), [udp_handler.rs](qeli/src/server/udp_handler.rs),
   [client/mod.rs](qeli/src/client/mod.rs), [UdpFrag.cs](qeli-shared/QeliShared/Protocol/UdpFrag.cs),
-  [UdpFrag.kt](qeli-android/app/src/main/kotlin/com/qeli/protocol/UdpFrag.kt))
+  [udp_frag.rs](qeli/src/protocol/udp_frag.rs))
 - **`dns.push_servers`** (сервер) — раздать клиентам конкретный резолвер (первый IP из списка)
   **без** запуска встроенного DNS-прокси: например LAN / AdGuard / NextDNS-бокс. Пушится в
   auth-OK, клиент применяет в режиме `dns = tunnel` со строгой валидацией IP. Пусто = поведение

@@ -1,6 +1,10 @@
+#[cfg(target_os = "linux")]
 pub mod dns;
+#[cfg(target_os = "linux")]
 pub mod gateway;
+#[cfg(target_os = "linux")]
 pub mod killswitch;
+#[cfg(target_os = "linux")]
 pub mod proxy;
 pub mod route;
 
@@ -9,10 +13,50 @@ use crate::crypto::{
     handshake_transcript_hash, Keypair,
 };
 use crate::protocol::{
-    generate_connection_id, pick_random_sni, read_record, read_tls_record, unwrap_quic,
-    wrap_quic_long, wrap_quic_short, FakeTlsHandshake, Framing, Obfuscator, PacketCodec,
+    generate_connection_id, pick_random_sni, read_record, read_record_into, read_tls_record,
+    unwrap_quic, unwrap_quic_payload, wrap_quic_long, wrap_quic_short, wrap_quic_short_into,
+    FakeTlsHandshake, Framing, Obfuscator, PacketCodec,
 };
+#[cfg(target_os = "linux")]
 use crate::trace;
+#[cfg(not(target_os = "linux"))]
+mod trace {
+    pub(crate) enum Dir {
+        Tx,
+        Rx,
+    }
+
+    #[inline]
+    pub(crate) fn record(_direction: Dir, _label: &str, _bytes: usize, _stream: u8) {}
+}
+use crate::transport_core::buffer_pool::PooledBuffer;
+#[cfg(target_os = "linux")]
+use crate::transport_core::linux_tun::LinuxTunPumpStop;
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+use crate::transport_core::linux_tun::{
+    LinuxTunPump, LinuxTunPumpConfig, TapHeaders, TunFraming, TunPacket, TunWriter,
+};
+#[cfg(target_os = "ios")]
+use crate::transport_core::packet_tun::TunWriter;
+#[cfg(target_os = "ios")]
+type TunPacket = PooledBuffer;
+#[cfg(target_os = "linux")]
+use crate::transport_core::network::is_full_tunnel;
+use crate::transport_core::network::{build_network_plan, server_push_log_lines, HandshakeNetwork};
+use crate::transport_core::session::{
+    authenticate_tcp, build_client_auth_plaintext, build_udp_client_hello_flight, effective_mtu,
+    parse_auth_ok, static_es, verify_server_identity, AuthOk, UdpClientHelloFlight,
+};
+use crate::transport_core::udp_buffer::{
+    UdpBufferController, UdpBufferPolicy, AUTO_MAX_RECV_BYTES,
+};
+#[cfg(target_os = "windows")]
+use crate::transport_core::wintun::{TunPacket, TunWriter, WindowsTunPump};
+#[cfg(target_os = "linux")]
+use crate::transport_core::{platform_capability, ClientCore, ClientState, CoreOptions, EventKind};
+#[cfg(all(test, target_os = "linux"))]
+use crate::transport_core::{NetworkDns, NetworkRoute};
+use crate::transport_core::{NetworkPlan, RuntimeCounters};
 
 /// How many extra copies of the path-MTU report the UDP data plane emits after the first
 /// (#13/#5). The frame is never acknowledged — the server answers no control frame — so a
@@ -21,6 +65,14 @@ use crate::trace;
 /// burst; the server simply stores the latest value, and the copies all carry the same one, so the duplicates are a no-op.
 /// TCP needs none of this — it retransmits for us.
 const MTU_REPORT_RESENDS: u8 = 3;
+
+/// The current tunnel address plan is IPv4-only. Android's TUN can still surface IPv6
+/// packets while the OS is withdrawing routes or probing connectivity; sending them to
+/// the server only produces source-guard drops and can starve useful traffic in a burst.
+#[inline]
+fn is_supported_inner_packet(packet: &[u8]) -> bool {
+    packet.len() >= 20 && (packet[0] >> 4) == 4
+}
 
 /// The address the data-plane socket is ACTUALLY connected to.
 ///
@@ -32,8 +84,10 @@ const MTU_REPORT_RESENDS: u8 = 3;
 /// tunnel is not using — while the address it IS using fell under the full-tunnel halves
 /// and got routed into the tunnel we are building. Record what the socket actually
 /// connected to and pin that.
+#[cfg(target_os = "linux")]
 static CONNECTED_PEER: std::sync::Mutex<Option<std::net::IpAddr>> = std::sync::Mutex::new(None);
 
+#[cfg(target_os = "linux")]
 fn note_connected_peer(ip: std::net::IpAddr) {
     if let Ok(mut g) = CONNECTED_PEER.lock() {
         *g = Some(ip);
@@ -42,6 +96,7 @@ fn note_connected_peer(ip: std::net::IpAddr) {
 
 /// The peer address to pin, as a literal; falls back to the configured address when the
 /// socket never reported one (should not happen after a successful connect).
+#[cfg(target_os = "linux")]
 fn pin_target(config: &crate::config::client::ClientConfig) -> String {
     CONNECTED_PEER
         .lock()
@@ -50,7 +105,7 @@ fn pin_target(config: &crate::config::client::ClientConfig) -> String {
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| config.server.address.clone())
 }
-
+#[cfg(target_os = "linux")]
 /// Spawn a local SOCKS/HTTP proxy when `proxy = true`. Outbound dials bind to the
 /// tunnel-assigned client IP so only proxied apps use the VPN in split-tunnel mode.
 fn start_local_proxy(
@@ -87,13 +142,17 @@ fn start_local_proxy(
         }
     }))
 }
+
 use crate::transport::tcp::set_tcp_keepalive;
+#[cfg(target_os = "linux")]
 use crate::tun::iface::TunInterface;
-use crate::tun::{
-    generate_mac, is_tap_mode, prepend_ethernet_header, strip_ethernet_header, tap_interface_name,
-};
+#[cfg(target_os = "linux")]
+use crate::tun::{generate_mac, is_tap_mode, tap_interface_name};
 use rand::prelude::*;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 // `portable_atomic::AtomicU64` so the data-plane byte counters compile on 32-bit
 // mipsel routers (no native 64-bit atomics); native instruction on aarch64/x86_64.
@@ -101,9 +160,394 @@ use portable_atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+#[cfg(target_os = "linux")]
+use tokio::net::TcpStream;
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+pub(crate) type IdentityFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'static>>;
+pub(crate) type IdentityVerifier = Arc<dyn Fn([u8; 32]) -> IdentityFuture + Send + Sync + 'static>;
+
+/// The packet/session code is platform-neutral. This is the deliberately small boundary
+/// retained by Linux and Android: identity persistence/trust, NetworkPlan execution and
+/// ownership of the already-created TUN descriptors.
+pub(crate) trait ClientPlatform {
+    fn next_generation(&mut self) -> u64;
+    fn device_id(&self) -> anyhow::Result<[u8; crate::protocol::DEVICE_ID_LEN]>;
+    fn identity_verifier(&self, config: &crate::config::client::ClientConfig) -> IdentityVerifier;
+    fn prepare_tunnel(
+        &mut self,
+        config: &crate::config::client::ClientConfig,
+        plan: NetworkPlan,
+        network: &HandshakeNetwork<'_>,
+    ) -> anyhow::Result<TunnelSetup>;
+    fn fallback_dns_servers(&self) -> &[String];
+    fn cancel_token(&self) -> Arc<AtomicBool>;
+    fn counters(&self) -> Arc<RuntimeCounters>;
+}
+
+/// In-process Linux adapter for the same lifecycle contract exported over the C ABI.
+/// It deliberately polls the bounded event queue instead of reaching around it: this is
+/// the first real adapter that freezes the semantics other clients will consume.
+#[cfg(target_os = "linux")]
+struct LinuxCoreAdapter {
+    core: ClientCore,
+    next_plan_generation: u64,
+    cancel: Arc<AtomicBool>,
+    counters: Arc<RuntimeCounters>,
+    diagnostics: ClientStatusReporter,
+}
+
+/// Sanitized state exported by a Linux client process for the server panel. This is a
+/// deliberately separate contract from logs: consumers no longer infer connection state,
+/// negotiated MTU or DNS by matching English log messages. Credentials, identity keys and
+/// session material are never copied into this structure.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct ClientStatusReporter {
+    path: Option<Arc<std::path::PathBuf>>,
+    state: Arc<std::sync::Mutex<ClientDiagnosticState>>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct ClientDiagnosticState {
+    profile: String,
+    state: String,
+    generation: u64,
+    reconnects: u64,
+    retry_in_secs: Option<u64>,
+    last_error: Option<String>,
+    plan: Option<serde_json::Value>,
+}
+
+#[cfg(target_os = "linux")]
+impl ClientStatusReporter {
+    fn from_env() -> Self {
+        let path = std::env::var("QELI_CLIENT_STATUS")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+            .map(Arc::new);
+        let profile =
+            std::env::var("QELI_CLIENT_PROFILE").unwrap_or_else(|_| "standalone".to_string());
+        Self {
+            path,
+            state: Arc::new(std::sync::Mutex::new(ClientDiagnosticState {
+                profile,
+                state: "created".to_string(),
+                generation: 0,
+                reconnects: 0,
+                retry_in_secs: None,
+                last_error: None,
+                plan: None,
+            })),
+        }
+    }
+
+    fn state_name(state: ClientState) -> &'static str {
+        match state {
+            ClientState::Created => "created",
+            ClientState::Connecting => "connecting",
+            ClientState::AwaitingNetwork => "awaiting_network",
+            ClientState::Running => "running",
+            ClientState::Stopping => "stopping",
+            ClientState::Stopped => "stopped",
+            ClientState::Failed => "failed",
+        }
+    }
+
+    fn clean_error(message: &str) -> String {
+        message
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .take(1024)
+            .collect::<String>()
+            .trim()
+            .to_string()
+    }
+
+    fn update_state(&self, state: ClientState, reconnects: u64) {
+        if let Ok(mut current) = self.state.lock() {
+            current.state = Self::state_name(state).to_string();
+            current.reconnects = reconnects;
+            current.retry_in_secs = None;
+            if state == ClientState::Running {
+                current.last_error = None;
+            }
+        }
+    }
+
+    fn update_plan(&self, plan: &NetworkPlan) {
+        if let Ok(mut current) = self.state.lock() {
+            current.generation = plan.generation;
+            current.plan = serde_json::to_value(plan).ok();
+        }
+    }
+
+    fn update_fault(&self, message: &str) {
+        if let Ok(mut current) = self.state.lock() {
+            current.last_error = Some(Self::clean_error(message));
+        }
+    }
+
+    fn retrying(&self, error: Option<&anyhow::Error>, attempt: u64, delay_secs: u64) {
+        if let Ok(mut current) = self.state.lock() {
+            current.state = "retrying".to_string();
+            current.reconnects = attempt;
+            current.retry_in_secs = Some(delay_secs);
+            if let Some(error) = error {
+                current.last_error = Some(Self::clean_error(&error.to_string()));
+            }
+        }
+    }
+
+    fn terminal(&self, error: Option<&anyhow::Error>) {
+        if let Ok(mut current) = self.state.lock() {
+            current.state = if error.is_some() { "failed" } else { "stopped" }.to_string();
+            current.retry_in_secs = None;
+            if let Some(error) = error {
+                current.last_error = Some(Self::clean_error(&error.to_string()));
+            }
+        }
+    }
+
+    fn publish(&self, counters: &RuntimeCounters) {
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        let current = match self.state.lock() {
+            Ok(current) => current.clone(),
+            Err(_) => return,
+        };
+        let udp = counters.udp.snapshot();
+        let updated_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
+        let body = serde_json::json!({
+            "schema": 1,
+            "profile": current.profile,
+            "state": current.state,
+            "updated_at_ms": updated_at_ms,
+            "generation": current.generation,
+            "reconnects": current.reconnects,
+            "retry_in_secs": current.retry_in_secs,
+            "last_error": current.last_error,
+            "plan": current.plan,
+            "stats": {
+                "tx_packets": counters.tx_packets.load(portable_atomic::Ordering::Relaxed),
+                "tx_bytes": counters.tx_bytes.load(portable_atomic::Ordering::Relaxed),
+                "rx_packets": counters.rx_packets.load(portable_atomic::Ordering::Relaxed),
+                "rx_bytes": counters.rx_bytes.load(portable_atomic::Ordering::Relaxed),
+                "udp_kernel_drops": udp.kernel_drops,
+                "udp_internal_drops": udp.internal_drops,
+                "udp_buffer_grows": udp.grow_events,
+                "udp_recv_buffer_bytes": udp.granted_recv_bytes,
+            },
+        });
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(encoded) = serde_json::to_vec(&body) {
+            if let Err(error) = crate::util::write_atomic_private(path, &encoded) {
+                log::debug!(
+                    "cannot publish client diagnostics {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    fn start_sampler(&self, counters: Arc<RuntimeCounters>) {
+        if self.path.is_none() {
+            return;
+        }
+        let reporter = self.clone();
+        tokio::spawn(async move {
+            loop {
+                reporter.publish(&counters);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxCoreAdapter {
+    fn new(config_text: &str) -> anyhow::Result<(Self, crate::config::client::ClientConfig)> {
+        let mut core = ClientCore::new(
+            config_text,
+            CoreOptions {
+                platform_capabilities: platform_capability::SYSTEM_PLAN,
+                ..CoreOptions::default()
+            },
+        )?;
+        let config = core.config().clone();
+        while core.poll_event().is_some() {}
+        let counters = Arc::new(RuntimeCounters::default());
+        let diagnostics = ClientStatusReporter::from_env();
+        diagnostics.publish(&counters);
+        Ok((
+            Self {
+                core,
+                next_plan_generation: 1,
+                cancel: Arc::new(AtomicBool::new(false)),
+                counters,
+                diagnostics,
+            },
+            config,
+        ))
+    }
+
+    fn begin_connection(&mut self, reconnect: bool) -> anyhow::Result<()> {
+        if !matches!(
+            self.core.state(),
+            ClientState::Created | ClientState::Stopped
+        ) {
+            self.core.stop()?;
+            self.drain_events(None)?;
+        }
+        if reconnect {
+            self.core.record_reconnect();
+        }
+        self.core.start()?;
+        self.drain_events(None).map(|_| ())
+    }
+
+    fn finish_connection(&mut self) -> anyhow::Result<()> {
+        self.core.stop()?;
+        self.drain_events(None).map(|_| ())
+    }
+
+    fn next_generation(&mut self) -> u64 {
+        let generation = self.next_plan_generation;
+        self.next_plan_generation = self.next_plan_generation.saturating_add(1);
+        generation
+    }
+
+    fn apply_network_plan<T>(
+        &mut self,
+        plan: NetworkPlan,
+        apply: impl FnOnce(&NetworkPlan) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let generation = plan.generation;
+        self.core.publish_network_plan(plan)?;
+        let executable = self.drain_events(Some(generation))?.ok_or_else(|| {
+            anyhow::anyhow!("core emitted no network plan for generation {generation}")
+        })?;
+
+        match apply(&executable) {
+            Ok(value) => {
+                self.core.ack_network_plan(generation, true, None)?;
+                self.drain_events(None)?;
+                Ok(value)
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                self.core
+                    .ack_network_plan(generation, false, Some(&reason))?;
+                self.drain_events(None)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn drain_events(&mut self, wanted_plan: Option<u64>) -> anyhow::Result<Option<NetworkPlan>> {
+        let mut found = None;
+        while let Some(event) = self.core.poll_event() {
+            match event.kind {
+                EventKind::StateChanged => {
+                    log::debug!("transport core state: {:?}", event.state);
+                    self.diagnostics
+                        .update_state(event.state, self.core.stats().reconnects);
+                    self.diagnostics.publish(&self.counters);
+                }
+                EventKind::NetworkPlan => {
+                    let plan = event
+                        .plan
+                        .ok_or_else(|| anyhow::anyhow!("network-plan event has no payload"))?;
+                    self.diagnostics.update_plan(&plan);
+                    self.diagnostics.publish(&self.counters);
+                    if wanted_plan == Some(plan.generation) {
+                        found = Some(plan);
+                    }
+                }
+                EventKind::Error => {
+                    if let Some(fault) = event.fault {
+                        log::warn!("transport core error {:?}: {}", fault.code, fault.message);
+                        self.diagnostics.update_fault(&fault.message);
+                        self.diagnostics.publish(&self.counters);
+                    }
+                }
+                EventKind::SocketProtect => {
+                    return Err(anyhow::anyhow!(
+                        "unexpected socket-protect event: Linux does not advertise that capability"
+                    ));
+                }
+                EventKind::ServerIdentity => {
+                    return Err(anyhow::anyhow!(
+                        "unexpected server-identity event: Linux verifies trust in-process"
+                    ));
+                }
+            }
+        }
+        Ok(found)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ClientPlatform for LinuxCoreAdapter {
+    fn next_generation(&mut self) -> u64 {
+        LinuxCoreAdapter::next_generation(self)
+    }
+
+    fn device_id(&self) -> anyhow::Result<[u8; crate::protocol::DEVICE_ID_LEN]> {
+        Ok(device_id())
+    }
+
+    fn identity_verifier(&self, config: &crate::config::client::ClientConfig) -> IdentityVerifier {
+        let expected = config.auth.server_public_key.clone();
+        let server_id = format!("{}:{}", config.server.address, config.server.port);
+        let allow_tofu = config.auth.allow_unpinned_tofu;
+        Arc::new(move |received| {
+            let expected = expected.clone();
+            let server_id = server_id.clone();
+            Box::pin(async move { verify_server_key(&received, &expected, &server_id, allow_tofu) })
+        })
+    }
+
+    fn prepare_tunnel(
+        &mut self,
+        config: &crate::config::client::ClientConfig,
+        plan: NetworkPlan,
+        network: &HandshakeNetwork<'_>,
+    ) -> anyhow::Result<TunnelSetup> {
+        self.apply_network_plan(plan, |plan| setup_tunnel(config, plan, network))
+    }
+
+    fn fallback_dns_servers(&self) -> &[String] {
+        &[]
+    }
+
+    fn cancel_token(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+
+    fn counters(&self) -> Arc<RuntimeCounters> {
+        self.counters.clone()
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
     // SIGUSR1 dumps the packet trace, when one is armed (no-op otherwise).
     tokio::spawn(trace::watch());
@@ -112,14 +556,44 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
     // STRICT: a misspelled key name and an unreadable value both used to fail open here —
     // only `check-config` reported them, while the real start substituted defaults in silence.
     // See `config::parse_client_config_strict`. (Audit 2026-08-01, §4/§5.)
-    let config: crate::config::client::ClientConfig =
-        crate::config::parse_client_config_strict(&config_content)?;
-    // Reject unknown enum values before connecting, so `check-config --client` and a real
-    // start agree. Without this a typo does not error — it silently picks the other branch
-    // (`proto = UDP` connects over TCP, `dns = of` leaves the host resolver in place).
-    // (Audit 2026-07-30, #7.)
-    config.validate()?;
-
+    let (mut core_adapter, config) = LinuxCoreAdapter::new(&config_content)?;
+    core_adapter
+        .diagnostics
+        .start_sampler(core_adapter.counters.clone());
+    // Warn when a config holding a cleartext password is readable by other local accounts.
+    //
+    // Nothing on the LOAD path ever looked at the file mode. `pass = <vpn password>` and a
+    // pinned `key` sit in this file verbatim, and the ordinary way to create it is to paste a
+    // `qeli://` link into an editor under the default umask — which yields 0644. The client
+    // then started without a word, and any local user could read the credential. Permissions
+    // are narrowed on WRITE (`write_atomic_private`), so this only ever bit hand-made files —
+    // i.e. the common case. The only existing mode check, `hooks::config_is_trusted`, looks
+    // at WRITABILITY and runs only when hooks are configured.
+    //
+    // A warning rather than a refusal: an operator with a 0644 config and no better option
+    // should still be able to bring the tunnel up, and OpenSSH's precedent (refuse) applies
+    // to keys the daemon can regenerate, not to a user's only way in. (Audit 2026-08-04.)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let has_secret = config
+            .auth
+            .password
+            .as_deref()
+            .is_some_and(|p| !p.is_empty());
+        if has_secret {
+            if let Ok(md) = std::fs::metadata(config_path) {
+                let mode = md.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    log::warn!(
+                        "config '{config_path}' is mode {mode:o} — it contains the VPN password \
+                         in cleartext and every local account can read it. `chmod 600 \
+                         {config_path}`."
+                    );
+                }
+            }
+        }
+    }
     let password = if let Some(ref pw) = config.auth.password {
         pw.clone()
     } else if let Some(ref pw_file) = config.auth.password_file {
@@ -218,6 +692,17 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
     // the tunnel resolver or behind a closed firewall. Last line of defence on top
     // of the per-connection restore in the data-plane loops below.
     let (sig_tun, sig_lan, sig_post_down) = (tun_if.clone(), lan_subnet.clone(), post_down.clone());
+    // The hook environment has to reach THIS path too.
+    //
+    // post_down is invoked from three places; the two orderly exits passed `&hook_env`, and
+    // the signal handler — `systemctl stop` and Ctrl-C, i.e. the way the client actually
+    // stops in practice — passed `&[]`. So the paired hooks operators are told to write,
+    // `post_up = iptables -I FORWARD -i "$QELI_TUN" -j ACCEPT` /
+    // `post_down = iptables -D FORWARD -i "$QELI_TUN" -j ACCEPT`, ran their teardown as
+    // `iptables -D FORWARD -i "" -j ACCEPT`: it fails, `hooks::run` only warns on a non-zero
+    // exit, and the rule that opens forwarding stays in the firewall after the VPN is gone.
+    // (Audit 2026-08-04.)
+    let sig_hook_env = hook_env.clone();
     // Also needed below: `process::exit` runs no destructors, so `TunGuard` — which owns
     // removing the device and the routes — never fires on this path. Everything it would
     // have done has to be done explicitly here.
@@ -263,7 +748,7 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
             route::cleanup_routes(&sig_tun, &sig_server, &sig_exclude).ok();
             TunInterface::delete(&sig_tun).ok();
         }
-        crate::hooks::run("post_down", &sig_post_down, &[]).await;
+        crate::hooks::run("post_down", &sig_post_down, &sig_hook_env).await;
         std::process::exit(0);
     });
 
@@ -301,12 +786,16 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
     let mut retry_count = 0u64;
 
     loop {
+        core_adapter.begin_connection(retry_count > 0)?;
         let started = std::time::Instant::now();
         let result = if config.server.protocol == "udp" {
-            connect_and_run_udp(&config, &password).await
+            connect_and_run_udp(&config, &password, &mut core_adapter).await
         } else {
-            connect_and_run_tcp(&config, &password).await
+            connect_and_run_tcp(&config, &password, &mut core_adapter).await
         };
+        if let Err(error) = core_adapter.finish_connection() {
+            log::error!("transport core teardown error: {error}");
+        }
         let ran = started.elapsed();
 
         match &result {
@@ -337,6 +826,8 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
                 gateway::disengage_exit(&tun_if);
             }
             crate::hooks::run("post_down", &post_down, &hook_env).await;
+            core_adapter.diagnostics.terminal(result.as_ref().err());
+            core_adapter.diagnostics.publish(&core_adapter.counters);
             return result;
         }
 
@@ -352,7 +843,10 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
                 gateway::disengage_exit(&tun_if);
             }
             crate::hooks::run("post_down", &post_down, &hook_env).await;
-            return Err(anyhow::anyhow!("max retries ({}) reached", max_retries));
+            let error = anyhow::anyhow!("max retries ({}) reached", max_retries);
+            core_adapter.diagnostics.terminal(Some(&error));
+            core_adapter.diagnostics.publish(&core_adapter.counters);
+            return Err(error);
         }
 
         // Exponential backoff from the base delay. Compute BEFORE incrementing so the
@@ -380,6 +874,10 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
         }
 
         log::info!("Reconnecting in {}s (attempt {})...", delay, retry_count);
+        core_adapter
+            .diagnostics
+            .retrying(result.as_ref().err(), retry_count, delay);
+        core_adapter.diagnostics.publish(&core_adapter.counters);
         tokio::time::sleep(Duration::from_secs(delay)).await;
     }
 }
@@ -388,38 +886,100 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
 /// stream bonding (multipath). Cloneable + callable from the data-plane to ramp
 /// streams. For modes without multipath support yet it's a stub that errors (and
 /// is never called, since their profiles don't advertise max_streams>1).
-type StreamConnector<S> = std::sync::Arc<
+pub(crate) type StreamConnector<S> = std::sync::Arc<
     dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<S>> + Send>>
         + Send
         + Sync,
 >;
 
+/// Divide the remaining dial deadline across every untried A record. A dead first address
+/// can consume only its fair share; addresses that fail quickly donate their unused time to
+/// the remaining candidates. No fixed per-address timeout is baked into the transport.
+#[cfg(any(target_os = "linux", test))]
+fn per_candidate_connect_budget(remaining: Duration, candidates_left: usize) -> Duration {
+    if candidates_left <= 1 {
+        remaining
+    } else {
+        remaining / u32::try_from(candidates_left).unwrap_or(u32::MAX)
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn connect_tcp_candidates(
+    host: &str,
+    port: u16,
+    total: Duration,
+    label: &str,
+) -> anyhow::Result<TcpStream> {
+    let deadline = tokio::time::Instant::now() + total;
+    let resolved = match tokio::time::timeout(total, tokio::net::lookup_host((host, port))).await {
+        Ok(result) => result.map_err(|error| {
+            anyhow::anyhow!("{label} DNS lookup for {host}:{port} failed: {error}")
+        })?,
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "{label} DNS lookup for {host}:{port} timed out after {}s",
+                total.as_secs()
+            ));
+        }
+    };
+    let mut seen = std::collections::HashSet::new();
+    let candidates: Vec<std::net::SocketAddr> = resolved
+        .filter(|address| address.is_ipv4())
+        .filter(|address| seen.insert(*address))
+        .collect();
+    if candidates.is_empty() {
+        return Err(anyhow::anyhow!(
+            "{label} DNS lookup for {host}:{port} returned no IPv4 address"
+        ));
+    }
+
+    let mut failures = Vec::with_capacity(candidates.len());
+    for (index, address) in candidates.iter().copied().enumerate() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let slice = per_candidate_connect_budget(remaining, candidates.len() - index);
+        match tokio::time::timeout(slice, TcpStream::connect(address)).await {
+            Ok(Ok(stream)) => {
+                note_connected_peer(address.ip());
+                if index > 0 {
+                    log::info!("{label} connected through fallback carrier {address}");
+                }
+                return Ok(stream);
+            }
+            Ok(Err(error)) => failures.push(format!("{address}: {error}")),
+            Err(_) => failures.push(format!(
+                "{address}: timed out after {} ms",
+                slice.as_millis()
+            )),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "{label} could not connect to any IPv4 address for {host}:{port} within {}s ({})",
+        total.as_secs(),
+        failures.join("; ")
+    ))
+}
+
 /// Open ONE reality-tls connection (TCP + browser-grade TLS 1.3 carrying the
 /// REALITY token). Reusable for the primary connection and each bonded stream —
 /// every call uses a fresh ephemeral + freshly sealed session_id.
+#[cfg(target_os = "linux")]
 async fn connect_reality(
     config: &crate::config::client::ClientConfig,
 ) -> anyhow::Result<crate::protocol::realtls::stream::RealTlsStream<TcpStream>> {
     // Bound connect + the TLS 1.3 handshake (reads) by connection_timeout_secs: a server
     // that accepts TCP then stalls the TLS handshake would otherwise hang here forever.
     let to = Duration::from_secs(config.server.connection_timeout_secs.max(1));
-    let addr = format!("{}:{}", config.server.address, config.server.port);
-    let mut stream = match tokio::time::timeout(to, TcpStream::connect(&addr)).await {
-        Ok(r) => {
-            let s = r?;
-            if let Ok(p) = s.peer_addr() {
-                note_connected_peer(p.ip());
-            }
-            s
-        }
-        Err(_) => {
-            return Err(anyhow::anyhow!(
-                "reality-tls TCP connect to {} timed out after {}s",
-                addr,
-                to.as_secs()
-            ))
-        }
-    };
+    let mut stream = connect_tcp_candidates(
+        &config.server.address,
+        config.server.port,
+        to,
+        "reality-tls TCP",
+    )
+    .await?;
     stream.set_nodelay(config.performance.tcp_nodelay)?;
     set_tcp_keepalive(&stream, config.server.tcp_keepalive_secs)?;
     // SNI precedence mirrors the inner handshake.
@@ -484,6 +1044,7 @@ async fn connect_reality(
 
 /// Open ONE obfs connection (TCP + ChaCha20 stream obfuscation with its own nonce
 /// exchange). Reusable for the primary connection and each bonded stream.
+#[cfg(target_os = "linux")]
 async fn connect_obfs(
     config: &crate::config::client::ClientConfig,
 ) -> anyhow::Result<crate::protocol::obfs::ObfsStream<TcpStream>> {
@@ -493,11 +1054,9 @@ async fn connect_obfs(
     // reconnect would fire. Covers both the primary and each bonded stream.
     let to = Duration::from_secs(config.server.connection_timeout_secs.max(1));
     match tokio::time::timeout(to, async {
-        let addr = format!("{}:{}", config.server.address, config.server.port);
-        let stream = TcpStream::connect(&addr).await?;
-        if let Ok(p) = stream.peer_addr() {
-            note_connected_peer(p.ip());
-        }
+        let stream =
+            connect_tcp_candidates(&config.server.address, config.server.port, to, "obfs TCP")
+                .await?;
         stream.set_nodelay(config.performance.tcp_nodelay)?;
         set_tcp_keepalive(&stream, config.server.tcp_keepalive_secs)?;
         let key = crate::protocol::obfs::derive_obfs_key(&config.obfuscation.obfs_key);
@@ -537,6 +1096,7 @@ async fn connect_obfs(
 /// Open ONE bare-TCP connection for the `fake-tls` / `plain` wire modes — the TLS
 /// mimicry (fake-tls) or raw framing (plain) is applied by the qeli handshake, not
 /// the transport. Reusable for the primary connection and each bonded stream.
+#[cfg(target_os = "linux")]
 async fn connect_bare_tcp(
     config: &crate::config::client::ClientConfig,
 ) -> anyhow::Result<TcpStream> {
@@ -544,31 +1104,18 @@ async fn connect_bare_tcp(
     // OS SYN timeout, so a never-accepting server fails over to a reconnect promptly. No
     // handshake reads here — the qeli handshake (bounded in run_tcp_tunnel) does those.
     let to = Duration::from_secs(config.server.connection_timeout_secs.max(1));
-    let addr = format!("{}:{}", config.server.address, config.server.port);
-    let stream = match tokio::time::timeout(to, TcpStream::connect(&addr)).await {
-        Ok(r) => {
-            let s = r?;
-            if let Ok(p) = s.peer_addr() {
-                note_connected_peer(p.ip());
-            }
-            s
-        }
-        Err(_) => {
-            return Err(anyhow::anyhow!(
-                "TCP connect to {} timed out after {}s",
-                addr,
-                to.as_secs()
-            ))
-        }
-    };
+    let stream =
+        connect_tcp_candidates(&config.server.address, config.server.port, to, "TCP").await?;
     stream.set_nodelay(config.performance.tcp_nodelay)?;
     set_tcp_keepalive(&stream, config.server.tcp_keepalive_secs)?;
     Ok(stream)
 }
 
+#[cfg(target_os = "linux")]
 async fn connect_and_run_tcp(
     config: &crate::config::client::ClientConfig,
     password: &str,
+    core: &mut LinuxCoreAdapter,
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.server.address, config.server.port);
     log::info!(
@@ -593,7 +1140,7 @@ async fn connect_and_run_tcp(
             let cfg = cfg.clone();
             Box::pin(async move { connect_obfs(&cfg).await })
         });
-        run_tcp_tunnel(first, connector, config, password).await
+        run_tcp_tunnel(first, connector, config, password, core).await
     } else if config.obfuscation.mode == "reality-tls" {
         log::info!("Wire mode: reality-tls (real TLS 1.3 carrying the tunnel)");
         let first = connect_reality(config).await?;
@@ -604,7 +1151,7 @@ async fn connect_and_run_tcp(
             let cfg = cfg.clone();
             Box::pin(async move { connect_reality(&cfg).await })
         });
-        run_tcp_tunnel(first, connector, config, password).await
+        run_tcp_tunnel(first, connector, config, password, core).await
     } else {
         // fake-tls / plain: bare TCP transport; the qeli handshake applies the
         // fake-TLS mimicry or the raw framing. Both support stream bonding.
@@ -615,7 +1162,7 @@ async fn connect_and_run_tcp(
             let cfg = cfg.clone();
             Box::pin(async move { connect_bare_tcp(&cfg).await })
         });
-        run_tcp_tunnel(first, connector, config, password).await
+        run_tcp_tunnel(first, connector, config, password, core).await
     }
 }
 
@@ -647,6 +1194,22 @@ struct StreamPump {
     pipeline_rx: bool,
 }
 
+/// Plaintext queued for one TCP stream. TUN packets retain their reusable backing
+/// allocation until encryption finishes; small control frames keep ordinary owned storage.
+enum ClientUplink {
+    Tun(TunPacket),
+    Owned(Vec<u8>),
+}
+
+impl AsRef<[u8]> for ClientUplink {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Tun(packet) => packet,
+            Self::Owned(packet) => packet,
+        }
+    }
+}
+
 /// Spawn one bonded stream's reader (decrypt → TUN-writer) and writer/heartbeat
 /// tasks (outgoing plaintext → encrypt → socket). Returns the outgoing channel
 /// the distributor feeds. `live` counts streams still up; this stream's death
@@ -659,25 +1222,25 @@ fn spawn_stream<R, W>(
     mut write_half: W,
     rx_codec: PacketCodec,
     tx_codec: PacketCodec,
-    tun_write_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    tun_write_tx: TunWriter,
     dead_tx: mpsc::Sender<()>,
     total_tx: Arc<AtomicU64>,
     total_rx: Arc<AtomicU64>,
+    runtime: Arc<RuntimeCounters>,
     live: Arc<std::sync::atomic::AtomicUsize>,
     // Every task this stream spawns is registered here so the teardown can abort them.
     // Without it the caller had no handle at all: a reader parked in `read_record` on a
-    // half-open connection kept its `tun_write_tx` clone forever, the dedicated TUN
-    // writer thread's channel never closed, and its dup of the TUN fd held the device —
-    // so the next reconnect could not recreate it. The ramp task already had this
-    // treatment (see the teardown comment); the per-stream tasks did not.
+    // half-open connection outlived its connection generation, retaining its socket,
+    // codecs and outbound channel. The shared TUN pump can now stop despite sender
+    // clones, but the obsolete stream tasks still must not survive a reconnect.
     tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     cfg: StreamPump,
-) -> mpsc::Sender<Vec<u8>>
+) -> mpsc::Sender<ClientUplink>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(4096);
+    let (out_tx, mut out_rx) = mpsc::channel::<ClientUplink>(4096);
     let base = tokio::time::Instant::now();
     let last_rx = Arc::new(AtomicU64::new(0));
     // This stream counts itself as live; its first dying task (reader/writer)
@@ -707,6 +1270,8 @@ where
         let stream_dead = stream_dead.clone();
         let live = live.clone();
         let total_rx = total_rx.clone();
+        let runtime = runtime.clone();
+        let record_pool = tun_write_tx.clone();
 
         // Where the reader sends each framed record. `Inline` decrypts in this
         // task (all non-reality modes, unchanged behaviour); `Pipe` forwards the
@@ -716,40 +1281,42 @@ where
         // codec would only add an indirection to the common inline path.
         #[allow(clippy::large_enum_variant)]
         enum RxSink {
-            Inline {
-                rx: PacketCodec,
-                tun: std::sync::mpsc::SyncSender<Vec<u8>>,
-            },
-            Pipe(mpsc::Sender<Vec<u8>>),
+            Inline { rx: PacketCodec, tun: TunWriter },
+            Pipe(mpsc::Sender<PooledBuffer>),
         }
 
         let mut sink = if cfg.pipeline_rx {
-            let (rec_tx, mut rec_rx) = mpsc::channel::<Vec<u8>>(1024);
+            let (rec_tx, mut rec_rx) = mpsc::channel::<PooledBuffer>(1024);
             let mut inner_rx_codec = rx;
             let inner_tun = tun_write_tx;
             let inner_total_rx = total_rx.clone();
+            let inner_runtime = runtime.clone();
             // Stage B: inner ChaCha decrypt → TUN. Ends when the reader drops
             // `rec_tx`. Never blocks (the TUN send is drop-on-full), so it always
             // drains the FIFO — the reader's backpressure send can therefore
             // always make progress (no deadlock).
             let __h = tokio::spawn(async move {
-                while let Some(record) = rec_rx.recv().await {
-                    match inner_rx_codec.decrypt_packet(&record) {
-                        Ok(pt) if !pt.is_empty() => {
-                            inner_total_rx.fetch_add(pt.len() as u64, Ordering::Relaxed);
-                            trace::record(trace::Dir::Rx, "client.tcp", pt.len(), 0);
-                            match inner_tun.try_send(pt) {
+                while let Some(mut record) = rec_rx.recv().await {
+                    match inner_rx_codec.decrypt_packet_in_place(record.as_vec_mut()) {
+                        Ok(()) if !record.is_empty() => {
+                            inner_total_rx.fetch_add(record.len() as u64, Ordering::Relaxed);
+                            inner_runtime.rx_packets.fetch_add(1, Ordering::Relaxed);
+                            inner_runtime
+                                .rx_bytes
+                                .fetch_add(record.len() as u64, Ordering::Relaxed);
+                            trace::record(trace::Dir::Rx, "client.tcp", record.len(), 0);
+                            match inner_tun.try_send(record) {
                                 Ok(()) => {}
                                 Err(std::sync::mpsc::TrySendError::Full(_)) => {}
                                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
                             }
                         }
-                        Ok(_) => {}
+                        Ok(()) => {}
                         Err(e) => log::debug!("Decrypt error: {}", e),
                     }
                 }
             });
-            tasks.lock().unwrap().push(__h);
+            crate::util::lock_or_recover(&tasks, "client::tasks").push(__h);
             RxSink::Pipe(rec_tx)
         } else {
             RxSink::Inline {
@@ -761,25 +1328,40 @@ where
         // Stage A: socket read (+ outer decrypt/framing for reality-tls) → sink.
         let __h = tokio::spawn(async move {
             loop {
-                match read_record(&mut read_half, framing).await {
-                    Ok(record) => {
+                let mut record = match record_pool.acquire().await {
+                    Some(record) => record,
+                    None => break,
+                };
+                match read_record_into(&mut read_half, framing, record.as_vec_mut()).await {
+                    Ok(()) => {
                         last_rx.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
                         match &mut sink {
-                            RxSink::Inline { rx, tun } => match rx.decrypt_packet(&record) {
-                                Ok(pt) if !pt.is_empty() => {
-                                    total_rx.fetch_add(pt.len() as u64, Ordering::Relaxed);
-                                    trace::record(trace::Dir::Rx, "client.tcp", pt.len(), 0);
-                                    match tun.try_send(pt) {
-                                        Ok(()) => {}
-                                        Err(std::sync::mpsc::TrySendError::Full(_)) => {}
-                                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                                            break
+                            RxSink::Inline { rx, tun } => {
+                                match rx.decrypt_packet_in_place(record.as_vec_mut()) {
+                                    Ok(()) if !record.is_empty() => {
+                                        total_rx.fetch_add(record.len() as u64, Ordering::Relaxed);
+                                        runtime.rx_packets.fetch_add(1, Ordering::Relaxed);
+                                        runtime
+                                            .rx_bytes
+                                            .fetch_add(record.len() as u64, Ordering::Relaxed);
+                                        trace::record(
+                                            trace::Dir::Rx,
+                                            "client.tcp",
+                                            record.len(),
+                                            0,
+                                        );
+                                        match tun.try_send(record) {
+                                            Ok(()) => {}
+                                            Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+                                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                                break
+                                            }
                                         }
                                     }
+                                    Ok(()) => {}
+                                    Err(e) => log::debug!("Decrypt error: {}", e),
                                 }
-                                Ok(_) => {}
-                                Err(e) => log::debug!("Decrypt error: {}", e),
-                            },
+                            }
                             // Hand the outer-decrypted record to the inner-decrypt
                             // task. `.send().await` applies backpressure rather than
                             // dropping — there is no `select!` in this loop, so a
@@ -823,7 +1405,7 @@ where
                 }
             }
         });
-        tasks.lock().unwrap().push(__h);
+        crate::util::lock_or_recover(&tasks, "client::tasks").push(__h);
     }
 
     // Writer + heartbeat: outgoing plaintext → encrypt → socket.
@@ -837,6 +1419,8 @@ where
             hb_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut idle_tick = tokio::time::interval(Duration::from_secs(5));
             idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_tick_wall = std::time::SystemTime::now();
+            let mut last_tick_inst = tokio::time::Instant::now();
             let hb_ms = cfg.heartbeat_interval.as_millis() as u64;
             let idle_ms = cfg.idle_timeout.as_millis() as u64;
             let mut last_tx_ms: u64 = 0;
@@ -847,51 +1431,88 @@ where
                 crate::protocol::Shaper::new(cfg.shaping.clone(), std::time::Instant::now());
             let shaping_on = shaper.enabled();
             let heartbeat_enabled = cfg.heartbeat_enabled && !shaping_on;
+            let rx_dead_ms = crate::protocol::liveness_deadline(
+                heartbeat_enabled,
+                cfg.heartbeat_interval,
+                Duration::from_millis(cfg.hb_jitter),
+                shaping_on,
+                Duration::from_millis(cfg.shaping.idle_gap_max_ms),
+            )
+            .map(|deadline| u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX));
             let mut cover_deadline =
                 tokio::time::Instant::now() + shaper.next_gap(&mut rand::rng());
+            // One real record may have to stay intact while stealth pacing emits cover
+            // records first, hence two connection-owned buffers. Both are allocated once
+            // and reused by `encrypt_packet_into`; neither crosses to another task.
+            let wire_capacity = crate::protocol::packet::TLS_RECORD_HEADER
+                + crate::protocol::packet::MAX_RECORD_SIZE;
+            let mut wire_record = Vec::with_capacity(wire_capacity);
+            let mut cover_record = Vec::with_capacity(wire_capacity);
+            let mut normalized_packet = Vec::with_capacity(1400);
+            let mut padding = Vec::with_capacity(crate::protocol::packet::MAX_RECORD_SIZE);
             loop {
                 tokio::select! {
                     biased;
 
                     Some(pt) = out_rx.recv() => {
-                        // Build data+padding in a sub-scope so the (non-Send) RNG
-                        // inside Obfuscator is dropped before the write .await.
-                        let (data, padding) = {
+                        // Normalize, pad and encrypt in a sub-scope so the (non-Send) RNG
+                        // inside Obfuscator is dropped before the write .await. A pooled TUN
+                        // buffer is borrowed directly; normalization, padding and wire records
+                        // each use connection-owned storage for the lifetime of this writer.
+                        let encrypted_data_len = {
                             let mut obf = Obfuscator::new();
-                            let mut data = pt;
-                            if cfg.norm_enabled && !cfg.norm_sizes.is_empty() {
+                            let normalized = if cfg.norm_enabled && !cfg.norm_sizes.is_empty() {
                                 // Same ceiling this block already uses for the pad cap
                                 // below. A stream has no datagram to overflow, so this
                                 // bounds the record rather than the path.
-                                data = obf.normalize_packet_length(&data, &cfg.norm_sizes, 1400);
-                            }
+                                obf.normalize_packet_length_into(
+                                    pt.as_ref(),
+                                    &cfg.norm_sizes,
+                                    1400,
+                                    &mut normalized_packet,
+                                );
+                                Some(normalized_packet.as_slice())
+                            } else {
+                                None
+                            };
+                            let data = normalized.unwrap_or_else(|| pt.as_ref());
                             let pad_cap = {
                                 let b = data.len().saturating_add(60);
                                 (cfg.padding_max as usize).min(1400usize.saturating_sub(b)) as u16
                             };
-                            let padding = obf.generate_padding_opts(
+                            obf.generate_padding_opts_into(
                                 cfg.padding_enabled, cfg.padding_min, pad_cap,
-                                cfg.padding_randomize, cfg.padding_prob,
+                                cfg.padding_randomize, cfg.padding_prob, &mut padding,
                             );
-                            (data, padding)
+                            tx.encrypt_packet_into(data, &padding, &mut wire_record)
+                                .ok()
+                                .map(|()| data.len())
                         };
-                        if let Ok(enc) = tx.encrypt_packet(&data, &padding) {
-                            total_tx.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        // Return a pooled TUN allocation before pacing or socket I/O awaits.
+                        drop(pt);
+                        if let Some(data_len) = encrypted_data_len {
+                            total_tx.fetch_add(data_len as u64, Ordering::Relaxed);
                             // Stealth: pace the uplink to stealth_rate; fill the gap
                             // with jittered small cover (size mix + non-metronome
                             // timing) instead of one smooth sleep.
-                            let d = shaper.stealth_pace(enc.len(), std::time::Instant::now());
+                            let d = shaper.stealth_pace(wire_record.len(), std::time::Instant::now());
                             if shaper.stealth() && !d.is_zero() {
                                 let mut remaining = d;
                                 while remaining > Duration::from_millis(6) {
                                     let csize = shaper.next_size(&mut rand::rng());
-                                    let cover = if shaper.try_spend(csize, std::time::Instant::now()) {
+                                    let cover_ready = if shaper.try_spend(csize, std::time::Instant::now()) {
                                         let mut obf = Obfuscator::new();
-                                        let pad = obf.generate_padding(csize as u16, csize as u16);
-                                        tx.encrypt_packet(&[], &pad).ok()
-                                    } else { None };
-                                    if let Some(c) = cover {
-                                        if write_half.write_all(&c).await.is_err() { break; }
+                                        obf.generate_padding_into(
+                                            csize as u16,
+                                            csize as u16,
+                                            &mut padding,
+                                        );
+                                        tx.encrypt_packet_into(&[], &padding, &mut cover_record).is_ok()
+                                    } else { false };
+                                    if cover_ready
+                                        && write_half.write_all(&cover_record).await.is_err()
+                                    {
+                                        break;
                                     }
                                     let step = Duration::from_millis(rand::rng().random_range(4..=18));
                                     let s = step.min(remaining);
@@ -902,7 +1523,7 @@ where
                                 tokio::time::sleep(d).await;
                             }
                             last_tx_ms = base.elapsed().as_millis() as u64;
-                            if write_half.write_all(&enc).await.is_err() { break; }
+                            if write_half.write_all(&wire_record).await.is_err() { break; }
                         }
                     }
 
@@ -920,14 +1541,18 @@ where
                             Duration::from_millis(rng.random_range(0..=cfg.hb_jitter))
                         } else { Duration::ZERO };
                         tokio::time::sleep(jitter).await;
-                        let hb = {
+                        let hb_ready = {
                             let mut obf = Obfuscator::new();
                             // saturating: hb_data is u16 and may be server-pushed.
-                            let padding = obf.generate_padding(cfg.hb_data, cfg.hb_data.saturating_add(32));
-                            tx.encrypt_packet(&[], &padding).ok()
+                            obf.generate_padding_into(
+                                cfg.hb_data,
+                                cfg.hb_data.saturating_add(32),
+                                &mut padding,
+                            );
+                            tx.encrypt_packet_into(&[], &padding, &mut cover_record).is_ok()
                         };
-                        if let Some(hb) = hb {
-                            if write_half.write_all(&hb).await.is_err() { break; }
+                        if hb_ready && write_half.write_all(&cover_record).await.is_err() {
+                            break;
                         }
                         last_tx_ms = base.elapsed().as_millis() as u64;
                     }
@@ -939,13 +1564,17 @@ where
                         if shaper.stealth() || now_ms.saturating_sub(last_tx_ms) >= 50 {
                             let size = shaper.next_size(&mut rand::rng());
                             if shaper.try_spend(size, std::time::Instant::now()) {
-                                let cover = {
+                                let cover_ready = {
                                     let mut obf = Obfuscator::new();
-                                    let padding = obf.generate_padding(size as u16, size as u16);
-                                    tx.encrypt_packet(&[], &padding).ok()
+                                    obf.generate_padding_into(
+                                        size as u16,
+                                        size as u16,
+                                        &mut padding,
+                                    );
+                                    tx.encrypt_packet_into(&[], &padding, &mut cover_record).is_ok()
                                 };
-                                if let Some(pkt) = cover {
-                                    if write_half.write_all(&pkt).await.is_err() { break; }
+                                if cover_ready {
+                                    if write_half.write_all(&cover_record).await.is_err() { break; }
                                     last_tx_ms = base.elapsed().as_millis() as u64;
                                 }
                             }
@@ -958,27 +1587,28 @@ where
                         // Propagate a read-side death (e.g. decrypt desync while the
                         // socket write side still looks alive) so this writer exits too.
                         if stream_dead.load(Ordering::Relaxed) { break; }
-                        let now = base.elapsed().as_millis() as u64;
-                        // rx-liveness reaping is ALWAYS on. It used to be gated on
-                        // `heartbeat_enabled || shaping_on`, which left a server-pushed
-                        // `heartbeat.enabled = false` with shaping off relying solely on the
-                        // TX-side idle timer below — and that one is reset by every packet
-                        // the client sends. So when the server vanished (restart, NAT
-                        // rebinding) while the TCP socket still accepted writes, nothing
-                        // noticed: no reconnect until the kernel's retransmit timeout gave
-                        // up, on the order of fifteen minutes. The threshold still follows
-                        // the heartbeat interval where there is one; without inbound cover
-                        // the floor is what matters, and 30 s of complete silence on a live
-                        // tunnel already means the peer is gone. (Audit 2026-07-27, R2.)
-                        let rx_dead = if heartbeat_enabled || shaping_on {
-                            hb_ms.saturating_mul(3).max(30_000)
-                        } else {
-                            // No inbound keepalive to pace against: use a fixed, generous
-                            // window so an idle-but-healthy link is never reaped.
-                            120_000
-                        };
-                        if now.saturating_sub(last_rx.load(Ordering::Relaxed)) > rx_dead {
+                        // `tokio::Instant` may freeze while a laptop sleeps whereas wall
+                        // time keeps advancing. Cycle a half-open TCP carrier promptly on
+                        // resume instead of waiting for the OS retransmit timeout.
+                        let wall_gap = last_tick_wall.elapsed().unwrap_or_default();
+                        last_tick_wall = std::time::SystemTime::now();
+                        let tick_gap = last_tick_inst.elapsed();
+                        last_tick_inst = tokio::time::Instant::now();
+                        if wall_gap.saturating_sub(tick_gap) > Duration::from_secs(10) {
+                            log::warn!(
+                                "TCP: resumed from suspend (~{}s) — reconnecting",
+                                wall_gap.as_secs()
+                            );
                             break;
+                        }
+                        let now = base.elapsed().as_millis() as u64;
+                        // An RX deadline is meaningful only when the peer promises
+                        // inbound liveness traffic. With heartbeat and shaping disabled a
+                        // healthy TCP tunnel may legitimately be silent for hours.
+                        if let Some(rx_dead) = rx_dead_ms {
+                            if now.saturating_sub(last_rx.load(Ordering::Relaxed)) > rx_dead {
+                                break;
+                            }
                         }
                         if idle_ms > 0 && now.saturating_sub(last_tx_ms) > idle_ms { break; }
                     }
@@ -999,17 +1629,18 @@ where
                 }
             }
         });
-        tasks.lock().unwrap().push(__h);
+        crate::util::lock_or_recover(&tasks, "client::tasks").push(__h);
     }
 
     out_tx
 }
 
-async fn run_tcp_tunnel<S>(
+pub(crate) async fn run_tcp_tunnel<S>(
     mut stream: S,
     connector: StreamConnector<S>,
     config: &crate::config::client::ClientConfig,
     password: &str,
+    core: &mut dyn ClientPlatform,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static + crate::protocol::obfs::SplitStream,
@@ -1020,17 +1651,29 @@ where
     // outer reconnect loop never re-runs because this future never returns. The timeout
     // wraps ONLY the handshake phase; once it returns, the data plane runs untimed.
     let hs_to = Duration::from_secs(config.server.connection_timeout_secs.max(1));
-    let (client_rx, client_tx, ok) =
-        match tokio::time::timeout(hs_to, tcp_handshake(&mut stream, config, password)).await {
-            Ok(r) => r?,
-            Err(_) => {
-                return Err(anyhow::anyhow!(
-                    "TCP handshake timed out after {}s (server accepted the connection but did \
+    let client_device_id = core.device_id()?;
+    let identity_verifier = core.identity_verifier(config);
+    let (client_rx, client_tx, ok) = match tokio::time::timeout(
+        hs_to,
+        tcp_handshake(
+            &mut stream,
+            config,
+            password,
+            &client_device_id,
+            identity_verifier.clone(),
+        ),
+    )
+    .await
+    {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "TCP handshake timed out after {}s (server accepted the connection but did \
                      not complete the qeli handshake)",
-                    hs_to.as_secs()
-                ))
-            }
-        };
+                hs_to.as_secs()
+            ))
+        }
+    };
     let AuthOk {
         client_ip: client_ip_str,
         server_ip,
@@ -1044,19 +1687,6 @@ where
         max_streams,
         adaptive,
     } = ok;
-    log_server_push(
-        config,
-        &client_ip_str,
-        prefix,
-        &server_ip,
-        pushed_mtu,
-        &dns_ip,
-        &dns_port,
-        &routes_json,
-        pushed_obf.as_ref(),
-        max_streams,
-        adaptive,
-    );
     // Multipath plan: the primary connection is stream #0; secondaries JOIN with
     // `session_token` (opened below — fixed fan-out, or adaptive ramp when `adaptive`).
     if max_streams > 1 {
@@ -1073,33 +1703,63 @@ where
     // server pushed, so the two ends always agree without the client carrying
     // them in its config.
     let mut eff_obf = config.obfuscation.clone();
-    if let Some(po) = pushed_obf {
-        eff_obf.padding = po.padding;
-        eff_obf.heartbeat = po.heartbeat;
-        eff_obf.traffic_normalization = po.traffic_normalization;
-        eff_obf.traffic_shaping = po.traffic_shaping;
+    if let Some(po) = pushed_obf.as_ref() {
+        eff_obf.padding = po.padding.clone();
+        eff_obf.heartbeat = po.heartbeat.clone();
+        eff_obf.traffic_normalization = po.traffic_normalization.clone();
+        eff_obf.traffic_shaping = po.traffic_shaping.clone();
     }
 
     // Bound once: the TUN is brought up with it, and it is reported to the server below so
     // the server's downlink respects it too (#13).
     let tun_mtu = effective_mtu(config.tun.mtu, pushed_mtu);
-    let tunnel = setup_tunnel(
+    let fallback_dns_servers = core.fallback_dns_servers().to_vec();
+    let network = HandshakeNetwork {
+        client_ip: &client_ip_str,
+        prefix,
+        tunnel_gateway: &server_ip,
+        dns_ip: &dns_ip,
+        dns_port: &dns_port,
+        routes_json: &routes_json,
+        mtu: tun_mtu,
+        fallback_dns_servers: &fallback_dns_servers,
+    };
+    let mut plan = build_network_plan(config, core.next_generation(), &network)?;
+    plan.max_streams = max_streams;
+    plan.adaptive = adaptive;
+    plan.data_plane = crate::transport_core::NetworkDataPlaneFacts::from_obfuscation(&eff_obf);
+    plan.connection_log = server_push_log_lines(
         config,
-        &client_ip_str,
-        &prefix_to_netmask(prefix),
-        &server_ip,
+        &plan,
+        pushed_mtu,
         &dns_ip,
         &dns_port,
-        tun_mtu,
-    )?;
-    route::apply_local_networks(&config.routing, &routes_json, &tunnel.if_name, &server_ip);
+        &routes_json,
+        pushed_obf.as_ref(),
+    );
+    for line in &plan.connection_log {
+        log::info!("{line}");
+    }
+    let tunnel = core.prepare_tunnel(config, plan, &network)?;
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     let reader_fd = tunnel.reader_fd;
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     let writer_fd = tunnel.writer_fd;
+    #[cfg(target_os = "linux")]
     let tun_name = tunnel.if_name;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     let is_tap = tunnel.is_tap;
+    #[cfg(target_os = "macos")]
+    let is_tap = false;
+    #[cfg(target_os = "linux")]
     let server_addr = pin_target(config);
+    #[cfg(target_os = "linux")]
     let tunnel_tun = tunnel.tun;
+    #[cfg(target_os = "linux")]
     let tap_mac = if is_tap { generate_mac() } else { [0u8; 6] };
+    #[cfg(not(target_os = "linux"))]
+    let tap_mac = [0u8; 6];
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     let gateway_mac: [u8; 6] = if is_tap {
         [0x02, 0x00, 0x00, 0x00, 0x00, 0x01]
     } else {
@@ -1123,142 +1783,57 @@ where
     let padding_enabled = eff_obf.padding.enabled;
     let padding_randomize = eff_obf.padding.randomize;
     let padding_prob = eff_obf.padding.probability;
-    let tun_buf_size = config.performance.tun_buffer_size;
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    let tun_buf_size = config
+        .performance
+        .tun_buffer_size
+        .saturating_add(if cfg!(target_os = "macos") { 4 } else { 0 });
     let norm_sizes = &eff_obf.traffic_normalization.round_sizes;
 
-    let (tun_read_tx, mut tun_read_rx) = mpsc::channel::<Vec<u8>>(4096);
-
-    let is_tap_reader = is_tap;
-    // Stop flag so the blocking TUN-reader thread terminates promptly when the
-    // connection drops. The tun fd is non-blocking, so the loop spins on
-    // WouldBlock; without this flag it would never notice the channel closing
-    // (it only checks on a successful read) and `tun_reader_handle.await` in
-    // cleanup would hang forever — blocking reconnect.
-    let tun_stop = Arc::new(AtomicBool::new(false));
     // Everything below can bail out through `?`, which would skip the teardown at the
     // end of this function; from here on the guard covers that (see `TunGuard`).
+    #[cfg(target_os = "linux")]
     let mut tun_guard = TunGuard::new(
         tun_name.clone(),
-        tun_stop.clone(),
         !config.tun.attach_existing,
         server_addr.clone(),
         config.routing.exclude.clone(),
     );
-    let tun_stop_r = tun_stop.clone();
-    let tun_reader_handle = tokio::task::spawn_blocking(move || {
-        let mut buf2 = vec![0u8; tun_buf_size];
-        loop {
-            if tun_stop_r.load(Ordering::Relaxed) {
-                break;
-            }
-            let n = unsafe {
-                libc::read(
-                    reader_fd,
-                    buf2.as_mut_ptr() as *mut libc::c_void,
-                    buf2.len(),
-                )
-            };
-            if n < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::WouldBlock {
-                    // Wait in the kernel for readability rather than spinning. The old
-                    // 1 ms sleep meant ~1000 wakeups per second per client on a
-                    // completely idle tunnel — invisible on a desktop, but real cost on
-                    // a battery-powered phone or a small router. `poll` returns the
-                    // instant a packet arrives, so nothing is added to the latency of
-                    // actual traffic; the timeout only bounds how long the stop flag
-                    // above can go unnoticed during teardown.
-                    let mut pfd = libc::pollfd {
-                        fd: reader_fd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    unsafe { libc::poll(&mut pfd, 1, 250) };
-                    continue;
-                }
-                log::error!("TUN read error: {}", err);
-                break;
-            }
-            if n == 0 {
-                break;
-            }
-            let raw = &buf2[..n as usize];
-            let packet = if is_tap_reader {
-                match strip_ethernet_header(raw) {
-                    Some(ip) => ip.to_vec(),
-                    None => continue,
-                }
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    let mut tun_pump = LinuxTunPump::start(
+        reader_fd,
+        writer_fd,
+        LinuxTunPumpConfig {
+            buffer_size: tun_buf_size,
+            framing: if cfg!(target_os = "macos") {
+                TunFraming::Utun
+            } else if is_tap {
+                TunFraming::Tap(TapHeaders {
+                    client_mac: tap_mac,
+                    gateway_mac,
+                })
             } else {
-                raw.to_vec()
-            };
-            if tun_read_tx.blocking_send(packet).is_err() {
-                break;
-            }
-        }
-        unsafe {
-            libc::close(reader_fd);
-        }
-        log::info!("TUN reader stopped");
-    });
-
-    // Dedicated TUN writer thread — exact same architecture as
-    // server/mod.rs:411–438. One std::thread reads packets out of a bounded
-    // std::sync::mpsc::sync_channel and does a single libc::write per packet,
-    // with no per-packet spawn_blocking. Replaces the prior pattern where
-    // every inbound packet did `tokio::task::spawn_blocking(libc::write)`,
-    // overflowing the 512-thread tokio blocking pool under sustained traffic
-    // (cliff ~200 Mbps plain, far lower with obfuscation). See ROADMAP P0.1.
-    let is_tap_writer = is_tap;
-    let (tun_write_tx, tun_write_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2048);
-    let _tun_writer_thread = {
-        let tap_mac_w = tap_mac;
-        let gateway_mac_w = gateway_mac;
-        std::thread::spawn(move || {
-            log::info!("TUN writer started");
-            'writer: for packet in tun_write_rx {
-                if packet.is_empty() {
-                    continue;
-                }
-                let tap_frame = if is_tap_writer {
-                    Some(prepend_ethernet_header(&packet, &tap_mac_w, &gateway_mac_w))
-                } else {
-                    None
-                };
-                let buf: &[u8] = tap_frame.as_deref().unwrap_or(&packet);
-                // Mirror server/mod.rs's writer: the write result is load-bearing. The fd
-                // is non-blocking, so EINTR must retry and a full TX queue is a normal
-                // congestion drop — but a fatal errno (bad fd, device gone) means every
-                // further write is discarded into a dead descriptor while the tunnel still
-                // looks connected and keeps decrypting. Stop the writer instead, so the
-                // failure is visible rather than a silent black hole.
-                loop {
-                    let n = unsafe {
-                        libc::write(writer_fd, buf.as_ptr() as *const libc::c_void, buf.len())
-                    };
-                    if n >= 0 {
-                        break;
-                    }
-                    let err = std::io::Error::last_os_error();
-                    match err.raw_os_error() {
-                        Some(libc::EINTR) => continue, // interrupted — retry same buffer
-                        // NB: on Linux EAGAIN == EWOULDBLOCK (same value) — listing one.
-                        Some(libc::ENOBUFS) | Some(libc::EAGAIN) => {
-                            log::debug!("TUN writer: dropped packet ({})", err);
-                            break;
-                        }
-                        _ => {
-                            log::warn!("TUN writer: fatal write error ({}) — stopping", err);
-                            break 'writer;
-                        }
-                    }
-                }
-            }
-            unsafe {
-                libc::close(writer_fd);
-            }
-            log::info!("TUN writer stopped");
-        })
+                TunFraming::Raw
+            },
+        },
+    )?;
+    #[cfg(target_os = "windows")]
+    let mut tun_pump = match tunnel.windows_tun {
+        WindowsTunSetup::Ring(adapter_name) => WindowsTunPump::open(&adapter_name)?,
+        WindowsTunSetup::Packet(packet_tun) => WindowsTunPump::packet(packet_tun),
     };
+    #[cfg(target_os = "ios")]
+    let mut tun_pump = tunnel.packet_tun;
+    #[cfg(target_os = "linux")]
+    tun_guard.attach_pump(tun_pump.stop_handle());
+    let tun_write_tx = tun_pump.sender_to_tun();
+    let cancel = core.cancel_token();
+    let runtime_counters = core.counters();
+    // Keep one timer across select iterations. Recreating `sleep(100ms)` inside the loop
+    // lets continuous packet readiness cancel it forever and can starve stop/reconnect.
+    let mut cancel_tick = tokio::time::interval(Duration::from_millis(100));
+    cancel_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    cancel_tick.tick().await;
 
     let heartbeat_interval = Duration::from_millis(if heartbeat_enabled {
         hb_config.interval_ms
@@ -1291,7 +1866,7 @@ where
     // Handles for every task the bonded streams spawn, so the teardown can stop them.
     let stream_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
-    let outs: Arc<std::sync::Mutex<Vec<mpsc::Sender<Vec<u8>>>>> =
+    let outs: Arc<std::sync::Mutex<Vec<mpsc::Sender<ClientUplink>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     // Bytes encrypted+sent across all streams (uplink half of the adaptive probe).
     let total_tx = Arc::new(AtomicU64::new(0));
@@ -1325,7 +1900,7 @@ where
     };
 
     // Stream #0 = the primary (already authenticated) connection.
-    outs.lock().unwrap().push(spawn_stream(
+    crate::util::lock_or_recover(&outs, "client::outs").push(spawn_stream(
         primary_r,
         primary_w,
         client_rx,
@@ -1334,6 +1909,7 @@ where
         dead_tx.clone(),
         total_tx.clone(),
         total_rx.clone(),
+        runtime_counters.clone(),
         live.clone(),
         stream_tasks.clone(),
         pump.clone(),
@@ -1346,9 +1922,11 @@ where
     // packet larger than our TUN's MTU is dropped when we write it, transport regardless.
     if let Ok(mtu) = u16::try_from(tun_mtu.max(0)) {
         let frame = crate::protocol::ctrl::mtu_report(mtu);
-        let sender = outs.lock().unwrap().first().cloned();
+        let sender = crate::util::lock_or_recover(&outs, "client::outs")
+            .first()
+            .cloned();
         if let Some(s) = sender {
-            match s.try_send(frame) {
+            match s.try_send(ClientUplink::Owned(frame)) {
                 Ok(()) => log::debug!("reported tunnel MTU {mtu} to the server"),
                 Err(e) => log::debug!("could not report tunnel MTU: {e}"),
             }
@@ -1360,9 +1938,11 @@ where
     // report above: an older server discards the frame as a malformed packet, and nothing
     // here waits for or depends on a reply.
     if let Some(frame) = crate::protocol::ctrl::this_build() {
-        let sender = outs.lock().unwrap().first().cloned();
+        let sender = crate::util::lock_or_recover(&outs, "client::outs")
+            .first()
+            .cloned();
         if let Some(s) = sender {
-            if let Err(e) = s.try_send(frame) {
+            if let Err(e) = s.try_send(ClientUplink::Owned(frame)) {
                 log::debug!("could not report client version: {e}");
             }
         }
@@ -1376,9 +1956,17 @@ where
     };
     let token_bytes = hex_to_bytes(&session_token);
     let bonding = target > 1 && !token_bytes.is_empty();
+    // The adaptive ramp decides the desired width; a separate maintainer restores
+    // that width after individual bonded streams die. Fixed mode wants the full
+    // configured width from the start (including retrying initial JOIN failures).
+    let desired_streams = Arc::new(std::sync::atomic::AtomicUsize::new(
+        if bonding && !adaptive { target } else { 1 },
+    ));
+    let next_join_index = Arc::new(std::sync::atomic::AtomicUsize::new(target.max(1)));
+    let join_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Handle of the adaptive ramp task (if any) so teardown can abort it — otherwise
-    // it loops forever holding a `tun_write_tx` clone and keeps `writer_fd` open.
+    // Handle of the adaptive ramp task (if any) so teardown can abort it. Otherwise it
+    // keeps opening bonded streams for an obsolete connection generation.
     let mut ramp_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     if bonding && !adaptive {
@@ -1391,7 +1979,13 @@ where
                     // tun_write_tx clone. It only degrades bonding (the primary survives).
                     let join = match tokio::time::timeout(
                         Duration::from_secs(config.server.connection_timeout_secs.max(1)),
-                        tcp_join_handshake(&mut s, config, &token_bytes, idx as u8),
+                        tcp_join_handshake(
+                            &mut s,
+                            config,
+                            &token_bytes,
+                            idx as u8,
+                            identity_verifier.clone(),
+                        ),
                     )
                     .await
                     {
@@ -1401,7 +1995,7 @@ where
                     match join {
                         Ok((rx, tx)) => {
                             let (r, w) = s.split_io();
-                            outs.lock().unwrap().push(spawn_stream(
+                            crate::util::lock_or_recover(&outs, "client::outs").push(spawn_stream(
                                 r,
                                 w,
                                 rx,
@@ -1410,6 +2004,7 @@ where
                                 dead_tx.clone(),
                                 total_tx.clone(),
                                 total_rx.clone(),
+                                runtime_counters.clone(),
                                 live.clone(),
                                 stream_tasks.clone(),
                                 pump.clone(),
@@ -1423,7 +2018,7 @@ where
         }
         log::info!(
             "Multipath: {} bonded stream(s) active (fixed)",
-            outs.lock().unwrap().len()
+            crate::util::lock_or_recover(&outs, "client::outs").len()
         );
     } else if bonding && adaptive {
         // ADAPTIVE: ramp from 1 stream up based on measured throughput.
@@ -1438,6 +2033,10 @@ where
         let cfg_r = std::sync::Arc::new(config.clone());
         let token_r = token_bytes.clone();
         let live_r = live.clone();
+        let runtime_r = runtime_counters.clone();
+        let identity_r = identity_verifier.clone();
+        let desired_r = desired_streams.clone();
+        let joining_r = join_in_flight.clone();
         ramp_handle = Some(tokio::spawn(async move {
             let mut last_bytes = 0u64;
             let mut best_rate = 0u64;
@@ -1445,7 +2044,7 @@ where
             let mut idx = 1u8;
             loop {
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                let cur = outs_r.lock().unwrap().len();
+                let cur = crate::util::lock_or_recover(&outs_r, "client::outs_r").len();
                 if cur >= target {
                     break;
                 }
@@ -1471,32 +2070,42 @@ where
                     log::info!("Multipath adaptive: plateau at {} stream(s)", cur);
                     break;
                 }
+                if joining_r
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
                 match conn_r().await {
                     // Bound the adaptive JOIN handshake as well (see the fixed path); flatten
                     // the timeout Elapsed into an Err so the existing match arms stay put.
                     Ok(mut s) => match tokio::time::timeout(
                         Duration::from_secs(cfg_r.server.connection_timeout_secs.max(1)),
-                        tcp_join_handshake(&mut s, &cfg_r, &token_r, idx),
+                        tcp_join_handshake(&mut s, &cfg_r, &token_r, idx, identity_r.clone()),
                     )
                     .await
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("JOIN handshake timed out")))
                     {
                         Ok((rx, tx)) => {
                             let (r, w) = s.split_io();
-                            outs_r.lock().unwrap().push(spawn_stream(
-                                r,
-                                w,
-                                rx,
-                                tx,
-                                tww.clone(),
-                                dead_r.clone(),
-                                total_r.clone(),
-                                total_rx_r.clone(),
-                                live_r.clone(),
-                                stream_tasks_r.clone(),
-                                pump_r.clone(),
-                            ));
+                            crate::util::lock_or_recover(&outs_r, "client::outs_r").push(
+                                spawn_stream(
+                                    r,
+                                    w,
+                                    rx,
+                                    tx,
+                                    tww.clone(),
+                                    dead_r.clone(),
+                                    total_r.clone(),
+                                    total_rx_r.clone(),
+                                    runtime_r.clone(),
+                                    live_r.clone(),
+                                    stream_tasks_r.clone(),
+                                    pump_r.clone(),
+                                ),
+                            );
                             idx = idx.wrapping_add(1);
+                            desired_r.store(cur + 1, Ordering::Release);
                             grace = 1;
                             log::info!(
                                 "Multipath adaptive: ramped to {} stream(s) ({} KB/s)",
@@ -1508,29 +2117,142 @@ where
                     },
                     Err(e) => log::warn!("adaptive connect failed: {}", e),
                 }
+                joining_r.store(false, Ordering::Release);
             }
         }));
     }
 
     let proxy_handle = start_local_proxy(config, &client_ip_str, &tun_name);
+    // Restore lost members of an established bond. Previously a dead secondary
+    // merely reduced `live`; once the ramp task had ended nothing ever recreated
+    // it, so a long-lived multipath session silently degraded to one stream.
+    let maintenance_handle = if bonding {
+        let outs_m = outs.clone();
+        let stream_tasks_m = stream_tasks.clone();
+        let total_m = total_tx.clone();
+        let total_rx_m = total_rx.clone();
+        let tww_m = tun_write_tx.clone();
+        let dead_m = dead_tx.clone();
+        let pump_m = pump.clone();
+        let conn_m = connector.clone();
+        let cfg_m = std::sync::Arc::new(config.clone());
+        let token_m = token_bytes.clone();
+        let live_m = live.clone();
+        let desired_m = desired_streams.clone();
+        let next_m = next_join_index.clone();
+        let joining_m = join_in_flight.clone();
+        let runtime_m = runtime_counters.clone();
+        let identity_m = identity_verifier.clone();
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let desired = desired_m.load(Ordering::Acquire).min(target);
+                if live_m.load(Ordering::Acquire) >= desired {
+                    continue;
+                }
+                if joining_m
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                let raw_index = next_m.fetch_add(1, Ordering::AcqRel);
+                if raw_index > u8::MAX as usize {
+                    // JOIN derives per-stream state from the u8 index. Never wrap and
+                    // reuse it in one session; reconnect to obtain a fresh session key.
+                    log::warn!("Multipath JOIN index exhausted — reconnecting tunnel");
+                    let _ = dead_m.try_send(());
+                    joining_m.store(false, Ordering::Release);
+                    break;
+                }
+                let joined = match conn_m().await {
+                    Ok(mut stream) => tokio::time::timeout(
+                        Duration::from_secs(cfg_m.server.connection_timeout_secs.max(1)),
+                        tcp_join_handshake(
+                            &mut stream,
+                            &cfg_m,
+                            &token_m,
+                            raw_index as u8,
+                            identity_m.clone(),
+                        ),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("JOIN handshake timed out")))
+                    .map(|(rx, tx)| (stream, rx, tx)),
+                    Err(error) => Err(error),
+                };
+                match joined {
+                    Ok((stream, rx, tx)) => {
+                        let (reader, writer) = stream.split_io();
+                        crate::util::lock_or_recover(&outs_m, "client::outs_m").push(spawn_stream(
+                            reader,
+                            writer,
+                            rx,
+                            tx,
+                            tww_m.clone(),
+                            dead_m.clone(),
+                            total_m.clone(),
+                            total_rx_m.clone(),
+                            runtime_m.clone(),
+                            live_m.clone(),
+                            stream_tasks_m.clone(),
+                            pump_m.clone(),
+                        ));
+                        log::info!(
+                            "Multipath: restored bond to {}/{} live stream(s)",
+                            live_m.load(Ordering::Acquire),
+                            desired
+                        );
+                    }
+                    Err(error) => log::warn!("Multipath replacement JOIN failed: {error}"),
+                }
+                joining_m.store(false, Ordering::Release);
+            }
+        }))
+    } else {
+        None
+    };
 
     // Distributor: FLOW-PIN TUN packets across the live bonded streams (by inner
     // 5-tuple) so each connection stays in order. Each stream's tasks own
     // encrypt/heartbeat/idle; a dead stream fires dead_rx.
+    let mut unsupported_inner_drops = 0u64;
     loop {
         tokio::select! {
             biased;
 
             _ = dead_rx.recv() => { break; }
 
-            Some(ip_packet) = tun_read_rx.recv() => {
+            _ = cancel_tick.tick() => {
+                if cancel.load(Ordering::Acquire) { break; }
+            }
+
+            packet = tun_pump.recv_from_tun() => {
+                let Some(ip_packet) = packet else {
+                    log::warn!("TCP: TUN reader stopped — reconnecting");
+                    break;
+                };
+                if !is_supported_inner_packet(ip_packet.as_ref()) {
+                    unsupported_inner_drops = unsupported_inner_drops.saturating_add(1);
+                    if unsupported_inner_drops.is_power_of_two() {
+                        log::debug!(
+                            "TCP client dropped unsupported non-IPv4 inner packet (total {})",
+                            unsupported_inner_drops
+                        );
+                    }
+                    continue;
+                }
                 trace::record(trace::Dir::Tx, "client.tcp", ip_packet.len(), 0);
+                runtime_counters.tx_packets.fetch_add(1, Ordering::Relaxed);
+                runtime_counters
+                    .tx_bytes
+                    .fetch_add(ip_packet.len() as u64, Ordering::Relaxed);
                 // Pin by flow hash, lazily dropping any dead stream (closed channel)
                 // and re-pinning onto a live one. When the last stream is gone the
                 // per-stream death handler has already fired `dead_rx`.
-                let mut g = outs.lock().unwrap();
-                let mut pkt = ip_packet;
-                let h = crate::protocol::flow_hash(&pkt);
+                let mut g = crate::util::lock_or_recover(&outs, "client::outs");
+                let h = crate::protocol::flow_hash(ip_packet.as_ref());
+                let mut pkt = ClientUplink::Tun(ip_packet);
                 while !g.is_empty() {
                     let i = (h % g.len() as u64) as usize;
                     match g[i].try_send(pkt) {
@@ -1551,117 +2273,48 @@ where
     }
 
     // Stop the adaptive ramp task first: it loops indefinitely trying to add bonded
-    // streams and holds a `tun_write_tx` clone. Left running after a disconnect, the
-    // dedicated TUN-writer thread's channel never closes, so `writer_fd` (a dup of the
-    // TUN fd) stays open and `vpn0` remains busy — every reconnect then fails to
-    // recreate the TUN with EBUSY ("Device or resource busy"). Aborting drops the clone.
+    // streams and must not create sockets for an obsolete connection generation.
     if let Some(h) = ramp_handle {
         h.abort();
     }
     if let Some(h) = proxy_handle {
         h.abort();
     }
-    // Same reasoning, now for the per-stream tasks. The writer half notices a dead
-    // stream on its 5s tick, but the READER sits in `read_record` with no timeout: on a
-    // half-open connection (write side failed, nothing ever arrives) it waits forever,
-    // holding its `tun_write_tx` clone and keeping the TUN alive. Abort cancels it at
-    // that await point.
-    for h in stream_tasks.lock().unwrap().drain(..) {
+    if let Some(h) = maintenance_handle {
         h.abort();
     }
+    // Same reasoning for the per-stream tasks. A reader can sit in `read_record` on a
+    // half-open socket forever; abort cancels it at that await point before the shared
+    // TUN backend releases this generation's descriptors.
+    for h in crate::util::lock_or_recover(&stream_tasks, "client::stream_tasks").drain(..) {
+        h.abort();
+    }
+    #[cfg(target_os = "linux")]
     dns::restore_dns();
-    tun_stop.store(true, Ordering::Relaxed); // tell the reader thread to exit
-    drop(tun_read_rx);
-    let _ = tun_reader_handle.await;
-    // tun_write_tx dropped here, dedicated writer thread closes writer_fd
-    // inside the thread when its channel-receive loop ends.
     drop(tun_write_tx);
+    tun_pump.shutdown().await;
     // Closes the TUN fd: `TunInterface` holds it as a `File`. (Do NOT also close the raw
     // number — that would be a double close, and the freed number can already have been
     // handed to another thread's socket.)
+    #[cfg(target_os = "linux")]
     drop(tunnel_tun);
     // Attach mode: the interface + routes belong to an external owner — leave them
     // (we only borrowed the fd). Otherwise remove the device + routes we created.
+    #[cfg(target_os = "linux")]
     if !config.tun.attach_existing {
         TunInterface::delete(&tun_name).ok();
         route::cleanup_routes(&tun_name, &server_addr, &config.routing.exclude).ok();
     }
+    #[cfg(target_os = "linux")]
     tun_guard.disarm(); // graceful teardown done — nothing left for `Drop` to repeat
     log::info!("Client disconnected");
     Ok(())
 }
 
-/// Verify the server identity message in either format:
-///  * ≥64 bytes — `static_pub||proof` (TOFU or pinned cross-check),
-///  * 32 bytes — proof-only (server hid its key in require-pinned mode; the
-///    client must have the key pinned to verify).
-///
-/// Returns the server static public key bytes.
-fn verify_server_identity(
-    auth_proof_msg: &[u8],
-    client_kp: &Keypair,
-    ephemeral_shared: &[u8; 32],
-    transcript_hash: &[u8; 32],
-    pinned: &Option<String>,
-) -> anyhow::Result<[u8; 32]> {
-    if auth_proof_msg.len() >= 64 {
-        crate::crypto::verify_server_auth_message(
-            auth_proof_msg,
-            client_kp,
-            ephemeral_shared,
-            transcript_hash,
-        )
-    } else {
-        let pin = pinned.as_deref().and_then(crate::crypto::parse_pubkey_hex)
-            .ok_or_else(|| anyhow::anyhow!(
-                "server sent proof-only (require-pinned mode) but client has no server_public_key pinned"))?;
-        crate::crypto::verify_server_proof_only(
-            auth_proof_msg,
-            client_kp,
-            &pin,
-            ephemeral_shared,
-            transcript_hash,
-        )
-    }
-}
-
-/// Build the auth packet plaintext: `[client_key_proof:32][username:password]`.
-/// The proof is computed from the *pinned* server public key (config), so only a
-/// client that has pinned the key can produce a valid one — letting a server with
-/// `require_client_key_proof` reject unpinned clients. All-zero when not pinned.
-fn build_client_auth_plaintext(
-    config: &crate::config::client::ClientConfig,
-    client_kp: &Keypair,
-    ephemeral_shared: &[u8; 32],
-    transcript_hash: &[u8; 32],
-    password: &str,
-) -> Vec<u8> {
-    let proof = config
-        .auth
-        .server_public_key
-        .as_deref()
-        .and_then(crate::crypto::parse_pubkey_hex)
-        .map(|pk| {
-            let ss = client_kp.derive_shared(&crate::crypto::PublicKey::from_bytes(&pk));
-            crate::crypto::compute_client_key_proof(&ss.0, ephemeral_shared, transcript_hash)
-        })
-        .unwrap_or([0u8; 32]);
-    let creds = format!("{}:{}", config.auth.username, password);
-    // Present this device's stable id (marker 0x00 + 16 bytes) so the server keys the
-    // session/pool IP by device: several devices of one login coexist, and the SAME
-    // device cleanly supersedes its own old session on an IP change (Wi-Fi <-> LTE).
-    let did = device_id();
-    let mut out = Vec::with_capacity(32 + 1 + did.len() + creds.len());
-    out.extend_from_slice(&proof);
-    out.push(0u8);
-    out.extend_from_slice(&did);
-    out.extend_from_slice(creds.as_bytes());
-    out
-}
-
 /// Load (or first-time generate + persist) this client's stable device id. Stored
 /// at a fixed state path; an unwritable host falls back to a per-run random id
 /// (still works — just not stable across restarts there).
+#[cfg(target_os = "linux")]
 fn device_id() -> [u8; crate::protocol::DEVICE_ID_LEN] {
     // `QELI_DEVICE_ID_FILE` overrides the path (lets several instances on one host —
     // or tests — keep distinct device ids).
@@ -1670,6 +2323,7 @@ fn device_id() -> [u8; crate::protocol::DEVICE_ID_LEN] {
     device_id_at(&path)
 }
 
+#[cfg(target_os = "linux")]
 fn device_id_at(path: &str) -> [u8; crate::protocol::DEVICE_ID_LEN] {
     use std::io::{Read, Write};
     let mut id = [0u8; crate::protocol::DEVICE_ID_LEN];
@@ -1686,250 +2340,51 @@ fn device_id_at(path: &str) -> [u8; crate::protocol::DEVICE_ID_LEN] {
     if let Some(parent) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(mut f) = std::fs::File::create(path) {
+    // 0600, not whatever the umask allows.
+    //
+    // `File::create` gave 0666 & ~umask — 0644 on a normal host — for a value that is (a)
+    // stable across reboots and (b) sent to the server in the CLEARTEXT part of every auth
+    // message, where it identifies this machine. Any local user could read it, which is a
+    // durable cross-session correlator for the device; paired with a leaked or observed
+    // password it also lets them present as the same device, and the server treats a
+    // matching device-id as "same device, new address" and evicts the real session — a
+    // targeted denial of service against one user. Every other state file this module
+    // writes is already private (`known_hosts` opens with .mode(0o600), the DNS refcount
+    // goes through write_atomic_private); this one was the exception.
+    // (Audit 2026-08-04.)
+    #[cfg(unix)]
+    let created = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let created = std::fs::File::create(path);
+    if let Ok(mut f) = created {
         let _ = f.write_all(&id);
     }
     id
-}
-
-/// When `auth.bind_static_to_session` is set (the default since 0.7.1), compute the
-/// static-ephemeral DH `es = X25519(our_ephemeral, pinned_server_static)` so the
-/// session keys can be bound to the server's long-lived identity (H-1). Requires
-/// `server_public_key` to be pinned. Returns `None` only when the feature is
-/// explicitly disabled (`bind_static = false`), in which case the unbound KDF is
-/// used — identical wire behaviour to a 0.7.0 / TOFU client.
-fn static_es(
-    config: &crate::config::client::ClientConfig,
-    client_kp: &Keypair,
-) -> anyhow::Result<Option<[u8; 32]>> {
-    if !config.auth.bind_static_to_session {
-        return Ok(None);
-    }
-    let hex = config.auth.server_public_key.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "auth.bind_static_to_session is on but no server key is pinned; set \
-             auth.server_public_key (qeli show-identity) or set bind_static = false"
-        )
-    })?;
-    let raw = crate::crypto::parse_pubkey_hex(hex)
-        .ok_or_else(|| anyhow::anyhow!("invalid auth.server_public_key hex"))?;
-    // Reject the all-zero TOFU sentinel: an unpinned client cannot do H-1.
-    if raw.iter().all(|&b| b == 0) {
-        anyhow::bail!(
-            "auth.bind_static_to_session is on but server_public_key is the all-zero \
-             TOFU sentinel; pin the real server key or set bind_static = false"
-        );
-    }
-    let server_static = crate::crypto::PublicKey::from_bytes(&raw);
-    Ok(Some(client_kp.derive_shared(&server_static).0))
 }
 
 async fn tcp_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     config: &crate::config::client::ClientConfig,
     password: &str,
+    client_device_id: &[u8; crate::protocol::DEVICE_ID_LEN],
+    identity_verifier: IdentityVerifier,
 ) -> anyhow::Result<(PacketCodec, PacketCodec, AuthOk)> {
-    let client_kp = Keypair::generate();
-
-    // `plain` wire mode: no TLS mimicry at all. Exchange ephemeral X25519 publics
-    // raw, bind the channel to H(client_pub‖server_pub), then run the same
-    // encrypted auth flow over bare length-prefixed records (Framing::Raw). The
-    // data plane that follows is header-only ([len][nonce][ct]) too.
-    if config.obfuscation.mode == "plain" {
-        stream.write_all(client_kp.public().as_bytes()).await?;
-        let mut sp = [0u8; 32];
-        stream
-            .read_exact(&mut sp)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read server key (plain): {}", e))?;
-        let server_pub = crate::crypto::PublicKey::from_bytes(&sp);
-        let transcript_hash = handshake_transcript_hash(&[client_kp.public().as_bytes(), &sp]);
-
-        let shared = client_kp
-            .derive_shared_checked(&server_pub)
-            .ok_or_else(|| anyhow::anyhow!("rejected low-order server public key"))?;
-        let (server_to_client, client_to_server) = match static_es(config, &client_kp)? {
-            Some(es) => derive_keys_bound(&shared.0, &es),
-            None => derive_keys(&shared.0),
-        };
-        let mut client_rx = PacketCodec::new_raw(server_to_client);
-        let mut client_tx = PacketCodec::new_raw(client_to_server);
-
-        let auth_proof_record = read_record(stream, Framing::Raw)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read auth proof (plain): {}", e))?;
-        let auth_proof_msg = client_rx.decrypt_packet(&auth_proof_record)?;
-        let server_static_pub_bytes = verify_server_identity(
-            &auth_proof_msg,
-            &client_kp,
-            &shared.0,
-            &transcript_hash,
-            &config.auth.server_public_key,
-        )?;
-        verify_server_key(
-            &server_static_pub_bytes,
-            &config.auth.server_public_key,
-            &format!("{}:{}", config.server.address, config.server.port),
-            config.auth.allow_unpinned_tofu,
-        )?;
-        log::info!("Server identity verified (plain)");
-
-        let auth_plain =
-            build_client_auth_plaintext(config, &client_kp, &shared.0, &transcript_hash, password);
-        let auth_packet = client_tx.encrypt_packet(&auth_plain, &[])?;
-        stream.write_all(&auth_packet).await?;
-
-        let auth_response_record = read_record(stream, Framing::Raw)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read auth response (plain): {}", e))?;
-        let auth_response = client_rx.decrypt_packet(&auth_response_record)?;
-        let ok = parse_auth_ok(&String::from_utf8(auth_response)?)?;
-        log::info!("Auth OK (plain), assigned IP: {}", ok.client_ip);
-        return Ok((client_rx, client_tx, ok));
-    }
-
-    // SNI precedence: an explicit `obfuscation.sni` override (e.g. pinned by a
-    // qeli:// link) wins; else the connect hostname; else a random decoy when
-    // connecting to a bare IP.
-    let server_name: &str = match config.obfuscation.sni.as_deref() {
-        Some(s) if !s.is_empty() => s,
-        _ if config.server.address.parse::<std::net::IpAddr>().is_ok() => pick_random_sni(),
-        _ => &config.server.address,
-    };
-
-    // REALITY: when a short_id + pinned server key are configured, embed a crypto
-    // auth token in the (browser-like) ClientHello's session_id. The server uses
-    // it to recognise us instead of the legacy "no ALPN" signal.
-    let reality_sid: Option<[u8; 32]> = match (
-        config
-            .obfuscation
-            .reality_short_id
-            .as_deref()
-            .filter(|s| !s.is_empty()),
-        config
-            .auth
-            .server_public_key
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .and_then(crate::crypto::parse_pubkey_hex),
-    ) {
-        (Some(sid_hex), Some(pk)) => {
-            let reality_pub = crate::crypto::PublicKey::from_bytes(&pk);
-            let short_id = crate::crypto::reality::short_id_from_hex(sid_hex);
-            Some(crate::crypto::reality::seal_session_id(
-                &reality_pub,
-                &client_kp,
-                &short_id,
-            ))
-        }
-        _ => None,
-    };
-
-    // Hybrid PQ: keep the ML-KEM decapsulation key so we can open the server's
-    // ciphertext below and fold the ML-KEM secret into the tunnel keys.
-    let (client_hello, mlkem_dk) = FakeTlsHandshake::build_client_hello_pq(
-        client_kp.public(),
-        server_name,
-        0,
-        reality_sid.as_ref(),
-    );
-    stream.write_all(&client_hello).await?;
-
-    let server_hello_record = read_tls_record(stream)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to read ServerHello: {}", e))?;
-    // The hybrid ServerHello's X25519MLKEM768 key_share carries the ML-KEM ciphertext
-    // followed by the server's x25519 public.
-    let (mlkem_ct, server_x25519) =
-        FakeTlsHandshake::parse_server_hello_pq(&server_hello_record)
-            .ok_or_else(|| anyhow::anyhow!("failed to parse hybrid ServerHello"))?;
-    let server_pub = crate::crypto::PublicKey::from_bytes(&server_x25519);
-
-    let _ccs_record = read_tls_record(stream).await.ok();
-    let cert_record = read_tls_record(stream)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to read Certificate: {}", e))?;
-    let finished_record = read_tls_record(stream)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to read Finished: {}", e))?;
-    let _nst_record = read_tls_record(stream).await.ok();
-
-    let shared = client_kp
-        .derive_shared_checked(&server_pub)
-        .ok_or_else(|| anyhow::anyhow!("rejected low-order server public key"))?;
-    // Hybrid PQ: decapsulate the server's ML-KEM ciphertext, then fold both the
-    // X25519 and ML-KEM shared secrets into the tunnel keys.
-    let mlkem_ss = crate::crypto::mlkem::mlkem768_decapsulate(&mlkem_dk, &mlkem_ct)
-        .ok_or_else(|| anyhow::anyhow!("ML-KEM decapsulation failed"))?;
-    let mlkem_shared: [u8; 32] = mlkem_ss
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("ML-KEM shared secret not 32 bytes"))?;
-    let (server_to_client, client_to_server) = match static_es(config, &client_kp)? {
-        Some(es) => derive_keys_hybrid_bound(&shared.0, &mlkem_shared, &es),
-        None => derive_keys_hybrid(&shared.0, &mlkem_shared),
-    };
-    let mut client_rx = PacketCodec::new(server_to_client);
-    let mut client_tx = PacketCodec::new(client_to_server);
-
-    // Same handshake transcript the server bound the proof to. Order must match
-    // server/handler.rs::server_handshake: ClientHello, ServerHello, Cert, Finished.
-    let transcript_hash = handshake_transcript_hash(&[
-        &client_hello,
-        &server_hello_record,
-        &cert_record,
-        &finished_record,
-    ]);
-
-    log::info!("Handshake complete, reading server auth proof");
-
-    let auth_proof_record = read_tls_record(stream)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to read auth proof: {}", e))?;
-    let auth_proof_msg = client_rx.decrypt_packet(&auth_proof_record)?;
-
-    let server_static_pub_bytes = verify_server_identity(
-        &auth_proof_msg,
-        &client_kp,
-        &shared.0,
-        &transcript_hash,
-        &config.auth.server_public_key,
-    )?;
-
-    // Key pinning: verify server static key against pinned value, or warn TOFU
-    verify_server_key(
-        &server_static_pub_bytes,
-        &config.auth.server_public_key,
-        &format!("{}:{}", config.server.address, config.server.port),
-        config.auth.allow_unpinned_tofu,
-    )?;
-
-    log::info!("Server identity verified");
-
-    let auth_plain =
-        build_client_auth_plaintext(config, &client_kp, &shared.0, &transcript_hash, password);
-    let auth_packet = client_tx.encrypt_packet(&auth_plain, &[])?;
-    stream.write_all(&auth_packet).await?;
-
-    let auth_response_record = read_tls_record(stream)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to read auth response: {}", e))?;
-    let auth_response = client_rx.decrypt_packet(&auth_response_record)?;
-    let response_str = String::from_utf8(auth_response)?;
-
-    let ok = parse_auth_ok(&response_str)?;
-    log::info!("Auth OK, assigned IP: {}", ok.client_ip);
-    if ok.pushed_obf.is_some() {
-        log::info!("Applying server-pushed obfuscation params");
-    }
-    if ok.routes_json != "[]" && !ok.routes_json.is_empty() {
-        log::info!(
-            "Server pushed {} route(s)",
-            ok.routes_json.matches("cidr").count()
-        );
-    }
-
-    Ok((client_rx, client_tx, ok))
+    authenticate_tcp(
+        stream,
+        config,
+        password,
+        client_device_id,
+        move |received| identity_verifier(received),
+    )
+    .await
 }
 
 /// Inner qeli handshake for a SECONDARY bonded connection (stream bonding): the
@@ -1941,6 +2396,7 @@ async fn tcp_join_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     config: &crate::config::client::ClientConfig,
     token: &[u8],
     stream_index: u8,
+    identity_verifier: IdentityVerifier,
 ) -> anyhow::Result<(PacketCodec, PacketCodec)> {
     let client_kp = Keypair::generate();
 
@@ -1976,12 +2432,7 @@ async fn tcp_join_handshake<S: AsyncRead + AsyncWrite + Unpin>(
             &transcript_hash,
             &config.auth.server_public_key,
         )?;
-        verify_server_key(
-            &server_static_pub_bytes,
-            &config.auth.server_public_key,
-            &format!("{}:{}", config.server.address, config.server.port),
-            config.auth.allow_unpinned_tofu,
-        )?;
+        identity_verifier(server_static_pub_bytes).await?;
         let mut join = Vec::with_capacity(crate::protocol::JOIN_MAGIC.len() + token.len() + 1);
         join.extend_from_slice(crate::protocol::JOIN_MAGIC.as_slice());
         join.extend_from_slice(token);
@@ -2082,12 +2533,7 @@ async fn tcp_join_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         &transcript_hash,
         &config.auth.server_public_key,
     )?;
-    verify_server_key(
-        &server_static_pub_bytes,
-        &config.auth.server_public_key,
-        &format!("{}:{}", config.server.address, config.server.port),
-        config.auth.allow_unpinned_tofu,
-    )?;
+    identity_verifier(server_static_pub_bytes).await?;
 
     // Present the session JOIN token (instead of credentials).
     let mut join = Vec::with_capacity(crate::protocol::JOIN_MAGIC.len() + token.len() + 1);
@@ -2115,139 +2561,76 @@ fn hex_to_bytes(s: &str) -> Vec<u8> {
         .collect()
 }
 
-/// Parsed auth-OK payload. The server sends self-describing keyed JSON behind
-/// the `OK:` success marker (see handler::build_auth_ok); each field is looked up
-/// by key so an added/reordered field can't silently mis-map.
-struct AuthOk {
-    client_ip: String,
-    server_ip: String,
-    /// VPN subnet prefix length pushed by the server (default 24 for older
-    /// servers that don't send it). Determines the on-link netmask.
-    prefix: u8,
-    /// TUN MTU pushed by the server (its profile's tun.mtu). 0 = the server is
-    /// too old to push one; the client then uses its own config value or the
-    /// auto fallback.
-    mtu: i32,
-    dns_ip: String,
-    dns_port: String,
-    routes_json: String,
-    pushed_obf: Option<crate::config::PushedObf>,
-    /// Stream bonding: per-session join token (hex) presented by secondary
-    /// connections, and the max number of parallel streams the server allows.
-    /// Empty token / max_streams<=1 (or an older server) => single stream.
-    session_token: String,
-    max_streams: u32,
-    /// Server asked the client to auto-ramp streams (vs open exactly max_streams).
-    adaptive: bool,
+#[cfg(target_os = "windows")]
+pub(crate) enum WindowsTunSetup {
+    Ring(String),
+    Packet(crate::transport_core::packet_tun::PacketTunPump),
 }
 
-fn parse_auth_ok(response_str: &str) -> anyhow::Result<AuthOk> {
-    let json = response_str
-        .strip_prefix("OK:")
-        .ok_or_else(|| anyhow::anyhow!("auth failed: {}", response_str))?;
-    let v: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| anyhow::anyhow!("malformed auth OK json: {}", e))?;
-    // Validate BOTH addresses as IPv4 before anything downstream uses them.
-    //
-    // These were the last server-pushed fields taken on trust: `client_ip` was only
-    // checked for emptiness and `server_ip` not at all, while pushed DNS, CIDRs and
-    // gateways all go through parsers whose comments state that a hostile server must not
-    // be able to smuggle anything through. `client_ip` reaches `ip addr add <v>/<prefix>
-    // dev <tun>` and `server_ip` becomes the main gateway in `route::setup_routes`. Argv
-    // passing already prevents classic shell injection, so the damage was a confusing
-    // failure rather than an exploit: `ip route add` rejected the value, both halves of
-    // the full-tunnel default route failed, and the client looped through reconnects with
-    // no usable explanation. Reject it here, where the message names the field.
-    // (Audit 2026-07-27, C5.)
-    let client_ip = v["client_ip"].as_str().unwrap_or("").to_string();
-    if client_ip.is_empty() {
-        return Err(anyhow::anyhow!("auth OK missing client_ip"));
-    }
-    if client_ip.parse::<std::net::Ipv4Addr>().is_err() {
-        return Err(anyhow::anyhow!(
-            "auth OK client_ip {:?} is not a valid IPv4 address — refusing to configure \
-             the tunnel with it",
-            client_ip
-        ));
-    }
-    let server_ip = v["server_ip"].as_str().unwrap_or("").to_string();
-    // Empty stays allowed: an older server omits it and the client falls back.
-    if !server_ip.is_empty() && server_ip.parse::<std::net::Ipv4Addr>().is_err() {
-        return Err(anyhow::anyhow!(
-            "auth OK server_ip {:?} is not a valid IPv4 address — refusing to install \
-             routes through it",
-            server_ip
-        ));
-    }
-    let dns_port = match &v["dns_port"] {
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::String(s) => s.clone(),
-        _ => "53".to_string(),
-    };
-    // VPN subnet prefix (default /24 when the server is older and omits it).
-    let prefix: u8 = v["prefix"]
-        .as_u64()
-        .map(|n| n as u8)
-        .filter(|p| (1..=32).contains(p))
-        .unwrap_or(24);
-    // Server-pushed TUN MTU; 0/absent => server did not push one.
-    let mtu: i32 = v["mtu"]
-        .as_i64()
-        .filter(|m| crate::config::server::mtu_in_range(*m))
-        .map(|m| m as i32)
-        .unwrap_or(0);
-    Ok(AuthOk {
-        client_ip,
-        server_ip,
-        prefix,
-        mtu,
-        dns_ip: v["dns"].as_str().unwrap_or("").to_string(),
-        dns_port,
-        routes_json: v
-            .get("routes")
-            .map(|r| r.to_string())
-            .unwrap_or_else(|| "[]".into()),
-        pushed_obf: v
-            .get("obfuscation")
-            .and_then(|o| serde_json::from_value(o.clone()).ok()),
-        session_token: v["session_token"].as_str().unwrap_or("").to_string(),
-        // Clamp before the cast. This is a server-supplied number: `as u32` silently
-        // wraps (2^32 becomes 0), and the value then drives a connection loop and is
-        // narrowed again to a u8 stream id — so an absurd or hostile value meant either
-        // no streams at all or an unbounded open-loop against ourselves. 16 is far above
-        // any useful bonding width.
-        max_streams: v["max_streams"].as_u64().unwrap_or(1).clamp(1, 16) as u32,
-        adaptive: v["multipath_adaptive"].as_bool().unwrap_or(false),
-    })
-}
-
-struct TunnelSetup {
+pub(crate) struct TunnelSetup {
+    #[cfg(target_os = "linux")]
     tun: TunInterface,
-    reader_fd: i32,
-    writer_fd: i32,
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    reader_fd: OwnedFd,
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    writer_fd: OwnedFd,
+    #[cfg(target_os = "linux")]
     if_name: String,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     is_tap: bool,
+    #[cfg(target_os = "windows")]
+    windows_tun: WindowsTunSetup,
+    #[cfg(target_os = "ios")]
+    packet_tun: crate::transport_core::packet_tun::PacketTunPump,
+}
+
+impl TunnelSetup {
+    #[cfg(any(target_os = "android", target_os = "macos"))]
+    pub(crate) fn external(reader_fd: OwnedFd, writer_fd: OwnedFd) -> Self {
+        Self {
+            reader_fd,
+            writer_fd,
+            #[cfg(target_os = "android")]
+            is_tap: false,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn wintun(adapter_name: String) -> Self {
+        Self {
+            windows_tun: WindowsTunSetup::Ring(adapter_name),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn packet(packet_tun: crate::transport_core::packet_tun::PacketTunPump) -> Self {
+        Self {
+            windows_tun: WindowsTunSetup::Packet(packet_tun),
+        }
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(crate) fn packet(packet_tun: crate::transport_core::packet_tun::PacketTunPump) -> Self {
+        Self { packet_tun }
+    }
 }
 
 /// Unconditional TUN teardown, for the paths the graceful one cannot reach.
 ///
 /// The cleanup at the end of `run_tcp_tunnel` / `connect_and_run_udp` runs only when
 /// the data plane exits NORMALLY. Every `?` in those functions — the uplink dying when
-/// a modem is power-cycled, say — returns early and skips it, and the blocking TUN
-/// reader is then left spinning: it only notices its channel closed after a SUCCESSFUL
-/// read (see the reader loop), so on an idle TUN it polls `WouldBlock` forever, holding
-/// its dup of the fd. The device is non-persistent, so it survives exactly as long as
-/// that fd — and the next reconnect trips the "already exists" check in `setup_tunnel`
-/// and fails, every time, until the process is killed by hand.
+/// a modem is power-cycled, say — returns early and skips the route/DNS/device teardown.
+/// The shared TUN pump releases its `OwnedFd` workers on `Drop`, but it deliberately does
+/// not own these platform resources.
 ///
-/// So this guard carries the parts that must happen no matter how we leave: raise the
-/// reader's stop flag (which is what actually releases the fd, and therefore the
-/// device), restore the resolver, and remove the interface and the routes we installed.
-/// The normal path `disarm()`s it after running the fuller graceful sequence, whose
-/// `.await`s are impossible in `Drop`.
+/// This guard carries the platform parts that must happen no matter how we leave: request
+/// pump cancellation before touching the device, restore the resolver, and remove the
+/// interface and routes we installed. The normal path `disarm()`s it after the fuller
+/// graceful sequence, whose `.await`s are impossible in `Drop`.
+#[cfg(target_os = "linux")]
 struct TunGuard {
     if_name: String,
-    stop: Arc<AtomicBool>,
+    stop: Option<LinuxTunPumpStop>,
     /// Attach mode borrows an externally-owned device: pump packets, never tear down.
     owns_device: bool,
     server_addr: String,
@@ -2255,22 +2638,21 @@ struct TunGuard {
     armed: bool,
 }
 
+#[cfg(target_os = "linux")]
 impl TunGuard {
-    fn new(
-        if_name: String,
-        stop: Arc<AtomicBool>,
-        owns_device: bool,
-        server_addr: String,
-        exclude: Vec<String>,
-    ) -> Self {
+    fn new(if_name: String, owns_device: bool, server_addr: String, exclude: Vec<String>) -> Self {
         Self {
             if_name,
-            stop,
+            stop: None,
             owns_device,
             server_addr,
             exclude,
             armed: true,
         }
+    }
+
+    fn attach_pump(&mut self, stop: LinuxTunPumpStop) {
+        self.stop = Some(stop);
     }
 
     /// Called once the graceful teardown has run, so `Drop` does not repeat it.
@@ -2279,6 +2661,7 @@ impl TunGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for TunGuard {
     fn drop(&mut self) {
         if !self.armed {
@@ -2288,11 +2671,12 @@ impl Drop for TunGuard {
             "connection ended on an error path — releasing TUN {}",
             self.if_name
         );
-        // Unblock the reader thread so it closes its dup of the TUN fd. Without this the
-        // fd outlives the connection and keeps the device alive; the fds are NOT closed
-        // here directly, because the reader/writer threads may still be inside a
-        // read/write on them and a closed number can be reused by another thread.
-        self.stop.store(true, Ordering::Relaxed);
+        // Ask both workers to stop before deleting the device. The descriptors are not
+        // closed here directly: their OwnedFd values live in the workers and closing a
+        // raw number concurrently with read/write could target a subsequently reused fd.
+        if let Some(stop) = &self.stop {
+            stop.request_stop();
+        }
         dns::restore_dns_for(&self.if_name); // R7: only this instance's link
         if self.owns_device {
             TunInterface::delete(&self.if_name).ok();
@@ -2308,6 +2692,7 @@ impl Drop for TunGuard {
 /// client already requires it for TUN); entries we cannot read are skipped, so the
 /// result is "who we can PROVE holds it", which is why the caller treats an empty
 /// answer as "not ours" rather than "free to take".
+#[cfg(target_os = "linux")]
 fn tun_fd_holders(if_name: &str) -> Vec<u32> {
     let mut pids = Vec::new();
     let Ok(procs) = std::fs::read_dir("/proc") else {
@@ -2368,6 +2753,7 @@ fn tun_fd_holders(if_name: &str) -> Vec<u32> {
 ///   * held by nobody -> only a PERSISTENT device survives with no fd, and ours never
 ///     are, so it was created by someone else -> refuse
 ///   * held only by us -> our own leftover -> reclaim
+#[cfg(target_os = "linux")]
 fn reclaim_stale_tun(if_name: &str) -> anyhow::Result<()> {
     let advice = "Set 'dev=<name>' in [qeli] to use a different interface name (or \
                   'dev_attach=true' to attach to an externally-owned interface).";
@@ -2439,136 +2825,10 @@ fn reclaim_stale_tun(if_name: &str) -> anyhow::Result<()> {
     )
 }
 
-/// Resolve the effective TUN MTU by precedence: an explicit client config value
-/// (`> 0`) wins; otherwise the server-pushed MTU (`> 0`); otherwise the auto
-/// fallback (1400, for servers too old to push one).
-/// Log EVERY setting the server pushed at auth, and what this client did with it.
-///
-/// Without this you cannot tell "the server never sent it" from "the client
-/// dropped it" — from the outside both look identical (a missing route / DNS and
-/// no log line at all). Each pushed item gets one line, and when it is NOT applied
-/// the line says WHY and which knob fixes it. Called on both the TCP and the UDP
-/// auth paths.
-#[allow(clippy::too_many_arguments)]
-fn log_server_push(
-    config: &crate::config::client::ClientConfig,
-    client_ip: &str,
-    prefix: u8,
-    server_ip: &str,
-    pushed_mtu: i32,
-    dns_ip: &str,
-    dns_port: &str,
-    routes_json: &str,
-    pushed_obf: Option<&crate::config::PushedObf>,
-    max_streams: u32,
-    adaptive: bool,
-) {
-    let n_routes = serde_json::from_str::<Vec<serde_json::Value>>(routes_json)
-        .map(|v| v.len())
-        .unwrap_or(0);
-    log::info!(
-        "server push: ip={}/{} gw={} mtu={} dns={} routes={} obf={} streams={}",
-        client_ip,
-        prefix,
-        server_ip,
-        if pushed_mtu > 0 {
-            pushed_mtu.to_string()
-        } else {
-            "-".to_string()
-        },
-        if dns_ip.is_empty() {
-            "-".to_string()
-        } else {
-            format!("{}:{}", dns_ip, dns_port)
-        },
-        n_routes,
-        if pushed_obf.is_some() { "yes" } else { "-" },
-        max_streams,
-    );
-
-    // MTU — the client's own explicit mtu wins over the pushed one.
-    let eff = effective_mtu(config.tun.mtu, pushed_mtu);
-    if pushed_mtu <= 0 {
-        log::info!("server push: mtu not sent (older server) — using {}", eff);
-    } else if config.tun.mtu > 0 {
-        log::info!(
-            "server push: mtu {} IGNORED — this client sets mtu = {} in its config (wins); using {}",
-            pushed_mtu, config.tun.mtu, eff
-        );
-    } else {
-        log::info!(
-            "server push: mtu {} APPLIED (client mtu = 0/auto)",
-            pushed_mtu
-        );
-    }
-
-    // DNS — applied only when this client manages the resolver (dns = tunnel).
-    if dns_ip.is_empty() {
-        log::info!(
-            "server push: no DNS sent — keeping this host's own resolvers \
-             (on the server set dns.push_servers = <ip>, or dns.enabled = true + dns.listen)"
-        );
-    } else if config.leaves_resolver_alone() {
-        log::warn!(
-            "server push: DNS {} IGNORED — this client has dns = {} (it does not touch the \
-             resolver). Set dns = tunnel to apply the pushed resolver.",
-            dns_ip,
-            config.dns.mode
-        );
-    } else {
-        log::info!(
-            "server push: DNS {}:{} APPLIED (client dns = {})",
-            dns_ip,
-            dns_port,
-            config.dns.mode
-        );
-    }
-
-    // Routes — each applied one is logged separately by route::apply_pushed_routes.
-    if n_routes == 0 {
-        log::info!(
-            "server push: no routes sent — the server profile has no valid `route = <cidr> …` \
-             (or this user's personal routes override it with an empty set)"
-        );
-    } else {
-        log::info!(
-            "server push: {} route(s) received — see the 'Pushed route applied' lines below",
-            n_routes
-        );
-    }
-
-    if let Some(po) = pushed_obf {
-        log::info!(
-            "server push: obfuscation APPLIED (padding={}, heartbeat={}, normalization={}, shaping={})",
-            po.padding.enabled,
-            po.heartbeat.enabled,
-            po.traffic_normalization.enabled,
-            po.traffic_shaping.enabled
-        );
-    }
-    if max_streams > 1 {
-        log::info!(
-            "server push: multipath max_streams={} adaptive={}",
-            max_streams,
-            adaptive
-        );
-    }
-}
-
-fn effective_mtu(client_mtu: i32, pushed_mtu: i32) -> i32 {
-    if client_mtu > 0 {
-        client_mtu
-    } else if pushed_mtu > 0 {
-        pushed_mtu
-    } else {
-        crate::config::client::MTU_AUTO_FALLBACK
-    }
-}
-
 /// Set `IP_MTU_DISCOVER` on the raw UDP fd (Linux). `PROBE` sets DF and ignores the
 /// kernel's cached PMTU (so we can probe freely); `DO` keeps DF for the data plane;
 /// `DONT` allows fragmentation (the behaviour we restore if probing can't complete).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn set_pmtudisc(fd: std::os::unix::io::RawFd, mode: libc::c_int) -> bool {
     let v: libc::c_int = mode;
     let rc = unsafe {
@@ -2583,13 +2843,102 @@ fn set_pmtudisc(fd: std::os::unix::io::RawFd, mode: libc::c_int) -> bool {
     rc == 0
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn begin_mtu_probe(socket: &crate::protocol::obfs::ObfsUdp) -> bool {
+    set_pmtudisc(socket.as_raw_fd(), libc::IP_PMTUDISC_PROBE)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn finish_mtu_probe(socket: &crate::protocol::obfs::ObfsUdp, success: bool) {
+    let _ = set_pmtudisc(
+        socket.as_raw_fd(),
+        if success {
+            libc::IP_PMTUDISC_DO
+        } else {
+            libc::IP_PMTUDISC_DONT
+        },
+    );
+}
+
+/// Darwin exposes a boolean DF control rather than Linux's three-state PMTU policy. Probes
+/// still get the property we need: an oversized datagram fails locally instead of fragmenting.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn set_dont_fragment(fd: std::os::unix::io::RawFd, enabled: bool) -> bool {
+    const IP_DONTFRAG: libc::c_int = 28;
+    let value: libc::c_int = i32::from(enabled);
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            IP_DONTFRAG,
+            &value as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    rc == 0
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn begin_mtu_probe(socket: &crate::protocol::obfs::ObfsUdp) -> bool {
+    set_dont_fragment(socket.as_raw_fd(), true)
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn finish_mtu_probe(socket: &crate::protocol::obfs::ObfsUdp, success: bool) {
+    let _ = set_dont_fragment(socket.as_raw_fd(), success);
+}
+
+/// Winsock's IP_DONTFRAGMENT option (14) is a BOOL on an IPv4 UDP socket. Keeping this tiny
+/// declaration local avoids adding a Windows-only dependency to router/server builds.
+#[cfg(target_os = "windows")]
+fn set_dont_fragment(socket: std::os::windows::io::RawSocket, enabled: bool) -> bool {
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn setsockopt(
+            socket: usize,
+            level: i32,
+            option_name: i32,
+            option_value: *const i8,
+            option_length: i32,
+        ) -> i32;
+    }
+    const IPPROTO_IP: i32 = 0;
+    const IP_DONTFRAGMENT: i32 = 14;
+    let value: i32 = i32::from(enabled);
+    unsafe {
+        setsockopt(
+            socket as usize,
+            IPPROTO_IP,
+            IP_DONTFRAGMENT,
+            &value as *const i32 as *const i8,
+            std::mem::size_of::<i32>() as i32,
+        ) == 0
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn begin_mtu_probe(socket: &crate::protocol::obfs::ObfsUdp) -> bool {
+    set_dont_fragment(socket.as_raw_socket(), true)
+}
+
+#[cfg(target_os = "windows")]
+fn finish_mtu_probe(socket: &crate::protocol::obfs::ObfsUdp, success: bool) {
+    let _ = set_dont_fragment(socket.as_raw_socket(), success);
+}
+
 /// Active path-MTU discovery on a UDP transport (Linux). Sends DF-marked probe
 /// datagrams from `ceiling` down a small ladder; each probe's wire size equals a
 /// full data packet of the candidate tunnel MTU, so the largest one the server
 /// echoes is a size that traverses the path unfragmented. Returns that MTU, or
 /// `None` (→ caller keeps the pushed/effective MTU) on any failure — probing is
 /// purely additive and never makes connectivity worse (DF is dropped again on miss).
-#[cfg(target_os = "linux")]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "ios"
+))]
 async fn probe_udp_mtu(
     socket: &crate::protocol::obfs::ObfsUdp,
     quic_enabled: bool,
@@ -2602,8 +2951,7 @@ async fn probe_udp_mtu(
     // qeli UDP record overhead (nonce+counter+tag+padlen+framing) + a small margin, so
     // a probe that fits certifies a real full-MTU data packet also fits.
     const REC_OVERHEAD: usize = 48;
-    let fd = socket.as_raw_fd();
-    if !set_pmtudisc(fd, libc::IP_PMTUDISC_PROBE) {
+    if !begin_mtu_probe(socket) {
         return None;
     }
     // How many bytes of the PATH a probe for tunnel-MTU `m` occupies beyond `m` itself:
@@ -2731,22 +3079,31 @@ async fn probe_udp_mtu(
     }
     // Keep DF for the data plane on success (packets ≤ the discovered MTU never
     // fragment); restore fragmentation-allowed on a miss so behaviour is unchanged.
-    set_pmtudisc(
-        fd,
-        if found.is_some() {
-            libc::IP_PMTUDISC_DO
-        } else {
-            libc::IP_PMTUDISC_DONT
-        },
-    );
+    finish_mtu_probe(socket, found.is_some());
     found
 }
 
 /// Stop refining once the bracket is this narrow. Chasing the last few dozen bytes is not
 /// worth a round trip, and the threshold also bounds the loop for a very wide gap.
+#[cfg(any(
+    test,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "ios"
+))]
 pub(crate) const MTU_REFINE_STEP: i32 = 256;
 
 /// Hard cap on refinement probes, so a pathological bracket cannot stretch the handshake.
+#[cfg(any(
+    test,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "ios"
+))]
 pub(crate) const MTU_REFINE_MAX_PROBES: u8 = 5;
 
 /// Next size to try between a rung known to WORK (`lo`) and one known to FAIL (`hi`), or
@@ -2755,6 +3112,14 @@ pub(crate) const MTU_REFINE_MAX_PROBES: u8 = 5;
 /// Split out of the probe loop so the search itself is testable without a socket: the loop
 /// contributes only "send and wait", and everything that decides *which* size to ask about
 /// lives here.
+#[cfg(any(
+    test,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "ios"
+))]
 pub(crate) fn mtu_refine_step(lo: i32, hi: i32) -> Option<i32> {
     if hi - lo <= MTU_REFINE_STEP {
         return None;
@@ -2770,6 +3135,14 @@ pub(crate) fn mtu_refine_step(lo: i32, hi: i32) -> Option<i32> {
 /// whole point: rungs are inner MTUs, 1280 is an outer PATH mtu, and using it directly as
 /// the lowest rung meant asking a 1280-byte path for 1280 + overhead bytes. Every rung then
 /// failed on exactly the narrow paths probing exists for.
+#[cfg(any(
+    test,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "ios"
+))]
 fn mtu_probe_ladder(ceiling: i32, outer_overhead: usize) -> Vec<i32> {
     const PATH_FLOOR: i32 = 1280; // IPv6 minimum path MTU — the narrowest path we must serve
     let floor = (PATH_FLOOR - outer_overhead as i32).clamp(576, ceiling);
@@ -2937,7 +3310,13 @@ mod mtu_ladder_tests {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "ios"
+)))]
 async fn probe_udp_mtu(
     _socket: &crate::protocol::obfs::ObfsUdp,
     _quic_enabled: bool,
@@ -2948,15 +3327,19 @@ async fn probe_udp_mtu(
     None // no kernel DF control off Linux → keep the pushed/effective MTU
 }
 
+#[cfg(target_os = "linux")]
 fn setup_tunnel(
     config: &crate::config::client::ClientConfig,
-    client_ip: &str,
-    netmask: &str,
-    server_ip: &str,
-    dns_ip: &str,
-    dns_port: &str,
-    mtu: i32,
+    plan: &NetworkPlan,
+    network: &HandshakeNetwork<'_>,
 ) -> anyhow::Result<TunnelSetup> {
+    let client_ip = plan.tunnel_address.as_str();
+    let netmask = prefix_to_netmask(plan.prefix_len);
+    let server_ip = plan.tunnel_gateway.as_str();
+    let dns_ip = network.dns_ip;
+    let dns_port = network.dns_port;
+    let routes_json = network.routes_json;
+    let mtu = i32::from(plan.mtu);
     let is_tap = is_tap_mode(&config.tun.device_type);
     let if_name = tap_interface_name(&config.tun.name, &config.tun.device_type);
     let attach = config.tun.attach_existing;
@@ -3023,7 +3406,7 @@ fn setup_tunnel(
             client_ip
         );
     } else {
-        TunInterface::set_address(&if_name, client_ip, netmask)?;
+        TunInterface::set_address(&if_name, client_ip, plan.prefix_len)?;
         TunInterface::set_up(&if_name, mtu)?;
         log::info!("{} {} is up (IP: {})", dev_label, if_name, client_ip);
     }
@@ -3043,14 +3426,29 @@ fn setup_tunnel(
     // either, because the holder it found was OUR OWN pid and the fds were never going
     // to be released, so every later reconnect timed out waiting and bailed. `OwnedFd`
     // closes them on any early return; ownership passes to the caller only on success.
+    // F_DUPFD_CLOEXEC, not dup(2).
+    //
+    // POSIX says dup(2) CLEARS FD_CLOEXEC on the new descriptor. The original /dev/net/tun
+    // fd is opened by std, which sets O_CLOEXEC — and both dups threw that away. After this
+    // point the client keeps spawning children: `ip` (routes), `resolvectl` (DNS),
+    // `iptables`/`ip6tables` (kill-switch refresh on EVERY reconnect), and above all
+    // `hooks::run("post_down", …)`, which is `/bin/sh -c <operator string>`. Each inherited
+    // a live, readable TUN descriptor: `exec 9<&<N>` in a hook script reads the user's raw
+    // pre-encryption IP traffic, straight past the tunnel's cryptography. A dumber failure
+    // is just as real — a hook that leaves a background child keeps a dup alive, the
+    // interface never goes away, and every later reconnect fails.
+    //
+    // `F_DUPFD_CLOEXEC` (POSIX.1-2008) duplicates AND sets close-on-exec atomically, so
+    // there is no window where a concurrent fork could inherit it either.
+    // (Audit 2026-08-04.)
     let (owned_reader, owned_writer) = unsafe {
         use std::os::fd::{FromRawFd, OwnedFd};
-        let r = libc::dup(tun.as_raw_fd());
+        let r = libc::fcntl(tun.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0);
         if r < 0 {
             return Err(anyhow::anyhow!("failed to dup TUN fd (reader)"));
         }
         let r = OwnedFd::from_raw_fd(r);
-        let w = libc::dup(tun.as_raw_fd());
+        let w = libc::fcntl(tun.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0);
         if w < 0 {
             // `r` drops here and closes itself.
             return Err(anyhow::anyhow!("failed to dup TUN fd (writer)"));
@@ -3069,9 +3467,12 @@ fn setup_tunnel(
         // bypass route and, in full-tunnel, the IPv6 blackholes (`::/1`, `8000::/1`) on
         // the host. No VPN, and no IPv6 either, fixable only by hand.
         // (Audit 2026-07-27, B1.)
-        if let Err(e) =
+        let route_result =
             route::setup_routes(&config.routing, server_ip, &if_name, &pin_target(config))
-        {
+                .and_then(|()| {
+                    route::apply_local_networks(&config.routing, routes_json, &if_name, server_ip)
+                });
+        if let Err(e) = route_result {
             if let Err(ce) = route::cleanup_routes(&if_name, server_ip, &config.routing.exclude) {
                 log::warn!("route rollback after a failed setup also failed: {ce}");
             }
@@ -3095,44 +3496,70 @@ fn setup_tunnel(
     // On a full-tunnel host with dns=off, all traffic is routed through the tunnel but the
     // system resolver is left untouched — on a normal host (unlike a router with its own
     // local resolver) that can leak DNS to the physical network's resolver. Make it visible.
-    if config.routing.add_default_gateway && config.leaves_resolver_alone() {
+    if is_full_tunnel(config) && config.leaves_resolver_alone() {
         log::warn!(
             "full-tunnel + dns=off/system: qeli does not manage the host resolver, so DNS queries may \
              go to the physical network's resolver. Prefer dns=tunnel unless this host already \
              has a trusted local resolver (e.g. a router)."
         );
     }
-    // DNS resolver management is BEST-EFFORT: the tunnel data-plane is already up by here,
-    // so a failure to touch the host resolver must NOT tear a working tunnel down. This is
-    // exactly the read-only-/etc case (a hardened systemd unit with ProtectSystem, a
-    // container with a read-only rootfs, a netns) where the atomic resolv.conf rewrite hits
-    // `Read-only file system` — previously fatal (`?`), which crash-looped a tunnel that
-    // otherwise carried traffic fine. Warn and continue; the only thing skipped is the
-    // automatic anti-DNS-leak, and the message names the config that suppresses it for good.
-    if let Err(e) = dns::setup_dns_for_interface(&config.dns, dns_ip, dns_port, &if_name) {
-        log::warn!(
-            "DNS setup failed ({e}) — keeping the tunnel UP with the host resolver unchanged. \
-             If /etc is read-only (hardened systemd unit / container / netns), set `dns = off` \
-             in the client config to manage DNS yourself and silence this. In a full-tunnel \
-             profile, DNS queries may go to the physical network's resolver until then."
-        );
+    // DNS is part of the generation-scoped platform plan. Do not acknowledge Running when
+    // a requested resolver could not be installed: that would make the new lifecycle lie
+    // and, in full-tunnel mode, can expose or break name resolution. Operators whose
+    // environment intentionally owns DNS can set `dns = off` and receive an empty DNS plan.
+    // Tunnel subnet, so a server-pushed resolver can be checked for reachability through
+    // the tunnel instead of being written into the host resolver on trust.
+    let tun_net = match (
+        client_ip.parse::<std::net::Ipv4Addr>(),
+        netmask.parse::<std::net::Ipv4Addr>(),
+    ) {
+        (Ok(a), Ok(m)) => Some((a, m)),
+        _ => None,
+    };
+    let dns_result = dns::setup_dns_for_interface(
+        &config.dns,
+        dns_ip,
+        dns_port,
+        &if_name,
+        tun_net,
+        is_full_tunnel(config),
+    );
+    if plan.dns_servers.is_empty() {
+        if let Err(e) = dns_result {
+            log::warn!(
+                "DNS was omitted from the network plan ({e}) — keeping the host resolver unchanged. \
+                 Configure dns_servers, let the server push a reachable resolver, or set `dns = off` \
+                 when the platform manages DNS itself."
+            );
+        }
+    } else if let Err(e) = dns_result {
+        dns::restore_dns_for(&if_name);
+        if !attach {
+            if let Err(ce) = route::cleanup_routes(&if_name, server_ip, &config.routing.exclude) {
+                log::warn!("route rollback after DNS setup failure also failed: {ce}");
+            }
+        }
+        return Err(anyhow::anyhow!(
+            "DNS network-plan step failed: {e}. Set `dns = off` only when the platform manages DNS itself"
+        ));
     }
 
-    // Past every fallible step — hand the raw fds to the caller, who closes them via the
-    // reader/writer threads (see `TunGuard` and the teardown).
-    use std::os::fd::IntoRawFd;
+    // Past every fallible platform step — move the RAII descriptors to the caller, which
+    // immediately hands them to the shared TUN backend. No raw integer ownership escapes.
     Ok(TunnelSetup {
         tun,
-        reader_fd: owned_reader.into_raw_fd(),
-        writer_fd: owned_writer.into_raw_fd(),
+        reader_fd: owned_reader,
+        writer_fd: owned_writer,
         if_name,
         is_tap,
     })
 }
 
+#[cfg(target_os = "linux")]
 async fn connect_and_run_udp(
     config: &crate::config::client::ClientConfig,
     password: &str,
+    core: &mut LinuxCoreAdapter,
 ) -> anyhow::Result<()> {
     if config.obfuscation.mode == "plain" {
         return Err(anyhow::anyhow!(
@@ -3153,28 +3580,45 @@ async fn connect_and_run_udp(
         ));
     }
     let raw_socket = UdpSocket::bind("0.0.0.0:0").await?;
-    // Size the socket buffers BEFORE any traffic. UDP gets no autotuning (unlike TCP), so
-    // the socket keeps net.core.rmem_default — 208 KB on a stock kernel, only tens of
-    // milliseconds of traffic at tunnel speeds. A stall then makes the kernel drop
-    // datagrams, and every dropped datagram is a lost TCP segment INSIDE the tunnel, which
-    // halves the inner connection's window. The receive side is what matters: an
-    // undersized send buffer only applies backpressure, it does not lose data.
-    //
-    // This also makes `performance.recv_buffer_size` / `send_buffer_size` mean something:
-    // both fields existed but were never applied anywhere on the client path.
-    // Both sizes carry their own "leave the kernel alone" default (0), and set_udp_buffers
-    // skips a 0, so this needs no special-casing here.
-    if let Err(e) = crate::transport::tcp::set_udp_buffers(
-        &raw_socket,
-        config.performance.send_buffer_size,
-        config.performance.recv_buffer_size,
-    ) {
-        log::warn!("UDP socket buffers could not be set ({e}) — throughput may suffer");
-    }
+    // The shared UDP path below applies the socket policy before its first handshake packet,
+    // so Linux and every native client use one controller and one set of counters.
     raw_socket.connect(&addr).await?;
     if let Ok(p) = raw_socket.peer_addr() {
         note_connected_peer(p.ip());
     }
+    run_udp_tunnel(raw_socket, config, password, core).await
+}
+
+pub(crate) async fn run_udp_tunnel(
+    raw_socket: UdpSocket,
+    config: &crate::config::client::ClientConfig,
+    password: &str,
+    core: &mut dyn ClientPlatform,
+) -> anyhow::Result<()> {
+    if config.obfuscation.mode == "plain" {
+        return Err(anyhow::anyhow!(
+            "plain (raw) wire mode is TCP-only; set server.protocol = tcp"
+        ));
+    }
+    if config.obfuscation.mode == "obfs" && config.obfuscation.obfs_key.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "obfs wire mode requires a non-empty obfuscation.obfs_key"
+        ));
+    }
+    let runtime_counters = core.counters();
+    let mut udp_buffer = UdpBufferController::configure(
+        &raw_socket,
+        UdpBufferPolicy {
+            send_bytes: config.performance.send_buffer_size,
+            receive_bytes: config.performance.recv_buffer_size,
+            automatic_receive: config.performance.recv_buffer_auto,
+            max_receive_bytes: AUTO_MAX_RECV_BYTES,
+        },
+        runtime_counters.udp.clone(),
+        "client UDP",
+    );
+    let client_device_id = core.device_id()?;
+    let identity_verifier = core.identity_verifier(config);
     // `obfs` wire mode: transparently XOR every datagram (ObfsUdp). None = fake-tls.
     let obfs_key = if config.obfuscation.mode == "obfs" && !config.obfuscation.obfs_key.is_empty() {
         Some(crate::protocol::obfs::derive_obfs_key(
@@ -3193,28 +3637,17 @@ async fn connect_and_run_udp(
     };
     let mut quic_pn = 0u32;
 
-    let client_kp = Keypair::generate();
-    // SNI precedence: an explicit `obfuscation.sni` override (e.g. pinned by a
-    // qeli:// link) wins; else the connect hostname; else a random decoy when
-    // connecting to a bare IP.
-    let server_name: &str = match config.obfuscation.sni.as_deref() {
-        Some(s) if !s.is_empty() => s,
-        _ if config.server.address.parse::<std::net::IpAddr>().is_ok() => pick_random_sni(),
-        _ => &config.server.address,
-    };
-
     // The UDP ClientHello carries the ML-KEM-768 encapsulation key (~1.4 KB total)
     // and the ServerHello the ML-KEM ciphertext + cert (~2 KB); both exceed the path
     // MTU and would be IP-fragmented, which mobile / CGNAT networks drop (breaking UDP
     // on LTE). We fragment them ourselves so no datagram needs IP fragmentation.
     // `pad_to_min` still enforces the anti-amplification floor; see build_client_hello.
-    let (client_hello, mlkem_dk) =
-        FakeTlsHandshake::build_client_hello_pq(client_kp.public(), server_name, 1200, None);
-    let ch_frags = crate::protocol::udp_frag::fragment(
-        crate::protocol::udp_frag::MSG_CLIENT_HELLO,
-        &client_hello,
-    )
-    .map_err(|e| anyhow::anyhow!("ClientHello too large to fragment: {e}"))?;
+    let UdpClientHelloFlight {
+        client_keypair: client_kp,
+        mlkem_decapsulation_key: mlkem_dk,
+        client_hello,
+        fragments: ch_frags,
+    } = build_udp_client_hello_flight(config)?;
     let n_frags = ch_frags.len();
 
     // AWG junk (AmneziaWG-style Jc) on UDP: before the ClientHello, emit `jc` throwaway
@@ -3481,17 +3914,18 @@ async fn connect_and_run_udp(
         &transcript_hash,
         &config.auth.server_public_key,
     )?;
-    verify_server_key(
-        &server_static_pub_bytes,
-        &config.auth.server_public_key,
-        &format!("{}:{}", config.server.address, config.server.port),
-        config.auth.allow_unpinned_tofu,
-    )?;
+    identity_verifier(server_static_pub_bytes).await?;
 
     log::info!("UDP: Server identity verified");
 
-    let auth_plain =
-        build_client_auth_plaintext(config, &client_kp, &shared.0, &transcript_hash, password);
+    let auth_plain = build_client_auth_plaintext(
+        config,
+        &client_kp,
+        &shared.0,
+        &transcript_hash,
+        &client_device_id,
+        password,
+    );
     // The inner encrypted auth packet is fixed; only the QUIC wrapper's packet number
     // changes per (re)send. Resending identical inner bytes is safe: a duplicate that
     // reaches the server is replay-dropped, while a resend after loss is processed as
@@ -3606,20 +4040,6 @@ async fn connect_and_run_udp(
     let response_str = String::from_utf8(auth_response)?;
 
     let ok = parse_auth_ok(&response_str)?;
-    // Log the whole push BEFORE the fields are moved out of `ok` below.
-    log_server_push(
-        config,
-        &ok.client_ip,
-        ok.prefix,
-        &ok.server_ip,
-        ok.mtu,
-        &ok.dns_ip,
-        &ok.dns_port,
-        &ok.routes_json,
-        ok.pushed_obf.as_ref(),
-        ok.max_streams,
-        ok.adaptive,
-    );
     let client_ip = ok.client_ip;
     let server_ip = ok.server_ip;
     let prefix = ok.prefix;
@@ -3627,18 +4047,21 @@ async fn connect_and_run_udp(
     let dns_ip = ok.dns_ip;
     let dns_port = ok.dns_port;
     let routes_json_udp = ok.routes_json;
+    let max_streams_udp = ok.max_streams;
+    let adaptive_udp = ok.adaptive;
 
     let mut eff_obf = config.obfuscation.clone();
-    if let Some(po) = ok.pushed_obf {
-        eff_obf.padding = po.padding;
-        eff_obf.heartbeat = po.heartbeat;
-        eff_obf.traffic_normalization = po.traffic_normalization;
-        eff_obf.traffic_shaping = po.traffic_shaping;
+    let pushed_obf = ok.pushed_obf;
+    if let Some(po) = pushed_obf.as_ref() {
+        eff_obf.padding = po.padding.clone();
+        eff_obf.heartbeat = po.heartbeat.clone();
+        eff_obf.traffic_normalization = po.traffic_normalization.clone();
+        eff_obf.traffic_shaping = po.traffic_shaping.clone();
     }
 
     log::info!("UDP: Auth OK, assigned IP: {}", client_ip);
-    // (the full push — routes/DNS/MTU/obf and what was applied — is logged by
-    // log_server_push() right after parse_auth_ok above)
+    // The complete push journal is attached below after path-MTU probing, so every
+    // platform sees both the server ceiling and the final selected MTU.
 
     // Auto MTU on UDP: when `mtu = 0` and probing is on, actively discover the path
     // MTU (DF probes from the pushed ceiling down) before bringing the TUN up — so a
@@ -3672,28 +4095,53 @@ async fn connect_and_run_udp(
     } else {
         base_mtu
     };
-    let tun_setup = setup_tunnel(
+    let fallback_dns_servers = core.fallback_dns_servers().to_vec();
+    let network = HandshakeNetwork {
+        client_ip: &client_ip,
+        prefix,
+        tunnel_gateway: &server_ip,
+        dns_ip: &dns_ip,
+        dns_port: &dns_port,
+        routes_json: &routes_json_udp,
+        mtu: tun_mtu,
+        fallback_dns_servers: &fallback_dns_servers,
+    };
+    let mut plan = build_network_plan(config, core.next_generation(), &network)?;
+    plan.max_streams = max_streams_udp;
+    plan.adaptive = adaptive_udp;
+    plan.data_plane = crate::transport_core::NetworkDataPlaneFacts::from_obfuscation(&eff_obf);
+    plan.connection_log = server_push_log_lines(
         config,
-        &client_ip,
-        &prefix_to_netmask(prefix),
-        &server_ip,
+        &plan,
+        pushed_mtu,
         &dns_ip,
         &dns_port,
-        tun_mtu,
-    )?;
-    route::apply_local_networks(
-        &config.routing,
         &routes_json_udp,
-        &tun_setup.if_name,
-        &server_ip,
+        pushed_obf.as_ref(),
     );
+    for line in &plan.connection_log {
+        log::info!("{line}");
+    }
+    let tun_setup = core.prepare_tunnel(config, plan, &network)?;
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     let reader_fd = tun_setup.reader_fd;
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     let writer_fd = tun_setup.writer_fd;
+    #[cfg(target_os = "linux")]
     let tun_name = tun_setup.if_name;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     let is_tap = tun_setup.is_tap;
+    #[cfg(target_os = "macos")]
+    let is_tap = false;
+    #[cfg(target_os = "linux")]
     let server_addr = pin_target(config);
+    #[cfg(target_os = "linux")]
     let tunnel_tun = tun_setup.tun;
+    #[cfg(target_os = "linux")]
     let tap_mac = if is_tap { generate_mac() } else { [0u8; 6] };
+    #[cfg(any(target_os = "android", target_os = "macos"))]
+    let tap_mac = [0u8; 6];
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     let gateway_mac: [u8; 6] = if is_tap {
         [0x02, 0x00, 0x00, 0x00, 0x00, 0x01]
     } else {
@@ -3709,127 +4157,56 @@ async fn connect_and_run_udp(
     let padding_enabled = eff_obf.padding.enabled;
     let padding_randomize = eff_obf.padding.randomize;
     let padding_prob = eff_obf.padding.probability;
-    let tun_buf_size = config.performance.tun_buffer_size;
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    let tun_buf_size = config
+        .performance
+        .tun_buffer_size
+        .saturating_add(if cfg!(target_os = "macos") { 4 } else { 0 });
     let norm_sizes = &eff_obf.traffic_normalization.round_sizes;
 
-    let (tun_read_tx, mut tun_read_rx) = mpsc::channel::<Vec<u8>>(4096);
-
-    let is_tap_reader_udp = is_tap;
-    let tun_stop = Arc::new(AtomicBool::new(false));
     // Everything below can bail out through `?`, which would skip the teardown at the
     // end of this function; from here on the guard covers that (see `TunGuard`).
+    #[cfg(target_os = "linux")]
     let mut tun_guard = TunGuard::new(
         tun_name.clone(),
-        tun_stop.clone(),
         !config.tun.attach_existing,
         server_addr.clone(),
         config.routing.exclude.clone(),
     );
-    let tun_stop_r = tun_stop.clone();
-    let tun_reader_handle = tokio::task::spawn_blocking(move || {
-        let mut buf2 = vec![0u8; tun_buf_size];
-        loop {
-            if tun_stop_r.load(Ordering::Relaxed) {
-                break;
-            }
-            let n = unsafe {
-                libc::read(
-                    reader_fd,
-                    buf2.as_mut_ptr() as *mut libc::c_void,
-                    buf2.len(),
-                )
-            };
-            if n < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::WouldBlock {
-                    // Wait in the kernel for readability rather than spinning. The old
-                    // 1 ms sleep meant ~1000 wakeups per second per client on a
-                    // completely idle tunnel — invisible on a desktop, but real cost on
-                    // a battery-powered phone or a small router. `poll` returns the
-                    // instant a packet arrives, so nothing is added to the latency of
-                    // actual traffic; the timeout only bounds how long the stop flag
-                    // above can go unnoticed during teardown.
-                    let mut pfd = libc::pollfd {
-                        fd: reader_fd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    unsafe { libc::poll(&mut pfd, 1, 250) };
-                    continue;
-                }
-                log::error!("TUN read error: {}", err);
-                break;
-            }
-            if n == 0 {
-                break;
-            }
-            let raw = &buf2[..n as usize];
-            let packet = if is_tap_reader_udp {
-                match strip_ethernet_header(raw) {
-                    Some(ip) => ip.to_vec(),
-                    None => continue,
-                }
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    let mut tun_pump = LinuxTunPump::start(
+        reader_fd,
+        writer_fd,
+        LinuxTunPumpConfig {
+            buffer_size: tun_buf_size,
+            framing: if cfg!(target_os = "macos") {
+                TunFraming::Utun
+            } else if is_tap {
+                TunFraming::Tap(TapHeaders {
+                    client_mac: tap_mac,
+                    gateway_mac,
+                })
             } else {
-                raw.to_vec()
-            };
-            if tun_read_tx.blocking_send(packet).is_err() {
-                break;
-            }
-        }
-        unsafe {
-            libc::close(reader_fd);
-        }
-        log::info!("TUN reader stopped");
-    });
-
-    // Dedicated UDP-side TUN writer thread; same pattern as the TCP-side fix.
-    let is_tap_writer_udp = is_tap;
-    let (tun_write_tx, tun_write_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2048);
-    let _tun_writer_thread = {
-        let tap_mac_w = tap_mac;
-        let gateway_mac_w = gateway_mac;
-        std::thread::spawn(move || {
-            log::info!("UDP: TUN writer started");
-            'writer: for packet in tun_write_rx {
-                if packet.is_empty() {
-                    continue;
-                }
-                let tap_frame = if is_tap_writer_udp {
-                    Some(prepend_ethernet_header(&packet, &tap_mac_w, &gateway_mac_w))
-                } else {
-                    None
-                };
-                let buf: &[u8] = tap_frame.as_deref().unwrap_or(&packet);
-                // Same handling as the TCP-side writer and server/mod.rs: retry EINTR, treat
-                // a full TX queue as a congestion drop, and stop on a fatal errno instead of
-                // silently discarding every packet into a dead fd while still "connected".
-                loop {
-                    let n = unsafe {
-                        libc::write(writer_fd, buf.as_ptr() as *const libc::c_void, buf.len())
-                    };
-                    if n >= 0 {
-                        break;
-                    }
-                    let err = std::io::Error::last_os_error();
-                    match err.raw_os_error() {
-                        Some(libc::EINTR) => continue,
-                        Some(libc::ENOBUFS) | Some(libc::EAGAIN) => {
-                            log::debug!("UDP: TUN writer dropped packet ({})", err);
-                            break;
-                        }
-                        _ => {
-                            log::warn!("UDP: TUN writer fatal write error ({}) — stopping", err);
-                            break 'writer;
-                        }
-                    }
-                }
-            }
-            unsafe {
-                libc::close(writer_fd);
-            }
-            log::info!("UDP: TUN writer stopped");
-        })
+                TunFraming::Raw
+            },
+        },
+    )?;
+    #[cfg(target_os = "windows")]
+    let mut tun_pump = match tun_setup.windows_tun {
+        WindowsTunSetup::Ring(adapter_name) => WindowsTunPump::open(&adapter_name)?,
+        WindowsTunSetup::Packet(packet_tun) => WindowsTunPump::packet(packet_tun),
     };
+    #[cfg(target_os = "ios")]
+    let mut tun_pump = tun_setup.packet_tun;
+    #[cfg(target_os = "linux")]
+    tun_guard.attach_pump(tun_pump.stop_handle());
+    let tun_write_tx = tun_pump.sender_to_tun();
+    let cancel = core.cancel_token();
+    // Persistent for the same reason as the TCP cancellation tick: high packet rates must
+    // never postpone teardown by continually resetting a newly-created sleep future.
+    let mut cancel_tick = tokio::time::interval(Duration::from_millis(100));
+    cancel_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    cancel_tick.tick().await;
 
     let heartbeat_interval = Duration::from_millis(if heartbeat_enabled {
         hb_config.interval_ms
@@ -3840,14 +4217,14 @@ async fn connect_and_run_udp(
     heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut idle_check = tokio::time::interval(Duration::from_secs(5));
     idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut udp_buffer_tick = tokio::time::interval(Duration::from_secs(1));
+    udp_buffer_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_activity = tokio::time::Instant::now();
     // Last datagram RECEIVED from the server (RX-only) — for dead-link detection,
     // independent of our own heartbeats. (UDP has no connection state, so this is
     // the only way to notice a vanished server.)
     let mut last_rx_inst = tokio::time::Instant::now();
     let idle_timeout = Duration::from_secs(config.performance.idle_timeout_secs);
-    let rx_dead = std::cmp::max(heartbeat_interval * 3, Duration::from_secs(30));
-
     let socket = Arc::new(socket);
 
     // Flow-shaping (client->server idle cover): mirror of the TCP path; replaces
@@ -3866,6 +4243,13 @@ async fn connect_and_run_udp(
     );
     let shaping_on = shaper.enabled();
     let heartbeat_enabled = heartbeat_enabled && !shaping_on;
+    let rx_dead = crate::protocol::liveness_deadline(
+        heartbeat_enabled,
+        heartbeat_interval,
+        Duration::from_millis(hb_config.jitter_ms),
+        shaping_on,
+        Duration::from_millis(eff_obf.traffic_shaping.idle_gap_max_ms),
+    );
     let mut last_tx_inst = tokio::time::Instant::now();
     let mut cover_deadline = tokio::time::Instant::now() + shaper.next_gap(&mut rand::rng());
     // Suspend/resume baseline: each idle tick compares wall-clock elapsed to monotonic
@@ -3873,6 +4257,18 @@ async fn connect_and_run_udp(
     // on macOS/Windows) while the wall clock kept running ⇒ the session + NAT are gone.
     let mut last_tick_wall = std::time::SystemTime::now();
     let mut last_tick_inst = tokio::time::Instant::now();
+    // The UDP loop is sequential, so it can retain its record/envelope allocations for the
+    // whole connection. A separate cover record is required because stealth pacing may send
+    // cover while the real record is waiting; the QUIC envelope can be reused for both.
+    let wire_capacity =
+        crate::protocol::packet::TLS_RECORD_HEADER + crate::protocol::packet::MAX_RECORD_SIZE;
+    let mut wire_record = Vec::with_capacity(wire_capacity);
+    let mut cover_record = Vec::with_capacity(wire_capacity);
+    let mut quic_record =
+        Vec::with_capacity(wire_capacity + crate::protocol::quic::QUIC_SHORT_HEADER_MIN);
+    let mut normalized_packet = Vec::with_capacity(tun_mtu.max(0) as usize);
+    let mut padding = Vec::with_capacity(crate::protocol::packet::MAX_RECORD_SIZE);
+    let mut oversize_tun_drops: u64 = 0;
 
     // Tell the server the MTU we actually settled on (#13). It sized its own downlink from
     // the profile's `tun.mtu`, which is the path up to ITS tun — it cannot see that our leg
@@ -3891,14 +4287,18 @@ async fn connect_and_run_udp(
     let mut mtu_resends: u8 = 0;
     if let Some(mtu) = mtu_report_value {
         let frame = crate::protocol::ctrl::mtu_report(mtu);
-        if let Ok(pkt) = client_tx.encrypt_packet(&frame, &[]) {
-            let send_data = if quic_enabled {
+        if client_tx
+            .encrypt_packet_into(&frame, &[], &mut cover_record)
+            .is_ok()
+        {
+            let send_data: &[u8] = if quic_enabled {
                 quic_pn += 1;
-                wrap_quic_short(&pkt, &connection_id, quic_pn - 1)
+                wrap_quic_short_into(&cover_record, &connection_id, quic_pn - 1, &mut quic_record);
+                &quic_record
             } else {
-                pkt
+                &cover_record
             };
-            match socket.send(&send_data).await {
+            match socket.send(send_data).await {
                 Ok(_) => {
                     log::debug!("reported tunnel MTU {mtu} to the server");
                     mtu_resends = MTU_REPORT_RESENDS;
@@ -3913,38 +4313,87 @@ async fn connect_and_run_udp(
     // report above: an older server discards the frame as a malformed packet, and nothing
     // here waits for or depends on a reply.
     if let Some(frame) = crate::protocol::ctrl::this_build() {
-        if let Ok(pkt) = client_tx.encrypt_packet(&frame, &[]) {
-            let send_data = if quic_enabled {
+        if client_tx
+            .encrypt_packet_into(&frame, &[], &mut cover_record)
+            .is_ok()
+        {
+            let send_data: &[u8] = if quic_enabled {
                 quic_pn += 1;
-                wrap_quic_short(&pkt, &connection_id, quic_pn - 1)
+                wrap_quic_short_into(&cover_record, &connection_id, quic_pn - 1, &mut quic_record);
+                &quic_record
             } else {
-                pkt
+                &cover_record
             };
-            if let Err(e) = socket.send(&send_data).await {
+            if let Err(e) = socket.send(send_data).await {
                 log::debug!("could not report client version: {e}");
             }
         }
     }
 
     let proxy_handle = start_local_proxy(config, &client_ip, &tun_name);
-
+    let mut unsupported_inner_drops = 0u64;
     loop {
         tokio::select! {
-            Some(ip_packet) = tun_read_rx.recv() => {
+            _ = cancel_tick.tick() => {
+                if cancel.load(Ordering::Acquire) { break; }
+            }
+
+            _ = udp_buffer_tick.tick() => {
+                udp_buffer.tick(socket.raw_socket());
+            }
+
+            packet = tun_pump.recv_from_tun() => {
+                let Some(ip_packet) = packet else {
+                    log::warn!("UDP: TUN reader stopped — reconnecting");
+                    break;
+                };
+                if !is_supported_inner_packet(ip_packet.as_ref()) {
+                    unsupported_inner_drops = unsupported_inner_drops.saturating_add(1);
+                    udp_buffer.note_internal_drop();
+                    if unsupported_inner_drops.is_power_of_two() {
+                        log::debug!(
+                            "UDP client dropped unsupported non-IPv4 inner packet (total {})",
+                            unsupported_inner_drops
+                        );
+                    }
+                    continue;
+                }
+                let mtu = tun_mtu.max(0) as usize;
+                if mtu != 0 && ip_packet.len() > mtu {
+                    oversize_tun_drops = oversize_tun_drops.saturating_add(1);
+                    udp_buffer.note_internal_drop();
+                    if oversize_tun_drops.is_power_of_two() {
+                        log::warn!(
+                            "UDP client dropped inner packet larger than tunnel MTU: {} > {} bytes (total {})",
+                            ip_packet.len(), mtu, oversize_tun_drops
+                        );
+                    }
+                    continue;
+                }
                 trace::record(trace::Dir::Tx, "client.udp", ip_packet.len(), 0);
+                runtime_counters.tx_packets.fetch_add(1, Ordering::Relaxed);
+                runtime_counters
+                    .tx_bytes
+                    .fetch_add(ip_packet.len() as u64, Ordering::Relaxed);
                 last_activity = tokio::time::Instant::now();
                 last_tx_inst = last_activity;
                 let encrypted = {
                     let mut obf = Obfuscator::new();
-                    let mut data_with_route = ip_packet;
-                    let mtu = tun_mtu.max(0) as usize;
-                    if eff_obf.traffic_normalization.enabled && !norm_sizes.is_empty() {
+                    let normalized = if eff_obf.traffic_normalization.enabled && !norm_sizes.is_empty() {
                         // Bounded by the SAME mtu the pad cap below uses: normalization that
                         // rounds past it re-creates the oversized DF datagram the probe just
                         // ruled out, and the pad cap cannot undo it (it only trims padding).
-                        data_with_route =
-                            obf.normalize_packet_length(&data_with_route, norm_sizes, mtu);
-                    }
+                        obf.normalize_packet_length_into(
+                            ip_packet.as_ref(),
+                            norm_sizes,
+                            mtu,
+                            &mut normalized_packet,
+                        );
+                        Some(normalized_packet.as_slice())
+                    } else {
+                        None
+                    };
+                    let data_with_route = normalized.unwrap_or_else(|| ip_packet.as_ref());
                     // Clamp padding so the whole record (data + padding) stays within the
                     // DISCOVERED/pushed tunnel MTU. The path-MTU probe certifies that a
                     // datagram of `tun_mtu + REC_OVERHEAD(48)` fits, and the real record adds
@@ -3956,17 +4405,27 @@ async fn connect_and_run_udp(
                     // `+60` overhead that under-counted obfs+quic (65) by 5 bytes.
                     let pad_cap =
                         (padding_max as usize).min(mtu.saturating_sub(data_with_route.len())) as u16;
-                    let padding = obf.generate_padding_opts(
-                        padding_enabled, padding_min, pad_cap, padding_randomize, padding_prob,
+                    obf.generate_padding_opts_into(
+                        padding_enabled,
+                        padding_min,
+                        pad_cap,
+                        padding_randomize,
+                        padding_prob,
+                        &mut padding,
                     );
-                    client_tx.encrypt_packet(&data_with_route, &padding).ok()
+                    client_tx
+                        .encrypt_packet_into(data_with_route, &padding, &mut wire_record)
+                        .is_ok()
                 };
-                if let Some(pkt) = encrypted {
+                // Encryption has copied the plaintext into its wire record; return the TUN
+                // allocation before any pacing or socket-send await below.
+                drop(ip_packet);
+                if encrypted {
                     // Stealth: pace the uplink to stealth_rate; fill the gap with
                     // jittered small cover (size mix + non-metronome). Cover datagrams
                     // take their own QUIC pns FIRST so the real packet's pn stays the
                     // largest (monotonic on the wire).
-                    let d = shaper.stealth_pace(pkt.len(), std::time::Instant::now());
+                    let d = shaper.stealth_pace(wire_record.len(), std::time::Instant::now());
                     if shaper.stealth() && !d.is_zero() {
                         let mut remaining = d;
                         while remaining > Duration::from_millis(6) {
@@ -3977,17 +4436,29 @@ async fn connect_and_run_udp(
                             let csize =
                                 shaper.next_size(&mut rand::rng()).min(tun_mtu.max(0) as usize);
                             if shaper.try_spend(csize, std::time::Instant::now()) {
-                                let cover = {
+                                let cover_ready = {
                                     let mut obf = Obfuscator::new();
-                                    let pad = obf.generate_padding(csize as u16, csize as u16);
-                                    client_tx.encrypt_packet(&[], &pad).ok()
+                                    obf.generate_padding_into(
+                                        csize as u16,
+                                        csize as u16,
+                                        &mut padding,
+                                    );
+                                    client_tx
+                                        .encrypt_packet_into(&[], &padding, &mut cover_record)
+                                        .is_ok()
                                 };
-                                if let Some(c) = cover {
-                                    let cd = if quic_enabled {
+                                if cover_ready {
+                                    let send_data: &[u8] = if quic_enabled {
                                         quic_pn += 1;
-                                        wrap_quic_short(&c, &connection_id, quic_pn - 1)
-                                    } else { c };
-                                    let _ = socket.send(&cd).await;
+                                        wrap_quic_short_into(
+                                            &cover_record,
+                                            &connection_id,
+                                            quic_pn - 1,
+                                            &mut quic_record,
+                                        );
+                                        &quic_record
+                                    } else { &cover_record };
+                                    let _ = socket.send(send_data).await;
                                 }
                             }
                             let step = Duration::from_millis(rand::rng().random_range(4..=18));
@@ -3998,13 +4469,22 @@ async fn connect_and_run_udp(
                     } else if !d.is_zero() {
                         tokio::time::sleep(d).await;
                     }
-                    let send_data = if quic_enabled {
+                    let send_data: &[u8] = if quic_enabled {
                         quic_pn += 1;
-                        wrap_quic_short(&pkt, &connection_id, quic_pn - 1)
+                        wrap_quic_short_into(
+                            &wire_record,
+                            &connection_id,
+                            quic_pn - 1,
+                            &mut quic_record,
+                        );
+                        &quic_record
                     } else {
-                        pkt
+                        &wire_record
                     };
-                    let _ = socket.send(&send_data).await;
+                    if let Err(error) = socket.send(send_data).await {
+                        log::warn!("UDP carrier send failed: {error}");
+                        break;
+                    }
                 }
             }
 
@@ -4013,28 +4493,55 @@ async fn connect_and_run_udp(
                     Ok(n) => n,
                     Err(_) => break,
                 };
-                last_activity = tokio::time::Instant::now();
-                last_rx_inst = last_activity;
+                udp_buffer.note_receive(n);
+                // Unlike TCP, UDP must not await a pool slot here: doing so would stall this
+                // select loop's heartbeat and dead-link timers. Congestion already uses
+                // drop-on-full semantics at the TUN queue, so drop the datagram when every
+                // bounded record allocation is still in flight.
+                let mut record = match tun_write_tx.try_acquire() {
+                    Some(record) => record,
+                    None => {
+                        log::trace!("downlink record pool exhausted — dropping inbound datagram");
+                        udp_buffer.note_internal_drop();
+                        continue;
+                    }
+                };
                 let payload = if quic_enabled {
-                    match unwrap_quic(&recv_buf[..n]) {
-                        Ok(pkt) => pkt.payload,
+                    match unwrap_quic_payload(&recv_buf[..n]) {
+                        Ok(payload) => payload,
                         Err(_) => continue,
                     }
                 } else {
-                    recv_buf[..n].to_vec()
+                    &recv_buf[..n]
                 };
-                match client_rx.decrypt_packet(&payload) {
-                    Ok(plaintext) => {
-                        if !plaintext.is_empty() {
+                // A crafted oversized datagram must not make a pooled Vec grow beyond the
+                // fixed per-slot budget before PacketCodec gets to reject its length field.
+                if payload.len() > wire_capacity {
+                    continue;
+                }
+                record.as_vec_mut().extend_from_slice(payload);
+                match client_rx.decrypt_packet_in_place(record.as_vec_mut()) {
+                    Ok(()) => {
+                        // Only authenticated records prove that the peer/session is alive.
+                        // Updating this before QUIC parsing + AEAD let malformed or spoofed
+                        // carrier datagrams suppress reconnect indefinitely.
+                        last_activity = tokio::time::Instant::now();
+                        last_rx_inst = last_activity;
+                        if !record.is_empty() {
+                            runtime_counters.rx_packets.fetch_add(1, Ordering::Relaxed);
+                            runtime_counters
+                                .rx_bytes
+                                .fetch_add(record.len() as u64, Ordering::Relaxed);
                             // Non-blocking: a blocking send() here would stall the
                             // entire select! loop (heartbeat, RX-liveness, reads)
                             // whenever the TUN writer falls behind. Drop on a full
                             // queue — correct congestion behaviour.
-                            trace::record(trace::Dir::Rx, "client.udp", plaintext.len(), 0);
-                            match tun_write_tx.try_send(plaintext) {
+                            trace::record(trace::Dir::Rx, "client.udp", record.len(), 0);
+                            match tun_write_tx.try_send(record) {
                                 Ok(()) => {}
                                 Err(std::sync::mpsc::TrySendError::Full(_)) => {
                                     log::trace!("TUN write queue full — dropping inbound datagram");
+                                    udp_buffer.note_internal_drop();
                                 }
                                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
                             }
@@ -4064,7 +4571,7 @@ async fn connect_and_run_udp(
                 };
                 tokio::time::sleep(jitter).await;
 
-                let heartbeat = {
+                let heartbeat_ready = {
                     let mut obf = Obfuscator::new();
                     // Cap the (server-pushable) heartbeat size to the probed MTU so a large
                     // data_size_bytes can't make a DF-marked keepalive overflow the path and
@@ -4073,17 +4580,25 @@ async fn connect_and_run_udp(
                     let hb_lo = (hb_config.data_size_bytes as usize).min(hb_cap) as u16;
                     let hb_hi = ((hb_config.data_size_bytes as usize).saturating_add(32))
                         .min(hb_cap) as u16;
-                    let padding = obf.generate_padding(hb_lo, hb_hi);
-                    client_tx.encrypt_packet(&[], &padding).ok()
+                    obf.generate_padding_into(hb_lo, hb_hi, &mut padding);
+                    client_tx
+                        .encrypt_packet_into(&[], &padding, &mut cover_record)
+                        .is_ok()
                 };
-                if let Some(hb) = heartbeat {
-                    let send_data = if quic_enabled {
+                if heartbeat_ready {
+                    let send_data: &[u8] = if quic_enabled {
                         quic_pn += 1;
-                        wrap_quic_short(&hb, &connection_id, quic_pn - 1)
+                        wrap_quic_short_into(
+                            &cover_record,
+                            &connection_id,
+                            quic_pn - 1,
+                            &mut quic_record,
+                        );
+                        &quic_record
                     } else {
-                        hb
+                        &cover_record
                     };
-                    let _ = socket.send(&send_data).await;
+                    let _ = socket.send(send_data).await;
                 }
                 last_activity = tokio::time::Instant::now();
                 last_tx_inst = last_activity;
@@ -4096,19 +4611,31 @@ async fn connect_and_run_udp(
                     // Cap idle-cover size to the probed MTU (see the stealth-cover branch).
                     let size = shaper.next_size(&mut rand::rng()).min(tun_mtu.max(0) as usize);
                     if shaper.try_spend(size, std::time::Instant::now()) {
-                        let cover = {
+                        let cover_ready = {
                             let mut obf = Obfuscator::new();
-                            let padding = obf.generate_padding(size as u16, size as u16);
-                            client_tx.encrypt_packet(&[], &padding).ok()
+                            obf.generate_padding_into(
+                                size as u16,
+                                size as u16,
+                                &mut padding,
+                            );
+                            client_tx
+                                .encrypt_packet_into(&[], &padding, &mut cover_record)
+                                .is_ok()
                         };
-                        if let Some(pkt) = cover {
-                            let send_data = if quic_enabled {
+                        if cover_ready {
+                            let send_data: &[u8] = if quic_enabled {
                                 quic_pn += 1;
-                                wrap_quic_short(&pkt, &connection_id, quic_pn - 1)
+                                wrap_quic_short_into(
+                                    &cover_record,
+                                    &connection_id,
+                                    quic_pn - 1,
+                                    &mut quic_record,
+                                );
+                                &quic_record
                             } else {
-                                pkt
+                                &cover_record
                             };
-                            let _ = socket.send(&send_data).await;
+                            let _ = socket.send(send_data).await;
                             last_tx_inst = tokio::time::Instant::now();
                         }
                     }
@@ -4127,14 +4654,23 @@ async fn connect_and_run_udp(
                     mtu_resends -= 1;
                     if let Some(mtu) = mtu_report_value {
                         let frame = crate::protocol::ctrl::mtu_report(mtu);
-                        if let Ok(pkt) = client_tx.encrypt_packet(&frame, &[]) {
-                            let send_data = if quic_enabled {
+                        if client_tx
+                            .encrypt_packet_into(&frame, &[], &mut cover_record)
+                            .is_ok()
+                        {
+                            let send_data: &[u8] = if quic_enabled {
                                 quic_pn += 1;
-                                wrap_quic_short(&pkt, &connection_id, quic_pn - 1)
+                                wrap_quic_short_into(
+                                    &cover_record,
+                                    &connection_id,
+                                    quic_pn - 1,
+                                    &mut quic_record,
+                                );
+                                &quic_record
                             } else {
-                                pkt
+                                &cover_record
                             };
-                            let _ = socket.send(&send_data).await;
+                            let _ = socket.send(send_data).await;
                         }
                     }
                 }
@@ -4149,20 +4685,17 @@ async fn connect_and_run_udp(
                     log::warn!("UDP: resumed from suspend (~{}s) — reconnecting", wall_gap.as_secs());
                     break;
                 }
-                // Uplink active but no downlink ⇒ dead session, regardless of heartbeat/
-                // shaping (covers a network change with no suspend and the both-off profiles).
-                // A live tunnel with active TX always gets return traffic (ACKs/data).
-                if last_tx_inst.elapsed() < Duration::from_secs(2)
-                    && last_rx_inst.elapsed() > Duration::from_secs(8) {
-                    log::warn!("UDP: uplink active but no downlink >8s — reconnecting");
-                    break;
-                }
-                // RX-liveness: server silent for >3 heartbeat intervals ⇒ dead ⇒
-                // break to reconnect. The server heartbeats (or sends shaping cover)
-                // while idle, so a live link always refreshes last_rx_inst.
-                if (heartbeat_enabled || shaping_on) && last_rx_inst.elapsed() > rx_dead {
-                    log::warn!("UDP: no data from server for >{}s — reconnecting", rx_dead.as_secs());
-                    break;
+                // RX-liveness is valid only when the peer promises authenticated heartbeat
+                // or shaping cover. Ordinary UDP uplink is allowed to be one-way and has no
+                // transport ACK, so it must never be treated as proof that downlink is due.
+                if let Some(deadline) = rx_dead {
+                    if last_rx_inst.elapsed() > deadline {
+                        log::warn!(
+                            "UDP: no authenticated data from server for >{}s — reconnecting",
+                            deadline.as_secs()
+                        );
+                        break;
+                    }
                 }
                 if idle_timeout.as_secs() > 0 && last_activity.elapsed() > idle_timeout {
                     log::debug!("Idle timeout reached");
@@ -4175,21 +4708,22 @@ async fn connect_and_run_udp(
     if let Some(h) = proxy_handle {
         h.abort();
     }
+    #[cfg(target_os = "linux")]
     dns::restore_dns();
-    tun_stop.store(true, Ordering::Relaxed); // tell the reader thread to exit
-    drop(tun_read_rx);
-    let _ = tun_reader_handle.await;
-    // tun_write_tx dropped here, dedicated writer thread closes writer_fd
     drop(tun_write_tx);
+    tun_pump.shutdown().await;
     // Closes the TUN fd: `TunInterface` holds it as a `File`. (Do NOT also close the raw
     // number — that would be a double close, and the freed number can already have been
     // handed to another thread's socket.)
+    #[cfg(target_os = "linux")]
     drop(tunnel_tun);
     // Attach mode: the interface + routes belong to an external owner — leave them.
+    #[cfg(target_os = "linux")]
     if !config.tun.attach_existing {
         TunInterface::delete(&tun_name).ok();
         route::cleanup_routes(&tun_name, &server_addr, &config.routing.exclude).ok();
     }
+    #[cfg(target_os = "linux")]
     tun_guard.disarm(); // graceful teardown done — nothing left for `Drop` to repeat
     log::info!("UDP client disconnected");
     Ok(())
@@ -4198,6 +4732,7 @@ async fn connect_and_run_udp(
 /// Convert a CIDR prefix length (e.g. 24) to a dotted IPv4 netmask (e.g.
 /// "255.255.255.0"). Out-of-range values fall back to /24 so a malformed push
 /// can never produce an unusable mask.
+#[cfg(target_os = "linux")]
 fn prefix_to_netmask(prefix: u8) -> String {
     let p = if (1..=32).contains(&prefix) {
         prefix
@@ -4221,6 +4756,7 @@ fn prefix_to_netmask(prefix: u8) -> String {
 ///   verified against it on every later connection, so a later key change aborts as
 ///   a probable MITM (instead of the old behaviour of warning and accepting any key
 ///   every time).
+#[cfg(target_os = "linux")]
 fn verify_server_key(
     received: &[u8],
     pinned_hex: &Option<String>,
@@ -4247,15 +4783,17 @@ fn verify_server_key(
 
 /// Path of the TOFU trust store (SSH-`known_hosts`-style). Override with
 /// `QELI_KNOWN_HOSTS` (tests, or routers with a different writable path).
+#[cfg(target_os = "linux")]
 fn known_hosts_path() -> String {
     std::env::var("QELI_KNOWN_HOSTS").unwrap_or_else(|_| "/var/lib/qeli/known_hosts".to_string())
 }
 
 /// Trust-on-first-use with persistence. Pins the server's static key on first
 /// sight (recorded under `server_id`), then verifies every later connection
-/// against it — a changed key aborts as a probable MITM. Best-effort on an
-/// unwritable host: if the store can't be written we fall back to a TOFU warning
-/// (no worse than before), but a *readable* store is always enforced.
+/// against it — a changed key aborts as a probable MITM. An unwritable store fails
+/// closed unless the explicit `allow_unpinned_tofu` escape hatch is enabled; a
+/// readable existing pin is always enforced.
+#[cfg(target_os = "linux")]
 fn trust_on_first_use(
     server_id: &str,
     received_hex: &str,
@@ -4266,6 +4804,7 @@ fn trust_on_first_use(
 
 /// Path-injectable core of [`trust_on_first_use`] — unit-testable without touching
 /// the real `/var/lib/qeli/known_hosts`.
+#[cfg(target_os = "linux")]
 fn trust_on_first_use_at(
     path: &str,
     server_id: &str,
@@ -4324,7 +4863,7 @@ fn trust_on_first_use_at(
             {
                 if !allow_unpinned {
                     return Err(anyhow::anyhow!(
-                        "cannot pin server key for {} — writing to the known_hosts store {}                          failed ({}). Refusing to continue unpinned; fix the path or set                          auth.allow_unpinned_tofu = true to accept the risk.",
+                        "cannot pin server key for {} — writing to the known_hosts store {}                          failed ({}). Refusing to continue unpinned; fix the path or set                          allow_unpinned_tofu = true to accept the risk.",
                         server_id,
                         path,
                         e
@@ -4359,7 +4898,7 @@ fn trust_on_first_use_at(
                      Refusing to connect unpinned (fail closed) to avoid a first-connect MITM \
                      window. Fix: set auth.server_public_key to pin explicitly (recommended), \
                      point QELI_KNOWN_HOSTS at a writable path, or set \
-                     auth.allow_unpinned_tofu = true to accept the risk.",
+                     allow_unpinned_tofu = true to accept the risk.",
                     server_id,
                     path,
                     e
@@ -4367,7 +4906,7 @@ fn trust_on_first_use_at(
             }
             log::warn!(
                 "⚠ Could not record server key in {} ({}). MITM protection NOT pinned this run \
-                 (auth.allow_unpinned_tofu = true); set auth.server_public_key to pin explicitly. \
+                 (allow_unpinned_tofu = true); set key in [qeli] to pin explicitly. \
                  Server key: {}",
                 path,
                 e,
@@ -4378,10 +4917,140 @@ fn trust_on_first_use_at(
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod lifecycle_adapter_tests {
+    use super::*;
+
+    const CONFIG: &str = "[qeli]\nserver = 127.0.0.1:443\nproto = tcp\nuser = test\npass = secret\nkey = 1111111111111111111111111111111111111111111111111111111111111111\nmode = fake-tls\n";
+
+    fn plan(generation: u64) -> NetworkPlan {
+        NetworkPlan {
+            generation,
+            tunnel_address: "10.20.0.2".into(),
+            prefix_len: 24,
+            mtu: 1400,
+            tunnel_gateway: "10.20.0.1".into(),
+            carrier_address: None,
+            routes: vec![NetworkRoute {
+                cidr: "192.0.2.0/24".into(),
+                gateway: "10.20.0.1".into(),
+                metric: 100,
+            }],
+            pushed_routes: vec!["192.0.2.0/24".into()],
+            dns_servers: vec![NetworkDns {
+                address: "10.20.0.1".into(),
+                port: 53,
+            }],
+            full_tunnel: false,
+            kill_switch: false,
+            max_streams: 1,
+            adaptive: false,
+            data_plane: Default::default(),
+            connection_log: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn linux_adapter_enters_running_only_after_platform_apply() {
+        let (mut adapter, _) = LinuxCoreAdapter::new(CONFIG).unwrap();
+        adapter.begin_connection(false).unwrap();
+        assert_eq!(adapter.core.state(), ClientState::Connecting);
+
+        let generation = adapter.next_generation();
+        let result = adapter
+            .apply_network_plan(plan(generation), |event_plan| {
+                assert_eq!(event_plan.generation, generation);
+                assert_eq!(event_plan.routes[0].gateway, "10.20.0.1");
+                Ok(42)
+            })
+            .unwrap();
+
+        assert_eq!(result, 42);
+        assert_eq!(adapter.core.state(), ClientState::Running);
+    }
+
+    #[test]
+    fn linux_adapter_rejects_a_partial_platform_plan() {
+        let (mut adapter, _) = LinuxCoreAdapter::new(CONFIG).unwrap();
+        adapter.begin_connection(false).unwrap();
+        let generation = adapter.next_generation();
+        let error = adapter
+            .apply_network_plan::<()>(plan(generation), |_| {
+                Err(anyhow::anyhow!("route installation failed"))
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("route installation failed"));
+        assert_eq!(adapter.core.state(), ClientState::Failed);
+    }
+}
+
 #[cfg(test)]
 mod obf_push_tests {
     use super::*;
     use crate::config::PushedObf;
+
+    #[test]
+    fn ipv4_only_dataplane_rejects_ipv6_and_truncated_packets() {
+        let mut ipv4 = [0u8; 20];
+        ipv4[0] = 0x45;
+        assert!(is_supported_inner_packet(&ipv4));
+
+        let mut ipv6 = [0u8; 40];
+        ipv6[0] = 0x60;
+        assert!(!is_supported_inner_packet(&ipv6));
+        assert!(!is_supported_inner_packet(&ipv4[..19]));
+        assert!(!is_supported_inner_packet(&[]));
+    }
+
+    #[test]
+    fn multi_a_budget_is_shared_across_remaining_candidates() {
+        let total = Duration::from_secs(30);
+        assert_eq!(
+            per_candidate_connect_budget(total, 3),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            per_candidate_connect_budget(total, 2),
+            Duration::from_secs(15)
+        );
+        assert_eq!(per_candidate_connect_budget(total, 1), total);
+        assert_eq!(per_candidate_connect_budget(total, 0), total);
+    }
+
+    #[test]
+    fn rx_liveness_uses_the_actual_promised_cadence() {
+        assert_eq!(
+            crate::protocol::liveness_deadline(
+                true,
+                Duration::from_secs(15),
+                Duration::from_secs(2),
+                false,
+                Duration::ZERO,
+            ),
+            Some(Duration::from_secs(51)),
+        );
+        assert_eq!(
+            crate::protocol::liveness_deadline(
+                false,
+                Duration::from_secs(15),
+                Duration::ZERO,
+                true,
+                Duration::from_secs(120),
+            ),
+            Some(Duration::from_secs(363)),
+        );
+        assert_eq!(
+            crate::protocol::liveness_deadline(
+                false,
+                Duration::from_secs(15),
+                Duration::ZERO,
+                false,
+                Duration::from_secs(120),
+            ),
+            None,
+        );
+    }
 
     /// The keyed `OK:{json}` payload round-trips through parse_auth_ok: every
     /// field is looked up by key, so routes (JSON, full of `:`) and the inline
@@ -4488,6 +5157,7 @@ mod obf_push_tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn prefix_to_netmask_known_values() {
         assert_eq!(prefix_to_netmask(24), "255.255.255.0");
         assert_eq!(prefix_to_netmask(23), "255.255.254.0");
@@ -4513,7 +5183,7 @@ mod obf_push_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tofu_tests {
     use super::trust_on_first_use_at;
     use std::path::PathBuf;
@@ -4576,7 +5246,7 @@ mod tofu_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod device_id_tests {
     use super::device_id_at;
     use std::path::PathBuf;

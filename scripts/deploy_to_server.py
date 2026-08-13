@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+raise SystemExit("RETIRED: unsafe generic root-SSH deploy; use the supported installer/release procedure.")
 """
 Deploy Qeli VPN to a remote server.
 - Uploads source code
@@ -10,6 +11,7 @@ import os
 import sys
 import time
 import paramiko
+import ssh_hostkey
 import getpass
 
 SERVER_IP = "YOUR_DEPLOY_HOST"
@@ -22,7 +24,7 @@ VPN_PASS = "TestPass123!"
 
 def connect():
     ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh_hostkey.harden(ssh)
     ssh.connect(SERVER_IP, username=SERVER_USER, password=SERVER_PASS, timeout=15)
     print(f"[OK] Connected to {SERVER_IP}")
     return ssh
@@ -133,7 +135,6 @@ bind.port = 443
 bind.transport = tcp
 tun.name = vpn0
 tun.address = 10.10.10.1
-tun.netmask = 255.255.255.0
 tun.mtu = 1280
 tun.queues = 0
 pool.cidr = 10.10.10.0/24
@@ -202,6 +203,9 @@ def create_user_and_start(ssh):
         cat >> /etc/sysctl.conf << 'SYSCTLEOF'
 net.core.rmem_max=16777216
 net.core.wmem_max=16777216
+net.core.rmem_default=4194304
+net.core.wmem_default=4194304
+net.core.netdev_max_backlog=4000
 net.ipv4.tcp_rmem=4096 87380 16777216
 net.ipv4.tcp_wmem=4096 65536 16777216
 net.core.default_qdisc=fq

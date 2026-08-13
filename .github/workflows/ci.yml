@@ -64,6 +64,11 @@ defaults:
   run:
     working-directory: qeli
 
+# CI only reads the checkout. Jobs that need stronger GitHub capabilities must
+# declare them explicitly instead of inheriting repository-wide token defaults.
+permissions:
+  contents: read
+
 jobs:
   # Hard gate: the committed native libraries (.so/.dll/.dylib) must match their
   # manifest. They are opaque blobs whose diff no reviewer can read, so without this a
@@ -77,14 +82,15 @@ jobs:
         working-directory: .          # the script expects the repo root, not qeli/
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Test native reproducibility contract
+        run: python3 -m unittest discover -s scripts -p 'test_native_*.py'
       - name: Verify native library hashes
         run: bash native-libs/verify.sh
-      # verify.sh only proves the two copies of each library agree with each other. It
-      # cannot tell whether they correspond to the Rust source beside them — and that is
-      # the failure that actually happened: the cores were built from the 0.7.12 source and
-      # stayed put while qeli/src moved on, so every GUI client shipped an older
-      # realtls/FFI core than the tree described, invisibly (a .so has no readable diff).
-      # (Audit 2026-07-27, G1/I4.)
+      # verify.sh proves copy/manifest parity. provenance.py additionally requires the exact
+      # source digest and machine-readable evidence that each canonical + consumed artifact
+      # came from byte-identical clean A/B builds under the pinned recipe. This catches the
+      # historical failure where old cores survived while qeli/src moved on, invisibly.
+      # (Audit 2026-07-27, G1/I4; transport refactor TC-4.2.)
       - name: Native cores match the source in this tree
         run: python3 native-libs/provenance.py --check
 
@@ -95,19 +101,39 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: qeli
       - name: Build
-        run: cargo build --bin qeli --release
+        run: cargo build --locked --bin qeli --release
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
+      # The whole-client ABI is opt-in while clients migrate. Test its state machine with
+      # the normal feature set (some older realtls unit tests require `server`), then build
+      # the actual minimal cdylib configuration separately. The release profile is the
+      # important half: `transport-core-ffi` implies `ffi-cdylib`, whose compile-time guard
+      # rejects panic=abort because it would make every catch_unwind boundary ineffective.
+      - name: Transport-core C ABI tests
+        env:
+          CARGO_PROFILE_RELEASE_PANIC: unwind
+        run: cargo test --locked --features transport-core-ffi transport_core
+      - name: Build minimal transport-core cdylib
+        env:
+          CARGO_PROFILE_RELEASE_PANIC: unwind
+        run: cargo build --locked --release --no-default-features --features transport-core-ffi
+      - name: C header is self-contained
+        run: cc -x c -std=c11 -fsyntax-only include/qeli_transport_core.h
       # The shared cross-language KAT fixtures (conformance/*.json) are GENERATED from the
       # Rust canon. Without this gate they can silently fall out of step with the code they
       # pin: the other three implementations would keep passing against a stale table and
       # believe they still agree. Regenerates in memory and fails on any drift.
       - name: Conformance fixtures are up to date
-        run: cargo run --features conformance-gen --bin gen-conformance -- --check
+        run: cargo run --locked --features conformance-gen --bin gen-conformance -- --check
+      # Permanent release-mode microbenchmark. The conservative floor catches catastrophic
+      # PacketCodec regressions without treating noisy shared-runner timing as a precise lab
+      # result; correctness and caller-buffer reuse are hard failures in the harness itself.
+      - name: PacketCodec benchmark gate (Rust)
+        run: cargo run --locked --release --no-default-features --features packet-bench --bin packet-codec-bench -- --ci
 
   # Hard gate: build and INSTALL the artifact that actually ships. (Audit 2026-07-27, G2)
   #
@@ -135,7 +161,7 @@ jobs:
         with:
           version: 0.13.0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: qeli
       - name: Install cargo-zigbuild
@@ -198,13 +224,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: qeli
       - name: rustfmt
         run: cargo fmt --check
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: clippy (minimal transport-core ABI)
+        env:
+          CARGO_PROFILE_RELEASE_PANIC: unwind
+        run: cargo clippy --locked --no-default-features --features transport-core-ffi --lib -- -D warnings
 
   # Documentation gate: no broken links, no orphaned pages, ru/eng file parity, and
   # every INI key the server actually emits is covered by CONFIG.md in BOTH languages
@@ -221,6 +251,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: docs checks
         run: python3 scripts/check_docs.py
+      - name: panel source checks
+        run: python3 scripts/check_panel.py
+      - name: embedded panel CSS is current
+        run: |
+          cd qeli/web-assets
+          npm ci --ignore-scripts
+          npm run build
+          git diff --exit-code -- ../src/web/assets/app.css
       # Needs the tags: the "these docs describe X" banner tracks the newest v* tag,
       # and actions/checkout fetches none by default.
       - name: fetch tags
@@ -241,11 +279,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+      # `gradle-wrapper.jar` is a BINARY committed to this repo, and every Gradle step below
+      # executes it. Nothing verified it: a tampered wrapper (or a `distributionUrl` pointed
+      # somewhere else) would run attacker code inside the job that builds and signs the
+      # Android client. Gradle's own action checks the jar against the published checksums
+      # of every known release; `allow-snapshots: false` keeps it to released versions.
+      # Pinned by SHA like every other action here. (Audit 2026-08-04.)
+      - name: Validate the Gradle wrapper
+        uses: gradle/actions/wrapper-validation@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
       - name: Assemble debug APK
         working-directory: qeli-android
         run: |
@@ -278,6 +324,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Verify pinned Wintun version and Authenticode signer
+        working-directory: .
+        shell: pwsh
+        run: ./scripts/verify_windows_drivers.ps1
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: '10.0.x'
@@ -292,6 +342,9 @@ jobs:
       - name: Self-test QeliWin (headless crypto/codec/parse round-trips)
         working-directory: qeli-win
         run: dotnet exec QeliWin/bin/Release/net10.0-windows/win-x64/QeliWin.dll selftest
+      - name: PacketCodec benchmark gate (managed Windows)
+        working-directory: qeli-win
+        run: dotnet exec QeliWin/bin/Release/net10.0-windows/win-x64/QeliWin.dll packetbench --ci
 
   macos-build:
     runs-on: macos-latest
@@ -306,6 +359,9 @@ jobs:
       - name: Self-test QeliMac (headless crypto/codec/parse round-trips)
         working-directory: qeli-mac
         run: dotnet exec QeliMac/bin/Release/net10.0/QeliMac.dll selftest
+      - name: PacketCodec benchmark gate (managed macOS)
+        working-directory: qeli-mac
+        run: dotnet exec QeliMac/bin/Release/net10.0/QeliMac.dll packetbench --ci
       # Build BOTH macOS architectures explicitly. The utun ioctl P/Invoke has an
       # arch-conditional signature (Apple ARM64 passes the variadic arg on the stack,
       # x86_64 in a register — C-07), so the Intel path is a distinct code path that a
@@ -316,6 +372,11 @@ jobs:
         run: |
           dotnet build QeliMac/QeliMac.csproj -c Release -r osx-arm64
           dotnet build QeliMac/QeliMac.csproj -c Release -r osx-x64
+      - name: Install XcodeGen for macOS per-app extension
+        run: brew install xcodegen
+      - name: Build and test macOS per-app system extension
+        working-directory: qeli-mac
+        run: ./per-app/build.sh "$PWD/dist/per-app-ci" arm64
 
   # iOS had NO CI at all: the Swift client (QeliCore crypto/protocol + the packet-tunnel
   # extension) could stop compiling and nothing would notice until a manual Xcode build.
@@ -331,7 +392,7 @@ jobs:
       # job could never build the product it claims to test; it died at project
       # generation instead. build_native.sh adds the iOS rustup targets itself.
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: qeli
       - name: Build the native core (XCFramework, device + simulator)
@@ -417,7 +478,7 @@ jobs:
           else
             rustup target add ${{ matrix.target }}
           fi
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: qeli
       - name: Install cargo-zigbuild
@@ -425,40 +486,36 @@ jobs:
       - name: Cross-build qeli-client (${{ matrix.arch }})
         run: |
           if [ "${{ matrix.arch }}" = "mipsel" ]; then
-            RUSTFLAGS='-C link-arg=-msoft-float' cargo zigbuild -Z build-std=std,panic_abort \
+            RUSTFLAGS='-C link-arg=-msoft-float' cargo zigbuild --locked -Z build-std=std,panic_abort \
               --release --bin qeli-client --no-default-features --features client-bin \
               --target ${{ matrix.target }}
           else
-            cargo zigbuild \
+            cargo zigbuild --locked \
               --release --bin qeli-client --no-default-features --features client-bin \
               --target ${{ matrix.target }}
           fi
       - name: Artifact info
         run: file target/${{ matrix.target }}/release/qeli-client
 
-  # Soft gate: build the fuzz harnesses and run a short smoke on each. Catches a
+  # Hard gate: build the fuzz harnesses and run a short smoke on each. Catches a
   # build break / API drift in the untrusted-input parsers (ClientHello, packet
-  # codec, realtls record) and any crash reachable within the time budget. Not a
-  # merge blocker — full fuzzing is run out-of-band (see qeli/fuzz/README.md).
+  # codec, realtls record) and any crash reachable within the time budget. The
+  # short smoke is a merge blocker; full coverage-guided fuzzing runs nightly.
   fuzz-smoke:
     runs-on: ubuntu-latest
-    # The job as a whole stays soft: it runs on the NIGHTLY toolchain, so upstream drift
-    # could otherwise block every merge for reasons unrelated to this code. But the part
-    # that catches real regressions — do the harnesses still COMPILE against the parsers —
-    # is gated per-step below. (R-04)
-    continue-on-error: true
+    # Parser harness drift and a reproduced crash are release blockers, not advisory
+    # telemetry; keep this job hard even though cargo-fuzz uses nightly. (R-04)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: qeli
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       # Build first and report the outcome explicitly: an API drift that stops the
       # harnesses compiling is a genuine regression in the untrusted-input parsers, and
-      # `continue-on-error` on the job would otherwise bury it. Annotated as an error in
-      # the run summary even though the job is allowed to pass. (R-04)
+      # a soft job would otherwise bury it. This gate intentionally fails the run. (R-04)
       - name: Build the fuzz harnesses
         working-directory: qeli
         run: |
@@ -470,7 +527,7 @@ jobs:
       - name: Smoke each target (30s)
         working-directory: qeli
         run: |
-          for t in clienthello packet_decrypt realtls_record obfs_datagram quic udp_frag; do
+          for t in clienthello client_config websocket_head packet_decrypt realtls_record obfs_datagram quic udp_frag; do
             echo "=== fuzz $t ==="
             cargo +nightly fuzz run "$t" -- -max_total_time=30
           done
@@ -485,11 +542,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [clienthello, packet_decrypt, realtls_record, obfs_datagram, quic, udp_frag]
+        target: [clienthello, client_config, websocket_head, packet_decrypt, realtls_record, obfs_datagram, quic, udp_frag]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: qeli
       - name: Install cargo-fuzz
@@ -528,10 +585,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: qeli
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: cargo audit
         run: cargo audit
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.18.4 --locked
+      - name: Dependency policy (bans and sources)
+        run: cargo deny check bans sources

@@ -35,6 +35,7 @@ import json
 import os
 import subprocess
 import sys
+import ssh_hostkey
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -45,31 +46,55 @@ BRANCH = sys.argv[1] if len(sys.argv) > 1 else subprocess.run(
 ).stdout.strip()
 
 # Identity of the sources a qeli binary is built from. Deliberately the same recipe on
-# both sides so the two are comparable: `sha256sum` every file under qeli/src plus
+# both sides so the two are comparable: `sha256sum` every file under the crate's src/ plus
 # Cargo.toml and Cargo.lock, sort those lines, hash the result. See gate 2. (O8)
-FP_FILES = ("qeli/Cargo.toml", "qeli/Cargo.lock")
-FP_TREE = "qeli/src"
+#
+# Paths are relative TO THE CRATE, not to the repository root, and that is load-bearing. The
+# digest hashes "<sha>  <path>" lines, so the two sides only agree if they name the files the
+# same way — and QELI_LAB_SRC points at the crate directory (/opt/qeli-src holds Cargo.toml),
+# because that is what gate 2 then cd's into to run cargo. The remote half used to look for
+# `qeli/src` inside it, which does not exist there: `find` matched nothing, the digest was a
+# constant, and it never equalled the local one. The mismatch reads as "the lab is out of
+# date", and its handler SKIPS the cross-builds — so the gate could not fail and could not
+# pass, it simply never ran. Silence like that is worse than a red gate.
+# CR bytes are stripped before hashing, on both sides. `.gitattributes` says `* text=auto
+# eol=lf`, so git normalises line endings itself and a CRLF-only difference cannot exist
+# between two commits — but it routinely exists between a WORKING TREE and a checkout, which
+# is what these two digests actually compare. Two web templates carry CRLF in this Windows
+# checkout and LF in the lab's clone, and without this the gate reported "the lab tree is not
+# the tree being released" over a line ending. Nothing is lost: a difference git cannot record
+# is not a difference the release can ship.
+FP_FILES = ("Cargo.toml", "Cargo.lock")
+FP_TREE = "src"
+LOCAL_CRATE = "qeli"          # where the crate lives inside this repository
 REMOTE_FINGERPRINT = (
     "{ find " + FP_TREE + " -type f -print; "
     "for f in " + " ".join(FP_FILES) + "; do [ -f \"$f\" ] && printf '%s\\n' \"$f\"; done; } "
-    "| xargs sha256sum | LC_ALL=C sort | sha256sum"
-    # The per-file lines are sorted, so the order sha256sum visits the files in does
-    # not matter; only the set of (digest, path) pairs does.
+    "| while IFS= read -r f; do "
+    "printf '%s  %s\\n' \"$(tr -d '\\r' < \"$f\" | sha256sum | cut -d' ' -f1)\" \"$f\"; done "
+    "| LC_ALL=C sort | sha256sum"
+    # The per-file lines are sorted, so the order the files are visited in does not
+    # matter; only the set of (digest, path) pairs does.
 )
 
 
 def source_fingerprint(base: str) -> str:
-    """Local half of REMOTE_FINGERPRINT — byte-for-byte the same digest."""
+    """Local half of REMOTE_FINGERPRINT — byte-for-byte the same digest.
+
+    `base` is the repository root; paths are emitted crate-relative so they match the remote
+    half, which runs inside the crate directory.
+    """
+    crate = os.path.join(base, LOCAL_CRATE)
     rels = []
-    tree = os.path.join(base, FP_TREE)
-    for root, dirs, files in os.walk(tree):
+    for root, dirs, files in os.walk(os.path.join(crate, FP_TREE)):
         for name in files:
-            rels.append(os.path.relpath(os.path.join(root, name), base).replace(os.sep, "/"))
-    rels += [r for r in FP_FILES if os.path.isfile(os.path.join(base, r))]
+            rels.append(os.path.relpath(os.path.join(root, name), crate).replace(os.sep, "/"))
+    rels += [r for r in FP_FILES if os.path.isfile(os.path.join(crate, r))]
     lines = []
     for rel in rels:
-        with open(os.path.join(base, rel), "rb") as fh:
-            lines.append(f"{hashlib.sha256(fh.read()).hexdigest()}  {rel}\n")
+        with open(os.path.join(crate, rel), "rb") as fh:
+            data = fh.read().replace(b"\r", b"")   # same rule as `tr -d '\r'` remotely
+        lines.append(f"{hashlib.sha256(data).hexdigest()}  {rel}\n")
     return hashlib.sha256("".join(sorted(lines)).encode()).hexdigest()
 
 
@@ -134,21 +159,7 @@ else:
         host = os.environ.get("QELI_LAB_SERVER", "10.66.116.10")
         src = os.environ.get("QELI_LAB_SRC", "/opt/qeli-src")
         c = paramiko.SSHClient()
-        # Host-key handling is now explicit. AutoAddPolicy trusted whatever answered on
-        # that address and then sent a root password to it — for a step whose whole job
-        # is to raise confidence before a release, that is the wrong default. known_hosts
-        # is honoured; an unknown host is only accepted when the operator says so.
-        # (Audit 2026-07-27, O8)
-        c.load_system_host_keys()
-        try:
-            c.load_host_keys(os.path.expanduser("~/.ssh/known_hosts"))
-        except OSError:
-            pass
-        if os.environ.get("QELI_LAB_TRUST_NEW_HOST") == "1":
-            print(f"  ! QELI_LAB_TRUST_NEW_HOST=1 — accepting an unverified host key for {host}")
-            c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        else:
-            c.set_missing_host_key_policy(paramiko.RejectPolicy())
+        ssh_hostkey.harden(c, host)
         try:
             c.connect(host, username="root", password=lab_pass, timeout=25,
                       look_for_keys=False, allow_agent=False)

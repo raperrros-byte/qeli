@@ -21,6 +21,7 @@ use crate::crypto::StaticKeypair;
 use crate::server::handler::SessionShared;
 use crate::transport::tcp::{set_tcp_buffers, set_tcp_keepalive};
 use crate::transport::TransportProtocol;
+use crate::transport_core::buffer_pool::{BufferPool, PooledBuffer};
 use crate::tun::iface::TunInterface;
 use crate::tun::prepend_ethernet_header;
 use crate::tun::strip_ethernet_header;
@@ -33,20 +34,12 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-/// Lock a Mutex, recovering the inner value if a prior holder panicked.
-/// Logs a warning on poisoning so silent corruption is at least observable.
-pub fn lock_or_recover<'a, T>(
-    m: &'a std::sync::Mutex<T>,
-    where_: &'static str,
-) -> std::sync::MutexGuard<'a, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => {
-            log::warn!("mutex poisoned in {} — recovering", where_);
-            poisoned.into_inner()
-        }
-    }
-}
+/// Re-export: the implementation moved to `crate::util` so the CLIENT can use it too.
+///
+/// `server` is behind `feature = "server"` and is absent from the router/client-only
+/// build, which is why the client half of the tree carried 12 raw `.lock().unwrap()`
+/// instead — the helper simply was not reachable from there. (Audit 2026-08-04.)
+pub use crate::util::lock_or_recover;
 
 /// Hard cap on the number of distinct source IPs tracked at once. A spoofed UDP
 /// flood can present a unique forged source IP per packet; without a bound the
@@ -59,6 +52,46 @@ pub fn lock_or_recover<'a, T>(
 /// are unaffected. The cap is far above any plausible count of legitimate
 /// distinct clients within the window.
 const MAX_TRACKED_IPS: usize = 100_000;
+
+/// Target memory budget for packets read from all TUN queues of one profile. The former
+/// `raw.to_vec()` path allocated once per packet and let every 4096-slot queue retain its own
+/// heap allocations. A shared pool bounds the aggregate instead and returns each allocation
+/// when the async forwarder finishes with it. At least one slot per queue is retained, so an
+/// explicitly extreme queue-count/read-buffer combination may raise the bound above 32 MiB.
+const SERVER_TUN_READ_POOL_BYTES: usize = 32 * 1024 * 1024;
+/// Independent client→TUN budget. Keeping the directions separate prevents a slow downlink
+/// forwarder from consuming every allocation needed to drain authenticated uplink records.
+const SERVER_TUN_WRITE_POOL_BYTES: usize = 32 * 1024 * 1024;
+
+fn server_tun_read_buffer_count(queue_count: usize, buffer_capacity: usize) -> usize {
+    (SERVER_TUN_READ_POOL_BYTES / buffer_capacity.max(1))
+        .max(queue_count)
+        .max(1)
+}
+
+pub(crate) enum ServerTunPacket {
+    Pooled(PooledBuffer),
+    /// IPv4 fragmentation is exceptional and inherently creates new packets. Keeping those
+    /// owned here lets the common unfragmented path remain allocation-free.
+    Fragment(Vec<u8>),
+}
+
+impl std::ops::Deref for ServerTunPacket {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Pooled(packet) => packet,
+            Self::Fragment(packet) => packet,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct TunIngress {
+    pub(crate) sender: mpsc::Sender<ServerTunPacket>,
+    pub(crate) pool: BufferPool,
+}
 
 pub struct RateLimiter {
     attempts: HashMap<IpAddr, VecDeque<Instant>>,
@@ -299,6 +332,8 @@ pub struct ProfileRuntime {
     pub pool: Arc<Mutex<pool::IpPool>>,
     pub sessions: Arc<RwLock<SessionMap>>,
     pub rate_limiter: Arc<Mutex<RateLimiter>>,
+    /// Aggregate local UDP diagnostics across this profile's SO_REUSEPORT workers.
+    pub(crate) udp_buffer_counters: Arc<crate::transport_core::udp_buffer::UdpBufferCounters>,
     /// This profile's own server identity (static X25519) keypair — distinct
     /// per interface, so a client pins the key of the interface it uses.
     pub static_keypair: Arc<StaticKeypair>,
@@ -619,6 +654,11 @@ pub struct ServerState {
     pub config: ServerConfig,
     pub users_db: Arc<RwLock<UsersDb>>,
     pub config_path: Mutex<Option<String>>,
+    /// Serializes every panel read-modify-write of the server config. Atomic rename keeps
+    /// each individual write crash-safe, but without a process-level lock two panel tabs
+    /// could both read the same revision and the later rename would silently erase the
+    /// earlier edit. Handlers also compare a content revision while holding this lock.
+    pub config_write_lock: Mutex<()>,
     pub profiles: Arc<RwLock<HashMap<String, Arc<ProfileRuntime>>>>,
     pub failed_auth: Arc<Mutex<FailedAuthTracker>>,
     /// Supervisor → worker control channel. `Some` only in the supervisor.
@@ -638,6 +678,8 @@ pub struct ServerState {
     /// process restart. Socket-bound fields (bind/port/tls/enabled) still need a
     /// restart and are read from `config.web`.
     pub live_web: Arc<RwLock<crate::config::server::WebConfig>>,
+    /// One memory-aware cap shared by every UDP profile/listener/SO_REUSEPORT worker.
+    pub(crate) udp_buffer_budget: crate::transport_core::udp_buffer::AggregateUdpBudgetPlan,
 }
 
 impl ServerState {
@@ -812,6 +854,25 @@ fn is_wildcard_bind_host(host: &str) -> bool {
     matches!(host, "" | "*" | "0.0.0.0" | "::")
 }
 
+/// The `addr:port` the profile's DHCP server binds to.
+///
+/// `dhcp.listen` defaults to EMPTY, meaning "the profile's tun address" — it used to default
+/// to `0.0.0.0:67`, publishing an unauthenticated service on every interface for anyone who
+/// merely set `dhcp.enabled = true`. One helper so the preflight collision check and
+/// `run_profile` cannot drift apart on what the value means. (Audit 2026-08-04.)
+fn dhcp_bind_spec(p: &crate::config::server::ProfileConfig) -> String {
+    let host = if p.dhcp.listen.trim().is_empty() {
+        p.tun.address.trim()
+    } else {
+        p.dhcp.listen.trim()
+    };
+    if host.contains(':') {
+        host.to_string()
+    } else {
+        format!("{host}:67")
+    }
+}
+
 /// Split an already-form-validated `addr:port` spec into a comparable (host, port).
 fn split_listen_spec(spec: &str) -> Option<(String, u16)> {
     let addr = spec.trim();
@@ -826,6 +887,10 @@ fn split_listen_spec(spec: &str) -> Option<(String, u16)> {
 const MAX_IFNAME_LEN: usize = 15;
 
 pub fn validate_profiles(config: &ServerConfig) -> anyhow::Result<()> {
+    if !config.web.public_host.trim().is_empty() {
+        crate::config::share::supported_public_endpoint(&config.web.public_host, 443)
+            .map_err(anyhow::Error::msg)?;
+    }
     // Both brute-force policies, before anything profile-specific. This function is the
     // one gate every write path shares — `check-config`, worker startup, `PUT /api/config`
     // and `PUT /api/config/raw` all call it — so validating here is what stops a policy
@@ -979,6 +1044,27 @@ pub fn validate_profiles(config: &ServerConfig) -> anyhow::Result<()> {
                 MAX_TUN_READ_BUFFER
             );
         }
+        // The receive controller has a smaller 16 MiB automatic ceiling. Explicit values
+        // remain fixed operator overrides, but still need a hard per-socket bound: UDP uses
+        // one SO_REUSEPORT socket per worker, so a typo here is multiplied by the queue count.
+        for (field, value) in [
+            (
+                "perf.udp.recv_buffer_size",
+                p.performance.udp.recv_buffer_size,
+            ),
+            (
+                "perf.udp.send_buffer_size",
+                p.performance.udp.send_buffer_size,
+            ),
+        ] {
+            if value > crate::transport_core::udp_buffer::MAX_CONFIGURED_SOCKET_BUFFER_BYTES {
+                anyhow::bail!(
+                    "profile '{}': {field} = {value} exceeds the per-socket UDP buffer limit {}",
+                    p.name,
+                    crate::transport_core::udp_buffer::MAX_CONFIGURED_SOCKET_BUFFER_BYTES
+                );
+            }
+        }
         // Reject unknown bind.transport / obf.mode outright. Both are plain
         // Strings compared verbatim elsewhere: an unrecognised transport parses
         // via `.unwrap_or(Tcp)` (a typo silently binds TCP) and an unrecognised
@@ -1089,11 +1175,7 @@ pub fn validate_profiles(config: &ServerConfig) -> anyhow::Result<()> {
             // map exists to catch — two profiles on the DHCP default — slipped through
             // whenever the operator wrote the address without a port.
             // (Audit 2026-08-01, §2.)
-            let spec = if p.dhcp.listen.contains(':') {
-                p.dhcp.listen.trim().to_string()
-            } else {
-                format!("{}:67", p.dhcp.listen.trim())
-            };
+            let spec = dhcp_bind_spec(p);
             if let Some((host, port)) = split_listen_spec(&spec) {
                 profile_endpoints.push((host, port, "udp".to_string(), format!("dhcp {spec}")));
             }
@@ -1173,6 +1255,26 @@ pub fn validate_profiles(config: &ServerConfig) -> anyhow::Result<()> {
                 p.name
             );
         }
+        // The pre-auth flood limiter has to have a working range too.
+        //
+        // `RateLimiter::new` takes these straight from the config with no bounds, and
+        // nothing validated them — the neighbouring check above covers only
+        // handshake_timeout_secs and max_clients. `window_secs = 0` makes
+        // `now.duration_since(t) > ZERO` true for every recorded attempt, so the deque
+        // empties on each call and the limiter always passes; `max_attempts = 0` makes it
+        // never pass. This is the ONLY per-source-IP gate ahead of authentication, on TCP
+        // accept and on every UDP datagram alike, and `qeli check-config` reported OK either
+        // way because `parse_or` accepts a plain 0. `BruteForceConfig::validate` was written
+        // for exactly this class of "a zero silently disables the control"; it just never
+        // covered ConnectionConfig. (Audit 2026-08-04.)
+        if perf.new_session_rate_max == 0 || perf.new_session_rate_window_secs == 0 {
+            anyhow::bail!(
+                "profile '{}': performance.connection.new_session_rate_max = {} and                  new_session_rate_window_secs = {} — a zero in either one silently DISABLES the                  only pre-authentication rate limit (0 attempts never passes; a 0-second window                  always does). Use real values, e.g. 30 attempts / 10 seconds.",
+                p.name,
+                perf.new_session_rate_max,
+                perf.new_session_rate_window_secs
+            );
+        }
         // Heartbeat knobs drive timing and sizing, and the server also PUSHES them to
         // clients, yet nothing range-checked them. The arithmetic itself is now
         // overflow-safe at every use site, but absurd values are still nonsense: a jitter
@@ -1198,13 +1300,17 @@ pub fn validate_profiles(config: &ServerConfig) -> anyhow::Result<()> {
                     hb.interval_ms
                 );
             }
-            // Leave room for the +32 the cover-padding sizing adds.
-            if hb.data_size_bytes > u16::MAX - 32 {
+            // Leave room for the +32 cover-padding sizing adds AND for the record-format
+            // ceiling. The former u16-only check accepted heartbeats that encryption could
+            // never put on the wire.
+            let max_heartbeat_data =
+                u16::try_from(crate::protocol::packet::MAX_TUNNEL_MTU - 32).unwrap();
+            if hb.data_size_bytes > max_heartbeat_data {
                 anyhow::bail!(
                     "profile '{}': obf.heartbeat.data_size_bytes ({}) must be <= {}",
                     p.name,
                     hb.data_size_bytes,
-                    u16::MAX - 32
+                    max_heartbeat_data
                 );
             }
         }
@@ -1286,6 +1392,22 @@ pub fn validate_profiles(config: &ServerConfig) -> anyhow::Result<()> {
                     sh.max_size
                 );
             }
+            if sh.budget_bytes_per_sec < u32::from(sh.max_size) {
+                anyhow::bail!(
+                    "profile '{}': obf.traffic_shaping.budget_bytes_per_sec ({}) must be at least max_size ({}) so each scheduled cover record can be emitted",
+                    p.name,
+                    sh.budget_bytes_per_sec,
+                    sh.max_size
+                );
+            }
+            if usize::from(sh.max_size) > crate::protocol::packet::MAX_TUNNEL_MTU {
+                anyhow::bail!(
+                    "profile '{}': obf.traffic_shaping.max_size ({}) must be <= {}",
+                    p.name,
+                    sh.max_size,
+                    crate::protocol::packet::MAX_TUNNEL_MTU
+                );
+            }
             if sh.budget_bytes_per_sec == 0 {
                 anyhow::bail!(
                     "profile '{}': obf.traffic_shaping.budget_bytes_per_sec must be > 0 when \
@@ -1293,6 +1415,15 @@ pub fn validate_profiles(config: &ServerConfig) -> anyhow::Result<()> {
                     p.name
                 );
             }
+        }
+        // UDP has no FIN/RST. With every liveness source disabled and an unlimited idle
+        // timeout, a vanished client can never be distinguished from a quiet one and keeps
+        // its address/max_clients slot forever. Require at least one bounded reaper signal.
+        if p.bind.transport == "udp" && !hb.enabled && !sh.enabled && perf.idle_timeout_secs == 0 {
+            anyhow::bail!(
+                "profile '{}': UDP cannot combine heartbeat=false, traffic_shaping=false and idle_timeout_secs=0; enable heartbeat/shaping or set a finite idle timeout so dead sessions release their IP and client slot",
+                p.name
+            );
         }
         if p.obfuscation.mode == "plain" && p.bind.transport == "udp" {
             anyhow::bail!(
@@ -1496,19 +1627,15 @@ pub fn validate_profiles(config: &ServerConfig) -> anyhow::Result<()> {
         }
 
         // Address fields. The worker parses these only once it STARTS the profile
-        // (`run_profile`: `IpPool::new`, `TunInterface::set_address`), so nothing here
+        // (`run_profile`: `IpPool::new_with_tun`, `TunInterface::set_address`), so nothing here
         // caught a typo: `check-config` answered OK / rc=0 and the worker then died on
         // every respawn — `invalid CIDR`, `invalid CIDR prefix (>32)`, or `ip` rejecting
         // the address with "any valid prefix is expected". The panel's save path calls
         // this function too, so an admin could persist a config that bricked the server.
         //
-        // Validated through the very code the data plane runs (`IpPool::new`, which also
-        // covers the /30-minimum rule and warns about unusable `pool.exclude` entries),
-        // so the two can't drift apart again.
-        pool::IpPool::new(&p.pool).map_err(|e| {
-            anyhow::anyhow!("profile '{}': pool.cidr '{}': {}", p.name, p.pool.cidr, e)
-        })?;
-        p.tun.address.parse::<std::net::Ipv4Addr>().map_err(|e| {
+        let tunnel_subnet = crate::config::server::pool_subnet(&p.pool.cidr)
+            .map_err(|e| anyhow::anyhow!("profile '{}': {}", p.name, e))?;
+        let tunnel_address = p.tun.address.parse::<std::net::Ipv4Addr>().map_err(|e| {
             anyhow::anyhow!(
                 "profile '{}': invalid tun.address '{}': {} — expected a plain IPv4 address \
                  (e.g. 10.9.0.1)",
@@ -1517,14 +1644,22 @@ pub fn validate_profiles(config: &ServerConfig) -> anyhow::Result<()> {
                 e
             )
         })?;
-        p.tun.netmask.parse::<std::net::Ipv4Addr>().map_err(|e| {
-            anyhow::anyhow!(
-                "profile '{}': invalid tun.netmask '{}': {} — expected a dotted mask \
-                 (e.g. 255.255.255.0)",
+        if !tunnel_subnet.contains_usable_host(tunnel_address) {
+            anyhow::bail!(
+                "profile '{}': tun.address {} is not a usable host inside pool.cidr {} \
+                 (network {}, broadcast {}). The TUN prefix and all client prefixes are \
+                 derived from pool.cidr; choose an address between them.",
                 p.name,
-                p.tun.netmask,
-                e
-            )
+                tunnel_address,
+                p.pool.cidr,
+                tunnel_subnet.network,
+                tunnel_subnet.broadcast
+            );
+        }
+        // Validate through the exact allocator used by the worker. Passing the actual
+        // server address is essential: tun.address may be any usable host, not just .1.
+        pool::IpPool::new_with_tun(&p.pool, tunnel_address).map_err(|e| {
+            anyhow::anyhow!("profile '{}': pool.cidr '{}': {}", p.name, p.pool.cidr, e)
         })?;
         // tun.mtu is handed straight to `ip link set … mtu N` at profile start
         // (`create_multiqueue` / `set_up`); the kernel then rejects anything outside
@@ -1557,7 +1692,7 @@ pub fn validate_profiles(config: &ServerConfig) -> anyhow::Result<()> {
         // dhcp.pool_start/end". Mirror that parse (defaults included) and the
         // end >= start rule here so the two paths can't drift.
         if p.dhcp.enabled {
-            crate::config::server::dhcp_pool_bounds(&p.dhcp, &p.tun.address, &p.tun.netmask)
+            crate::config::server::dhcp_pool_bounds(&p.dhcp, &p.pool.cidr, tunnel_address)
                 .map_err(|e| anyhow::anyhow!("profile '{}': {}", p.name, e))?;
             // A zero lease is not "no expiry", it is a lease that has already expired: the
             // client is told to renew at half of zero, so it renews continuously and the
@@ -1729,6 +1864,16 @@ pub fn validate_profiles(config: &ServerConfig) -> anyhow::Result<()> {
         // pushed value and then has nothing left to use). Validate all of them: a later entry
         // being wrong is a latent trap for the day the first one is removed.
         for ps in &p.dns.push_servers {
+            if matches!(
+                ps.trim().parse::<std::net::IpAddr>(),
+                Ok(std::net::IpAddr::V6(_))
+            ) {
+                anyhow::bail!(
+                    "profile '{}': dns.push_servers entry '{}' is IPv6, but qeli 0.7.15 clients carry only IPv4 inner packets",
+                    p.name,
+                    ps
+                );
+            }
             if ps.trim().parse::<std::net::IpAddr>().is_err() {
                 anyhow::bail!(
                     "profile '{}': dns.push_servers entry '{}' is not a valid IP address — \
@@ -1738,8 +1883,122 @@ pub fn validate_profiles(config: &ServerConfig) -> anyhow::Result<()> {
                 );
             }
         }
+
+        // DHCP is an UNAUTHENTICATED service and gets the same bind rule as the resolver.
+        //
+        // The two were treated inconsistently: `dns.listen = 0.0.0.0` is a hard error
+        // above, while `dhcp.listen` defaulted to `0.0.0.0:67` and `DhcpServer::bind`
+        // merely logged a warning and carried on. So a single `dhcp.enabled = true` — the
+        // only key an operator sets — published DHCP on every interface including the
+        // public one, where anyone able to reach UDP/67 (qeli programs NAT/FORWARD/MSS
+        // rules but never touches INPUT) gets a valid OFFER/ACK carrying an address from
+        // the profile's pool, its mask, gateway and DNS servers. Same class of exposure,
+        // same treatment. (Audit 2026-08-04.)
+        if p.dhcp.enabled {
+            let host = p
+                .dhcp
+                .listen
+                .rsplit_once(':')
+                .map_or(p.dhcp.listen.as_str(), |(h, _)| h);
+            match host.trim().parse::<std::net::IpAddr>() {
+                Ok(ip) if ip.is_unspecified() => anyhow::bail!(
+                    "profile '{}': dhcp.listen = {} publishes an UNAUTHENTICATED DHCP server on every interface, including any public one. Bind it to the profile's tun address ({}), or to the TAP bridge address if this profile bridges.",
+                    p.name,
+                    p.dhcp.listen,
+                    p.tun.address
+                ),
+                Ok(ip) if ip.is_multicast() => anyhow::bail!(
+                    "profile '{}': dhcp.listen = {} is not a bindable address",
+                    p.name,
+                    p.dhcp.listen
+                ),
+                Ok(_) | Err(_) => {}
+            }
+        }
     }
+    // This depends on the complete enabled-profile/listener/queue set, so it cannot be
+    // validated one profile at a time. Running it here makes check-config, panel save/restart,
+    // supervisor start and direct worker start all reject the same memory overcommit.
+    let _ = server_udp_buffer_budget(config)?;
     Ok(())
+}
+
+fn available_memory_bytes() -> u64 {
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+        if let Some(kib) = meminfo.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some("MemAvailable:"))
+                .then(|| fields.next()?.parse::<u64>().ok())
+                .flatten()
+        }) {
+            return kib.saturating_mul(1024);
+        }
+    }
+    // Conservative fallback when /proc is hidden by a container. `_SC_AVPHYS_PAGES` is
+    // current free physical memory (less generous than MemAvailable, which includes cache).
+    #[cfg(unix)]
+    unsafe {
+        let pages = libc::sysconf(libc::_SC_AVPHYS_PAGES);
+        let page_size = libc::sysconf(libc::_SC_PAGESIZE);
+        if pages > 0 && page_size > 0 {
+            return (pages as u64).saturating_mul(page_size as u64);
+        }
+    }
+    // Failing to observe memory must not accidentally authorize an unbounded configuration.
+    512 * 1024 * 1024
+}
+
+fn server_udp_buffer_budget(
+    config: &ServerConfig,
+) -> anyhow::Result<crate::transport_core::udp_buffer::AggregateUdpBudgetPlan> {
+    const ESTIMATED_OS_DEFAULT_KERNEL_BYTES: u64 = 512 * 1024;
+    let automatic_queues = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(1, 256);
+    let mut sockets = 0usize;
+    let mut automatic_sockets = 0usize;
+    let mut reserved_kernel_bytes = 0u64;
+    for profile in config
+        .profiles
+        .iter()
+        .filter(|profile| profile.enabled && profile.bind.transport.eq_ignore_ascii_case("udp"))
+    {
+        let queues = if profile.tun.queues == 0 {
+            automatic_queues
+        } else {
+            profile.tun.queues.clamp(1, 256)
+        };
+        let listener_count = 1usize.saturating_add(profile.bind.listen.len());
+        let count = queues.saturating_mul(listener_count);
+        sockets = sockets.saturating_add(count);
+        let perf = &profile.performance.udp;
+        let send_kernel = if perf.send_buffer_size == 0 {
+            ESTIMATED_OS_DEFAULT_KERNEL_BYTES
+        } else {
+            u64::from(perf.send_buffer_size).saturating_mul(2)
+        };
+        reserved_kernel_bytes =
+            reserved_kernel_bytes.saturating_add(send_kernel.saturating_mul(count as u64));
+        if perf.recv_buffer_auto && perf.recv_buffer_size > 0 {
+            automatic_sockets = automatic_sockets.saturating_add(count);
+        } else {
+            let receive_kernel = if perf.recv_buffer_size == 0 {
+                ESTIMATED_OS_DEFAULT_KERNEL_BYTES
+            } else {
+                u64::from(perf.recv_buffer_size).saturating_mul(2)
+            };
+            reserved_kernel_bytes =
+                reserved_kernel_bytes.saturating_add(receive_kernel.saturating_mul(count as u64));
+        }
+    }
+    crate::transport_core::udp_buffer::plan_aggregate_udp_budget(
+        available_memory_bytes(),
+        sockets,
+        automatic_sockets,
+        reserved_kernel_bytes,
+    )
+    .map_err(anyhow::Error::msg)
 }
 
 /// Data-plane worker: control socket + all VPN profiles. Runs as the child
@@ -1879,6 +2138,10 @@ pub async fn run_worker(cfg_path: &str) -> anyhow::Result<()> {
     }
 
     validate_profiles(&config)?;
+    // Defence in depth for every worker entry path, including a hand-started `_worker` and a
+    // config changed on disk behind the panel.  The API performs the same check before it
+    // stops the current worker, but the worker must not trust that it was its only caller.
+    preflight::run(&config)?;
 
     // A MISSING users file and an UNREADABLE one are not the same thing, and collapsing them
     // was doing real damage. Both landed here as "users file not found, creating empty" — so a
@@ -1914,6 +2177,17 @@ pub async fn run_worker(cfg_path: &str) -> anyhow::Result<()> {
         config.auth.users.len(),
         config.auth.users_file
     );
+    let udp_buffer_budget = server_udp_buffer_budget(&config)?;
+    if udp_buffer_budget.socket_count > 0 {
+        log::info!(
+            "UDP aggregate buffer budget: {} MiB for {} socket(s), {} automatic; auto initial/max={} / {} KiB",
+            udp_buffer_budget.budget_bytes / 1024 / 1024,
+            udp_buffer_budget.socket_count,
+            udp_buffer_budget.auto_socket_count,
+            udp_buffer_budget.auto_initial_recv_bytes / 1024,
+            udp_buffer_budget.auto_max_recv_bytes / 1024
+        );
+    }
     let users_db = Arc::new(RwLock::new(users_db));
 
     // Identity keys are per-profile now (loaded in run_profile), so there is no
@@ -1932,6 +2206,7 @@ pub async fn run_worker(cfg_path: &str) -> anyhow::Result<()> {
         config,
         users_db,
         config_path: Mutex::new(Some(cfg_path.to_string())),
+        config_write_lock: Mutex::new(()),
         profiles: Arc::new(RwLock::new(HashMap::new())),
         failed_auth,
         worker_tx: None,
@@ -1939,6 +2214,7 @@ pub async fn run_worker(cfg_path: &str) -> anyhow::Result<()> {
         metrics: Arc::new(metrics::MetricsState::new()),
         usage: Arc::new(usage::UsageStore::load(usage::USAGE_PATH)),
         live_web,
+        udp_buffer_budget,
     });
 
     // Control socket (shared across profiles) — the supervisor's panel reaches
@@ -1967,8 +2243,14 @@ pub async fn run_worker(cfg_path: &str) -> anyhow::Result<()> {
     // profiles re-install their own rules in run_profile right below.
     nat::cleanup_all();
 
-    // Start each profile. A JoinSet, not a Vec of handles — see the join loop below for why
-    // awaiting them in order hid a profile that had stopped.
+    // Profiles whose `post_down` has already run for their current lifecycle. A
+    // profile supervisor clears its entry immediately before every restart, so an
+    // aborted active generation is still paired by the worker's shutdown sweep.
+    let post_down_done: Arc<Mutex<std::collections::HashSet<String>>> =
+        Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+    // Start one independent supervisor per profile. The JoinSet only watches for a
+    // supervisor panic/return; ordinary profile failures are restarted in place.
     let mut profile_set = tokio::task::JoinSet::new();
     for pcfg in &state.config.profiles {
         if !pcfg.enabled {
@@ -1980,14 +2262,32 @@ pub async fn run_worker(cfg_path: &str) -> anyhow::Result<()> {
         }
         let state = state.clone();
         let pcfg = pcfg.clone();
-        // The task returns its own name: with a JoinSet the completion order is not the spawn
-        // order, so the name has to travel WITH the task rather than sit beside its handle.
+        let post_down_done = post_down_done.clone();
         profile_set.spawn(async move {
             let pname = pcfg.name.clone();
-            if let Err(e) = run_profile(state, pcfg).await {
-                log::error!("Profile '{}' error: {}", pname, e);
+            let mut retry_secs = 1u64;
+            loop {
+                post_down_done.lock().await.remove(&pname);
+                let started = tokio::time::Instant::now();
+                match run_profile(state.clone(), pcfg.clone()).await {
+                    Ok(()) => log::warn!("Profile '{}' stopped unexpectedly", pname),
+                    Err(e) => log::error!("Profile '{}' error: {}", pname, e),
+                }
+                run_post_down(&state, &pname, &post_down_done).await;
+
+                // Reset the backoff after a stable generation; persistent setup
+                // failures back off so they cannot spin and flood the journal.
+                if started.elapsed() >= Duration::from_secs(30) {
+                    retry_secs = 1;
+                }
+                log::warn!(
+                    "Profile '{}' will restart in {}s; other profiles remain online",
+                    pname,
+                    retry_secs
+                );
+                tokio::time::sleep(Duration::from_secs(retry_secs)).await;
+                retry_secs = retry_secs.saturating_mul(2).min(30);
             }
-            pname
         });
     }
 
@@ -2003,48 +2303,17 @@ pub async fn run_worker(cfg_path: &str) -> anyhow::Result<()> {
     let mut sigterm = signal(SignalKind::terminate())
         .map_err(|e| anyhow::anyhow!("failed to install SIGTERM handler: {}", e))?;
 
-    // Profiles whose `post_down` has already run, so the sweep at worker exit does not run it
-    // a SECOND time for a profile that stopped early. Shared because the two places that can
-    // trigger the hook — a profile ending on its own, and the worker shutting down — are in
-    // different scopes.
-    let post_down_done: Arc<Mutex<std::collections::HashSet<String>>> =
-        Arc::new(Mutex::new(std::collections::HashSet::new()));
-
-    let profiles_done = {
-        let post_down_done = post_down_done.clone();
-        let hook_state = state.clone();
-        async move {
-            // A profile task ending on its own is unexpected while the worker is still meant to be
-            // serving — surface it instead of swallowing it. Log only (no auto-restart): respawning
-            // here could loop forever.
-            //
-            // Awaited CONCURRENTLY. These used to be awaited in spawn order, and a healthy profile
-            // never returns — so the first `await` parked forever and any LATER profile stopping
-            // went unreported for as long as the first kept serving. Same defect as the per-listener
-            // join inside `run_profile`, one level up. (Audit 2026-07-30, #6.)
-            while let Some(joined) = profile_set.join_next().await {
-                match joined {
-                    Ok(pname) => {
-                        log::warn!("Profile '{}' task ended unexpectedly", pname);
-                        // `post_down` is the counterpart of `post_up`, and it used to run ONLY when
-                        // the whole worker exited — so a profile that died after its `post_up` left
-                        // that hook's changes to the host in place for as long as any OTHER profile
-                        // kept the worker alive. Pairing it with the profile's own end is what makes
-                        // the two hooks symmetric. (Audit 2026-08-01, §5.)
-                        run_post_down(&hook_state, &pname, &post_down_done).await;
-                    }
-                    // A panic loses the name with the task — report it rather than drop it.
-                    Err(e) => log::warn!("A profile task ended unexpectedly: {}", e),
-                }
-            }
-        }
-    };
-    tokio::pin!(profiles_done);
-
     let mut via_signal = false;
     loop {
         tokio::select! {
-            _ = &mut profiles_done => break,
+            joined = profile_set.join_next() => {
+                match joined {
+                    Some(Ok(())) => log::error!("A profile supervisor ended unexpectedly"),
+                    Some(Err(e)) => log::warn!("A profile supervisor failed: {}", e),
+                    None => log::error!("No profile supervisors remain"),
+                }
+                break;
+            },
             _ = tokio::signal::ctrl_c() => {
                 log::info!("Received SIGINT, stopping server...");
                 via_signal = true;
@@ -2061,6 +2330,12 @@ pub async fn run_worker(cfg_path: &str) -> anyhow::Result<()> {
             }
         }
     }
+
+    // Stop every supervisor before the final NAT/post_down sweep. Leaving them
+    // alive here lets a generation that is in its retry sleep wake up and install
+    // a fresh TUN/NAT rule while shutdown is removing the old one.
+    profile_set.abort_all();
+    while profile_set.join_next().await.is_some() {}
 
     // Tear down the host NAT rules we installed (the next start also cleans stale
     // rules, so a SIGKILL that skips this is recovered then) and run post_down.
@@ -2267,10 +2542,12 @@ pub async fn run_supervisor(cfg_path: &str) -> anyhow::Result<()> {
     let (worker_tx, mut worker_rx) = tokio::sync::mpsc::channel::<WorkerCmd>(8);
 
     let live_web = Arc::new(RwLock::new(config.web.clone()));
+    let udp_buffer_budget = server_udp_buffer_budget(&config)?;
     let state = Arc::new(ServerState {
         config,
         users_db,
         config_path: Mutex::new(Some(cfg_path.to_string())),
+        config_write_lock: Mutex::new(()),
         profiles: Arc::new(RwLock::new(HashMap::new())),
         failed_auth,
         worker_tx: Some(worker_tx),
@@ -2281,6 +2558,7 @@ pub async fn run_supervisor(cfg_path: &str) -> anyhow::Result<()> {
         // file back to its startup snapshot via Drop on every clean shutdown. (K3)
         usage: Arc::new(usage::UsageStore::load_read_only(usage::USAGE_PATH)),
         live_web,
+        udp_buffer_budget,
     });
 
     // Web panel — the always-up control plane.
@@ -2809,6 +3087,12 @@ mod reader_wakeup {
 struct QueueThreads {
     stop: Arc<std::sync::atomic::AtomicBool>,
     handles: Vec<std::thread::JoinHandle<()>>,
+    /// One sender per inbound queue, used only to wake a writer parked in
+    /// `blocking_recv()` after the stop flag is raised. A full queue is already a
+    /// wake-up, so `try_send` is sufficient and cannot block teardown.
+    wake_senders: Vec<mpsc::Sender<ServerTunPacket>>,
+    /// Wakes a reader that is waiting for a pooled allocation rather than inside `read()`.
+    pool_stop: tokio::sync::watch::Sender<bool>,
     /// Ids of the threads parked in a blocking syscall, published by each thread as it starts.
     /// Late registration is expected and handled — see `ProfileTeardown::drop`.
     #[cfg(target_os = "linux")]
@@ -2864,6 +3148,10 @@ impl Drop for ProfileTeardown {
             threads
                 .stop
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = threads.pool_stop.send(true);
+            for sender in &threads.wake_senders {
+                let _ = sender.try_send(ServerTunPacket::Fragment(Vec::new()));
+            }
 
             // Signalling is RETRIED rather than done once, and waiting is BOUNDED.
             //
@@ -3043,11 +3331,13 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
         .unwrap_or_else(|| pcfg.tun.name.clone());
     // The device exists from here on, so record it before the first fallible call below.
     teardown.ifname = Some(ifname.clone());
-    TunInterface::set_address(&ifname, &pcfg.tun.address, &pcfg.tun.netmask)?;
+    let profile_subnet = crate::config::server::pool_subnet(&pcfg.pool.cidr)
+        .map_err(|e| anyhow::anyhow!("profile '{}': {}", name, e))?;
+    TunInterface::set_address(&ifname, &pcfg.tun.address, profile_subnet.prefix)?;
     TunInterface::set_up(&ifname, pcfg.tun.mtu)?;
     TunInterface::set_queue_len(&ifname, pcfg.tun.tx_queue_len)?;
     log::info!(
-        "Profile '{}': {} {} is up with {} queue(s) ({} {})",
+        "Profile '{}': {} {} is up with {} queue(s) ({}/{})",
         name,
         if dev_type == DeviceType::Tap {
             "TAP"
@@ -3057,7 +3347,7 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
         ifname,
         queues.len(),
         pcfg.tun.address,
-        pcfg.tun.netmask
+        profile_subnet.prefix
     );
 
     // Host NAT (iptables) for full-tunnel egress. Always clear any rules we left
@@ -3124,6 +3414,44 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
         }
     }
 
+    // One shared fixed-budget pool feeds every queue's TUN reader. Size each slot exactly as
+    // the configured read buffer (the kernel writes directly into it), while retaining at
+    // least one slot per queue even for an intentionally huge read buffer. Pool exhaustion
+    // applies backpressure before the next read; it never allocates a fallback or drops a
+    // packet already removed from the kernel.
+    let tun_buf_size = pcfg.performance.tun.read_buffer_size;
+    let tun_read_buffer_count = server_tun_read_buffer_count(queues.len(), tun_buf_size);
+    let tun_read_pool = BufferPool::new(tun_read_buffer_count, tun_buf_size).map_err(|error| {
+        anyhow::anyhow!(
+            "profile '{name}': cannot allocate bounded TUN read pool ({tun_read_buffer_count} x {tun_buf_size} bytes): {error}"
+        )
+    })?;
+    log::info!(
+        "Profile '{}': bounded TUN read pool = {} buffers x {} bytes ({:.1} MiB)",
+        name,
+        tun_read_buffer_count,
+        tun_buf_size,
+        tun_read_buffer_count.saturating_mul(tun_buf_size) as f64 / (1024.0 * 1024.0)
+    );
+    let tun_write_buffer_capacity =
+        crate::protocol::packet::TLS_RECORD_HEADER + crate::protocol::packet::MAX_RECORD_SIZE;
+    let tun_write_buffer_count = (SERVER_TUN_WRITE_POOL_BYTES / tun_write_buffer_capacity)
+        .max(queues.len())
+        .max(1);
+    let tun_write_pool = BufferPool::new(tun_write_buffer_count, tun_write_buffer_capacity)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "profile '{name}': cannot allocate bounded TUN write pool ({tun_write_buffer_count} x {tun_write_buffer_capacity} bytes): {error}"
+            )
+        })?;
+    log::info!(
+        "Profile '{}': bounded TUN write pool = {} buffers x {} bytes ({:.1} MiB)",
+        name,
+        tun_write_buffer_count,
+        tun_write_buffer_capacity,
+        tun_write_buffer_count.saturating_mul(tun_write_buffer_capacity) as f64 / (1024.0 * 1024.0)
+    );
+
     // Per-queue reader/writer fds (dup'd so the blocking reader and writer threads each
     // own a closable fd for their queue). Dropping `queues` after this keeps the device
     // alive via these dups (closed when the threads exit).
@@ -3133,8 +3461,13 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
         // Leave the fds BLOCKING: the reader thread sleeps inside read() until a
         // packet arrives (no 1ms busy-poll → 0% idle CPU even with many queues); the
         // writer blocks on a full TUN queue (backpressure, not silent drop).
-        let rfd = unsafe { libc::dup(q.as_raw_fd()) };
-        let wfd = unsafe { libc::dup(q.as_raw_fd()) };
+        // F_DUPFD_CLOEXEC, not dup(2): dup CLEARS FD_CLOEXEC, so every one of these leaked
+        // into the server's children — `iptables`/`ip6tables`, `ip`, and the operator's own
+        // routing.post_up/post_down commands, which run as `/bin/sh -c <string>`. An
+        // inherited TUN queue fd reads the plaintext traffic of EVERY client on the profile.
+        // Same defect and same fix as the client side. (Audit 2026-08-04.)
+        let rfd = unsafe { libc::fcntl(q.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        let wfd = unsafe { libc::fcntl(q.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         if rfd < 0 || wfd < 0 {
             for fd in reader_fds.iter().chain(writer_fds.iter()) {
                 unsafe { libc::close(*fd) };
@@ -3154,15 +3487,20 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
 
     // Inbound (client -> TUN): one channel per queue. handle_client gets a sharded
     // sender (sticky per connection) so a connection's packets stay ordered.
-    let mut in_txs: Vec<mpsc::Sender<Vec<u8>>> = Vec::with_capacity(reader_fds.len());
-    let mut in_rxs: Vec<mpsc::Receiver<Vec<u8>>> = Vec::with_capacity(reader_fds.len());
+    let mut in_txs: Vec<mpsc::Sender<ServerTunPacket>> = Vec::with_capacity(reader_fds.len());
+    let mut in_rxs: Vec<mpsc::Receiver<ServerTunPacket>> = Vec::with_capacity(reader_fds.len());
     for _ in 0..reader_fds.len() {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(4096);
+        let (tx, rx) = mpsc::channel::<ServerTunPacket>(4096);
         in_txs.push(tx);
         in_rxs.push(rx);
     }
 
-    let pool = pool::IpPool::new(&pcfg.pool)?;
+    let tun_address: std::net::Ipv4Addr = pcfg
+        .tun
+        .address
+        .parse()
+        .map_err(|e| anyhow::anyhow!("profile '{}': invalid tun.address: {}", name, e))?;
+    let pool = pool::IpPool::new_with_tun(&pcfg.pool, tun_address)?;
 
     // Per-profile server identity (its own static key, bound to this interface).
     let static_keypair = Arc::new(load_or_generate_profile_key(&pcfg)?);
@@ -3311,6 +3649,9 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
             pcfg.performance.connection.new_session_rate_max,
             pcfg.performance.connection.new_session_rate_window_secs,
         ))),
+        udp_buffer_counters: Arc::new(
+            crate::transport_core::udp_buffer::UdpBufferCounters::default(),
+        ),
         static_keypair,
         reality_tls_config,
         reality_replay: Arc::new(Mutex::new(ReplayGuard::new(Duration::from_secs(
@@ -3335,15 +3676,15 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
 
     // Per-queue data-plane pump. Each queue gets: a blocking reader (TUN -> forwarder),
     // an async forwarder (lookup + ENCRYPT + send to client — encrypt now runs N-way in
-    // parallel, serialized only per-session by the codec lock), a blocking writer (drains
-    // its inbound channel -> TUN), and an async bridge feeding that writer. The kernel
-    // RSS-distributes outbound TUN packets across the queues by flow.
-    let tun_buf_size = pcfg.performance.tun.read_buffer_size;
+    // parallel, serialized only per-session by the codec lock), and a blocking writer that
+    // drains the bounded inbound channel directly into TUN. The kernel RSS-distributes
+    // outbound TUN packets across the queues by flow.
     // Shared with `ProfileTeardown`: the flag the readers check when a signal interrupts their
     // `read()`, and the thread ids to send that signal to.
     #[cfg(target_os = "linux")]
     reader_wakeup::install();
     let reader_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (reader_pool_stop, _) = tokio::sync::watch::channel(false);
     #[cfg(target_os = "linux")]
     let reader_tids: Arc<std::sync::Mutex<Vec<libc::pthread_t>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3353,6 +3694,10 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
     // carried out of the loop and returned only AFTER the handles reach the teardown guard.
     // Returning it here with `?` was the leak: everything spawned so far became detached.
     let mut spawn_err: Option<anyhow::Error> = None;
+    // A queue thread is part of the profile's health, not a detached best-effort
+    // helper. Its fatal exit is delivered to the async owner so the teardown guard
+    // dismantles this generation and the profile supervisor can rebuild it.
+    let (tun_fatal_tx, mut tun_fatal_rx) = mpsc::channel::<String>(1);
     for (qi, ((reader_fd, writer_fd), mut in_rx)) in reader_fds
         .into_iter()
         .zip(writer_fds)
@@ -3360,11 +3705,15 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
         .enumerate()
     {
         // Outbound: TUN[qi] -> forwarder -> client writer.
-        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(4096);
+        let (out_tx, mut out_rx) = mpsc::channel::<ServerTunPacket>(4096);
         {
             let name_r = name.clone();
             let is_tap_reader = is_tap;
             let stop = reader_stop.clone();
+            let pool = tun_read_pool.clone();
+            let mut pool_stop = reader_pool_stop.subscribe();
+            let fatal = tun_fatal_tx.clone();
+            let runtime = tokio::runtime::Handle::current();
             #[cfg(target_os = "linux")]
             let tids = reader_tids.clone();
             // A DEDICATED thread, not `spawn_blocking`: this loop blocks for the whole life of
@@ -3382,7 +3731,6 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                         }
                     }
                     log::info!("TUN reader q{} for profile '{}' started", qi, name_r);
-                    let mut buf = vec![0u8; tun_buf_size];
                     loop {
                         // BEFORE parking, not only after an interrupt. A teardown that happens
                         // while this thread is still starting up would otherwise find it about
@@ -3393,9 +3741,70 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                         if stop.load(std::sync::atomic::Ordering::Relaxed) {
                             break;
                         }
-                        let n = unsafe {
-                            libc::read(reader_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                        // The normal path is a lock-free semaphore try-acquire. Only actual
+                        // downstream congestion enters the runtime to wait, and teardown has
+                        // an explicit wake arm so a pool-starved reader cannot pin its fd.
+                        let Some(mut packet) = pool.try_acquire().or_else(|| {
+                            runtime.block_on(async {
+                                tokio::select! {
+                                    packet = pool.acquire() => packet,
+                                    _ = pool_stop.changed() => None,
+                                }
+                            })
+                        }) else {
+                            break;
                         };
+                        // ###################################################################
+                        // PERFORMANCE-CRITICAL — do not "simplify" this back to `resize`.
+                        //
+                        // Rewriting these five lines as the obvious
+                        //
+                        //     let read_buffer = packet.as_vec_mut();
+                        //     read_buffer.resize(tun_buf_size, 0);          // <- WAS THIS
+                        //     let n = unsafe {
+                        //         libc::read(reader_fd,
+                        //                    read_buffer.as_mut_ptr() as *mut libc::c_void,
+                        //                    read_buffer.len())
+                        //     };
+                        //     ...
+                        //     packet.as_vec_mut().truncate(n as usize);     // <- AND THIS
+                        //
+                        // costs ~13% of DOWNLOAD throughput. That form shipped in 0.7.15 and
+                        // was reverted here; if a future change ever needs to go back to it,
+                        // the block above is the exact code to restore.
+                        //
+                        // Why it is so expensive: a pooled buffer returns with `len == 0`
+                        // (PooledBuffer::drop clears it), so `resize` re-zeroes all 64 KiB
+                        // (`perf.tun.read_buffer_size`) before a ~1.4 KiB packet lands in it —
+                        // ~62k packets/s x 64 KiB is ~4 GB/s of stores that are immediately
+                        // overwritten. 0.7.14 was fast because it kept ONE buffer outside the
+                        // loop and never re-zeroed it.
+                        //
+                        // Measured, not guessed (scripts/ab_crossver_downlink.py,
+                        // scripts/ab_memset_fix.py; raw data in release/ab_*.json):
+                        //   S14/C14 721 | S14/C15 734 (+1.7%) | S15/C14 631 (-12.5%)
+                        //     -> the regression follows the SERVER, the client is innocent
+                        //   fixed vs 0.7.15: plain +10.9%, fake-tls +12.5%, obfs +18.2%
+                        // A bigger downlink pool does NOT help (16 MiB gave -0.3%): the cost
+                        // is the memset, not the queue depth.
+                        //
+                        // Read straight into the pooled allocation's SPARE capacity instead.
+                        // `spare_capacity_mut` hands out the uninitialised tail; `read` writes
+                        // the first `n` bytes and `set_len(n)` publishes exactly those, so no
+                        // uninitialised byte is ever readable through the Vec.
+                        // ###################################################################
+                        let read_buffer = packet.as_vec_mut();
+                        read_buffer.clear();
+                        let spare = read_buffer.spare_capacity_mut();
+                        let read_len = tun_buf_size.min(spare.len());
+                        let n = unsafe {
+                            libc::read(reader_fd, spare.as_mut_ptr() as *mut libc::c_void, read_len)
+                        };
+                        if n > 0 {
+                            // SAFETY: `read` initialised exactly `n` bytes of the spare tail,
+                            // and `n <= read_len <= capacity`.
+                            unsafe { read_buffer.set_len(n as usize) };
+                        }
                         if n < 0 {
                             let err = std::io::Error::last_os_error();
                             // Blocking read: only EINTR is retryable (the fd is no longer
@@ -3409,22 +3818,42 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                                 }
                                 continue;
                             }
+                            let _ = fatal.try_send(format!("TUN reader q{qi} failed: {err}"));
                             log::error!("TUN read error q{} on profile '{}': {}", qi, name_r, err);
                             break;
                         }
                         if n == 0 {
+                            if !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                let _ = fatal
+                                    .try_send(format!("TUN reader q{qi} reached unexpected EOF"));
+                            }
                             break;
                         }
-                        let raw = &buf[..n as usize];
-                        let packet = if is_tap_reader {
-                            match strip_ethernet_header(raw) {
-                                Some(ip) => ip.to_vec(),
-                                None => continue,
+                        // Length was published by `set_len(n)` right after the read, so the
+                        // old `truncate(n as usize)` that stood here is a no-op — it is left
+                        // out deliberately. Re-adding it is harmless on its own, but it only
+                        // makes sense together with the `resize` form, which is the slow one
+                        // (see the PERFORMANCE-CRITICAL block above before changing either).
+                        debug_assert_eq!(packet.len(), n as usize);
+                        if is_tap_reader {
+                            let Some(ip_offset) = strip_ethernet_header(&packet)
+                                .map(|ip| packet.len().saturating_sub(ip.len()))
+                            else {
+                                continue;
+                            };
+                            let ip_len = packet.len() - ip_offset;
+                            let packet_buffer = packet.as_vec_mut();
+                            packet_buffer.copy_within(ip_offset.., 0);
+                            packet_buffer.truncate(ip_len);
+                        }
+                        if out_tx
+                            .blocking_send(ServerTunPacket::Pooled(packet))
+                            .is_err()
+                        {
+                            if !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                let _ = fatal
+                                    .try_send(format!("TUN reader q{qi} lost its async forwarder"));
                             }
-                        } else {
-                            raw.to_vec()
-                        };
-                        if out_tx.blocking_send(packet).is_err() {
                             break;
                         }
                     }
@@ -3445,13 +3874,12 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                 }
             }
         }
-        // Created BEFORE the outbound forwarder so that forwarder can inject ICMP
-        // "Fragmentation Needed" back toward an origin whose packets are too big for a
-        // client's path (#13). The writer half is consumed by the TUN writer thread below.
-        let (tun_write_tx, tun_write_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(256);
+        // Created before the outbound forwarder: ICMP "Fragmentation Needed" shares the
+        // same bounded inbound queue as client packets and is consumed directly by the
+        // dedicated TUN writer thread below.
         {
             let fwd_profile = profile.clone();
-            let icmp_tx = tun_write_tx.clone();
+            let icmp_tx = in_txs[qi].clone();
             // The address our ICMP errors come from: this profile's TUN address, i.e. the
             // hop that could not forward. Parsed once — an unparseable address just disables
             // the signal rather than failing the profile.
@@ -3462,6 +3890,9 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                 .parse::<std::net::Ipv4Addr>()
                 .ok();
             tokio::spawn(async move {
+                // The forwarder serializes packets, so one task-owned buffer serves all
+                // server→client padding without a Vec allocation per record.
+                let mut padding = Vec::with_capacity(crate::protocol::packet::MAX_RECORD_SIZE);
                 while let Some(packet) = out_rx.recv().await {
                     if packet.len() < 20 || (packet[0] >> 4) != 4 {
                         continue;
@@ -3486,7 +3917,23 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                             let src_ip = std::net::Ipv4Addr::new(
                                 packet[12], packet[13], packet[14], packet[15],
                             );
-                            if sessions.by_ip.contains_key(&src_ip) {
+                            // "Is the SOURCE a client?" has to be asked the same way the
+                            // DESTINATION was resolved two lines up: pool address OR any
+                            // subnet routed to a client (iroute).
+                            //
+                            // Checking only `by_ip` looked at the pool and stopped there,
+                            // while `SrcGuard` deliberately lets a client send from any
+                            // address inside its own `client_subnets` — the site-to-site
+                            // case. So client A with `client_subnets = 192.168.50.0/24`
+                            // could source a packet from 192.168.50.9 to client B's tunnel
+                            // address: the uplink guard passed it (that source IS A's), the
+                            // isolation check saw an address absent from `by_ip` and treated
+                            // it as ordinary internet traffic, and B's reply routed straight
+                            // back into A's tunnel via `route_lookup`. A full bidirectional
+                            // channel with isolation switched ON. (Audit 2026-08-04.)
+                            if sessions.by_ip.contains_key(&src_ip)
+                                || sessions.route_lookup(src_ip).is_some()
+                            {
                                 continue;
                             }
                         }
@@ -3504,7 +3951,7 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                         // reported something narrower, so a pre-#13 client changes nothing.
                         // Set when an oversized non-DF packet was split instead of dropped;
                         // the send below then emits the pieces in place of the original.
-                        let mut fragmented: Option<Vec<Vec<u8>>> = None;
+                        let mut fragmented: Option<Vec<ServerTunPacket>> = None;
                         let session_mtu = session.downlink_mtu(fwd_profile.config.tun.mtu);
                         if let Some(mtu) = session_mtu {
                             if packet.len() > mtu as usize {
@@ -3519,7 +3966,7 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                                         // Best-effort, like every other TUN write here: a full
                                         // queue drops the notice rather than blocking the
                                         // forwarder for every other session.
-                                        let _ = icmp_tx.try_send(err);
+                                        let _ = icmp_tx.try_send(ServerTunPacket::Fragment(err));
                                     }
                                 } else if let Some(frags) =
                                     crate::protocol::icmp::fragment_ipv4(&packet, mtu as usize)
@@ -3530,7 +3977,9 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                                     // line — a black hole for exactly the traffic that said it
                                     // did not want one. Forward the pieces instead; the client's
                                     // stack reassembles them. (Audit 2026-07-30, #10.)
-                                    fragmented = Some(frags);
+                                    fragmented = Some(
+                                        frags.into_iter().map(ServerTunPacket::Fragment).collect(),
+                                    );
                                 } else {
                                     log::debug!(
                                         "downlink: dropped {} B non-DF packet for {} (path MTU {}) \
@@ -3557,8 +4006,15 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                         // hashing the pieces separately would scatter one datagram across
                         // different bonded streams and deliver it out of order.
                         let flow = crate::protocol::flow_hash(&packet);
-                        for packet in fragmented.unwrap_or_else(|| vec![packet]) {
-                            if let Some((codec_arc, writer)) = session.pick_stream(flow) {
+                        // Borrow the original packet as a one-element slice. The old
+                        // `unwrap_or_else(|| vec![packet])` allocated a container Vec for every
+                        // ordinary downlink packet even when fragmentation was not involved.
+                        let packets = fragmented
+                            .as_deref()
+                            .unwrap_or_else(|| std::slice::from_ref(&packet));
+                        for packet in packets {
+                            if let Some((codec_arc, writer, wire_pool)) = session.pick_stream(flow)
+                            {
                                 // Symmetric obfuscation: pad server→client traffic too. Clamp
                                 // under the path MTU so UDP sessions don't get fragmented.
                                 let pad_cfg = &fwd_profile.config.obfuscation.padding;
@@ -3584,23 +4040,47 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                                     (pad_cfg.max_bytes as usize).min(mtu.saturating_sub(base))
                                         as u16
                                 };
-                                let padding = obf.generate_padding_opts(
+                                obf.generate_padding_opts_into(
                                     pad_cfg.enabled,
                                     pad_cfg.min_bytes,
                                     pad_cap,
                                     pad_cfg.randomize,
                                     pad_cfg.probability,
+                                    &mut padding,
                                 );
+                                let Some(mut encrypted) = wire_pool.try_acquire() else {
+                                    // Pool exhaustion is the same slow-client signal as a full
+                                    // writer channel, but without allocating a fallback record.
+                                    session
+                                        .dropped
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    continue;
+                                };
                                 let mut codec = lock_or_recover(&codec_arc, "fwd::encrypt");
-                                if let Ok(encrypted) = codec.encrypt_packet(&packet, &padding) {
+                                let fits_pool = codec
+                                    .encrypted_record_len(packet.len(), padding.len())
+                                    .is_ok_and(|required| required <= encrypted.capacity());
+                                if !fits_pool {
+                                    // Profile validation and pool sizing should make this
+                                    // unreachable. Fail closed instead of allowing Vec::reserve
+                                    // to silently grow a slot beyond the advertised 4 MiB budget.
+                                    session
+                                        .dropped
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    continue;
+                                }
+                                if codec
+                                    .encrypt_packet_into(packet, &padding, encrypted.as_vec_mut())
+                                    .is_ok()
+                                    && writer.try_send(encrypted).is_err()
+                                {
                                     // A full writer channel = rate-limit / slow-client
                                     // backpressure. Count the drop so it's visible in
-                                    // list-clients instead of silently vanishing.
-                                    if writer.try_send(encrypted).is_err() {
-                                        session
-                                            .dropped
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
+                                    // list-clients instead of silently vanishing. Dropping the
+                                    // send error returns its record to the same bounded pool.
+                                    session
+                                        .dropped
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
                         }
@@ -3609,13 +4089,15 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
             });
         }
 
-        // Inbound: client -> in_rx -> TUN[qi] (dedicated blocking writer + async bridge).
-        // The channel itself is created above, before the outbound forwarder.
+        // Inbound: client -> bounded in_rx -> TUN[qi]. The dedicated writer consumes the
+        // Tokio receiver directly with `blocking_recv`: the former async bridge plus a
+        // second 256-slot std channel dropped bursts between two otherwise healthy queues.
         {
             let name_w = name.clone();
             let is_tap_writer = is_tap;
             let gw_mac = gateway_mac;
             let stop_w = reader_stop.clone();
+            let fatal_w = tun_fatal_tx.clone();
             #[cfg(target_os = "linux")]
             let tids_w = reader_tids.clone();
             let handle = std::thread::Builder::new()
@@ -3630,27 +4112,21 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                         }
                     }
                     log::info!("TUN writer q{} for profile '{}' started", qi, name_w);
-                    // `recv_timeout`, not `for packet in rx`. The plain iterator blocks until a
-                    // sender is dropped, and the senders are held by the async bridge and the
-                    // forwarder — so a stopping profile could not make this thread exit, and its
-                    // `writer_fd` stayed open holding the device up. A signal does not help
-                    // either: this parks on a condvar, not in a syscall, so EINTR never
-                    // surfaces. A timed wait is what gives it a chance to look at the flag.
-                    // Idle cost is one wakeup every 250 ms; when packets are flowing `recv_timeout`
-                    // returns immediately and costs nothing extra.
+                    // `ProfileTeardown` raises `stop_w` and try-sends one empty wake packet.
+                    // If the queue is full the writer is already runnable; if it is empty the
+                    // wake releases `blocking_recv`. This keeps teardown bounded without an
+                    // idle polling timer or a second channel.
                     'writer: loop {
-                        let packet = match tun_write_rx
-                            .recv_timeout(std::time::Duration::from_millis(250))
-                        {
-                            Ok(p) => p,
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                if stop_w.load(std::sync::atomic::Ordering::Relaxed) {
-                                    break 'writer;
+                        let packet = match in_rx.blocking_recv() {
+                            Some(packet) => packet,
+                            None => {
+                                if !stop_w.load(std::sync::atomic::Ordering::Relaxed) {
+                                    let _ = fatal_w.try_send(format!(
+                                        "TUN writer q{qi} lost all ingress senders"
+                                    ));
                                 }
-                                continue;
+                                break 'writer;
                             }
-                            // Every sender gone: nothing more can arrive.
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'writer,
                         };
                         if stop_w.load(std::sync::atomic::Ordering::Relaxed) {
                             break 'writer;
@@ -3713,6 +4189,8 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                                         name_w,
                                         err
                                     );
+                                    let _ =
+                                        fatal_w.try_send(format!("TUN writer q{qi} failed: {err}"));
                                     break 'writer;
                                 }
                             }
@@ -3735,18 +4213,6 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                 }
             }
         }
-        tokio::spawn(async move {
-            while let Some(packet) = in_rx.recv().await {
-                // `tun_write_tx` is a blocking SyncSender — a plain `.send()` here would
-                // PARK this tokio worker thread whenever the 256-slot channel is full,
-                // stalling the runtime. Drop on Full (congestion) instead; stop on close.
-                match tun_write_tx.try_send(packet) {
-                    Ok(()) => {}
-                    Err(std::sync::mpsc::TrySendError::Full(_)) => {}
-                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
-                }
-            }
-        });
     }
 
     // Hand the readers to the teardown guard, which from here on owns stopping them. Done
@@ -3755,6 +4221,8 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
     teardown.readers = Some(QueueThreads {
         stop: reader_stop,
         handles: queue_handles,
+        wake_senders: in_txs.clone(),
+        pool_stop: reader_pool_stop,
         #[cfg(target_os = "linux")]
         tids: reader_tids,
     });
@@ -3766,6 +4234,18 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
 
     // DNS proxy (per-profile)
     if pcfg.dns.enabled {
+        // A resolver bound to the profile TUN address is local server traffic: packets hit
+        // filter/INPUT, not FORWARD. Install a narrowly scoped permit before advertising the
+        // resolver so hosts with INPUT DROP cannot create a connected-but-DNS-dead tunnel.
+        nat::enable_dns_input(
+            &name,
+            &ifname,
+            &pcfg.pool.cidr,
+            &pcfg.dns.listen,
+            pcfg.dns.port,
+        )
+        .map_err(|error| anyhow::anyhow!("profile '{}': {error}", name))?;
+
         // Bridge 53 -> dns.port inside the tunnel when the proxy listens somewhere else, so
         // clients can keep using the only port their platform can express. No-op on 53.
         //
@@ -3854,22 +4334,15 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
     if pcfg.dhcp.enabled {
         // Same helper `validate_profiles` uses, so the runtime cannot resolve a different
         // pool than the one that was validated. (Audit 2026-07-27, C9.)
-        let (pool_start, pool_end) = crate::config::server::dhcp_pool_bounds(
-            &pcfg.dhcp,
-            &pcfg.tun.address,
-            &pcfg.tun.netmask,
-        )
-        .map_err(|e| anyhow::anyhow!("profile '{}': {}", name, e))?;
         let server_ip: std::net::Ipv4Addr = pcfg
             .tun
             .address
             .parse()
             .map_err(|e| anyhow::anyhow!("profile '{}': invalid tun.address: {}", name, e))?;
-        let subnet_mask: std::net::Ipv4Addr = pcfg
-            .tun
-            .netmask
-            .parse()
-            .map_err(|e| anyhow::anyhow!("profile '{}': invalid tun.netmask: {}", name, e))?;
+        let (pool_start, pool_end) =
+            crate::config::server::dhcp_pool_bounds(&pcfg.dhcp, &pcfg.pool.cidr, server_ip)
+                .map_err(|e| anyhow::anyhow!("profile '{}': {}", name, e))?;
+        let subnet_mask = profile_subnet.netmask;
         let dhcp_dns: Vec<std::net::Ipv4Addr> = if pcfg.dns.enabled {
             vec![server_ip]
         } else {
@@ -3878,11 +4351,7 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                 std::net::Ipv4Addr::new(8, 8, 8, 8),
             ]
         };
-        let dhcp_listen = if pcfg.dhcp.listen.contains(':') {
-            pcfg.dhcp.listen.clone()
-        } else {
-            format!("{}:67", pcfg.dhcp.listen)
-        };
+        let dhcp_listen = dhcp_bind_spec(&pcfg);
 
         let dhcp_server = Arc::new(dhcp::DhcpServer::new(
             server_ip,
@@ -3988,6 +4457,7 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
         let decoy_gate = decoy_gate.clone();
         let decoy_refused = decoy_refused.clone();
         let in_txs = in_txs.clone();
+        let tun_write_pool = tun_write_pool.clone();
         let pcfg = pcfg.clone();
         let name = name.clone();
         listener_set.spawn(async move {
@@ -4057,7 +4527,10 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                             use std::hash::{Hash, Hasher};
                             let mut h = std::collections::hash_map::DefaultHasher::new();
                             addr.hash(&mut h);
-                            in_txs[(h.finish() as usize) % in_txs.len()].clone()
+                            TunIngress {
+                                sender: in_txs[(h.finish() as usize) % in_txs.len()].clone(),
+                                pool: tun_write_pool.clone(),
+                            }
                         };
                         let use_reality = pcfg.obfuscation.tls.reality_proxy.enabled;
                         let nodelay = pcfg.performance.tcp.nodelay;
@@ -4176,17 +4649,25 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                     );
                     let mut handles = Vec::with_capacity(workers);
                     for wid in 0..workers {
-                        let socket =
-                            udp_handler::bind_reuseport(&bind_addr, &profile.config.performance.udp)?;
+                        let (socket, udp_buffer) = udp_handler::bind_reuseport(
+                            &bind_addr,
+                            &profile.config.performance.udp,
+                            profile.udp_buffer_counters.clone(),
+                            state.udp_buffer_budget,
+                        )?;
                         let udp_state = state.clone();
                         let udp_profile = profile.clone();
-                        let tun_tx_udp = in_txs[wid % in_txs.len()].clone();
+                        let tun_tx_udp = TunIngress {
+                            sender: in_txs[wid % in_txs.len()].clone(),
+                            pool: tun_write_pool.clone(),
+                        };
                         let pname = name.clone();
                         handles.push(tokio::spawn(async move {
                             if let Err(e) = udp_handler::run_udp_server(
                                 udp_state,
                                 udp_profile,
                                 socket,
+                                udp_buffer,
                                 wid,
                                 tun_tx_udp,
                             )
@@ -4231,14 +4712,18 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
     // Failing here hands the situation to the layer that can act on it: the guard rolls the
     // profile back (TUN, NAT, registry) and the spawn site logs it per profile while the other
     // profiles keep serving. (Audit 2026-08-01, §5.)
-    let why = match listener_set.join_next().await {
-        Some(Ok(Err(e))) => format!("a listener exited: {e}"),
-        Some(Ok(Ok(()))) => "a listener stopped unexpectedly".to_string(),
-        Some(Err(e)) => format!("a listener task panicked: {e}"),
-        // Nothing was ever spawned. The profile has a TUN, a pool and users, and accepts
-        // nothing at all — reported rather than returned as success, which is what used to
-        // happen when every bind failed.
-        None => "no listeners were started at all".to_string(),
+    let why = tokio::select! {
+        fatal = tun_fatal_rx.recv() => fatal
+            .unwrap_or_else(|| "all TUN queue health senders disappeared".to_string()),
+        joined = listener_set.join_next() => match joined {
+            Some(Ok(Err(e))) => format!("a listener exited: {e}"),
+            Some(Ok(Ok(()))) => "a listener stopped unexpectedly".to_string(),
+            Some(Err(e)) => format!("a listener task panicked: {e}"),
+            // Nothing was ever spawned. The profile has a TUN, a pool and users, and accepts
+            // nothing at all — reported rather than returned as success, which is what used to
+            // happen when every bind failed.
+            None => "no listeners were started at all".to_string(),
+        },
     };
     // Stop the survivors explicitly rather than relying on the JoinSet's drop: their accept
     // loops would otherwise keep taking connections for a profile that is being torn down,
@@ -4260,6 +4745,16 @@ mod tests {
         s.parse().unwrap()
     }
 
+    #[test]
+    fn tun_read_pool_has_a_fixed_budget_and_at_least_one_buffer_per_queue() {
+        assert_eq!(server_tun_read_buffer_count(4, 65_536), 512);
+        assert_eq!(server_tun_read_buffer_count(256, 1_048_576), 256);
+        assert_eq!(
+            server_tun_read_buffer_count(0, SERVER_TUN_READ_POOL_BYTES * 2),
+            1
+        );
+    }
+
     /// Minimal single-profile config with a valid [performance] block, so
     /// `validate_profiles` reaches the wire-mode/transport check.
     fn cfg_with(mode: &str, transport: &str) -> ServerConfig {
@@ -4270,7 +4765,6 @@ mod tests {
              bind.transport = {transport}\n\
              tun.name = vpn0\n\
              tun.address = 10.1.0.1\n\
-             tun.netmask = 255.255.255.0\n\
              tun.mtu = 1400\n\
              pool.cidr = 10.1.0.0/24\n\
              pool.exclude = 10.1.0.1\n\
@@ -4282,7 +4776,7 @@ mod tests {
     }
 
     /// The same fixture with the address fields under test made settable.
-    fn cfg_addr(tun_address: &str, tun_netmask: &str, pool_cidr: &str) -> ServerConfig {
+    fn cfg_addr(tun_address: &str, pool_cidr: &str) -> ServerConfig {
         let ini = format!(
             "[profile:p]\n\
              bind.address = 0.0.0.0\n\
@@ -4290,7 +4784,6 @@ mod tests {
              bind.transport = tcp\n\
              tun.name = vpn0\n\
              tun.address = {tun_address}\n\
-             tun.netmask = {tun_netmask}\n\
              tun.mtu = 1400\n\
              pool.cidr = {pool_cidr}\n\
              obf.mode = fake-tls\n\
@@ -4307,21 +4800,15 @@ mod tests {
         // rc=0, the panel accepted the save, and the server then crash-looped on every
         // respawn. Guard the whole class, not just the reported field.
         for (label, cfg) in [
-            (
-                "CIDR prefix >32",
-                cfg_addr("10.1.0.1", "255.255.255.0", "10.9.0.0/33"),
-            ),
-            (
-                "not a CIDR at all",
-                cfg_addr("10.1.0.1", "255.255.255.0", "not-a-cidr"),
-            ),
+            ("CIDR prefix >32", cfg_addr("10.1.0.1", "10.9.0.0/33")),
+            ("not a CIDR at all", cfg_addr("10.1.0.1", "not-a-cidr")),
             (
                 "octet >255 in tun.address",
-                cfg_addr("300.1.1.1", "255.255.255.0", "10.1.0.0/24"),
+                cfg_addr("300.1.1.1", "10.1.0.0/24"),
             ),
             (
-                "tun.netmask not an address",
-                cfg_addr("10.1.0.1", "not-a-mask", "10.1.0.0/24"),
+                "tun.address outside pool.cidr",
+                cfg_addr("10.2.0.1", "10.1.0.0/24"),
             ),
         ] {
             assert!(
@@ -4334,7 +4821,8 @@ mod tests {
     #[test]
     fn valid_address_fields_still_pass() {
         // The guard above must not start rejecting ordinary configs.
-        assert!(validate_profiles(&cfg_addr("10.1.0.1", "255.255.255.0", "10.1.0.0/24")).is_ok());
+        assert!(validate_profiles(&cfg_addr("10.1.0.1", "10.1.0.0/24")).is_ok());
+        assert!(validate_profiles(&cfg_addr("10.1.0.1", "10.1.0.0/16")).is_ok());
     }
 
     /// The PRIMARY bind, which the extra-listener checks never covered (§5).
@@ -4356,7 +4844,6 @@ bind.port = {port}
                  bind.transport = {transport}
 tun.name = vpn{name}
 tun.address = 10.1.0.1
-                 tun.netmask = 255.255.255.0
 tun.mtu = 1400
 pool.cidr = 10.1.0.0/24
                  obf.mode = fake-tls
@@ -4414,7 +4901,6 @@ pool.cidr = 10.1.0.0/24
                  {extra}\
                  tun.name = vpn{tun}\n\
                  tun.address = 10.{tun}.0.1\n\
-                 tun.netmask = 255.255.255.0\n\
                  tun.mtu = 1400\n\
                  pool.cidr = 10.{tun}.0.0/24\n\
                  obf.mode = fake-tls\n"
@@ -4495,7 +4981,6 @@ pool.cidr = 10.1.0.0/24
                  bind.transport = tcp\n\
                  tun.name = vpn{tun}\n\
                  tun.address = 10.{tun}.0.1\n\
-                 tun.netmask = 255.255.255.0\n\
                  tun.mtu = 1400\n\
                  pool.cidr = 10.{tun}.0.0/24\n\
                  obf.mode = fake-tls\n\
@@ -4539,11 +5024,14 @@ pool.cidr = 10.1.0.0/24
                     "dns.enabled = true\ndns.listen = 10.9.0.1\n",
                 ),
             ),
-            (
-                "two DHCP servers on the 0.0.0.0:67 default",
-                profile("a", "4443", 0, "dhcp.enabled = true\n")
-                    + &profile("b", "5443", 1, "dhcp.enabled = true\n"),
-            ),
+            // NB: "two DHCP servers on the 0.0.0.0:67 default" used to live here. It cannot
+            // happen any more: `dhcp.listen` defaults to EMPTY, which resolves to the
+            // PROFILE'S OWN tun address, so two default-configured profiles bind two
+            // different addresses instead of colliding on the wildcard. The old default
+            // published an unauthenticated DHCP server on every interface, which was the
+            // real problem — the collision was only how it surfaced. The case below (an
+            // EXPLICIT shared address) still exercises the conflict map.
+            // (Audit 2026-08-04.)
             (
                 // The runtime appends `:67` to a bare address, so reading the raw string let
                 // this exact collision through whenever the port was omitted.
@@ -4589,7 +5077,6 @@ pool.cidr = 10.1.0.0/24
                  bind.transport = tcp\n\
                  tun.name = {tun}\n\
                  tun.address = 10.{net}.0.1\n\
-                 tun.netmask = 255.255.255.0\n\
                  tun.mtu = 1400\n\
                  pool.cidr = 10.{net}.0.0/24\n\
                  obf.mode = fake-tls\n"
@@ -4642,7 +5129,6 @@ pool.cidr = 10.1.0.0/24
                  bind.transport = tcp\n\
                  tun.name = vpn0\n\
                  tun.address = 10.1.0.1\n\
-                 tun.netmask = 255.255.255.0\n\
                  tun.mtu = {mtu}\n\
                  tun.device_type = {dev}\n\
                  pool.cidr = 10.1.0.0/24\n\
@@ -4674,6 +5160,35 @@ pool.cidr = 10.1.0.0/24
         );
     }
 
+    #[test]
+    fn udp_socket_buffers_have_a_hard_per_worker_limit() {
+        fn cfg(key: &str, value: u32) -> ServerConfig {
+            crate::config::parse_server_config(&format!(
+                "[profile:p]\n\
+                 bind.address = 0.0.0.0\n\
+                 bind.port = 4443\n\
+                 bind.transport = udp\n\
+                 tun.name = vpn0\n\
+                 tun.address = 10.1.0.1\n\
+                 tun.mtu = 1400\n\
+                 tun.queues = 1\n\
+                 pool.cidr = 10.1.0.0/24\n\
+                 obf.mode = fake-tls\n\
+                 {key} = {value}\n"
+            ))
+            .expect("fixture INI must parse")
+        }
+
+        for key in ["perf.udp.recv_buffer_size", "perf.udp.send_buffer_size"] {
+            validate_profiles(&cfg(key, 64 * 1024 * 1024))
+                .expect("the documented maximum must validate");
+            let error = validate_profiles(&cfg(key, 64 * 1024 * 1024 + 1))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(key), "wrong validation error: {error}");
+        }
+    }
+
     /// `web.port = 0` is a whole-config property and has nothing to do with DNS — but the check
     /// was written inside the per-profile loop's `if p.dns.enabled` branch, so it never ran for
     /// a config whose profiles do not serve DNS. (Audit 2026-08-01, §9.)
@@ -4690,7 +5205,6 @@ pool.cidr = 10.1.0.0/24
                  bind.transport = tcp\n\
                  tun.name = vpn0\n\
                  tun.address = 10.1.0.1\n\
-                 tun.netmask = 255.255.255.0\n\
                  tun.mtu = 1400\n\
                  pool.cidr = 10.1.0.0/24\n\
                  obf.mode = fake-tls\n\
@@ -4725,7 +5239,6 @@ pool.cidr = 10.1.0.0/24
                  bind.transport = tcp\n\
                  tun.name = vpn0\n\
                  tun.address = 10.1.0.1\n\
-                 tun.netmask = 255.255.255.0\n\
                  tun.mtu = 1400\n\
                  pool.cidr = 10.1.0.0/24\n\
                  obf.mode = fake-tls\n\
@@ -4765,6 +5278,18 @@ pool.cidr = 10.1.0.0/24
             (
                 "shaping budget 0",
                 "obf.traffic_shaping.enabled = true\nobf.traffic_shaping.budget_bytes_per_sec = 0\n",
+            ),
+            (
+                "shaping budget below one cover record",
+                "obf.traffic_shaping.enabled = true\nobf.traffic_shaping.budget_bytes_per_sec = 63\nobf.traffic_shaping.max_size = 64\n",
+            ),
+            (
+                "heartbeat larger than one record",
+                "obf.heartbeat.enabled = true\nobf.heartbeat.data_size_bytes = 20000\n",
+            ),
+            (
+                "shaping cover larger than one record",
+                "obf.traffic_shaping.enabled = true\nobf.traffic_shaping.max_size = 20000\n",
             ),
         ] {
             assert!(
@@ -4867,6 +5392,32 @@ pool.cidr = 10.1.0.0/24
         // fake-tls is the only wire mode that also rides UDP (TLS-record-framed
         // datagrams + optional QUIC masking); it must pass validation on UDP.
         assert!(validate_profiles(&cfg_with("fake-tls", "udp")).is_ok());
+    }
+
+    #[test]
+    fn udp_requires_at_least_one_liveness_or_reaper_signal() {
+        let mut dead_forever = cfg_with("fake-tls", "udp");
+        dead_forever.profiles[0].obfuscation.heartbeat.enabled = false;
+        dead_forever.profiles[0].obfuscation.traffic_shaping.enabled = false;
+        dead_forever.profiles[0]
+            .performance
+            .connection
+            .idle_timeout_secs = 0;
+        let error = validate_profiles(&dead_forever).unwrap_err();
+        assert!(error.to_string().contains("dead sessions"));
+
+        dead_forever.profiles[0]
+            .performance
+            .connection
+            .idle_timeout_secs = 300;
+        assert!(validate_profiles(&dead_forever).is_ok());
+
+        dead_forever.profiles[0]
+            .performance
+            .connection
+            .idle_timeout_secs = 0;
+        dead_forever.profiles[0].obfuscation.heartbeat.enabled = true;
+        assert!(validate_profiles(&dead_forever).is_ok());
     }
 
     #[test]

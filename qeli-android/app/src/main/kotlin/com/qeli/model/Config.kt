@@ -1,6 +1,5 @@
 package com.qeli.model
 
-import com.qeli.protocol.UdpFrag
 import java.io.Serializable
 
 /**
@@ -27,6 +26,10 @@ data class VpnConfig(
     // auth.bind_static_to_session + requires a pinned key). Default TRUE
     // (secure-by-default since 0.7.1); set false for a legacy 0.7.0 / TOFU server.
     val bindStaticToSession: Boolean = true,
+    // Escape hatch only when a first-seen, server-proven key cannot be persisted. False by
+    // default: storage failure aborts fail-closed. True never permits a mismatch with an
+    // existing pin; it only allows this session to continue without durable TOFU state.
+    val allowUnpinnedTofu: Boolean = false,
     // ── tun ──
     // 0 = auto: adopt the MTU the server pushes at auth (falls back to 1400 if the
     // server is too old to push one). A value > 0 is an explicit override.
@@ -40,6 +43,11 @@ data class VpnConfig(
     // from `gateway`, and the UI writes it — so `validate` is where a bad value is caught.
     val routingMode: String = "full-tunnel",   // "full-tunnel" | "split-tunnel"
     val addDefaultGateway: Boolean = true,
+    // Android implements the shared kill-switch contract by requiring the OS-owned
+    // Always-on VPN lockdown before a full-tunnel connection may start. The app cannot
+    // flip that system policy itself, but it can verify it from the running VpnService and
+    // fail closed when the profile requires protection that is not active.
+    val killSwitch: Boolean = false,
     val includeRoutes: List<String> = emptyList(),
     val excludeRoutes: List<String> = emptyList(),
     // Route private/local networks (RFC1918) through the VPN. When true, the
@@ -58,22 +66,18 @@ data class VpnConfig(
     // inverse of — route_local_networks. Android extra; the desktop/CLI client ignores it.
     val allowLan: Boolean = false,
     // ── dns ──
-    // Public resolvers reachable through the tunnel (the server NATs them out).
-    // Without this, full-tunnel would point DNS at the server's tun IP, which
-    // only resolves if the server runs a DNS proxy.
-    // Empty by default so a config without DNS round-trips clean and the server-pushed
-    // resolver is honoured; the 1.1.1.1/8.8.8.8 fallback moved to connect time (QeliService).
+    // Explicit resolvers reached through the tunnel. Empty means that authenticated server
+    // push may supply the list; if neither source does, Android leaves the system resolver
+    // untouched and reports the missing tunnel DNS instead of inventing a public resolver.
     val dnsServers: List<String> = emptyList(),
     /**
      * DNS handling mode, mirroring `dns.mode` in the Rust client: `tunnel` (default — install
      * resolvers reachable through the tunnel), `off` or `system` (leave the device resolver
      * alone).
      *
-     * The flat INI spells the mode and the server list with the SAME key — `dns = off` versus
-     * `dns = 1.1.1.1, 8.8.8.8` — so a shared desktop/router profile carries a value this port
-     * used to discard. Discarding it was not neutral: with no explicit resolvers the connect
-     * path installs the public fallback on a full tunnel, so `off` produced exactly the
-     * behaviour it asks to prevent. (Audit 2026-08-02, §3.)
+     * Legacy mobile profiles used the same `dns` key for both a mode and a resolver list.
+     * Readers still accept that form, while writers use canonical `dns_servers`; the mode is
+     * kept separately so `off`/`system` survives an edit. (Audit 2026-08-02, §3.)
      */
     val dnsMode: String = "tunnel",
     // ── obfuscation ──
@@ -132,12 +136,12 @@ data class VpnConfig(
     val loggingFile: String? = null,
     val loggingTimeFormat: String? = null,
     /**
-     * `[qeli]` keys this port ACCEPTS but does not model — the Rust-client-only settings in
-     * [KNOWN_INI_KEYS] (`post_up`, `allow_unpinned_tofu`, `exit_node`, `gateway_nat`, …).
+     * `[qeli]` keys this Kotlin model accepts but does not edit — transport-owned or foreign
+     * platform settings in [KNOWN_INI_KEYS] (`post_up`, `exit_node`, `gateway_nat`, …).
      *
      * Accepting them without keeping them made import-then-save LOSSY in the worst possible
      * direction: a desktop `client.conf` opened here and re-saved came back missing its
-     * post-up/post-down hooks, its TOFU setting and its routing policy. The keys were on the
+     * post-up/post-down hooks, socket settings and routing policy. The keys were on the
      * allowlist precisely so such a profile would open, and then the profile was quietly
      * gutted by the act of opening it. Exactly the failure the `[logging]` passthrough above
      * already exists to prevent — this is the same fix for the rest of them.
@@ -242,6 +246,15 @@ data class VpnConfig(
                 "single value; implementations disagree on which wins — keep one"
         }
 
+        // Keep a distinct path for a real security control a future Android version cannot
+        // honour. The set is empty today: kill_switch is modelled and enforced through the
+        // OS Always-on VPN lockdown. (Audit 2026-08-04, M-20 follow-up.)
+        for (k in unknownKeys) {
+            UNSUPPORTED_INI_KEYS[k.lowercase()]?.let { why ->
+                throw IllegalArgumentException("'$k' is not supported by the Android client. $why")
+            }
+        }
+
         // A misspelled key name is invisible: nothing reads it, so the setting it was meant to
         // change silently keeps its default. (Audit 2026-08-01, §14.)
         require(unknownKeys.isEmpty()) {
@@ -312,6 +325,13 @@ data class VpnConfig(
         scalar("obfs_key", obfsKey); scalar("front", obfsFronting)
         for (v in includeRoutes) scalar("include", v)
         for (v in excludeRoutes) scalar("exclude", v)
+        for ((field, routes) in listOf("include" to includeRoutes, "exclude" to excludeRoutes)) {
+            for (route in routes) {
+                require(isCidrLiteral(route)) {
+                    "$field route '$route' is not an IPv4/IPv6 CIDR literal"
+                }
+            }
+        }
         for (v in dnsServers) scalar("dns", v)
         for (v in apps) scalar("apps", v)
         scalar("logging.level", loggingLevel); scalar("logging.file", loggingFile)
@@ -457,6 +477,7 @@ data class VpnConfig(
         append("pass = ").append(password).append('\n')
         if (!serverPublicKeyHex.isNullOrEmpty()) append("key = ").append(serverPublicKeyHex).append('\n')
         if (!bindStaticToSession) append("bind_static = false\n")  // on by default; emit only when off
+        if (allowUnpinnedTofu) append("allow_unpinned_tofu = true\n")
         append("mode = ").append(wireMode).append('\n')
         if (!sni.isNullOrBlank()) append("sni = ").append(sni).append('\n')
         if (!realityShortId.isNullOrEmpty()) append("reality_sid = ").append(realityShortId).append('\n')
@@ -474,7 +495,8 @@ data class VpnConfig(
         // Routing: full-tunnel is the default; emit `gateway = false` only for an
         // explicit split-tunnel so the choice survives a save round-trip (the editor
         // re-serializes to INI). Mirrors the Rust client's `gateway` key.
-        if (!isFullTunnel) append("gateway = false\n")
+        append("gateway = ").append(isFullTunnel).append('\n')
+        if (killSwitch) append("kill_switch = true\n")
         if (routeLocalNetworks) append("route_local = true\n")
         if (allowIpv6Leak) append("allow_ipv6_leak = true\n")
         if (allowLan) append("allow_lan = true\n")  // LAN bypass (exclude RFC1918 from tunnel)
@@ -482,9 +504,9 @@ data class VpnConfig(
         if (excludeRoutes.isNotEmpty()) append("exclude = ").append(excludeRoutes.joinToString(", ")).append('\n')
         // One key, two meanings — mirroring the Rust client. A non-default MODE wins over the
         // server list: `dns = off` must survive a save/load round-trip, or re-saving a profile
-        // would silently turn "leave my resolver alone" back into the public fallback.
+        // would silently turn "leave my resolver alone" back into tunnel-managed DNS.
         if (dnsMode != "tunnel") append("dns = ").append(dnsMode).append('\n')
-        else if (dnsServers.isNotEmpty()) append("dns = ").append(dnsServers.joinToString(", ")).append('\n')
+        if (dnsServers.isNotEmpty()) append("dns_servers = ").append(dnsServers.joinToString(", ")).append('\n')
         if (mtu > 0) append("mtu = ").append(mtu).append('\n')  // 0 = auto, omit
         if (!mtuProbe) append("mtu_probe = false\n")  // default true, emit only when off
         // Per-app split tunnel (Android extra). Emit only when active so default
@@ -494,36 +516,35 @@ data class VpnConfig(
         // with an empty list, silently reverting the profile to "all apps tunnelled".
         if (appsMode != "all") append("apps_mode = ").append(appsMode).append('\n')
         if (apps.isNotEmpty()) append("apps = ").append(apps.joinToString(", ")).append('\n')
-        // Reconnect / timeout tuning (Android extras; the Rust client ignores them).
-        // Emitted only when diverging from the defaults.
+        // Reconnect is Android lifecycle policy; timeout is transport-core policy. Reconnect
+        // remains sparse while timeout is explicit at the Android→Rust boundary.
         if (!reconnectEnabled) append("reconnect = false\n")
         if (reconnectMaxRetries != -1) append("reconnect_retries = ").append(reconnectMaxRetries).append('\n')
         if (reconnectBaseDelaySecs != 1L) append("reconnect_base_delay = ").append(reconnectBaseDelaySecs).append('\n')
         if (reconnectMaxDelaySecs != 60L) append("reconnect_max_delay = ").append(reconnectMaxDelaySecs).append('\n')
-        if (connectionTimeoutSecs != 30L) append("timeout = ").append(connectionTimeoutSecs).append('\n')
-        // Padding / heartbeat / shaping. Normally server-pushed, so these are local
-        // OVERRIDES and stay out of the file at their defaults. The key names match the
-        // iOS client exactly — it already read and wrote them, so without these an
+        append("timeout = ").append(connectionTimeoutSecs).append('\n')
+        // Padding / heartbeat / shaping are explicit local values at the core boundary. The
+        // key names match the iOS client exactly, so without these an
         // iOS-exported profile silently lost its shaping/heartbeat tuning here.
-        if (!paddingEnabled) append("padding = false\n")
-        if (paddingMin != 0) append("padding_min = ").append(paddingMin).append('\n')
-        if (paddingMax != 255) append("padding_max = ").append(paddingMax).append('\n')
-        if (!heartbeatEnabled) append("heartbeat = false\n")
-        if (heartbeatIntervalMs != 15000L) append("heartbeat_interval = ").append(heartbeatIntervalMs).append('\n')
-        if (heartbeatDataSize != 16) append("heartbeat_size = ").append(heartbeatDataSize).append('\n')
-        if (heartbeatJitterMs != 2000L) append("heartbeat_jitter = ").append(heartbeatJitterMs).append('\n')
-        if (shapingEnabled) append("shaping = true\n")
-        if (shapingGapMeanMs != 700L) append("shaping_gap_mean = ").append(shapingGapMeanMs).append('\n')
-        if (shapingGapMinMs != 40L) append("shaping_gap_min = ").append(shapingGapMinMs).append('\n')
-        if (shapingGapMaxMs != 6000L) append("shaping_gap_max = ").append(shapingGapMaxMs).append('\n')
-        if (shapingBudgetBytesPerSec != 16384) append("shaping_budget = ").append(shapingBudgetBytesPerSec).append('\n')
-        if (shapingMinSize != 64) append("shaping_min_size = ").append(shapingMinSize).append('\n')
-        if (shapingMaxSize != 1024) append("shaping_max_size = ").append(shapingMaxSize).append('\n')
-        if (shapingStealth) append("shaping_stealth = true\n")
-        if (shapingStealthRateMbps != 2) append("shaping_stealth_mbps = ").append(shapingStealthRateMbps).append('\n')
+        append("padding = ").append(paddingEnabled).append('\n')
+        append("padding_min = ").append(paddingMin).append('\n')
+        append("padding_max = ").append(paddingMax).append('\n')
+        append("heartbeat = ").append(heartbeatEnabled).append('\n')
+        append("heartbeat_interval = ").append(heartbeatIntervalMs).append('\n')
+        append("heartbeat_size = ").append(heartbeatDataSize).append('\n')
+        append("heartbeat_jitter = ").append(heartbeatJitterMs).append('\n')
+        append("shaping = ").append(shapingEnabled).append('\n')
+        append("shaping_gap_mean = ").append(shapingGapMeanMs).append('\n')
+        append("shaping_gap_min = ").append(shapingGapMinMs).append('\n')
+        append("shaping_gap_max = ").append(shapingGapMaxMs).append('\n')
+        append("shaping_budget = ").append(shapingBudgetBytesPerSec).append('\n')
+        append("shaping_min_size = ").append(shapingMinSize).append('\n')
+        append("shaping_max_size = ").append(shapingMaxSize).append('\n')
+        append("shaping_stealth = ").append(shapingStealth).append('\n')
+        append("shaping_stealth_mbps = ").append(shapingStealthRateMbps).append('\n')
         // Re-emit the keys this port accepts but does not model, verbatim and in a stable
         // order. Without this, opening a CLI profile here and saving it deleted its hooks
-        // (`post_up`/`post_down`), its TOFU setting and its routing policy — silently, and as
+        // (`post_up`/`post_down`), socket policy and routing policy — silently, and as
         // a side effect of merely opening it. (Audit 2026-08-02, §7.)
         for ((k, v) in carriedKeys.toSortedMap()) append(k).append(" = ").append(v).append('\n')
         // Re-emit [logging] verbatim so a desktop/router client.conf survives a mobile save.
@@ -533,6 +554,26 @@ data class VpnConfig(
             if (!loggingFile.isNullOrEmpty()) append("file = ").append(loggingFile).append('\n')
             if (!loggingTimeFormat.isNullOrEmpty()) append("time_format = ").append(loggingTimeFormat).append('\n')
         }
+    }
+
+    /** Canonical INI passed to the shared Rust transport core. */
+    fun toTransportCoreIni(label: String? = null): String = toIni(label)
+
+    /**
+     * Credential-free strict profile for the native UDP reachability diagnostic. The probe
+     * stops at the first server flight, so user/password, trust, routing and performance
+     * settings do not cross this JNI boundary. Rust remains the sole owner of TLS/PQ,
+     * fragmentation, QUIC and obfs construction.
+     */
+    fun toTransportProbeIni(): String = buildString {
+        validate()
+        append("[qeli]\n")
+        append("server = ").append(serverAddress).append(':').append(port).append('\n')
+        append("proto = ").append(protocol).append('\n')
+        append("mode = ").append(wireMode).append('\n')
+        if (!sni.isNullOrBlank()) append("sni = ").append(sni).append('\n')
+        if (obfsKey.isNotEmpty()) append("obfs_key = ").append(obfsKey).append('\n')
+        if (quicEnabled) append("quic = true\n")
     }
 
     companion object {
@@ -557,7 +598,7 @@ data class VpnConfig(
         // hand-written `mtu = 40`, went straight through to VpnService.Builder.setMtu, where
         // establish() fails and the retry loop reconnects forever with an opaque error. An
         // out-of-range padding_max is the same class of bug one layer down — every data
-        // record then exceeds PacketCodec.MAX_RECORD_SIZE and the peer drops it. Same ranges
+        // record then exceeds the shared Rust record-size limit and the peer drops it. Same ranges
         // as the Rust client (qeli/src/config/client.rs) and the C# port.
         /**
          * Upper bound for both reconnect delays, in seconds (one day).
@@ -629,6 +670,48 @@ data class VpnConfig(
             }
 
         /**
+         * Multi-profile import (parity with C# `VpnConfig.ParseMany`):
+         * - several `qeli://` lines (no `[qeli]` header) → one profile per link
+         * - several `[qeli]` INI sections → one profile per section
+         * - otherwise → single [parse]
+         */
+        fun parseMany(text: String): List<VpnConfig> {
+            require(text.isNotBlank()) { "empty config" }
+            val normalized = text.replace("\r\n", "\n").replace('\r', '\n')
+            val links = normalized.lineSequence()
+                .map { it.trim() }
+                .filter { it.startsWith("qeli://", ignoreCase = true) }
+                .toList()
+            val hasIni = normalized.contains("[qeli]", ignoreCase = true)
+            if (links.isNotEmpty() && !hasIni) {
+                return links.map { fromQeliUri(it) }
+            }
+            val sections = splitQeliIniSections(normalized)
+            if (sections.isEmpty()) return listOf(fromIni(text))
+            return sections.map { fromIni(it) }
+        }
+
+        /** Split a multi-profile INI into one blob per `[qeli]` section. */
+        fun splitQeliIniSections(text: String): List<String> {
+            val chunks = ArrayList<String>()
+            val cur = StringBuilder()
+            var inSection = false
+            for (raw in text.replace("\r\n", "\n").replace('\r', '\n').lineSequence()) {
+                val trimmed = raw.trim()
+                if (trimmed.equals("[qeli]", ignoreCase = true)) {
+                    if (inSection && cur.isNotEmpty()) chunks.add(cur.toString())
+                    cur.clear()
+                    cur.appendLine("[qeli]")
+                    inSection = true
+                    continue
+                }
+                if (inSection) cur.appendLine(raw)
+            }
+            if (inSection && cur.isNotEmpty()) chunks.add(cur.toString())
+            return chunks
+        }
+
+        /**
          * JSON is RETIRED, and detected only so the message can say so.
          *
          * It was the original config format and stopped being written years ago; INI
@@ -654,6 +737,13 @@ data class VpnConfig(
          * handshake. `dns`/`mtu` are optional app extras.
          */
         fun fromIni(text: String): VpnConfig {
+            val nSections = text.replace("\r\n", "\n").replace('\r', '\n').lineSequence()
+                .count { it.trim().equals("[qeli]", ignoreCase = true) }
+            if (nSections > 1) {
+                throw IllegalArgumentException(
+                    "config has $nSections [qeli] sections — use Import (parseMany) for a " +
+                        "multi-profile bundle, or import one [qeli] block at a time")
+            }
             val dupKeys = mutableListOf<String>()
             val ini = parseIni(text, dupKeys)
             val q = ini["qeli"] ?: throw IllegalArgumentException("config: missing [qeli] section")
@@ -687,19 +777,18 @@ data class VpnConfig(
             // DNS: `dns = <ip,ip>` is the Android resolver list, but the SAME key is a MODE in
             // the Rust/router client (`off` / `tunnel` / `system`, see config/client.rs).
             //
-            // Recognising the mode words was only half the job: they were mapped to "no
-            // explicit resolvers", and the connect path then treats that as "nothing chosen"
-            // and installs the public fallback on a full tunnel. So `dns = off` — which in the
-            // Rust client means LEAVE MY RESOLVER ALONE — sent every lookup to Cloudflare and
-            // Google instead, the exact opposite of what was asked, with a privacy cost and no
-            // message. The mode is now KEPT, and honoured at connect time.
+            // Legacy mobile profiles used the same key for both meanings. The mode is now kept
+            // separately and honoured at connect time; writers emit resolver lists through the
+            // canonical `dns_servers` key.
             // (Audit 2026-08-02, §3.)
             val dnsRaw = q["dns"]?.trim()
             val dnsModeParsed = dnsRaw?.lowercase()?.takeIf { it in setOf("off", "tunnel", "system") }
-            val dns = if (dnsRaw.isNullOrEmpty() || dnsModeParsed != null)
-                null
-            else
-                dnsRaw.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+            val canonicalDns = q["dns_servers"]?.trim()?.takeIf { it.isNotEmpty() }
+            val dns = when {
+                canonicalDns != null -> canonicalDns.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+                dnsRaw.isNullOrEmpty() || dnsModeParsed != null -> null
+                else -> dnsRaw.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+            }
             // Padding bounds are CLAMPED, not rejected — see [checkedPadding]. (C6) That is
             // about a number out of range; a value that is not a number at all is a typo, and
             // falling back to the default in silence is the same failure the boolean handling
@@ -730,8 +819,10 @@ data class VpnConfig(
                 serverPublicKeyHex = q["key"]?.takeIf { it.isNotEmpty() },
                 // H-1: on by default; needs a pinned key. `bind_static = false` for TOFU.
                 bindStaticToSession = boolAt("bind_static", true),
+                allowUnpinnedTofu = boolAt("allow_unpinned_tofu", false),
                 routingMode = if (fullTunnel) "full-tunnel" else "split-tunnel",
                 addDefaultGateway = fullTunnel,
+                killSwitch = boolAt("kill_switch", false),
                 wireMode = q["mode"]?.ifBlank { null } ?: "fake-tls",
                 sni = q["sni"]?.takeIf { it.isNotEmpty() },
                 realityShortId = q["reality_sid"]?.takeIf { it.isNotEmpty() },
@@ -831,9 +922,11 @@ data class VpnConfig(
          * The AUTH plaintext is `proof(32)` + the optional `[0x00 device_id(16)]` prefix +
          * `user:pass`, and the whole thing rides in one unfragmented datagram — so the
          * credentials are what decides whether it survives a path that drops IP fragments.
-         * Derived from [UdpFrag.MAX_CHUNK] rather than written out, so it tracks the budget.
+         * UI-side mirror of Rust `udp_frag::MAX_CHUNK - AUTH_OVERHEAD`: 1280-byte IPv6
+         * minimum MTU minus IPv6/UDP/obfs/QUIC/reserve/fragment headers and the 49-byte AUTH
+         * envelope. This is a validation scalar, not a Kotlin wire implementation.
          */
-        const val AUTH_CRED_BUDGET = UdpFrag.MAX_CHUNK - (32 + 17)
+        const val AUTH_CRED_BUDGET = 1114
 
         /**
          * True for a bare IPv4 or IPv6 literal.
@@ -895,17 +988,33 @@ data class VpnConfig(
             }
         }
 
+        private fun isCidrLiteral(s: String): Boolean {
+            val value = s.trim()
+            if (value.isEmpty()) return false
+            val parts = value.split('/')
+            if (parts.size !in 1..2 || !isIpLiteral(parts[0])) return false
+            val maximum = if (':' in parts[0]) 128 else 32
+            if (parts.size == 1) return true
+            val prefix = parts[1]
+            return prefix.isNotEmpty() && prefix.all(Char::isDigit)
+                && (prefix.toIntOrNull() ?: return false) in 0..maximum
+        }
+
+        /** Real cross-client keys Android must reject by name instead of silently carrying. */
+        private val UNSUPPORTED_INI_KEYS: Map<String, String> = emptyMap()
+
         private val CARRIED_INI_KEYS = setOf(
-            // Understood by the RUST client only, and documented as such — docs/ru/CONFIG.md
-            // "Что пушем НЕ передаётся" lists these as client file-only keys.
-            "allow_unpinned_tofu", "autostart", "dev_attach", "dns_servers", "exit_node",
+            // Not edited by the Android model. Some are foreign platform/lifecycle fields;
+            // transport-owned socket settings are preserved here and consumed by Rust after
+            // [toTransportCoreIni] crosses the JNI boundary.
+            // NB: `allow_unpinned_tofu` used to live here — carried through saves but read by
+            // nothing. It is a modelled field now (see VpnConfig.allowUnpinnedTofu), so it
+            // must NOT also be carried or toIni would emit it twice. (Audit 2026-08-04, M-20.)
+            "autostart", "dev", "dev_attach", "dev_node", "exit_node", "forward",
             "gateway_nat", "keepalive", "lan_subnet", "post_down", "post_up", "tcp_nodelay",
-            // Socket buffers, Linux-only in the Rust client. This port sizes its own receive
-            // buffer with a fixed 2 MB and reads neither key — but a client.conf carrying
-            // them is a valid CLI profile, and rejecting it as "likely misspelled" is exactly
-            // the false alarm this list exists to prevent. `password_file` /
-            // `password_command` are the same case: real Rust client keys for headless
-            // setups, meaningless on a phone, never a typo. (Audit 2026-08-02, §7.)
+            "local", "lport", "metric", "name", "persist_tun", "route_file",
+            // Password sources remain headless-only. Buffer values, when present, reach the
+            // common carrier implementation even though Android has no editor control for them.
             "password_command", "password_file", "recv_buffer_size", "send_buffer_size",
         )
 
@@ -923,13 +1032,14 @@ data class VpnConfig(
          */
         private val KNOWN_INI_KEYS = setOf(
             // Read by this port.
-            "allow_ipv6_leak", "awg", "bind_static", "dev", "dev_node", "dns", "exclude",
-            "forward", "front", "gateway", "heartbeat", "heartbeat_interval",
+            "allow_ipv6_leak", "allow_unpinned_tofu", "awg", "bind_static",
+            "dns", "dns_servers", "exclude",
+            "front", "gateway", "heartbeat", "heartbeat_interval", "kill_switch",
             "heartbeat_jitter", "heartbeat_size", "include", "jc", "jmax", "jmin", "key",
-            "kill_switch", "local", "lport", "metric", "mode", "mtu", "mtu_probe", "name",
-            "obfs_key", "padding", "padding_max", "padding_min", "pass", "persist_tun",
+            "mode", "mtu", "mtu_probe",
+            "obfs_key", "padding", "padding_max", "padding_min", "pass",
             "proto", "quic", "reality_sid", "reconnect", "reconnect_base_delay",
-            "reconnect_max_delay", "reconnect_retries", "route_file", "route_local", "server",
+            "reconnect_max_delay", "reconnect_retries", "route_local", "server",
             "shaping", "shaping_budget", "shaping_gap_max", "shaping_gap_mean",
             "shaping_gap_min", "shaping_max_size", "shaping_min_size", "shaping_stealth",
             "shaping_stealth_mbps", "sni", "timeout", "user",

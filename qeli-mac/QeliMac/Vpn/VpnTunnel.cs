@@ -11,6 +11,9 @@ namespace QeliMac.Vpn;
 public sealed class VpnTunnel : VpnTunnelBase
 {
     private NetworkConfigurator? _net;
+    private PerAppController? _perApp;
+
+    protected override bool NativeTunFdOwnership => true;
 
     /// <summary>Surface network steps that failed during SetupTun so the shared base can
     /// qualify the Connected status instead of showing an unconditional green. (C-17)</summary>
@@ -26,9 +29,24 @@ public sealed class VpnTunnel : VpnTunnelBase
     {
         // persist-tun: reuse the utun + routes from the previous attempt when the server
         // re-assigned the same client IP (no interface flicker / route gap on reconnect).
-        if (ReusePersistedTun(config, session)) return;
+        if (ReusePersistedTun(config, session))
+        {
+            if (config.UsesAppFilter && _tun is UtunDevice retained)
+            {
+                (_perApp ??= new PerAppController(Log)).StartOrUpdate(
+                    config, retained.Name, serverIp, EffectiveDns(config, session),
+                    config.IncludeRoutes.Concat(LoadRouteFile(config)).ToArray(),
+                    config.ExcludeRoutes, PushedRouteCidrs(session.RoutesJson), tunnelUp: true);
+            }
+            return;
+        }
         _net = new NetworkConfigurator(Log);
         var (physicalIf, gateway) = _net.PathToServer(serverIp);
+        // Resolve bypasses before the full-tunnel routes are installed. IPv4 and IPv6
+        // may use different physical interfaces and gateways.
+        var bypassPaths = config.ExcludeRoutes
+            .Select(route => (route, path: _net.PhysicalPathForRoute(route)))
+            .ToArray();
 
         var utun = new UtunDevice();
         utun.Open();
@@ -59,6 +77,22 @@ public sealed class VpnTunnel : VpnTunnelBase
         else
             Log("WARN: could not determine physical gateway; full-tunnel may loop");
 
+        // Per-app mode is deliberately NOT expressed as host routes or host DNS. A signed
+        // NETransparentProxyProvider classifies flows by source-app signing identifier and
+        // binds only the selected sockets to this utun. Unselected applications therefore
+        // retain the machine's ordinary route and resolver. Keeping this branch before all
+        // global route/DNS mutations is what makes include/exclude genuinely per-app.
+        if (config.UsesAppFilter)
+        {
+            (_perApp ??= new PerAppController(Log)).StartOrUpdate(
+                config, dev, serverIp, EffectiveDns(config, session),
+                config.IncludeRoutes.Concat(LoadRouteFile(config)).ToArray(),
+                config.ExcludeRoutes, PushedRouteCidrs(session.RoutesJson), tunnelUp: true);
+            if (string.IsNullOrEmpty(config.LocalAddress))
+                _net.VerifyCarrierPath(serverIp, dev);
+            return;
+        }
+
         if (config.IsFullTunnel)
         {
             _net.SetFullTunnelRoutes(dev);
@@ -67,11 +101,12 @@ public sealed class VpnTunnel : VpnTunnelBase
             if (!config.AllowIpv6Leak)
                 _net.CaptureIPv6(dev);
         }
-        else
+        else if (!session.PlanIncludesClientRoutes)
         {
             foreach (var r in config.IncludeRoutes) _net.AddRoute(r, dev);
-            foreach (var r in LoadRouteFile(config)) _net.AddRoute(r, dev);  // OpenVPN route-file
         }
+        if (!config.IsFullTunnel)
+            foreach (var r in LoadRouteFile(config)) _net.AddRoute(r, dev);  // OpenVPN route-file
 
         // Subnets the server advertised (`route = …` on the profile / per-user) are a
         // specific, explicit admin decision — always honoured, like OpenVPN's
@@ -81,7 +116,7 @@ public sealed class VpnTunnel : VpnTunnelBase
 
         // RouteLocalNetworks gates only the BLANKET RFC1918 pull, which stays off by
         // default because it would hijack the machine's own LAN (printers, NAS, router).
-        if (config.RouteLocalNetworks)
+        if (config.RouteLocalNetworks && !session.PlanIncludesClientRoutes)
         {
             foreach (var r in new[] { "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16" })
                 _net.AddRoute(r, dev);
@@ -91,9 +126,10 @@ public sealed class VpnTunnel : VpnTunnelBase
         // Exclude: route these subnets via the physical gateway so exclusion works even in
         // full-tunnel (a plain delete is a no-op there); fall back to a delete when the
         // gateway is unknown (split-tunnel).
-        foreach (var r in config.ExcludeRoutes)
+        foreach (var (r, path) in bypassPaths)
         {
-            if (gateway != null) _net.PinBypassRoute(r, gateway);
+            if (path.gateway != null || path.iface != null)
+                _net.PinBypassRoute(r, path.gateway, path.iface);
             else _net.DeleteRoute(r);
         }
 
@@ -151,7 +187,7 @@ public sealed class VpnTunnel : VpnTunnelBase
     /// <summary>Read a boolean sysctl. Null when it cannot be read.</summary>
     private static bool? ReadSysctlFlag(string name)
     {
-        var psi = new System.Diagnostics.ProcessStartInfo("sysctl", $"-n {name}")
+        var psi = new System.Diagnostics.ProcessStartInfo("/usr/sbin/sysctl", $"-n {name}")
         { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true };
         using var p = System.Diagnostics.Process.Start(psi);
         if (p == null) return null;
@@ -163,7 +199,7 @@ public sealed class VpnTunnel : VpnTunnelBase
 
     private static void SetSysctl(string assignment)
     {
-        var psi = new System.Diagnostics.ProcessStartInfo("sysctl", $"-w {assignment}")
+        var psi = new System.Diagnostics.ProcessStartInfo("/usr/sbin/sysctl", $"-w {assignment}")
         { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true };
         using var p = System.Diagnostics.Process.Start(psi);
         if (p == null) return;
@@ -204,19 +240,63 @@ public sealed class VpnTunnel : VpnTunnelBase
         catch (Exception e) { Log($"routes parse error: {e.Message}"); }
     }
 
+    private static IReadOnlyList<string> PushedRouteCidrs(string routesJson)
+    {
+        if (string.IsNullOrWhiteSpace(routesJson) || routesJson == "[]")
+            return Array.Empty<string>();
+        try
+        {
+            return JsonNode.Parse(routesJson) is JsonArray arr
+                ? arr.Select(n => (n?["cidr"] as JsonValue)?.GetValue<string>() ?? "")
+                    .Where(c => c.Length > 0).ToArray()
+                : Array.Empty<string>();
+        }
+        catch { return Array.Empty<string>(); }
+    }
+
     protected override void CleanupPlatform()
     {
         // Undo the host-wide sysctl before dropping the configurator, so a disconnect
         // leaves the machine as it was found. (C-18)
         RestoreIpForwarding();
-        try { _net?.Dispose(); } catch { }
-        _net = null;
+        var network = _net;
+        try
+        {
+            // NetworkConfigurator deliberately throws when the physical service's DNS was
+            // not restored. Keep the configurator referenced in that case so a second Stop
+            // in this process can retry instead of forgetting the recovery action.
+            network?.Dispose();
+            if (ReferenceEquals(_net, network)) _net = null;
+        }
+        finally
+        {
+            _perApp = null;
+        }
     }
+
+    // The system extension stays installed and retains its flow rules across a carrier
+    // reconnect. Selected apps are failed closed until the same utun is usable again.
+    protected override bool KeepTunDuringReconnect(VpnConfig config) =>
+        config.UsesAppFilter || base.KeepTunDuringReconnect(config);
+
+    protected override void OnTransportInterrupted(VpnConfig config)
+    {
+        if (config.UsesAppFilter) _perApp?.SetTunnelDown();
+    }
+
+    protected override void BeforeTunDispose() => _perApp?.Stop();
 
     // Firewall kill-switch (full-tunnel only) via pf. The utun name is dynamic, so
     // KillSwitch passes utun0..15 (the rule matches once our utun appears).
     protected override void KillSwitchEngage(VpnConfig config) =>
         KillSwitch.Engage(config.ServerAddress, Log);
+
+    protected override void CarrierAddressesChanging(
+        VpnConfig config, IReadOnlyList<string> previous, IReadOnlyList<string> refreshed)
+    {
+        if (config.KillSwitch && config.IsFullTunnel && !config.UsesAppFilter)
+            KillSwitch.UpdateServerAddresses(refreshed, Log);
+    }
 
     protected override void KillSwitchDisengage() => KillSwitch.Disengage(Log);
 }

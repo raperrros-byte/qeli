@@ -1,4 +1,5 @@
 use crate::config::client::ClientRoutingConfig;
+use crate::transport_core::NetworkRoute;
 
 /// Routes this process actually CREATED on the physical interface, so cleanup removes
 /// only those.
@@ -355,9 +356,18 @@ pub fn setup_routes(
             note_created(&["route", "del", &route.dest, "via", &route.via]);
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("File exists") {
-                log::warn!("Failed to add custom route {}: {}", route.dest, stderr);
+            if stderr.contains("File exists") {
+                let via = format!("via {}", route.via);
+                if existing_route_satisfies(false, &route.dest, &via) == Some(true) {
+                    continue;
+                }
             }
+            anyhow::bail!(
+                "custom route {} via {} was not applied: {} — refusing to acknowledge a partial network plan",
+                route.dest,
+                route.via,
+                stderr.trim()
+            );
         }
     }
 
@@ -373,6 +383,17 @@ struct PushedRoute {
     gateway: Option<String>,
     #[serde(default)]
     metric: Option<u32>,
+}
+
+/// Convert the server push into the exact route records exported by the shared core.
+/// Invalid and policy-forbidden entries are absent from the plan and therefore are never
+/// acknowledged as applied. `apply_pushed_routes` repeats the same checks immediately
+/// before invoking `ip`, keeping the platform boundary defensive against a hostile peer.
+pub fn planned_pushed_routes(
+    routes_json: &str,
+    default_gateway: &str,
+) -> anyhow::Result<Vec<NetworkRoute>> {
+    crate::transport_core::network::planned_pushed_routes(routes_json, default_gateway)
 }
 
 /// Apply the subnets the server advertised, plus — only when
@@ -394,11 +415,11 @@ pub fn apply_local_networks(
     routes_json: &str,
     ifname: &str,
     gateway: &str,
-) {
+) -> anyhow::Result<()> {
     // Specific subnets the server advertised — always honoured.
-    apply_pushed_routes(routes_json, ifname, gateway);
+    apply_pushed_routes(routes_json, ifname, gateway)?;
     if !routing.route_local_networks {
-        return;
+        return Ok(());
     }
     // Broad RFC1918 ranges so any private destination also tunnels.
     for cidr in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"] {
@@ -407,11 +428,17 @@ pub fn apply_local_networks(
                 "route", "add", cidr, "via", gateway, "dev", ifname, "metric", "100",
             ])
             .output();
-        if let Ok(o) = output {
-            if !o.status.success() {
+        match output {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
                 if !stderr.contains("File exists") {
-                    log::warn!("Failed to route local net {}: {}", cidr, stderr.trim());
+                    anyhow::bail!(
+                        "could not route requested local network {} through {}: {}",
+                        cidr,
+                        ifname,
+                        stderr.trim()
+                    );
                 } else {
                     // A route already exists — but pointing where? A pre-existing
                     // `10.0.0.0/8 via <LAN gw>` is the normal case on a router, and
@@ -420,21 +447,23 @@ pub fn apply_local_networks(
                     let dev = format!("dev {ifname}");
                     match existing_route_satisfies(false, cidr, &dev) {
                         Some(true) => {}
-                        Some(false) => log::warn!(
-                            "local net {} already has a route that does NOT use {} — it will                              NOT go through the tunnel",
+                        Some(false) => anyhow::bail!(
+                            "requested local network {} already has a route that does not use {}",
                             cidr,
                             ifname
                         ),
-                        None => log::warn!(
-                            "local net {} already has a route that could not be verified — it                              may not go through the tunnel",
+                        None => anyhow::bail!(
+                            "requested local network {} already has a route that could not be verified",
                             cidr
                         ),
                     }
                 }
             }
+            Err(e) => anyhow::bail!("could not add local network route {cidr}: {e}"),
         }
     }
     log::info!("Routing local networks (RFC1918 blanket) through the tunnel");
+    Ok(())
 }
 
 /// Does the route the kernel ALREADY has for `cidr` satisfy what we wanted?
@@ -450,6 +479,10 @@ pub fn apply_local_networks(
 /// `None` = could not tell (no `ip`, unparsable output); the caller warns rather than
 /// silently assuming either way.
 fn existing_route_satisfies(v6: bool, cidr: &str, want: &str) -> Option<bool> {
+    existing_route_satisfies_all(v6, cidr, &[want])
+}
+
+fn existing_route_satisfies_all(v6: bool, cidr: &str, wants: &[&str]) -> Option<bool> {
     let mut args: Vec<&str> = Vec::new();
     if v6 {
         args.push("-6");
@@ -463,20 +496,23 @@ fn existing_route_satisfies(v6: bool, cidr: &str, want: &str) -> Option<bool> {
     if text.trim().is_empty() {
         return None;
     }
-    Some(text.contains(want))
+    Some(wants.iter().all(|want| text.contains(want)))
 }
 
-pub fn apply_pushed_routes(routes_json: &str, ifname: &str, default_gateway: &str) {
+pub fn apply_pushed_routes(
+    routes_json: &str,
+    ifname: &str,
+    default_gateway: &str,
+) -> anyhow::Result<()> {
     let trimmed = routes_json.trim();
     if trimmed == "[]" || trimmed.is_empty() {
-        return;
+        return Ok(());
     }
 
     let routes: Vec<PushedRoute> = match serde_json::from_str(trimmed) {
         Ok(r) => r,
         Err(e) => {
-            log::warn!("Failed to parse pushed routes: {}", e);
-            return;
+            anyhow::bail!("failed to parse pushed routes: {e}");
         }
     };
 
@@ -516,6 +552,36 @@ pub fn apply_pushed_routes(routes_json: &str, ifname: &str, default_gateway: &st
             );
             continue;
         }
+        // The SERVER must not get to decide that this client is full-tunnel.
+        //
+        // `is_valid_cidr` accepts any prefix length 0..=32, and `apply_pushed_routes` runs
+        // unconditionally — before the `routing.route_local_networks` check and on both the
+        // TCP and UDP paths — so a split-tunnel client (the default: `gateway = false`)
+        // applied whatever the server sent. Pushing `0.0.0.0/1` + `128.0.0.0/1` captures all
+        // traffic while being MORE SPECIFIC than any physical default route, so it wins
+        // regardless of metric; `0.0.0.0/0 metric 0` beats a NetworkManager default at 100.
+        // Either way the user asked for split-tunnel and silently got everything routed to
+        // the server, with no bypass /32 for the server address (setup_routes only adds that
+        // in full-tunnel mode).
+        //
+        // Pushing a /8 or narrower is the legitimate site-to-site case this feature exists
+        // for and stays allowed. A route wide enough to redefine the client's default is a
+        // policy decision that belongs to the user, not to the peer.
+        // (Audit 2026-08-04.)
+        const MIN_PUSHED_PREFIX: u8 = 8;
+        let prefix = route
+            .cidr
+            .rsplit_once('/')
+            .and_then(|(_, p)| p.parse::<u8>().ok())
+            .unwrap_or(32);
+        if prefix < MIN_PUSHED_PREFIX {
+            log::warn!(
+                "REFUSING pushed route {}: a /{} covers the whole default route, and a server                  may not turn a split-tunnel client into a full-tunnel one. Set                  'routing.mode = full-tunnel' locally if that is what you want.",
+                route.cidr,
+                prefix
+            );
+            continue;
+        }
 
         let output = std::process::Command::new("ip")
             .args([
@@ -543,33 +609,27 @@ pub fn apply_pushed_routes(routes_json: &str, ifname: &str, default_gateway: &st
             }
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
-                if !stderr.contains("File exists") {
-                    // Name the gateway: the usual cause is a next hop that is NOT reachable on
-                    // the tunnel subnet ("Nexthop has invalid gateway"), which Linux refuses.
-                    // The desktop/mobile clients route interface-scoped and quietly accept such
-                    // a route, so the server side can look "fine" while Linux clients drop it.
-                    // LEAK-marked (L3): a pushed route that fails to install means that
-                    // subnet is NOT in the tunnel. In split-tunnel there is no kill-switch
-                    // (should_engage requires full-tunnel), so it goes out the physical
-                    // interface in the clear while auth still reports a working tunnel.
-                    // Kept as warn, not fatal: this mirrors OpenVPN's best-effort
-                    // `push "route"`, and making it fatal would let a broken/hostile server
-                    // config deny the client service. The wording now names it as a leak.
-                    log::warn!(
-                        "LEAK: pushed route {} via {} NOT applied: {} — traffic to this subnet \
-                         will use the PHYSICAL interface UNENCRYPTED. The next hop must be \
-                         reachable on the tunnel subnet; drop `gateway=` from the server's \
-                         `route =` line to use the tunnel gateway ({}) instead",
-                        route.cidr,
-                        gateway,
-                        stderr.trim(),
-                        default_gateway
-                    );
+                if stderr.contains("File exists") {
+                    let via = format!("via {gateway}");
+                    let dev = format!("dev {ifname}");
+                    let metric = format!("metric {metric}");
+                    if existing_route_satisfies_all(false, &route.cidr, &[&via, &dev, &metric])
+                        == Some(true)
+                    {
+                        continue;
+                    }
                 }
+                anyhow::bail!(
+                    "pushed route {} via {} was not applied: {} — refusing to acknowledge a partial network plan",
+                    route.cidr,
+                    gateway,
+                    stderr.trim()
+                );
             }
-            Err(e) => log::warn!("pushed route {} error: {}", route.cidr, e),
+            Err(e) => anyhow::bail!("pushed route {} error: {}", route.cidr, e),
         }
     }
+    Ok(())
 }
 
 /// Validate a server-pushed CIDR — shared with the config parser and the panel
@@ -692,7 +752,21 @@ pub fn cleanup_routes(ifname: &str, _server_addr: &str, _exclude: &[String]) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_cidr, is_valid_gateway};
+    use super::{is_valid_cidr, is_valid_gateway, planned_pushed_routes};
+
+    #[test]
+    fn pushed_route_plan_preserves_gateway_and_metric_after_policy_filtering() {
+        let json = r#"[
+            {"cidr":"192.0.2.0/24","gateway":"10.0.0.9","metric":7},
+            {"cidr":"0.0.0.0/1","gateway":"10.0.0.1","metric":1},
+            {"cidr":"not-a-route","gateway":"10.0.0.1"}
+        ]"#;
+        let routes = planned_pushed_routes(json, "10.0.0.1").unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].cidr, "192.0.2.0/24");
+        assert_eq!(routes[0].gateway, "10.0.0.9");
+        assert_eq!(routes[0].metric, 7);
+    }
 
     #[test]
     fn pushed_cidr_validation() {
@@ -861,6 +935,26 @@ mod fault_injection {
             err.to_string().contains("192.0.2.0/24"),
             "an include route that did not install must refuse, got: {err}"
         );
+    }
+
+    #[test]
+    fn a_failed_custom_route_rejects_the_network_plan() {
+        let cfg = ClientRoutingConfig {
+            custom_routes: vec![crate::config::client::CustomRoute {
+                dest: "203.0.113.0/24".to_string(),
+                via: "10.0.0.9".to_string(),
+                metric: 17,
+            }],
+            ..Default::default()
+        };
+        let _shim = Shim::new(
+            "custom",
+            &["route add 203.0.113.0/24"],
+            "RTNETLINK answers: network unreachable",
+        );
+        let err = setup_routes(&cfg, "10.0.0.1", "qtest", "1.2.3.4").unwrap_err();
+        assert!(err.to_string().contains("203.0.113.0/24"));
+        assert!(err.to_string().contains("partial network plan"));
     }
 
     #[test]

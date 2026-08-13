@@ -33,6 +33,7 @@ public static class WireConformance
         ok &= RunCtrlFrame(check);
         ok &= RunMtuLadder(check);
         ok &= RunIniBounds(check);
+        Qeli.Shared.Vpn.VpnTunnelBase.RunNetworkPolicySelfTests(check);
         return ok;
     }
 
@@ -44,9 +45,9 @@ public static class WireConformance
             Model.VpnConfig.FromIni("[qeli]\nserver = 1.2.3.4:443\nuser = u\npass = p\n"
                                     + string.Join("\n", extra) + "\n");
 
-        // A timeout above ~2.1M seconds used to survive parsing, then overflow the int
-        // multiply in VpnTunnelBase (`(int)secs * 1000`) into a NEGATIVE timeout — an
-        // instantly-expired connect rather than a long one.
+        // A timeout above ~2.1M seconds used to survive parsing and could overflow a
+        // millisecond conversion in language adapters. Keep the bound pinned even though
+        // production connect ownership has moved to Rust.
         var huge = Ini("timeout = 999999999");
         bool timeoutClamped = huge.ConnectionTimeoutSecs is >= 1 and <= 300;
         bool noOverflow = (int)huge.ConnectionTimeoutSecs * 1000 > 0;
@@ -268,7 +269,7 @@ public static class WireConformance
         // Keys this port accepts but does not model must SURVIVE an open-and-save.
         //
         // They are on the allowlist so a CLI or mobile profile opens here — and then saving it
-        // deleted them, because nothing stored them. Hooks, the TOFU setting, the routing
+        // deleted them, because nothing stored them. Hooks, socket settings, the routing
         // policy and the whole per-app selection vanished as a side effect of opening the
         // file, which is worse than refusing it would have been. Allowlisting alone was the
         // more dangerous half of the fix: it is what leads someone to press Save.
@@ -279,24 +280,41 @@ public static class WireConformance
             "recv_buffer_size = 8388608", "password_file = /etc/qeli/secret",
             "apps_mode = include", "apps = com.example.a", "allow_lan = true");
         var carriedBack = Model.VpnConfig.FromIni(carried.ToIni());
-        bool carriedSurvives = true;
+        bool carriedSurvives = carriedBack.AllowUnpinnedTofu;
         foreach (var (k, want) in new[]
                  {
                      ("post_up", "/etc/qeli/up.sh"), ("post_down", "/etc/qeli/down.sh"),
-                     ("allow_unpinned_tofu", "true"), ("gateway_nat", "true"),
+                     ("gateway_nat", "true"),
                      ("exit_node", "10.9.0.7"), ("recv_buffer_size", "8388608"),
-                     ("password_file", "/etc/qeli/secret"), ("apps_mode", "include"),
-                     ("apps", "com.example.a"), ("allow_lan", "true"),
+                     ("password_file", "/etc/qeli/secret"), ("allow_lan", "true"),
                  })
         {
             carriedSurvives &= carriedBack.CarriedKeys.TryGetValue(k, out var got) && got == want;
         }
+        // apps/apps_mode are now first-class shared fields because desktop clients apply
+        // them; they must still survive, just no longer through the opaque carried-key bag.
+        carriedSurvives &= carriedBack.AppsMode == "include"
+            && carriedBack.Apps.SequenceEqual(new[] { "com.example.a" });
         check("ini-carry: rust-only and mobile keys survive an open-and-save", carriedSurvives);
         // ...and the re-import must not then call them unknown — that would refuse the very
         // profile this port just wrote.
         check("ini-carry: the re-written profile still parses clean", carriedBack.UnknownKeys.Count == 0);
         // A profile that never carried them must not grow lines for them.
         check("ini-carry: a plain profile carries nothing", Ini().CarriedKeys.Count == 0);
+        check("ini-tofu: escape hatch is modelled and defaults fail-closed",
+            carried.AllowUnpinnedTofu && !Ini().AllowUnpinnedTofu);
+
+        // The sparse portable serializer is made explicit at the transport boundary: desktop
+        // full-tunnel and GUI data-plane defaults differ from an absent Rust key.
+        var nativeIni = Ini().ToTransportCoreIni();
+        check("ini-native: full/split mode is explicit", nativeIni.Contains("gateway = true"));
+        check("ini-native: connection timeout reaches Rust", nativeIni.Contains("timeout = 30"));
+        check("ini-native: GUI padding defaults reach Rust",
+            nativeIni.Contains("padding_min = 0") && nativeIni.Contains("padding_max = 255"));
+        check("ini-native: GUI heartbeat defaults reach Rust",
+            nativeIni.Contains("heartbeat_jitter = 2000"));
+        check("ini-native: GUI shaping defaults reach Rust",
+            nativeIni.Contains("shaping = false") && nativeIni.Contains("shaping_budget = 16384"));
 
         // ...and the GUI's Save path must keep them too.
         //
@@ -319,6 +337,26 @@ public static class WireConformance
         check("ini-carry: the editor's Save path keeps them", editorKeeps);
         check("ini-carry: and they reach the file it writes",
             edited.ToIni().Contains("post_up = /etc/qeli/up.sh"));
+
+        var extendedEdit = edited.WithEditorFields(
+            name: edited.Name, serverAddress: edited.ServerAddress, port: edited.Port,
+            protocol: edited.Protocol, wireMode: edited.WireMode, obfsKey: edited.ObfsKey,
+            obfsFronting: edited.ObfsFronting, realityShortId: edited.RealityShortId,
+            sni: edited.Sni, quicEnabled: edited.QuicEnabled, username: edited.Username,
+            password: edited.Password, serverPublicKeyHex: edited.ServerPublicKeyHex,
+            routingMode: edited.RoutingMode, addDefaultGateway: edited.AddDefaultGateway,
+            routeLocalNetworks: edited.RouteLocalNetworks, mtu: 0, dnsServers: new List<string>(),
+            paddingEnabled: edited.PaddingEnabled, paddingMin: edited.PaddingMin,
+            paddingMax: edited.PaddingMax, heartbeatEnabled: edited.HeartbeatEnabled,
+            heartbeatIntervalMs: edited.HeartbeatIntervalMs,
+            heartbeatJitterMs: edited.HeartbeatJitterMs,
+            connectionTimeoutSecs: 45, reconnectEnabled: false, reconnectMaxRetries: 5,
+            persistTun: true, mtuProbe: false, killSwitch: true, dnsMode: "system");
+        check("ini-editor: extended desktop controls persist",
+            extendedEdit.ConnectionTimeoutSecs == 45 && !extendedEdit.ReconnectEnabled
+            && extendedEdit.ReconnectMaxRetries == 5 && extendedEdit.PersistTun
+            && !extendedEdit.MtuProbe && extendedEdit.KillSwitch
+            && extendedEdit.DnsMode == "system");
 
         // The editor must not LAUNDER a typo either.
         //
@@ -416,7 +454,7 @@ public static class WireConformance
         check("ini-dns: and they reach the file",
             nowSetIni.Contains("dns_servers = 1.1.1.1") && !nowSetIni.Contains("dns = off"));
 
-        // Saving without touching DNS must NOT turn `off` into the public fallback.
+        // Saving without touching DNS must NOT turn `off` into tunnel-managed DNS.
         var stillOff = wasOff.WithEditorFields(
             name: null, serverAddress: "vpn.example.com", port: 443, protocol: "tcp",
             wireMode: "fake-tls", obfsKey: "", obfsFronting: "websocket", realityShortId: null,
@@ -503,10 +541,9 @@ public static class WireConformance
         check("ini-unknown: keys other ports own are NOT typos", foreignKeysAccepted);
         check("ini-unknown: everything ToIni writes is accepted back", roundTripClean);
 
-        // `dns` is a MODE in the Rust client and a resolver LIST here. Recognising the mode
-        // words was only half the job: they mapped to "no explicit resolvers", and EffectiveDns
-        // then installs 1.1.1.1/8.8.8.8 on a full tunnel — so `dns = off`, which means LEAVE MY
-        // RESOLVER ALONE, sent every lookup to Cloudflare and Google. (Audit 2026-08-02, §3.)
+        // Legacy mobile profiles used `dns` for both mode and resolver list. Mode words must be
+        // retained independently so `dns = off` keeps meaning LEAVE MY RESOLVER ALONE after an
+        // editor round-trip. (Audit 2026-08-02, §3.)
         bool dnsModeKept = true, dnsModeRoundTrips = true;
         foreach (var mode in new[] { "off", "system" })
         {
@@ -530,9 +567,31 @@ public static class WireConformance
         try { Ini("proto = udp").Validate(); } catch (ArgumentException) { enums = false; }
         check("ini-bools: unknown proto/mode/front are refused, valid ones accepted", enums);
 
+        bool cidrs = true;
+        foreach (string line in new[]
+                 {
+                     "include = vpn.example.com/24",
+                     "exclude = 10.0.0.1/not-a-prefix",
+                     "include = 10.0.0.1/33",
+                     "exclude = 2001:db8::/129",
+                 })
+        {
+            try { Ini(line).Validate(); cidrs = false; } catch (ArgumentException) { }
+        }
+        foreach (string line in new[]
+                 {
+                     "include = 10.0.0.0/8",
+                     "exclude = 2001:db8::/32",
+                     "include = 192.0.2.1",
+                 })
+        {
+            try { Ini(line).Validate(); } catch (ArgumentException) { cidrs = false; }
+        }
+        check("ini-routes: include/exclude require strict IP CIDRs", cidrs);
+
         return timeoutClamped && noOverflow && zeroTimeout && negTimeout && sane
                && ordered && capped && kept
-               && recorded && notFalsey && refuses && spellings && enums;
+               && recorded && notFalsey && refuses && spellings && enums && cidrs;
     }
 
     /// <summary>The path-MTU ladder's floor. Not fixture-driven — it is a policy, not a wire
@@ -948,7 +1007,16 @@ public static class WireConformance
                 // fresh window; the key is irrelevant here (no crypto is exercised).
                 var codec = new PacketCodec(new PacketCipher(new byte[32]));
 
-                var seqs = c.GetProperty("seqs").EnumerateArray().Select(v => v.GetInt64()).ToList();
+                // The packet counter is UNSIGNED 64-bit, so read it as one and reinterpret the
+                // bit pattern — `AcceptCounter` takes a `long` purely as a carrier.
+                //
+                // `GetInt64()` threw FormatException on any value above 2^63-1, which meant
+                // the harness could not even LOAD a vector exercising the high-bit range —
+                // precisely the range where Kotlin and C# used to disable the replay window
+                // outright (the -1 sentinel collided with it). A fixture that cannot express
+                // the bug cannot catch it. (Audit 2026-08-04.)
+                var seqs = c.GetProperty("seqs").EnumerateArray()
+                    .Select(v => unchecked((long)v.GetUInt64())).ToList();
                 var want = c.GetProperty("verdicts").EnumerateArray().Select(v => v.GetBoolean()).ToList();
                 var got = seqs.Select(codec.AcceptCounter).ToList();
 

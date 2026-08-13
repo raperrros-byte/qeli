@@ -74,12 +74,18 @@ public sealed class VpnConfig : INotifyPropertyChanged
     // auth
     public string Username { get; init; } = "client";
     public string Password { get; init; } = "";
+    /// <summary>Runtime journal detail carried into desktop service/daemon profiles.
+    /// It is an application preference, not a transport-core setting.</summary>
+    public string LoggingLevel { get; set; } = "info";
     public string? ServerPublicKeyHex { get; init; }     // pinned static key (hex), null = TOFU
     // H-1: bind data keys to the server static identity (folds es into the KDF).
     // Must match the server's auth.bind_static_to_session and requires a pinned key.
     // Default TRUE (secure-by-default since 0.7.1); wire-breaking — set false (or
     // pass bind_static=false) to talk to a legacy 0.7.0 / TOFU server.
     public bool BindStaticToSession { get; init; } = true;
+    /// <summary>Permit first-use trust when the proven key cannot be persisted. False keeps
+    /// the TOFU store fail-closed; it never weakens an existing-pin mismatch.</summary>
+    public bool AllowUnpinnedTofu { get; init; }
     // tun
     // 0 = auto: adopt the MTU the server pushes at auth (falls back to 1400 if the
     // server is too old to push one). A value > 0 is an explicit override.
@@ -122,21 +128,30 @@ public sealed class VpnConfig : INotifyPropertyChanged
     // wants native IPv6, accepting that it bypasses the tunnel. Default off (fail-closed);
     // mirrors the Rust client's `allow_ipv6_leak`.
     public bool AllowIpv6Leak { get; init; }
-    // dns — empty by default so a config the user never gave DNS round-trips WITHOUT a
-    // `dns = 1.1.1.1, 8.8.8.8` line and the server-pushed DNS (dns.push_servers) is honoured.
-    // The public-resolver fallback moved to connect time (SetupTun): explicit > server-pushed
-    // > 1.1.1.1/8.8.8.8 (full-tunnel only). See the per-platform SetupTun DNS block.
+    // Per-application routing. The value syntax is platform-owned: Android and macOS use
+    // package/signing identifiers, while Windows uses canonical executable paths. Keeping the
+    // common model typed means a profile can be edited on any desktop without losing the
+    // selection and each platform can apply the same include/exclude contract.
+    public string AppsMode { get; init; } = "all";
+    public List<string> Apps { get; init; } = new();
+
+    [JsonIgnore]
+    public bool UsesAppFilter =>
+        Apps.Count > 0
+        && (AppsMode.Equals("include", StringComparison.OrdinalIgnoreCase)
+            || AppsMode.Equals("exclude", StringComparison.OrdinalIgnoreCase));
+    // Empty by default so a profile that never specified DNS round-trips without inventing a
+    // resolver and server-pushed DNS remains authoritative. Resolution order is explicit list,
+    // then authenticated server push, then no change to the host resolver.
     public List<string> DnsServers { get; init; } = new();
 
     /// <summary>DNS handling mode, mirroring `dns.mode` in the Rust client: `tunnel` (default —
     /// install resolvers reachable through the tunnel), `off` or `system` (leave the device
     /// resolver alone).
     ///
-    /// The flat INI spells the mode and the server list with the SAME key — `dns = off` versus
-    /// `dns = 1.1.1.1, 8.8.8.8` — so a shared desktop/router profile carries a value this port
-    /// used to discard. Discarding it was not neutral: with no explicit resolvers `SetupTun`
-    /// installs the public fallback on a full tunnel, so `off` produced exactly the behaviour
-    /// it asks to prevent. (Audit 2026-08-02, §3.)</summary>
+    /// Legacy mobile profiles used the same `dns` key for both a mode and a resolver list.
+    /// Readers still accept that form, while writers use canonical `dns_servers`; the mode is
+    /// kept separately so `off`/`system` survives an edit. (Audit 2026-08-02, §3.)</summary>
     public string DnsMode { get; init; } = "tunnel";
     // obfuscation
     public string WireMode { get; init; } = "fake-tls";  // "fake-tls" | "obfs" | "reality-tls" | "plain"
@@ -203,28 +218,26 @@ public sealed class VpnConfig : INotifyPropertyChanged
     /// </remarks>
     public static readonly HashSet<string> CarriedIniKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
-        // Understood by the RUST client only, and documented as such — docs/ru/CONFIG.md
-        // "Что пушем НЕ передаётся" lists these as client file-only keys.
+        // Not edited by this managed model. Platform/lifecycle fields are preserved for their
+        // owner; transport-owned socket settings are consumed by Rust through
+        // ToTransportCoreIni even though the desktop editor has no control for them.
         // NB: `dns_servers` used to live here (carried, not understood). It is READ and WRITTEN
         // by this port now — see FromIni/ToIni — so it moved to KnownIniKeys below. Leaving it
         // here as well would have made it both carried and modelled, and `ToIni` would emit it
         // twice: once from CarriedKeys, once from the DNS block. (Audit 2026-08-03, D2.)
-        "allow_unpinned_tofu", "autostart", "dev_attach", "exit_node",
+        "autostart", "dev_attach", "exit_node",
         "gateway_nat", "keepalive", "lan_subnet", "post_down", "post_up", "tcp_nodelay",
-        // Socket buffers (Linux-only in the Rust client) and the headless password sources.
+        // Socket settings plus headless-only password sources.
         "password_command", "password_file", "recv_buffer_size", "send_buffer_size",
-        // Understood by the MOBILE ports only (per-app tunnelling, allow-LAN). Desktop has no
-        // per-app split, so `ToIni` never wrote them — which is exactly why
-        // `RoundTripKeysAreAllKnown` could not catch their absence: it only checks that what
-        // this port WRITES is accepted back. Now they are carried, so a profile that goes
-        // phone → desktop → phone keeps its app selection instead of losing it in the middle.
-        "allow_lan", "apps", "apps_mode",
+        // `allow_lan` remains mobile-owned. `apps`/`apps_mode` are modelled below because the
+        // Windows and macOS clients now apply the same per-application contract as Android.
+        "allow_lan",
     };
 
     private static readonly HashSet<string> KnownIniKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
         // Read by this port.
-        "allow_ipv6_leak", "awg", "bind_static", "dev", "dev_node", "dns", "dns_servers",
+        "allow_ipv6_leak", "allow_unpinned_tofu", "apps", "apps_mode", "awg", "bind_static", "dev", "dev_node", "dns", "dns_servers",
         "exclude", "forward",
         "front", "gateway", "heartbeat", "heartbeat_interval", "heartbeat_jitter",
         "heartbeat_size", "include", "jc", "jmax", "jmin", "key", "kill_switch", "local",
@@ -346,10 +359,11 @@ public sealed class VpnConfig : INotifyPropertyChanged
         ReconnectEnabled = ReconnectEnabled, ReconnectMaxRetries = ReconnectMaxRetries,
         ReconnectBaseDelaySecs = ReconnectBaseDelaySecs, ReconnectMaxDelaySecs = ReconnectMaxDelaySecs,
         Username = Username, Password = Password, ServerPublicKeyHex = ServerPublicKeyHex,
-        BindStaticToSession = BindStaticToSession,
+        BindStaticToSession = BindStaticToSession, AllowUnpinnedTofu = AllowUnpinnedTofu,
         Mtu = Mtu, MtuProbe = MtuProbe, RoutingMode = RoutingMode, AddDefaultGateway = AddDefaultGateway,
         IncludeRoutes = IncludeRoutes, ExcludeRoutes = ExcludeRoutes, RouteLocalNetworks = RouteLocalNetworks,
         PersistTun = PersistTun, KillSwitch = KillSwitch, AllowIpv6Leak = AllowIpv6Leak, Forward = Forward,
+        AppsMode = AppsMode, Apps = Apps,
         DnsServers = DnsServers, DnsMode = DnsMode, WireMode = WireMode, ObfsKey = ObfsKey, ObfsFronting = ObfsFronting,
         AwgEnabled = AwgEnabled, AwgJc = AwgJc, AwgJmin = AwgJmin, AwgJmax = AwgJmax,
         QuicEnabled = QuicEnabled, Sni = Sni,
@@ -383,9 +397,9 @@ public sealed class VpnConfig : INotifyPropertyChanged
     /// <remarks>
     /// Names as <c>FromIni</c> records them — the port is recorded under <c>server (port)</c>,
     /// because in the flat INI it is the tail of the <c>server</c> line and not a key of its own.
-    /// Everything absent from this list (<c>timeout</c>, <c>reconnect_*</c>, <c>lport</c>,
-    /// <c>metric</c>, <c>heartbeat_size</c>, <c>shaping_*</c>) has NO form control and must keep
-    /// its marker, exactly as with the booleans.
+    /// Newer editor controls such as timeout/reconnect are optional parameters of
+    /// <see cref="WithEditorFields"/> so conformance callers can still represent an untouched
+    /// field. Their markers are removed conditionally in the initializer below.
     /// </remarks>
     private static readonly string[] EditorControlledNumericKeys =
     {
@@ -401,7 +415,11 @@ public sealed class VpnConfig : INotifyPropertyChanged
         int mtu, List<string> dnsServers,
         bool paddingEnabled, int paddingMin, int paddingMax,
         bool heartbeatEnabled, long heartbeatIntervalMs, long heartbeatJitterMs,
-        bool proxyEnabled = false, string proxyListen = "127.0.0.1:1080", string proxyMode = "mixed") => new()
+        bool proxyEnabled = false, string proxyListen = "127.0.0.1:1080", string proxyMode = "mixed",
+        string? appsMode = null, List<string>? apps = null,
+        long? connectionTimeoutSecs = null, bool? reconnectEnabled = null,
+        int? reconnectMaxRetries = null, bool? persistTun = null,
+        bool? mtuProbe = null, bool? killSwitch = null, string? dnsMode = null) => new()
     {
         // ── form-edited fields (from params) ──
         ServerAddress = serverAddress, Port = port, Protocol = protocol, WireMode = wireMode,
@@ -410,26 +428,32 @@ public sealed class VpnConfig : INotifyPropertyChanged
         Username = username, Password = password, ServerPublicKeyHex = serverPublicKeyHex,
         RoutingMode = routingMode, AddDefaultGateway = addDefaultGateway, RouteLocalNetworks = routeLocalNetworks,
         Mtu = mtu, DnsServers = dnsServers,
-        // Typing resolvers into the form MEANS "use these", so it has to move the mode off
-        // `off`/`system` — otherwise the address the user just entered is stored and then
-        // ignored, with the UI showing it as if it applied. The mode is kept when the field is
-        // left empty, so a `dns = off` profile saved without touching DNS stays `off`.
-        DnsMode = dnsServers.Count > 0 ? "tunnel" : DnsMode,
+        // The current desktop editors expose DNS mode directly. Older callers omit it: in
+        // that compatibility path, entering resolvers still means "use these" and moves a
+        // legacy off/system profile back to tunnel-managed DNS.
+        DnsMode = dnsMode ?? (dnsServers.Count > 0 ? "tunnel" : DnsMode),
         PaddingEnabled = paddingEnabled, PaddingMin = paddingMin, PaddingMax = paddingMax,
         HeartbeatEnabled = heartbeatEnabled, HeartbeatIntervalMs = heartbeatIntervalMs, HeartbeatJitterMs = heartbeatJitterMs,
         Name = name,
         ProxyEnabled = proxyEnabled,
         ProxyListen = string.IsNullOrWhiteSpace(proxyListen) ? "127.0.0.1:1080" : proxyListen.Trim(),
         ProxyMode = string.IsNullOrWhiteSpace(proxyMode) ? "mixed" : proxyMode.Trim(),
+        AppsMode = appsMode ?? AppsMode,
+        Apps = apps ?? Apps,
+        ConnectionTimeoutSecs = connectionTimeoutSecs ?? ConnectionTimeoutSecs,
+        ReconnectEnabled = reconnectEnabled ?? ReconnectEnabled,
+        ReconnectMaxRetries = reconnectMaxRetries ?? ReconnectMaxRetries,
+        PersistTun = persistTun ?? PersistTun,
+        MtuProbe = mtuProbe ?? MtuProbe,
+        KillSwitch = killSwitch ?? KillSwitch,
         // ── preserved from `this` (no form control) ──
-        Id = Id, ConnectionTimeoutSecs = ConnectionTimeoutSecs,
+        Id = Id,
         LocalAddress = LocalAddress, LocalPort = LocalPort,
         RouteFile = RouteFile, InterfaceMetric = InterfaceMetric, DevNode = DevNode,
-        ReconnectEnabled = ReconnectEnabled, ReconnectMaxRetries = ReconnectMaxRetries,
         ReconnectBaseDelaySecs = ReconnectBaseDelaySecs, ReconnectMaxDelaySecs = ReconnectMaxDelaySecs,
-        BindStaticToSession = BindStaticToSession, MtuProbe = MtuProbe,
+        BindStaticToSession = BindStaticToSession, AllowUnpinnedTofu = AllowUnpinnedTofu,
         IncludeRoutes = IncludeRoutes, ExcludeRoutes = ExcludeRoutes,
-        PersistTun = PersistTun, KillSwitch = KillSwitch, AllowIpv6Leak = AllowIpv6Leak, Forward = Forward,
+        AllowIpv6Leak = AllowIpv6Leak, Forward = Forward,
         AwgEnabled = AwgEnabled, AwgJc = AwgJc, AwgJmin = AwgJmin, AwgJmax = AwgJmax,
         HeartbeatDataSize = HeartbeatDataSize,
         ShapingEnabled = ShapingEnabled, ShapingGapMeanMs = ShapingGapMeanMs, ShapingGapMinMs = ShapingGapMinMs,
@@ -459,6 +483,8 @@ public sealed class VpnConfig : INotifyPropertyChanged
         // a dead end with no way out of the UI. Carried minus what the form just rewrote.
         UnparsedNumericKeys = UnparsedNumericKeys
             .Where(k => !EditorControlledNumericKeys.Contains(k))
+            .Where(k => connectionTimeoutSecs == null || k != "timeout")
+            .Where(k => reconnectMaxRetries == null || k != "reconnect_retries")
             .ToArray(),
         UnknownKeys = UnknownKeys,
         // The raw text behind those markers, minus the ones the form just resolved — a marker
@@ -467,6 +493,12 @@ public sealed class VpnConfig : INotifyPropertyChanged
         InvalidRawValues = InvalidRawValues
             .Where(kv => !EditorControlledNumericKeys.Contains(kv.Key)
                          && !EditorControlledBooleanKeys.Contains(kv.Key))
+            .Where(kv => connectionTimeoutSecs == null || kv.Key != "timeout")
+            .Where(kv => reconnectMaxRetries == null || kv.Key != "reconnect_retries")
+            .Where(kv => reconnectEnabled == null || kv.Key != "reconnect")
+            .Where(kv => persistTun == null || kv.Key != "persist_tun")
+            .Where(kv => mtuProbe == null || kv.Key != "mtu_probe")
+            .Where(kv => killSwitch == null || kv.Key != "kill_switch")
             .ToDictionary(kv => kv.Key, kv => kv.Value),
         // Carried, MINUS whatever this form just rewrote.
         //
@@ -478,6 +510,10 @@ public sealed class VpnConfig : INotifyPropertyChanged
         // genuinely resolved and only the rest must survive. (Audit 2026-08-01, §10.)
         UnparsedBooleanKeys = UnparsedBooleanKeys
             .Where(k => !EditorControlledBooleanKeys.Contains(k))
+            .Where(k => reconnectEnabled == null || k != "reconnect")
+            .Where(k => persistTun == null || k != "persist_tun")
+            .Where(k => mtuProbe == null || k != "mtu_probe")
+            .Where(k => killSwitch == null || k != "kill_switch")
             .ToArray(),
         // DuplicateKeys is deliberately NOT carried (it defaults to empty). Unlike a bool typo,
         // a duplicate cannot survive this call: the parse already collapsed the key to one
@@ -542,6 +578,13 @@ public sealed class VpnConfig : INotifyPropertyChanged
         // round-trips to plain UDP and a quic-mode server stays silent.
         if (QuicEnabled) q.Add("quic=1");
         if (Mtu > 0) q.Add($"mtu={Mtu}");  // 0 = auto, omit
+        // Keep the cross-platform per-application contract in share links too.  INI
+        // already round-trips these fields, but dropping them here made a profile widen
+        // back to `all` merely by sharing it between clients.
+        if (!AppsMode.Equals("all", StringComparison.OrdinalIgnoreCase))
+            q.Add($"apps_mode={Uri.EscapeDataString(AppsMode)}");
+        if (Apps.Count > 0)
+            q.Add($"apps={Uri.EscapeDataString(string.Join(",", Apps))}");
         sb.Append('?').Append(string.Join("&", q));
 
         if (!string.IsNullOrWhiteSpace(Name)) sb.Append('#').Append(Uri.EscapeDataString(Name!));
@@ -571,6 +614,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
         sb.AppendLine($"pass = {IniSafe(Password)}");
         if (!string.IsNullOrEmpty(ServerPublicKeyHex)) sb.AppendLine($"key = {IniSafe(ServerPublicKeyHex)}");
         if (!BindStaticToSession) sb.AppendLine("bind_static = false");  // on by default; emit only when off
+        if (AllowUnpinnedTofu) sb.AppendLine("allow_unpinned_tofu = true");
         sb.AppendLine($"mode = {IniSafe(WireMode)}");
         if (!string.IsNullOrEmpty(ObfsKey)) sb.AppendLine($"obfs_key = {IniSafe(ObfsKey)}");
         if (!string.IsNullOrEmpty(Sni)) sb.AppendLine($"sni = {IniSafe(Sni)}");
@@ -592,6 +636,12 @@ public sealed class VpnConfig : INotifyPropertyChanged
         if (RouteLocalNetworks) sb.AppendLine("route_local = true");
         if (IncludeRoutes.Count > 0) sb.AppendLine($"include = {string.Join(", ", IncludeRoutes.Select(IniSafe))}");
         if (ExcludeRoutes.Count > 0) sb.AppendLine($"exclude = {string.Join(", ", ExcludeRoutes.Select(IniSafe))}");
+        // Emit independently: an empty include list is intentionally invalid/fail-closed and
+        // must not silently round-trip back to `all`.
+        if (!AppsMode.Equals("all", StringComparison.OrdinalIgnoreCase))
+            sb.AppendLine($"apps_mode = {IniSafe(AppsMode)}");
+        if (Apps.Count > 0)
+            sb.AppendLine($"apps = {string.Join(", ", Apps.Select(IniSafe))}");
         if (PersistTun) sb.AppendLine("persist_tun = true");
         if (Forward) sb.AppendLine("forward = true");
         if (KillSwitch) sb.AppendLine("kill_switch = true");
@@ -610,7 +660,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
         //
         // The mode is emitted whenever it is non-default, independently of the list: `dns = off`
         // has to survive a save/load round-trip, or re-saving would silently turn "leave my
-        // resolver alone" back into the public fallback.
+        // resolver alone" back into tunnel-managed DNS.
         if (DnsMode != "tunnel") sb.AppendLine($"dns = {DnsMode}");
         if (DnsServers.Count > 0) sb.AppendLine($"dns_servers = {string.Join(", ", DnsServers.Select(IniSafe))}");
         if (Mtu > 0) sb.AppendLine($"mtu = {Mtu}");  // 0 = auto, omit
@@ -626,35 +676,36 @@ public sealed class VpnConfig : INotifyPropertyChanged
         // this and fixed it; the key names below are its dialect, so profiles interchange
         // between the mobile and desktop clients unchanged.
         //
-        // Emitted only when they differ from the default, keeping a plain profile short —
-        // and matching how every other optional key here behaves.
+        // Reconnect policy remains sparse because it is GUI lifecycle state. Timeout and the
+        // transport data-plane groups are explicit at the GUI→Rust boundary so both sides use
+        // the same values even when their UI defaults evolve independently.
         if (!ReconnectEnabled) sb.AppendLine("reconnect = false");
         if (ReconnectMaxRetries != -1) sb.AppendLine($"reconnect_retries = {ReconnectMaxRetries}");
         if (ReconnectBaseDelaySecs != 1) sb.AppendLine($"reconnect_base_delay = {ReconnectBaseDelaySecs}");
         if (ReconnectMaxDelaySecs != 60) sb.AppendLine($"reconnect_max_delay = {ReconnectMaxDelaySecs}");
-        if (ConnectionTimeoutSecs != 30) sb.AppendLine($"timeout = {ConnectionTimeoutSecs}");
-        if (!PaddingEnabled) sb.AppendLine("padding = false");
-        if (PaddingMin != 0) sb.AppendLine($"padding_min = {PaddingMin}");
-        if (PaddingMax != 255) sb.AppendLine($"padding_max = {PaddingMax}");
-        if (!HeartbeatEnabled) sb.AppendLine("heartbeat = false");
-        if (HeartbeatIntervalMs != 15000) sb.AppendLine($"heartbeat_interval = {HeartbeatIntervalMs}");
-        if (HeartbeatDataSize != 16) sb.AppendLine($"heartbeat_size = {HeartbeatDataSize}");
-        if (HeartbeatJitterMs != 2000) sb.AppendLine($"heartbeat_jitter = {HeartbeatJitterMs}");
-        if (ShapingEnabled) sb.AppendLine("shaping = true");
-        if (ShapingGapMeanMs != 700) sb.AppendLine($"shaping_gap_mean = {ShapingGapMeanMs}");
-        if (ShapingGapMinMs != 40) sb.AppendLine($"shaping_gap_min = {ShapingGapMinMs}");
-        if (ShapingGapMaxMs != 6000) sb.AppendLine($"shaping_gap_max = {ShapingGapMaxMs}");
-        if (ShapingBudgetBytesPerSec != 16384) sb.AppendLine($"shaping_budget = {ShapingBudgetBytesPerSec}");
-        if (ShapingMinSize != 64) sb.AppendLine($"shaping_min_size = {ShapingMinSize}");
-        if (ShapingMaxSize != 1024) sb.AppendLine($"shaping_max_size = {ShapingMaxSize}");
-        if (ShapingStealth) sb.AppendLine("shaping_stealth = true");
-        if (ShapingStealthRateMbps != 2) sb.AppendLine($"shaping_stealth_mbps = {ShapingStealthRateMbps}");
+        sb.AppendLine($"timeout = {ConnectionTimeoutSecs}");
+        sb.AppendLine($"padding = {PaddingEnabled.ToString().ToLowerInvariant()}");
+        sb.AppendLine($"padding_min = {PaddingMin}");
+        sb.AppendLine($"padding_max = {PaddingMax}");
+        sb.AppendLine($"heartbeat = {HeartbeatEnabled.ToString().ToLowerInvariant()}");
+        sb.AppendLine($"heartbeat_interval = {HeartbeatIntervalMs}");
+        sb.AppendLine($"heartbeat_size = {HeartbeatDataSize}");
+        sb.AppendLine($"heartbeat_jitter = {HeartbeatJitterMs}");
+        sb.AppendLine($"shaping = {ShapingEnabled.ToString().ToLowerInvariant()}");
+        sb.AppendLine($"shaping_gap_mean = {ShapingGapMeanMs}");
+        sb.AppendLine($"shaping_gap_min = {ShapingGapMinMs}");
+        sb.AppendLine($"shaping_gap_max = {ShapingGapMaxMs}");
+        sb.AppendLine($"shaping_budget = {ShapingBudgetBytesPerSec}");
+        sb.AppendLine($"shaping_min_size = {ShapingMinSize}");
+        sb.AppendLine($"shaping_max_size = {ShapingMaxSize}");
+        sb.AppendLine($"shaping_stealth = {ShapingStealth.ToString().ToLowerInvariant()}");
+        sb.AppendLine($"shaping_stealth_mbps = {ShapingStealthRateMbps}");
         if (ProxyEnabled) sb.AppendLine("proxy = true");
         if (ProxyListen != "127.0.0.1:1080") sb.AppendLine($"proxy_listen = {IniSafe(ProxyListen)}");
         if (ProxyMode != "mixed") sb.AppendLine($"proxy_mode = {IniSafe(ProxyMode)}");
         // Re-emit the keys this port accepts but does not model, verbatim and in a stable
         // order. Without this, opening a CLI or mobile profile here and saving it deleted its
-        // hooks (`post_up`/`post_down`), its TOFU setting, its routing policy and the whole
+        // hooks (`post_up`/`post_down`), socket policy, routing policy and the whole
         // per-app selection — silently, and as a side effect of merely opening it. `IniSafe`
         // applies here too: a value with an embedded newline would otherwise forge config
         // lines on save. (Audit 2026-08-02, §4 of the follow-up.)
@@ -675,6 +726,46 @@ public sealed class VpnConfig : INotifyPropertyChanged
         // reports as a duplicate: a second, invented complaint on top of the real one.
         // (Audit 2026-08-02, §4 of the follow-up.)
         return InvalidRawValues.Count == 0 ? text : RestoreInvalidLines(text);
+    }
+
+    /// <summary>Canonical profile passed to the Rust transport owner. The ordinary exported
+    /// INI stays sparse, but values whose historical GUI defaults differ from Rust defaults
+    /// are made explicit at this boundary.</summary>
+    public string ToTransportCoreIni()
+    {
+        var lines = ToIni().Replace("\r", "").Split('\n').ToList();
+        int section = lines.FindIndex(line => line.Trim().Equals("[qeli]", StringComparison.OrdinalIgnoreCase));
+        if (section < 0) throw new InvalidDataException("transport profile has no [qeli] section");
+
+        void Ensure(string key, string value)
+        {
+            bool present = lines.Any(line =>
+            {
+                int eq = line.IndexOf('=');
+                return eq > 0 && line[..eq].Trim().Equals(key, StringComparison.OrdinalIgnoreCase);
+            });
+            if (!present) lines.Insert(++section, $"{key} = {value}");
+        }
+
+        Ensure("gateway", IsFullTunnel ? "true" : "false");
+        Ensure("timeout", ConnectionTimeoutSecs.ToString());
+        Ensure("padding", PaddingEnabled ? "true" : "false");
+        Ensure("padding_min", PaddingMin.ToString());
+        Ensure("padding_max", PaddingMax.ToString());
+        Ensure("heartbeat", HeartbeatEnabled ? "true" : "false");
+        Ensure("heartbeat_interval", HeartbeatIntervalMs.ToString());
+        Ensure("heartbeat_size", HeartbeatDataSize.ToString());
+        Ensure("heartbeat_jitter", HeartbeatJitterMs.ToString());
+        Ensure("shaping", ShapingEnabled ? "true" : "false");
+        Ensure("shaping_gap_mean", ShapingGapMeanMs.ToString());
+        Ensure("shaping_gap_min", ShapingGapMinMs.ToString());
+        Ensure("shaping_gap_max", ShapingGapMaxMs.ToString());
+        Ensure("shaping_budget", ShapingBudgetBytesPerSec.ToString());
+        Ensure("shaping_min_size", ShapingMinSize.ToString());
+        Ensure("shaping_max_size", ShapingMaxSize.ToString());
+        Ensure("shaping_stealth", ShapingStealth ? "true" : "false");
+        Ensure("shaping_stealth_mbps", ShapingStealthRateMbps.ToString());
+        return string.Join("\n", lines);
     }
 
     /// <summary>Replace (or append) one line per <see cref="InvalidRawValues"/> entry.</summary>
@@ -933,8 +1024,26 @@ public sealed class VpnConfig : INotifyPropertyChanged
             port = 443;
         }
 
-        string key = new string(Get("key").Where(Uri.IsHexDigit).ToArray()).ToLowerInvariant();
+        // A key that was SUPPLIED but is unusable must fail loudly, never silently unpin.
+        //
+        // `keyValid ? key : null` used to turn a truncated or corrupted pin into null, and
+        // null means TOFU — so a link whose `key` lost one character downgraded the client
+        // from "verify this exact server" to "trust whatever answers first", with no message
+        // anywhere. Rust, Kotlin and Swift all keep the supplied value and fail at the
+        // handshake instead; C# was the only port that quietly weakened the profile.
+        // Rejecting at import is the same fail-closed outcome, just with a usable error.
+        // An ABSENT key still means TOFU — that is a deliberate configuration, not a typo.
+        // (Audit 2026-08-04, H-08.)
+        string keyRaw = Get("key").Trim();
+        string key = new string(keyRaw.Where(Uri.IsHexDigit).ToArray()).ToLowerInvariant();
         bool keyValid = key.Length == 64 && key.Any(ch => ch != '0'); // all-zero = TOFU
+        if (keyRaw.Length > 0 && !keyValid)
+        {
+            throw new ArgumentException(
+                $"'key' must be 64 hex digits and not all zero, got '{keyRaw}' ({key.Length} "
+                + "hex digits). Leave it out entirely for trust-on-first-use — a malformed "
+                + "key must not silently become an unpinned profile.");
+        }
         string sni = Get("sni");
 
         // Routing: full-tunnel by default; `gateway = false` opts into split-tunnel.
@@ -986,7 +1095,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
         // Alias: `mode=udp-quic` / `udp-obfs` fold transport+QUIC into the wire mode.
         var (proto, mode, quic) = NormalizeMode(Get("proto", "tcp"), Get("mode", "fake-tls"), BoolAt("quic", false));
 
-        return new VpnConfig
+        var cfg = new VpnConfig
         {
             Name = Get("name", host),
             ServerAddress = host,
@@ -997,6 +1106,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
             ServerPublicKeyHex = keyValid ? key : null,
             // H-1: on by default; needs a pinned key. `bind_static = false` for TOFU.
             BindStaticToSession = BoolAt("bind_static", true),
+            AllowUnpinnedTofu = BoolAt("allow_unpinned_tofu", false),
             WireMode = mode,
             ObfsKey = Get("obfs_key"),
             ObfsFronting = Get("front", "websocket"),
@@ -1015,6 +1125,11 @@ public sealed class VpnConfig : INotifyPropertyChanged
             // `include` forces subnets IN (split-tunnel). Mirrors the Rust/Android keys.
             IncludeRoutes = SplitCidrs(Get("include")),
             ExcludeRoutes = SplitCidrs(Get("exclude")),
+            // Keep unknown values verbatim; Validate() rejects them. Coercing a typo to `all`
+            // would silently widen the tunnel.
+            AppsMode = Get("apps_mode", "all").Trim().ToLowerInvariant(),
+            Apps = Get("apps").Split(',').Select(s => s.Trim()).Where(s => s.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
             PersistTun = BoolAt("persist_tun", false),
             Forward = BoolAt("forward", false),
             // Was neither parsed nor emitted here, so an imported/exported flat-INI silently
@@ -1087,9 +1202,21 @@ public sealed class VpnConfig : INotifyPropertyChanged
                            .ToDictionary(kv => kv.Key, kv => kv.Value),
             RoutingMode = fullTunnel ? "full-tunnel" : "split-tunnel",
             AddDefaultGateway = fullTunnel,
-            DnsServers = dnsList ?? new List<string>(),  // empty when unset; fallback at connect time
+            DnsServers = dnsList ?? new List<string>(),  // empty when unset; server push may fill it
             DnsMode = dnsMode,
         };
+        // NB: `Validate()` is deliberately NOT called here.
+        //
+        // `FromIni` is the LENIENT parser: it clamps out-of-range numbers and records them in
+        // `UnparsedNumericKeys` / `InvalidRawValues` so the config editor can open a broken
+        // profile and show what is wrong — and `WireConformance.RunIniBounds` asserts exactly
+        // that by feeding it out-of-range values on purpose. Validating in here made both
+        // impossible (the first attempt at this fix did, and the harness threw instead of
+        // running). The check belongs at the IMPORT boundary, where an untrusted profile is
+        // being ADDED — see the `Parse` call sites in the two GUIs. `FromQeliUri` does
+        // validate, because a link is always an import and never an editor load.
+        // (Audit 2026-08-04, H-07.)
+        return cfg;
     }
 
     // ── imported-value ranges ────────────────────────────────────────────────
@@ -1119,11 +1246,9 @@ public sealed class VpnConfig : INotifyPropertyChanged
     /// scanned or pasted link should still yield a usable profile. (Audit 2026-07-27, C6)</summary>
     private static int LinkMtu(int mtu) => mtu == 0 || (mtu >= MtuMin && mtu <= MtuMax) ? mtu : 0;
 
-    /// <summary>Clamp the connect timeout to the same 1..300 s the Android and iOS clients
-    /// enforce. Unbounded before: the INI accepted any positive long, and
-    /// <c>VpnTunnelBase</c> then computes <c>(int)ConnectionTimeoutSecs * 1000</c> — so a value
-    /// above ~2.1 M seconds overflowed the int multiply into a NEGATIVE timeout, which is not a
-    /// long wait but an immediately-expired one. (Audit 2026-07-30, #11.)</summary>
+    /// <summary>Clamp the connect timeout to the common 1..300 s transport contract.
+    /// This prevents overflow or effectively unbounded waits in every consumer, including
+    /// the active Rust runtime and retained configuration diagnostics.</summary>
     private const long TimeoutSecsMin = 1;
     private const long TimeoutSecsMax = 300;
 
@@ -1193,8 +1318,16 @@ public sealed class VpnConfig : INotifyPropertyChanged
     /// boolean read as false, which disabled the kill switch and the static-key binding.
     ///
     /// Called at CONNECT, not at load: an editor must still be able to open a bad profile in
-    /// order to fix it. Same split as the Rust client. (Audit 2026-07-31.)</summary>
-    public void Validate()
+    /// order to fix it. Same split as the Rust client. (Audit 2026-07-31.)
+    ///
+    /// <para><paramref name="platformCapabilities"/> gates the checks that are about what THIS
+    /// client can currently do rather than about whether the profile is well-formed — today
+    /// just the IPv6-endpoint refusal. The import paths pass false: the cross-language
+    /// fixture <c>conformance/qeli-links.json</c> contains an IPv6-literal link that every
+    /// port must PARSE, and Kotlin's and Swift's validate() have no such check, so running it
+    /// at import would make C# reject a link the shared contract says is valid. It still runs
+    /// at connect, where it belongs. (Audit 2026-08-04, H-07.)</para></summary>
+    public void Validate(bool platformCapabilities = true)
     {
         // The flat INI spells the MODE and the RESOLVER LIST with the same `dns` key, so a
         // misspelled mode does not fall through to an error — it falls through to being read
@@ -1280,7 +1413,8 @@ public sealed class VpnConfig : INotifyPropertyChanged
         // a confusing "address family not supported" at connect time instead of a clear refusal
         // here — the same reason the Rust client refuses it. Real support is tracked for 0.8.0.
         // (Audit 2026-08-01, §9.)
-        if (System.Net.IPAddress.TryParse(ServerAddress.Trim('[', ']'), out var parsed)
+        if (platformCapabilities
+            && System.Net.IPAddress.TryParse(ServerAddress.Trim('[', ']'), out var parsed)
             && parsed.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6)
         {
             throw new ArgumentException(
@@ -1289,6 +1423,11 @@ public sealed class VpnConfig : INotifyPropertyChanged
         }
         Enum_("proto", Protocol, "tcp", "udp");
         Enum_("mode", WireMode, "fake-tls", "obfs", "plain", "reality-tls");
+        Enum_("apps_mode", AppsMode, "all", "include", "exclude");
+        if (!AppsMode.Equals("all", StringComparison.OrdinalIgnoreCase) && Apps.Count == 0)
+            throw new ArgumentException(
+                "'apps_mode' is include/exclude but 'apps' is empty — refusing to silently "
+                + "turn a per-application profile into an unrestricted tunnel");
         // Both fields are individually valid and the PAIR is not. The server refuses these two
         // combinations, so a client that accepts them cannot reach any working profile — it
         // just fails later and less clearly. Worse for `reality-tls`: nothing about the name
@@ -1361,6 +1500,19 @@ public sealed class VpnConfig : INotifyPropertyChanged
                     $"invalid proxy_listen '{ProxyListen}' — expected host:port");
             }
         }
+        foreach (var (field, routes) in new[]
+                 {
+                     ("include", (IEnumerable<string>)IncludeRoutes),
+                     ("exclude", (IEnumerable<string>)ExcludeRoutes),
+                 })
+        {
+            foreach (string route in routes)
+            {
+                if (!IsStrictCidr(route))
+                    throw new ArgumentException(
+                        $"'{field}' route '{route}' is not an IPv4/IPv6 CIDR literal");
+            }
+        }
         if (ConnectionTimeoutSecs is < 1 or > 300)
             throw new ArgumentException($"'timeout' must be 1..300, got {ConnectionTimeoutSecs}");
     }
@@ -1373,6 +1525,31 @@ public sealed class VpnConfig : INotifyPropertyChanged
     /// again (strict IP literal) before being spliced into route commands.</summary>
     private static List<string> SplitCidrs(string v) =>
         v.Split(',').Select(s => s.Trim()).Where(s => s.Length > 0).ToList();
+
+    private static bool IsStrictCidr(string value)
+    {
+        string text = value.Trim();
+        if (text.Length == 0) return false;
+        string[] parts = text.Split('/');
+        if (parts.Length is < 1 or > 2) return false;
+        string addressText = parts[0];
+        bool ipv6 = addressText.Contains(':');
+        if (!System.Net.IPAddress.TryParse(addressText, out var address)) return false;
+        if (ipv6 != (address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6))
+            return false;
+        if (!ipv6)
+        {
+            string[] octets = addressText.Split('.');
+            if (octets.Length != 4 || octets.Any(o => o.Length == 0
+                    || o.Any(c => !char.IsAsciiDigit(c))
+                    || !byte.TryParse(o, out _)))
+                return false;
+        }
+        int maximum = ipv6 ? 128 : 32;
+        return parts.Length == 1
+            || (parts[1].Length > 0 && parts[1].All(char.IsAsciiDigit)
+                && int.TryParse(parts[1], out int prefix) && prefix <= maximum);
+    }
 
     /// <summary>
     /// Parse a qeli:// share link. Mirrors Android VpnConfig.fromQeliUri /
@@ -1435,6 +1612,8 @@ public sealed class VpnConfig : INotifyPropertyChanged
         }
 
         string proto = "tcp", mode = "fake-tls", obfs = "", front = "websocket";
+        string appsMode = "all";
+        var apps = new List<string>();
         string? key = null, sni = null, rsid = null;
         bool quic = false;
         int mtu = 0;  // 0 = auto (use server-pushed MTU)
@@ -1459,8 +1638,20 @@ public sealed class VpnConfig : INotifyPropertyChanged
                     // (TOFU) instead of storing junk that only fails at handshake. (Shared)
                     case "key":
                     {
-                        var hex = new string(v.Where(Uri.IsHexDigit).ToArray()).ToLowerInvariant();
-                        key = hex.Length == 64 && hex.Any(ch => ch != '0') ? hex : null;
+                        // Supplied-but-unusable must fail loudly, never silently unpin —
+                        // see the identical guard in FromIni. (Audit 2026-08-04, H-08.)
+                        var raw = v.Trim();
+                        var hex = new string(raw.Where(Uri.IsHexDigit).ToArray()).ToLowerInvariant();
+                        bool ok = hex.Length == 64 && hex.Any(ch => ch != '0');
+                        if (raw.Length > 0 && !ok)
+                        {
+                            throw new ArgumentException(
+                                $"'key' must be 64 hex digits and not all zero, got '{raw}' "
+                                + $"({hex.Length} hex digits). Omit it entirely for "
+                                + "trust-on-first-use — a malformed key must not silently "
+                                + "become an unpinned profile.");
+                        }
+                        key = ok ? hex : null;
                         break;
                     }
                     case "sni": sni = v.Length == 0 ? null : v; break;
@@ -1469,6 +1660,14 @@ public sealed class VpnConfig : INotifyPropertyChanged
                     case "front": if (v.Length > 0) front = v; break;
                     case "quic": quic = v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase); break;
                     case "mtu": int.TryParse(v, out mtu); break;
+                    case "apps_mode": appsMode = v.Trim().ToLowerInvariant(); break;
+                    case "apps":
+                        apps = v.Split(',')
+                            .Select(item => item.Trim())
+                            .Where(item => item.Length > 0)
+                            .Distinct(StringComparer.OrdinalIgnoreCase)
+                            .ToList();
+                        break;
                     case "awg": awg = v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase); break;
                     case "jc": if (uint.TryParse(v, out var jcp)) awgJc = Math.Min(jcp, 128u); break;
                     case "jmin": if (ushort.TryParse(v, out var jminp)) awgJmin = Math.Min(jminp, (ushort)1400); break;
@@ -1481,15 +1680,26 @@ public sealed class VpnConfig : INotifyPropertyChanged
         // (`mode=udp-quic` / `udp-obfs`). Split it back into proto + wire mode + quic.
         (proto, mode, quic) = NormalizeMode(proto, mode, quic);
 
-        return new VpnConfig
+        var cfg = new VpnConfig
         {
             Name = label,
             ServerAddress = host, Port = port, Protocol = proto,
             Username = user, Password = pass, ServerPublicKeyHex = key,
             WireMode = mode, ObfsKey = obfs, ObfsFronting = front, Sni = sni, QuicEnabled = quic,
             AwgEnabled = awg, AwgJc = awgJc, AwgJmin = awgJmin, AwgJmax = awgJmax,
-            RealityShortId = rsid, Mtu = LinkMtu(mtu),
+            RealityShortId = rsid, Mtu = LinkMtu(mtu), AppsMode = appsMode, Apps = apps,
         };
+        // Kotlin's fromQeliUri and Swift's fromQeliURI both end with validate(); C# defined
+        // the same checks and then never ran them on any import path — grep found Validate()
+        // called only from the test harness. So every semantic rule the other clients
+        // enforce (mode must be a known value, udp+plain and udp+reality-tls are refused,
+        // mode=obfs needs an obfs_key, mode=reality-tls needs BOTH a reality_sid and a
+        // pinned key) was inert here: a link Android and iOS reject imported cleanly on
+        // Windows and macOS, and reality-tls without a pinned key means the client cannot
+        // tell the real server from the decoy an active prober is proxied to.
+        // (Audit 2026-08-04, H-07.)
+        cfg.Validate(platformCapabilities: false);
+        return cfg;
     }
 
     /// <summary>Accept convenience aliases where transport/QUIC is folded into the wire

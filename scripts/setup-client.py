@@ -1,15 +1,20 @@
+raise SystemExit(
+    "RETIRED: this root-SSH script overwrites the removed vpn-obfuscated JSON service. "
+    "Use install-qeli-client.sh with qeli/config/client.conf."
+)
 import os
 import sys
 import io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
 import paramiko
+import ssh_hostkey
 import json
 
 print("=== Configuring 10.66.116.11 as VPN CLIENT ===\n")
 
 ssh = paramiko.SSHClient()
-ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+ssh_hostkey.harden(ssh)
 ssh.connect('10.66.116.11', username='root', password=os.environ.get("QELI_LAB_PASS", ""), timeout=10)
 
 # 1. Stop VPN service

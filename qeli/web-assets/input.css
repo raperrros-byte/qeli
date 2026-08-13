@@ -85,6 +85,25 @@ code,pre,.mono,.font-mono{ font-family:'JetBrains Mono',ui-monospace,Menlo,monos
 /* ── card ── */
 .card{ background:linear-gradient(180deg,rgba(255,255,255,.015),transparent), var(--bg-card); border:1px solid var(--line); border-radius:var(--radius); }
 
+/* Dashboard profiles are deliberately compact: on a wide operations screen the
+   operator should see the whole transport set at a glance, not one profile per
+   row. This is plain CSS (rather than generated responsive utilities), so the
+   committed stylesheet cannot silently lose the layout during a Tailwind scan. */
+.profile-grid{ display:grid; grid-template-columns:minmax(0,1fr); gap:.625rem; }
+.profile-card{ min-width:0; padding:.75rem; }
+@media (min-width:640px){
+  .profile-grid{ grid-template-columns:repeat(2,minmax(0,1fr)); }
+}
+@media (min-width:900px){
+  .profile-grid{ grid-template-columns:repeat(3,minmax(0,1fr)); }
+}
+@media (min-width:1200px){
+  .profile-grid{ grid-template-columns:repeat(4,minmax(0,1fr)); }
+}
+@media (min-width:1536px){
+  .profile-grid{ grid-template-columns:repeat(6,minmax(0,1fr)); }
+}
+
 /* ── buttons ── */
 .btn{ display:inline-flex; align-items:center; gap:7px; padding:8px 15px; border-radius:10px; font-size:.8125rem; font-weight:600; cursor:pointer; border:1px solid transparent; transition:all .2s var(--ease); line-height:1.4; white-space:nowrap; }
 .btn:disabled{ opacity:.5; cursor:not-allowed; }
@@ -100,11 +119,43 @@ code,pre,.mono,.font-mono{ font-family:'JetBrains Mono',ui-monospace,Menlo,monos
 .btn-ghost:hover:not(:disabled){ background:rgba(255,255,255,.07); color:var(--txt); border-color:rgba(120,150,210,.3); }
 .btn-sm{ padding:5px 11px; font-size:.75rem; border-radius:8px; }
 
+/* Shared toolbar primitives. Pages should compose these instead of restyling native
+   buttons/selects ad hoc; this keeps dark/light, focus and compact density consistent. */
+.panel-toolbar{ display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; }
+.segmented{ display:inline-flex; overflow:hidden; border:1px solid var(--line); border-radius:10px; background:var(--bg-2); }
+.segmented button{ padding:.375rem .75rem; color:var(--txt-mut); font-size:.75rem; font-weight:600; transition:color .15s,background .15s; }
+.segmented button:hover{ color:var(--txt); }
+.segmented button[aria-pressed=true]{ background:var(--blue); color:#fff; }
+
 /* ── inputs / selects ── */
-.inp{ width:100%; background:var(--bg-2); border:1px solid var(--line); border-radius:10px; padding:9px 12px; font-size:.875rem; color:var(--txt); outline:none; transition:border-color .15s,box-shadow .15s; }
+.inp{ width:100%; background-color:var(--bg-2); border:1px solid var(--line); border-radius:10px; padding:9px 12px; font-size:.875rem; color:var(--txt); outline:none; transition:border-color .15s,box-shadow .15s,background-color .15s; }
+.inp:hover:not(:disabled){ border-color:rgba(120,150,210,.32); }
 .inp:focus{ border-color:rgba(74,158,255,.55); box-shadow:0 0 0 3px rgba(74,158,255,.12); }
 .inp::placeholder{ color:#4a5878; }
-select.inp option{ background:var(--bg-card-2); }
+.inp:disabled{ cursor:not-allowed; opacity:.58; }
+/* Normalise platform-native dropdown/search controls. Without appearance:none,
+   Chromium on Windows paints its own white arrow/button over the dark panel. */
+select.inp{
+  -webkit-appearance:none; appearance:none; cursor:pointer; padding-right:2.25rem;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236b7a9b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m7 10 5 5 5-5'/%3E%3C/svg%3E");
+  background-repeat:no-repeat; background-position:right .7rem center; background-size:1rem;
+}
+select.inp::-ms-expand{ display:none; }
+select.inp option{ background-color:var(--bg-card-2); color:var(--txt); }
+select.inp.inp-compact{ height:30px; padding-top:3px; padding-bottom:3px; font-size:.8rem; }
+.inp[type=search]{
+  -webkit-appearance:none; appearance:none; padding-left:2.1rem;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236b7a9b' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='6'/%3E%3Cpath d='m20 20-4.2-4.2'/%3E%3C/svg%3E");
+  background-repeat:no-repeat; background-position:left .65rem center; background-size:1rem;
+}
+.inp[type=search]::-webkit-search-cancel-button{
+  -webkit-appearance:none; appearance:none; width:.9rem; height:.9rem; cursor:pointer; opacity:.75;
+  background:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%236b7a9b' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='m5 5 10 10M15 5 5 15'/%3E%3C/svg%3E") center/contain no-repeat;
+}
+.code-editor{ width:100%; min-height:calc(100vh - 300px); padding:16px; display:block; resize:vertical; tab-size:2;
+  background:var(--log-bg); color:var(--txt); border:1px solid var(--line); outline:none;
+  font-family:'JetBrains Mono','Fira Code',monospace; font-size:12.5px; line-height:1.6; }
+.code-editor:focus{ border-color:rgba(74,158,255,.55); box-shadow:inset 0 0 0 1px rgba(74,158,255,.2); }
 /* A width utility on an .inp must beat .inp{width:100%}. Both are single-class
    selectors, and .inp is emitted AFTER the utilities layer, so it wins the tie and
    every narrow input would stretch full-width. These compound selectors (0,2,0)
@@ -137,8 +188,13 @@ select.inp option{ background:var(--bg-card-2); }
 .section-hdr{ font-size:0.875rem; font-weight:600; color:#e2e8f0; padding-bottom:12px; border-bottom:1px solid #21314e; margin-bottom:16px; }
 .field-toggle{ display:flex; align-items:flex-start; gap:12px; }
 .toggle-wrap{ cursor:pointer; flex-shrink:0; padding-top:2px; }
+.toggle-wrap:focus-visible{ outline:2px solid var(--blue); outline-offset:3px; border-radius:10px; }
 .toggle{ width:32px; height:18px; border-radius:9px; position:relative; transition:background-color 0.2s; }
 .toggle-dot{ position:absolute; top:2px; width:14px; height:14px; background:white; border-radius:50%; box-shadow:0 1px 3px rgba(0,0,0,0.3); transition:transform 0.2s; }
+.toggle-lg{ width:40px; height:20px; border-radius:10px; }
+.toggle-lg .toggle-dot{ width:16px; height:16px; }
+.toggle-sm{ width:32px; height:16px; border-radius:8px; }
+.toggle-sm .toggle-dot{ width:12px; height:12px; }
 
 /* ── card section anchor (single-page profile) ── */
 .cfg-anchor{ scroll-margin-top:var(--topbar-h); }
@@ -152,6 +208,37 @@ select.inp option{ background:var(--bg-card-2); }
 .badge-udp{ background:rgba(167,139,250,.16); color:#c4b5fd; }
 .badge-on{ background:rgba(0,230,118,.14); color:var(--green-2); }
 .badge-off{ background:rgba(120,150,210,.1); color:var(--txt-dim); }
+.badge-green{ background:rgba(0,230,118,.14); color:var(--green-2); }
+.badge-blue{ background:rgba(74,158,255,.14); color:var(--blue-2); }
+.badge-gray{ background:rgba(120,150,210,.1); color:var(--txt-dim); }
+.badge-red{ background:rgba(255,93,108,.13); color:var(--red); }
+
+/* Compact key/value diagnostics shared by Transport Health and client details. */
+.diag-grid{ display:grid; grid-template-columns:minmax(0,.8fr) minmax(0,1.2fr); gap:.35rem .75rem; font-size:.7rem; line-height:1.35; }
+.diag-grid dt{ color:var(--txt-dim); min-width:0; }
+.diag-grid dd{ color:var(--txt); min-width:0; margin:0; text-align:right; overflow-wrap:anywhere; }
+
+/* Transport Health details must not participate in the profile grid layout. */
+.transport-stat{ padding:13px 14px; }
+.transport-stat .stat-val{ font-size:1.35rem; }
+.transport-stat .stat-lbl{ font-size:.62rem; }
+.transport-card{ transition:border-color .16s,box-shadow .16s; }
+.transport-card-selected{ border-color:rgba(74,158,255,.5); box-shadow:0 0 0 1px rgba(74,158,255,.12); }
+.transport-drawer-backdrop{
+  position:fixed; inset:0; z-index:70; display:flex; justify-content:flex-end;
+  background:rgba(4,7,14,.58); backdrop-filter:blur(3px);
+}
+.transport-drawer{
+  width:min(520px,100vw); height:100dvh; overflow-y:auto; overscroll-behavior:contain;
+  background:var(--bg-card); border-left:1px solid var(--line);
+  box-shadow:-24px 0 70px -28px rgba(0,0,0,.8);
+}
+.transport-drawer-header{
+  position:sticky; top:0; z-index:1; display:flex; align-items:center; justify-content:space-between;
+  gap:16px; padding:18px 20px; background:rgba(17,26,46,.96); border-bottom:1px solid var(--line);
+  backdrop-filter:blur(10px);
+}
+.transport-drawer-body{ padding:20px; }
 
 /* ── tables ── */
 .tbl-th{ padding:11px 15px; text-align:left; font-size:.68rem; font-weight:600; text-transform:uppercase; letter-spacing:.06em; color:var(--txt-dim); border-bottom:1px solid var(--line); }
@@ -237,6 +324,8 @@ html[data-theme=light] .hover\:text-white:hover{color:#0f1a2c}
 html[data-theme=light] .hover\:bg-white\/5:hover{background-color:rgba(47,127,230,.06)}
 /* surfaces */
 html[data-theme=light] .modal{box-shadow:0 24px 60px -20px rgba(15,26,44,.28)}
+html[data-theme=light] .transport-drawer{box-shadow:-24px 0 70px -28px rgba(15,26,44,.35)}
+html[data-theme=light] .transport-drawer-header{background:rgba(255,255,255,.96)}
 html[data-theme=light] .qs-tile{background:#f5f8fc}
 html[data-theme=light] .qs-tile:hover:not(:disabled){background:#eef3fb}
 html[data-theme=light] ::-webkit-scrollbar-thumb{background:#c4cfe0}
@@ -255,6 +344,11 @@ html[data-theme=light] ::-webkit-scrollbar-thumb:hover{background:#aebccf}
   /* Column spans assume a 2/3-wide grid; at one column they'd overflow the row. */
   .col-span-2,.col-span-3{grid-column:span 1/span 1}
   .modal{max-width:100%}
+  .transport-drawer-backdrop{align-items:flex-end}
+  .transport-drawer{
+    width:100%; height:auto; max-height:86dvh; border-left:0; border-top:1px solid var(--line);
+    border-radius:18px 18px 0 0; box-shadow:0 -24px 70px -28px rgba(0,0,0,.8);
+  }
   /* Data tables (dashboard, users ×2, blocked ×2, client, quickstart) — all seven
      are a direct child of .card, so :has() reaches every one without touching a
      single template. They keep a readable width and scroll INSIDE the card rather

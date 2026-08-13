@@ -12,6 +12,7 @@ enforces it (server log AUTH OK vs AUTH DENIED), for BOTH:
 import os, sys, io, time, tempfile
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import paramiko
+import ssh_hostkey
 
 PW = os.environ["QELI_LAB_PASS"]
 SRV = ("10.66.116.10", "root", PW)
@@ -38,7 +39,6 @@ bind.port = {PA}
 bind.transport = tcp
 tun.name = ura0
 tun.address = 10.86.0.1
-tun.netmask = 255.255.255.0
 tun.mtu = 1400
 pool.cidr = 10.86.0.0/24
 pool.exclude = 10.86.0.1
@@ -54,7 +54,6 @@ bind.port = {PB}
 bind.transport = tcp
 tun.name = urb0
 tun.address = 10.85.0.1
-tun.netmask = 255.255.255.0
 tun.mtu = 1400
 pool.cidr = 10.85.0.0/24
 pool.exclude = 10.85.0.1
@@ -113,9 +112,9 @@ level = info
 file = /root/reload-cli.log
 """
 
-sc = paramiko.SSHClient(); sc.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+sc = paramiko.SSHClient(); ssh_hostkey.harden(sc)
 sc.connect(SRV[0], username=SRV[1], password=SRV[2], timeout=25, look_for_keys=False, allow_agent=False)
-cc = paramiko.SSHClient(); cc.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+cc = paramiko.SSHClient(); ssh_hostkey.harden(cc)
 cc.connect(CLI[0], username=CLI[1], password=CLI[2], timeout=25, look_for_keys=False, allow_agent=False)
 
 def S(cmd, t=60):

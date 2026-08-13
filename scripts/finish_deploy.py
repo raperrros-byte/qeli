@@ -5,6 +5,7 @@ import sys
 import io
 import time
 import paramiko
+import ssh_hostkey
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
@@ -16,7 +17,7 @@ VPN_USER = "testuser"
 VPN_PASS = "TestPass123!"
 
 ssh = paramiko.SSHClient()
-ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+ssh_hostkey.harden(ssh)
 ssh.connect(SERVER_IP, username=SERVER_USER, password=SERVER_PASS, timeout=15)
 print("[OK] Connected")
 
@@ -62,6 +63,9 @@ run("""cat >> /etc/sysctl.conf << 'EOF'
 net.ipv4.ip_forward=1
 net.core.rmem_max=16777216
 net.core.wmem_max=16777216
+net.core.rmem_default=4194304
+net.core.wmem_default=4194304
+net.core.netdev_max_backlog=4000
 net.ipv4.tcp_rmem=4096 87380 16777216
 net.ipv4.tcp_wmem=4096 65536 16777216
 net.core.default_qdisc=fq

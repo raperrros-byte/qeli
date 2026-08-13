@@ -1,27 +1,25 @@
 # qeli-win
 
-Нативный Windows-клиент для VPN **qeli** (Quick Easy Link IP). Порт логики
-Android-приложения (`qeli-android`) на C# / .NET 10 + WPF. Полностью повторяет
-протокол: фейк-TLS 1.3 рукопожатие, X25519, HKDF-SHA256, ChaCha20-Poly1305,
-auth-proof v2 с привязкой к транскрипту, padding/heartbeat, обфускация `obfs`,
-маскировка под QUIC для UDP. Реализован байт-в-байт с Rust-сервером `qeli`.
+Нативный Windows-клиент для VPN **qeli** (Quick Easy Link IP): C# / .NET 10 + WPF
+как platform/UI слой и общее Rust transport-ядро через ABI 1.10. Rust владеет
+DNS/connect, handshake, crypto, TCP/UDP/QUIC/Reality, heartbeat/shaping, bonding и
+Wintun session/rings; C# управляет lifecycle/reconnect, созданием интерфейса,
+маршрутами/DNS/kill-switch, trust и UI. Только для per-app-профиля C# передаёт
+перехваченные WinDivert-пакеты в то же Rust-ядро через общий packet-device ABI.
 
 Режим **`reality-tls`** несёт туннель внутри *настоящего* браузерного TLS 1.3
 (byte-exact Chrome ClientHello, JA4 `t13d1516h2_8daaf6152771`): qeli-протокол
 работает **вложенно** внутри этой TLS-сессии, на проводе DPI видит только реальный
-Chrome-handshake. Внешний TLS-слой даёт общее чистое Rust-ядро `realtls`
-(`qeli/src/protocol/realtls/`) через P/Invoke — нативная либа `qeli.dll` (тот же
-C-ABI, что у Android `.so` и macOS `libqeli.dylib`), вшитая в exe.
+Chrome-handshake. Весь transport, включая внешний TLS-слой, выполняет общее Rust-ядро
+через P/Invoke — нативная `qeli.dll` с whole-client ABI, вшитая в exe.
 
 ## Технологии
 
 | Компонент            | Чем реализовано                                              |
 |----------------------|-------------------------------------------------------------|
-| TUN-устройство       | [Wintun](https://www.wintun.net) (`wintun.dll` amd64, **вшита** в exe) |
-| X25519               | BouncyCastle (`Org.BouncyCastle.Math.EC.Rfc7748`)           |
-| ChaCha20-Poly1305    | BouncyCastle (managed, без зависимости от ОС)               |
-| ChaCha20 (`obfs`)    | BouncyCastle `ChaCha7539Engine`                             |
-| HKDF / HMAC / SHA-256| `System.Security.Cryptography`                              |
+| TUN-устройство       | Wintun для `apps_mode=all`; WinDivert capture для `include`/`exclude` (обе пары DLL/драйверов вшиты в exe) |
+| Transport/crypto     | Rust `qeli.dll`, ABI 1.10 (`qeli_client_run` + native Wintun rings) |
+| Conformance/diagnostics | .NET wire/KAT и reachability tools; production fallback отсутствует |
 | GUI                  | WPF (.NET 10)                                                |
 | Маршруты / DNS / IP  | `iphlpapi` (LUID→index, gateway, `CreateIpForwardEntry2` для маршрутов) + `netsh` / `route` (fallback) |
 
@@ -30,24 +28,25 @@ C-ABI, что у Android `.so` и macOS `libqeli.dylib`), вшитая в exe.
 ```
 qeli-win/
 ├── QeliWin/
-│   ├── Crypto/        KeyExchange, KeyDerivation, PacketCipher
-│   ├── Protocol/      TlsHandshake, PacketCodec, ObfsStream, Quic
-│   ├── Model/         VpnConfig (JSON + qeli://), ProfileStore
-│   ├── Vpn/           Wintun (P/Invoke), NetworkConfigurator, VpnTunnel
+│   ├── Model/         VpnConfig (INI + qeli://), ProfileStore
+│   ├── Vpn/           Wintun lifecycle, NetworkConfigurator, ABI 1.10 adapter
 │   ├── App.xaml(.cs)  точка входа + headless CLI
 │   ├── MainWindow.*   интерфейс
 │   ├── InputDialog.cs модальный ввод
 │   ├── CliRunner.cs   режимы selftest / handshake / connect / genassets
 │   ├── Branding.cs    логотип + иконки (GDI+), NativeLoader (вшитый Wintun)
-│   └── wintun/wintun.dll  (встраивается в exe как ресурс)
-└── dist/              готовые сборки — QeliWin-standalone.exe / QeliWin-net-required.exe
+│   ├── wintun/wintun.dll  (встраивается в exe как ресурс)
+│   └── windivert/         WinDivert.dll + WinDivert64.sys (встраиваются в exe)
+├── dist/              готовые сборки — QeliWin-standalone.exe / QeliWin-net-required.exe
+└── ../qeli-shared/    lifecycle/model + retained conformance diagnostics
 ```
 
 ## Запуск
 
 VPN требует прав администратора (создание Wintun-адаптера, изменение маршрутов/DNS).
 
-Из релиза приходят **два** файла — выберите один:
+Из релиза приходят **два варианта приложения** — выберите один. Рядом лежат общие
+`WinDivert-LICENSE.txt` и `WinDivert-NOTICE.txt`, необходимые для поставки драйвера:
 
 | Файл | Размер | Что нужно на машине |
 |---|---|---|
@@ -60,11 +59,22 @@ VPN требует прав администратора (создание Wintu
    распаковывается при старте в `%LOCALAPPDATA%\QeliWin\native`).
 3. Запустите его (по запросу UAC согласитесь на повышение прав).
 4. Нажмите **Импорт** → вставьте `qeli://`-ссылку или **INI-конфиг** (`[qeli]`-секция) →
-   **Подключить**. JSON тоже принимается (легаси).
+   **Подключить**.
 
 > Оба варианта собираются из одного исходника — см. раздел «Сборка из исходников».
 
 Профили сохраняются в `%APPDATA%\QeliWin\profiles.json`.
+
+### Раздельный туннель по приложениям
+
+В редакторе профиля `apps_mode = include` направляет в VPN только выбранные `.exe`,
+а `exclude` — все процессы, кроме выбранных. Полные пути хранятся в `apps`; picker
+записывает их без потери Android/macOS-идентификаторов, уже присутствующих в переносимом
+профиле. WinDivert перехватывает outbound-пакеты, сопоставляет TCP/UDP endpoints с PID и
+исполняемым файлом, а затем передаёт выбранные пакеты в обычное Rust-ядро. DNS destination
+NAT и fragment affinity не дают DNS и последующим IPv4-фрагментам обойти решение первого
+пакета. При reconnect выбранный трафик остаётся fail-closed. Обычные профили этот путь не
+включают и работают через прежние нативные Wintun rings.
 
 ### Логотип
 
@@ -80,9 +90,9 @@ VPN требует прав администратора (создание Wintu
   (`DynamicResource`). Шрифты — Segoe UI Variable.
 - **Toast-уведомления.** При подключении/отключении/ошибке снизу справа выезжает
   аккуратное окошко-тостер с логотипом и цветной полосой статуса (`Toast.cs`).
-- **Редактор профиля.** «Новый»/«Изм.» открывают форму с выпадающими списками
-  (`ConfigEditorWindow`, без прокрутки) — только настраиваемые поля; сырой
-  `qeli://`/JSON по-прежнему через «Импорт».
+- **Редактор профиля.** «Новый»/«Изм.» открывают прокручиваемую форму, разбитую на
+  логические разделы подключения, транспорта, сети и приложений. Полный INI можно открыть кнопкой **«Редактировать INI»**;
+  `qeli://`-ссылки и INI-файлы также принимаются через «Импорт».
 
 #### Обфускация в редакторе
 
@@ -165,15 +175,18 @@ fragmentation, traffic-normalization, http2-masking, anti-fingerprinting —
 dotnet build QeliWin\QeliWin.csproj -c Debug
 
 # ── вариант A: framework-dependent (~11 МБ, нужен .NET 10 Desktop Runtime) ──
-# Задайте -p:AssemblyName, иначе оба варианта дадут одинаковый QeliWin.exe и второй
-# publish молча перезапишет первый — именно поэтому в релизе лежат разные имена.
+# Публикуем варианты в разные каталоги. Глобальный -p:AssemblyName использовать нельзя:
+# он наследуется QeliShared через ProjectReference, и NuGet видит два проекта с одним именем.
 dotnet publish QeliWin\QeliWin.csproj -c Release -r win-x64 --self-contained false `
-  -p:PublishSingleFile=true -p:AssemblyName=QeliWin-net-required -o dist
+  -p:PublishSingleFile=true -o dist\net-required
+Copy-Item dist\net-required\QeliWin.exe dist\QeliWin-net-required.exe
+Copy-Item dist\net-required\WinDivert-*.txt dist\
 
 # ── вариант B: сжатый self-contained (~77 МБ, без установки .NET) ──
 dotnet publish QeliWin\QeliWin.csproj -c Release -r win-x64 --self-contained true `
   -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
-  -p:EnableCompressionInSingleFile=true -p:AssemblyName=QeliWin-standalone -o dist
+  -p:EnableCompressionInSingleFile=true -o dist\standalone
+Copy-Item dist\standalone\QeliWin.exe dist\QeliWin-standalone.exe
 ```
 
 Wintun вшит в exe как ресурс (`EmbeddedResource`) — отдельный файл рядом не нужен
@@ -187,18 +200,21 @@ Wintun вшит в exe как ресурс (`EmbeddedResource`) — отдель
 | Команда                                   | Что делает                                            | Админ |
 |-------------------------------------------|-------------------------------------------------------|-------|
 | `selftest`                                | Проверки крипто/кодека/парсинга (без сети)            | нет   |
-| `handshake <link\|json\|file>`            | TCP/UDP + полное рукопожатие, печатает выданный IP    | нет   |
-| `connect <link\|json\|file> [секунды]`    | Поднимает полный туннель на N секунд                  | да    |
+| `handshake <link\|ini\|file>`             | TCP/UDP + полное рукопожатие, печатает выданный IP    | нет   |
+| `connect <link\|ini\|file> [секунды]`     | Поднимает полный туннель на N секунд                  | да    |
 
-## Статус тестирования (2026-06-04)
+## Статус тестирования (2026-08-10)
 
 - ✅ `selftest` — все проверки PASS (X25519 симметричен, HKDF совпадает с RFC 5869,
   ChaCha20-Poly1305 round-trip, PacketCodec + anti-replay, obfs, разбор `qeli://`,
   ClientHello c UDP-паддингом).
-- ✅ `handshake` против **тестового** сервера `10.66.116.10` (TOFU) → IP `10.9.0.3`.
+- ✅ ABI 1.10 source gates: Rust tests и strict Clippy зелёные; UDP buffer telemetry доступна
+  через расширенный stats ABI.
+- ⏳ `scripts/e2e_windows_native.py` и полный Wintun data-plane нужно повторить с заново
+  собранной ABI 1.10 `qeli.dll`; лежащая в дереве ABI 1.9 DLL новых stats-полей не содержит.
 - ✅ `handshake` против **боевого** сервера `YOUR_PROD_HOST` с пиннингом ключа
   `7ff1c274…2057` (клиент `client1`) → IP `10.9.0.2`.
-- ⏳ Полный data-plane туннель (Wintun + маршруты + DNS) — реализован, требует
+- ⏳ Полный live data-plane acceptance (Rust Wintun rings + маршруты + DNS) — реализован, требует
   запуска с правами администратора на реальной машине (UAC), автотест headless
   невозможен.
 

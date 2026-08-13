@@ -1,11 +1,10 @@
 use crate::crypto::{reality, PublicKey};
 use crate::protocol::FakeTlsHandshake;
 use crate::server::handler;
-use crate::server::{ProfileRuntime, ServerState};
+use crate::server::{ProfileRuntime, ServerState, TunIngress};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 
 /// Acceptance window for the REALITY session_id timestamp (anti-replay). The
 /// replay guard remembers accepted tokens for twice this long (see
@@ -66,12 +65,12 @@ impl DecoyGate {
     }
 }
 
-pub async fn handle_connection(
+pub(crate) async fn handle_connection(
     server_state: Arc<ServerState>,
     profile: Arc<ProfileRuntime>,
     stream: TcpStream,
     addr: std::net::SocketAddr,
-    tun_tx: mpsc::Sender<Vec<u8>>,
+    tun_tx: TunIngress,
     // Pre-auth admission permit (see the accept loop). Passed to `handle_client`, which
     // releases it once the peer authenticates. (S-01)
     pre_auth_permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -487,6 +486,101 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+
+    /// `has_alpn_extension` walks attacker-controlled length fields and decides whether a peer
+    /// is a qeli client or a probe to be bridged to the decoy site — and it had no test at all.
+    /// Every byte it indexes comes off the wire, and the build is `panic = "abort"`, so an
+    /// out-of-bounds index here is not a wrong answer, it is the whole server exiting on one
+    /// unauthenticated segment. These cases pin the two properties that matter: it never
+    /// panics, and it always terminates. (Audit 2026-08-04.)
+    #[test]
+    fn has_alpn_extension_never_panics_on_hostile_input() {
+        // Empty, sub-minimum, and exactly-at-the-boundary lengths.
+        for n in 0..64 {
+            assert!(!has_alpn_extension(&vec![0u8; n]), "all-zero len {n}");
+            assert!(!has_alpn_extension(&vec![0xFFu8; n]), "all-ones len {n}");
+        }
+
+        // A well-formed prefix (record header + handshake type 0x01) followed by length
+        // fields that each claim far more than the buffer holds. Any one of these taken at
+        // face value would index past the end.
+        let mut m = vec![0u8; 64];
+        m[5] = 0x01; // handshake type = ClientHello
+        for pos in [43usize, 44, 46, 50, 60, 63] {
+            let mut bad = m.clone();
+            for v in [0xFFu8, 0x7F, 0x80] {
+                bad[pos] = v;
+                // The assertion here is that the call RETURNS at all: a panic inside would
+                // fail the test, and under panic=abort in a release build it would take the
+                // whole server down. The verdict itself is not the property under test.
+                let _ = has_alpn_extension(&bad);
+            }
+        }
+
+        // ext_len = 0 must still advance the cursor (the `+ 4` does it) — otherwise the
+        // extension walk spins forever. A 200 ms budget is ~6 orders of magnitude above the
+        // real cost, so this fails loudly if the invariant is ever broken.
+        //
+        // `ext_total` has to COVER every extension appended, or the walk stops before the
+        // last one — the extensions region is bounded by the declared length, not by the end
+        // of the buffer.
+        let hello = |exts: &[[u8; 4]]| -> Vec<u8> {
+            let mut m = vec![0u8; 43];
+            m[5] = 0x01; // handshake type = ClientHello
+            m.push(0); // session_id length
+            m.extend_from_slice(&[0, 0]); // cipher_suites length
+            m.push(0); // compression methods length
+            let total = (exts.len() * 4) as u16;
+            m.extend_from_slice(&total.to_be_bytes());
+            for e in exts {
+                m.extend_from_slice(e);
+            }
+            m
+        };
+
+        // 256 zero-length extensions, none of them ALPN.
+        let filler = vec![[0x00u8, 0x2B, 0x00, 0x00]; 256]; // supported_versions, len = 0
+        let started = std::time::Instant::now();
+        assert!(
+            !has_alpn_extension(&hello(&filler)),
+            "no ALPN extension present"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "the extension walk must terminate"
+        );
+
+        // The positive case: an ALPN extension (0x0010) is found — first, last and alone.
+        let mut trailing = filler.clone();
+        trailing.push([0x00, 0x10, 0x00, 0x00]);
+        assert!(
+            has_alpn_extension(&hello(&trailing)),
+            "ALPN last must be detected"
+        );
+
+        let mut leading = vec![[0x00u8, 0x10, 0x00, 0x00]];
+        leading.extend_from_slice(&filler);
+        assert!(
+            has_alpn_extension(&hello(&leading)),
+            "ALPN first must be detected"
+        );
+
+        assert!(
+            has_alpn_extension(&hello(&[[0x00, 0x10, 0x00, 0x00]])),
+            "a lone ALPN extension must be detected"
+        );
+
+        // A declared length that overruns the buffer must not read past the end.
+        let mut lying = hello(&filler);
+        let n = lying.len();
+        lying[47] = 0xFF;
+        lying[48] = 0xFF; // extensions total = 65535, far beyond the buffer
+        assert!(
+            !has_alpn_extension(&lying),
+            "must not find ALPN past the buffer"
+        );
+        assert_eq!(lying.len(), n, "the parser must not mutate its input");
+    }
 
     /// recv_peek must reassemble a window delivered in many small TCP segments —
     /// regression for the old fixed-iteration loop that could return a truncated

@@ -10,7 +10,7 @@
 >
 > Updated: 2026-08-13
 >
-> База сравнения — upstream `v0.7.14`. В форке добавлено (новые сверху):
+> База сравнения — upstream `v0.7.15`. В форке добавлено (новые сверху):
 >
 > - **Клиент Win/mac: REALITY seal для профиля `reality` (:8443).** Профиль
 >   `mode=fake-tls` + `reality_sid` вставляет AEAD-токен в ClientHello `session_id`
@@ -92,10 +92,10 @@
 >   apt-get update -qq && apt-get install -y --no-install-recommends make dpkg-dev binutils xz-utils >/dev/null
 >   make -C qeli/debian deb
 >   make -C qeli/debian stage BINARY=../target/release/qeli \
->     DEB_DIR=/tmp/qeli_pkg/qeli_0.7.14_amd64 BUILD_DIR=/tmp/qeli_pkg
+>     DEB_DIR=/tmp/qeli_pkg/qeli_0.7.15_amd64 BUILD_DIR=/tmp/qeli_pkg
 >   find /tmp/qeli_pkg -type d -exec chmod 755 {} \;
 >   find /tmp/qeli_pkg -type f -exec chmod 644 {} \;
->   dpkg-deb --root-owner-group -Zxz --build /tmp/qeli_pkg/qeli_0.7.14_amd64 /w/qeli/debian/qeli_0.7.14_amd64.deb
+>   dpkg-deb --root-owner-group -Zxz --build /tmp/qeli_pkg/qeli_0.7.15_amd64 /w/qeli/debian/qeli_0.7.15_amd64.deb
 > '
 > ```
 >
@@ -238,7 +238,14 @@
 > Дополнительно: portable ABI — `make -C qeli/debian deb-portable` (zig + cargo-zigbuild).
 > Runbook для агента/Windows: [`scripts/AGENT_DEB_BUILD_DEPLOY.md`](scripts/AGENT_DEB_BUILD_DEPLOY.md).
 
-> Runbook для агента/Windows: [`scripts/AGENT_DEB_BUILD_DEPLOY.md`](scripts/AGENT_DEB_BUILD_DEPLOY.md).
+<p align="center">
+  <img src="assets/branding/qeli-logo.png" alt="Qeli logo" width="180">
+</p>
+
+**Qeli** (Quick Easy Link IP) — a self-hosted VPN with its own L4 protocol and built-in
+obfuscation over TCP or UDP. It aims at resilience against passive / signature-based DPI
+while keeping the convenience of a classic full-tunnel TUN VPN, and ships with a web admin
+panel.
 
 ---
 
@@ -250,7 +257,9 @@
 
 ## Что это
 
-- **TUN VPN**, не per-app proxy: маршруты и DNS на уровне ОС; full- и split-tunnel.
+- **TUN VPN** с optional per-app routing (Windows, macOS, Android): маршруты и DNS на
+  уровне ОС; full- и split-tunnel. Локальный SOCKS/HTTP proxy в форке — для split-tunnel
+  без замены qeli application-layer прокси.
 - **Wire modes:** `plain` · `fake-tls` · `obfs` · `reality` / `reality-tls` · UDP+QUIC.
 - **Post-quantum:** hybrid X25519 + ML-KEM-768, ChaCha20-Poly1305.
 - **Панель:** `qeli://` / QR, Argon2id, HTTPS.

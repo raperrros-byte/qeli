@@ -1,12 +1,14 @@
+raise SystemExit("RETIRED: unsafe pre-flat-INI root-SSH source mutator; use server-multiprofile.conf.")
 import os
 import sys
 import io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
 import paramiko
+import ssh_hostkey
 
 ssh = paramiko.SSHClient()
-ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+ssh_hostkey.harden(ssh)
 ssh.connect('10.66.116.10', username='root', password=os.environ.get("QELI_LAB_PASS", ""), timeout=15)
 
 # Read current server mod.rs
@@ -203,13 +205,14 @@ pub async fn run_server(config_path: &str) -> anyhow::Result<()> {
         
         TunInterface::delete(&config.tun.name).ok();
         let tun = TunInterface::create(&config.tun.name, config.tun.mtu)?;
-        TunInterface::set_address(&config.tun.name, &config.tun.address, &config.tun.netmask)?;
+        let (_, prefix) = crate::server::pool::parse_cidr(&config.pool.cidr)?;
+        TunInterface::set_address(&config.tun.name, &config.tun.address, prefix)?;
         TunInterface::set_up(&config.tun.name, config.tun.mtu)?;
         TunInterface::set_queue_len(&config.tun.name, config.tun.tx_queue_len)?;
         // Use blocking mode for efficiency
         // tun.set_nonblocking()?;
         
-        log::info!("TUN {} is up ({} {})", config.tun.name, config.tun.address, config.tun.netmask);
+        log::info!("TUN {} is up ({}/{})", config.tun.name, config.tun.address, prefix);
         
         // Setup NAT if enabled
         if config.routing.nat.enabled {

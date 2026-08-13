@@ -41,17 +41,10 @@ import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import com.qeli.protocol.ObfsStream
-import com.qeli.protocol.Quic
-import com.qeli.protocol.TlsHandshake
-import com.qeli.protocol.UdpFrag
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.security.SecureRandom
 
 class MainActivity : AppCompatActivity() {
 
@@ -80,6 +73,11 @@ class MainActivity : AppCompatActivity() {
     // CANCEL the attempt, otherwise a server that keeps closing the connection leaves
     // the client retrying forever with no way to stop it from the UI.
     private var isConnecting = false
+    // Native owns duplicated TUN descriptors. This state remains busy until the service
+    // confirms that its runner has exited and Android routes/DNS are actually restored.
+    private var isDisconnecting = false
+    // Invalidates reachability probes launched against a VPN generation being torn down.
+    private var reachEpoch = 0L
     private var clientIp = ""
     private var logLineCount = 0
     // Mirror of PREF_LOG_TIME_FORMAT, cached because appendLog reads it per line.
@@ -138,6 +136,12 @@ class MainActivity : AppCompatActivity() {
         // has always shown, and a full date on every line eats a phone-width row.
         const val PREF_LOG_TIME_FORMAT = "log_time_format"
         const val DEFAULT_LOG_TIME_FORMAT = "time"
+        const val PREF_LOG_LEVEL = "log_level"
+        const val DEFAULT_LOG_LEVEL = "info"
+        /** Shadowrocket-like: on give-up, try the next profile in the list. */
+        const val PREF_FAILOVER = "profile_failover"
+        /** Geo routing preset id (proxy-all / bypass-ru / …). */
+        const val PREF_GEO_PRESET = "geo_route_preset"
         // Flat-INI template — the same `[qeli]` schema the Rust client reads.
         private const val TEMPLATE = """# My server
 [qeli]
@@ -148,8 +152,9 @@ pass = changeme
 key =
 mode = fake-tls
 sni = www.microsoft.com
+# kill_switch = true       ; requires Android Always-on VPN + Block without VPN
 # route_local = false      ; route LAN/RFC1918 through the tunnel
-# dns = 1.1.1.1, 8.8.8.8   ; resolvers reached via the tunnel
+# dns_servers = 1.1.1.1, 8.8.8.8 ; resolvers reached via the tunnel
 """
     }
 
@@ -185,6 +190,17 @@ sni = www.microsoft.com
 
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == VpnServiceImpl.BROADCAST_FAILOVER) {
+                val idx = intent.getIntExtra(VpnServiceImpl.EXTRA_FAILOVER_INDEX, -1)
+                runOnUiThread {
+                    loadProfiles()
+                    if (idx in profiles.indices) activeIndex = idx
+                    persist(); renderProfileList(); renderActiveProfile()
+                    appendLog("Failover switched to profile #${idx + 1}")
+                    setConnectingState()
+                }
+                return
+            }
             val status = intent.getStringExtra(VpnServiceImpl.EXTRA_STATUS)
             val error = intent.getStringExtra(VpnServiceImpl.EXTRA_ERROR)
             val log = intent.getStringExtra(VpnServiceImpl.EXTRA_LOG)
@@ -234,7 +250,10 @@ sni = www.microsoft.com
             override fun onTabReselected(tab: TabLayout.Tab) {}
         })
 
-        val filter = IntentFilter(VpnServiceImpl.BROADCAST_STATUS)
+        val filter = IntentFilter().apply {
+            addAction(VpnServiceImpl.BROADCAST_STATUS)
+            addAction(VpnServiceImpl.BROADCAST_FAILOVER)
+        }
         // Not-exported on EVERY API level (via ContextCompat, like QeliTileService). The old
         // SDK>=33 gate left the receiver EXPORTED on API 26-32, where a co-installed app could
         // broadcast com.qeli.STATUS to spoof "Connected"/inject log lines — lethal for a
@@ -397,6 +416,7 @@ sni = www.microsoft.com
         when (VpnServiceImpl.liveStatus) {
             VpnServiceImpl.STATUS_CONNECTED -> { clientIp = VpnServiceImpl.liveIp; setConnectedState() }
             VpnServiceImpl.STATUS_CONNECTING -> setConnectingState()
+            VpnServiceImpl.STATUS_DISCONNECTING -> setDisconnectingState()
             else -> { /* disconnected / error → already in the default state */ }
         }
     }
@@ -437,6 +457,55 @@ sni = www.microsoft.com
             text = getString(R.string.allow_lan)
             isChecked = prefs.getBoolean(PREF_ALLOW_LAN, false)
         }
+        val cbFailover = android.widget.CheckBox(this).apply {
+            text = getString(R.string.profile_failover)
+            isChecked = prefs.getBoolean(PREF_FAILOVER, false)
+        }
+        val tvGeo = android.widget.TextView(this).apply {
+            text = getString(R.string.geo_route_preset)
+            setPadding(0, dp(8), 0, dp(4))
+        }
+        val geoPresets = com.qeli.geo.ProxyRoutePreset.ALL
+        val geoIds = geoPresets.map { it.id }
+        val currentGeo = com.qeli.geo.ProxyRoutePreset.normalize(
+            prefs.getString(PREF_GEO_PRESET, com.qeli.geo.ProxyRoutePreset.PROXY_ALL))
+        val rgGeo = android.widget.RadioGroup(this)
+        val geoButtons = geoPresets.map { e ->
+            android.widget.RadioButton(this).apply {
+                id = View.generateViewId()
+                text = if (QeliApp.language(this@MainActivity) == "ru") e.labelRu else e.labelEn
+            }.also { rgGeo.addView(it) }
+        }
+        rgGeo.check(geoButtons[geoIds.indexOf(currentGeo).coerceAtLeast(0)].id)
+        val tvGeoStatus = android.widget.TextView(this).apply {
+            text = getString(R.string.geo_status, com.qeli.geo.GeoAssetStore.statusText(this@MainActivity))
+            setPadding(0, dp(4), 0, dp(4))
+        }
+        val btnGeoDl = outlined().apply {
+            text = getString(R.string.geo_download)
+            setOnClickListener {
+                isEnabled = false
+                text = getString(R.string.geo_downloading)
+                lifecycleScope.launch {
+                    try {
+                        withContext(Dispatchers.IO) {
+                            com.qeli.geo.GeoAssetStore.download(this@MainActivity) { msg ->
+                                runOnUiThread { tvGeoStatus.text = msg }
+                            }
+                        }
+                        tvGeoStatus.text = getString(R.string.geo_status,
+                            com.qeli.geo.GeoAssetStore.statusText(this@MainActivity))
+                        Toast.makeText(this@MainActivity, R.string.geo_download_ok, Toast.LENGTH_SHORT).show()
+                    } catch (e: Exception) {
+                        Toast.makeText(this@MainActivity,
+                            getString(R.string.geo_download_fail, e.message ?: ""), Toast.LENGTH_LONG).show()
+                    } finally {
+                        isEnabled = true
+                        text = getString(R.string.geo_download)
+                    }
+                }
+            }
+        }
         // Interface language. Applied via AppCompatDelegate, which recreates this Activity —
         // so it is handled on Save and nothing else in the dialog needs to know about it.
         val langs = QeliApp.LANGUAGES
@@ -475,6 +544,21 @@ sni = www.microsoft.com
             }.also { rgLogFmt.addView(it) }
         }
         rgLogFmt.check(logFmtButtons[logFmts.indexOf(current).takeIf { it >= 0 } ?: 0].id)
+        val logLevels = listOf("info", "debug")
+        val logLevelLabels = listOf(R.string.log_compact, R.string.log_detailed)
+        val tvLogLevel = android.widget.TextView(this).apply {
+            text = getString(R.string.log_detail)
+            setPadding(0, dp(8), 0, dp(4))
+        }
+        val currentLogLevel = prefs.getString(PREF_LOG_LEVEL, DEFAULT_LOG_LEVEL)
+        val rgLogLevel = android.widget.RadioGroup(this)
+        val logLevelButtons = logLevels.indices.map { i ->
+            android.widget.RadioButton(this).apply {
+                id = View.generateViewId()
+                text = getString(logLevelLabels[i])
+            }.also { rgLogLevel.addView(it) }
+        }
+        rgLogLevel.check(logLevelButtons[logLevels.indexOf(currentLogLevel).takeIf { it >= 0 } ?: 0].id)
         val btnBackup = outlined().apply {
             text = getString(R.string.backup_profiles)
             setOnClickListener { backupLauncher.launch("qeli-profiles.json") }
@@ -486,9 +570,11 @@ sni = www.microsoft.com
         val box = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             setPadding(dp(20), dp(12), dp(20), 0)
-            addView(cbLaunch); addView(cbBoot); addView(cbLan)
+            addView(cbLaunch); addView(cbBoot); addView(cbLan); addView(cbFailover)
+            addView(tvGeo); addView(rgGeo); addView(tvGeoStatus); addView(btnGeoDl)
             addView(tvLang); addView(rgLang)
             addView(tvLogFmt); addView(rgLogFmt)
+            addView(tvLogLevel); addView(rgLogLevel)
             addView(android.widget.Space(context), android.widget.LinearLayout.LayoutParams(0, dp(12)))
             addView(btnBackup); addView(btnRestore)
         }
@@ -504,11 +590,20 @@ sni = www.microsoft.com
                 val pickedLogFmt = logFmts.getOrElse(
                     logFmtButtons.indexOfFirst { it.id == rgLogFmt.checkedRadioButtonId },
                 ) { DEFAULT_LOG_TIME_FORMAT }
+                val pickedLogLevel = logLevels.getOrElse(
+                    logLevelButtons.indexOfFirst { it.id == rgLogLevel.checkedRadioButtonId },
+                ) { DEFAULT_LOG_LEVEL }
+                val pickedGeo = geoIds.getOrElse(
+                    geoButtons.indexOfFirst { it.id == rgGeo.checkedRadioButtonId },
+                ) { com.qeli.geo.ProxyRoutePreset.PROXY_ALL }
                 prefs.edit()
                     .putBoolean(PREF_AUTO_CONNECT_LAUNCH, cbLaunch.isChecked)
                     .putBoolean(PREF_AUTO_CONNECT_BOOT, cbBoot.isChecked)
                     .putBoolean(PREF_ALLOW_LAN, cbLan.isChecked)
+                    .putBoolean(PREF_FAILOVER, cbFailover.isChecked)
+                    .putString(PREF_GEO_PRESET, pickedGeo)
                     .putString(PREF_LOG_TIME_FORMAT, pickedLogFmt)
+                    .putString(PREF_LOG_LEVEL, pickedLogLevel)
                     .apply()
                 logTimeFormat = pickedLogFmt  // applies to the next line, no restart
                 val pickedLang = langs.getOrElse(
@@ -728,29 +823,52 @@ sni = www.microsoft.com
             .setPrompt(getString(R.string.scan_qr_prompt))
             .setBeepEnabled(false)
             .setOrientationLocked(false)
+            .setCaptureActivity(QrCaptureActivity::class.java)
         qrScanLauncher.launch(opts)
     }
 
     private fun showPasteLinkDialog() {
-        val input = EditText(this).apply { hint = getString(R.string.paste_link_hint); setSingleLine(false) }
+        val input = EditText(this).apply {
+            hint = getString(R.string.paste_link_hint_multi)
+            setSingleLine(false)
+            minLines = 4
+        }
         MaterialAlertDialogBuilder(this)
             .setTitle(R.string.paste_link_title)
             .setView(input)
             .setNegativeButton(R.string.cancel, null)
-            .setPositiveButton(R.string.save) { _, _ -> addProfileFromQeliUri(input.text.toString()) }
+            .setPositiveButton(R.string.save) { _, _ -> importProfilesBundle(input.text.toString()) }
             .show()
     }
 
-    /** Parse a scanned/pasted qeli:// link and add it as a profile (stored as INI). */
-    private fun addProfileFromQeliUri(raw: String) {
+    /** Parse a scanned/pasted qeli:// link (or multi-link / multi-[qeli] bundle) and add profiles. */
+    private fun addProfileFromQeliUri(raw: String) = importProfilesBundle(raw)
+
+    /** Import one or many profiles from paste/file (parity with Windows ParseMany). */
+    private fun importProfilesBundle(raw: String) {
         try {
-            val cfg = VpnConfig.fromQeliUri(raw)
-            val label = qeliLabel(raw) ?: cfg.serverAddress
-            profiles.add(Profile(label, cfg.toIni(label))); activeIndex = activeAfterAdd()
+            val normalized = raw.replace("\r\n", "\n").replace('\r', '\n')
+            val linkLabels = normalized.lineSequence()
+                .map { it.trim() }
+                .filter { it.startsWith("qeli://", ignoreCase = true) }
+                .map { qeliLabel(it) }
+                .toList()
+            val list = VpnConfig.parseMany(raw)
+            if (list.isEmpty()) throw IllegalArgumentException("empty")
+            var added = 0
+            for ((i, cfg) in list.withIndex()) {
+                cfg.validate()
+                val label = linkLabels.getOrNull(i)?.takeIf { !it.isNullOrBlank() }
+                    ?: commentLabel(normalized).takeIf { list.size == 1 }
+                    ?: "${cfg.wireMode} · ${cfg.serverAddress}:${cfg.port}"
+                profiles.add(Profile(label!!, cfg.toIni(label)))
+                added++
+            }
+            activeIndex = activeAfterAdd()
             persist(); renderProfileList(); renderActiveProfile(); pingActive()
             binding.tabs.getTabAt(0)?.select()
-            appendLog("Imported \"$label\" from QR/link")
-            Toast.makeText(this, getString(R.string.imported_toast, label), Toast.LENGTH_SHORT).show()
+            appendLog("Imported $added profile(s)")
+            Toast.makeText(this, getString(R.string.imported_many_toast, added), Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             Toast.makeText(this, getString(R.string.invalid_link, e.message ?: ""), Toast.LENGTH_LONG).show()
         }
@@ -767,24 +885,7 @@ sni = www.microsoft.com
         try {
             val text = contentResolver.openInputStream(uri)?.use { it.readBytes().decodeToString() }
                 ?.trim() ?: throw IllegalStateException("Empty file")
-            // A file may hold a qeli:// link or an INI config. A JSON one is refused by
-            // `parse` below, by name — see `VpnConfig.jsonRetired`.
-            if (text.startsWith("qeli://")) { addProfileFromQeliUri(text); return }
-            // `parse` only PARSES — fromIni never called validate(), so the comment that
-            // used to sit here claiming otherwise was the whole bug: a raw INI file was stored
-            // verbatim with port 0 / 99999, an unknown proto or mode, an out-of-range timeout
-            // or a negative reconnect, and only failed much later at connect. Validate at the
-            // boundary where untrusted text enters, exactly as the qeli:// import already does.
-            // (Audit 2026-07-29, #5.)
-            val cfg = VpnConfig.parse(text).also { it.validate() }
-            // Stored verbatim: what parsed is already INI, so re-emitting it through `toIni`
-            // would only drop the author's comments and ordering for no gain.
-            val label = commentLabel(text).orEmpty().ifBlank { cfg.serverAddress }
-            profiles.add(Profile(label, text)); activeIndex = activeAfterAdd()
-            persist(); renderProfileList(); renderActiveProfile(); pingActive()
-            binding.tabs.getTabAt(0)?.select()
-            appendLog("Imported \"$label\"")
-            Toast.makeText(this, getString(R.string.imported_toast, label), Toast.LENGTH_SHORT).show()
+            importProfilesBundle(text)
         } catch (e: Exception) {
             Toast.makeText(this, getString(R.string.invalid_config, e.message ?: ""), Toast.LENGTH_LONG).show()
         }
@@ -940,8 +1041,8 @@ sni = www.microsoft.com
         actions.addView(outlined().apply {
             text = getString(R.string.protection_always_on)
             layoutParams = android.widget.LinearLayout.LayoutParams(lp).also { it.marginStart = dp(6) }
-            // Always-on + "block connections without VPN" is a SYSTEM setting an app can
-            // neither flip nor read from an Activity, so this only opens the right screen.
+            // Always-on + "block connections without VPN" is a SYSTEM setting a regular VPN
+            // app cannot flip, so this action opens the authoritative Android screen.
             setOnClickListener {
                 try { startActivity(Intent(Settings.ACTION_VPN_SETTINGS)) }
                 catch (e: Exception) { Toast.makeText(this@MainActivity, e.message ?: "", Toast.LENGTH_SHORT).show() }
@@ -1036,7 +1137,7 @@ sni = www.microsoft.com
             // Switching the active profile is refused while a tunnel is up — it would tear
             // down a live connection on a single tap. Dim the other rows so it reads as
             // unavailable before the tap, but keep them clickable so the tap can explain why.
-            val locked = (isConnected || isConnecting) && i != activeIndex
+            val locked = (isConnected || isConnecting || isDisconnecting) && i != activeIndex
             row.root.alpha = if (locked) 0.45f else 1f
             row.root.setOnClickListener {
                 if (locked) {
@@ -1238,7 +1339,7 @@ sni = www.microsoft.com
      * become a back-door profile switch on a live connection.
      */
     private fun activeAfterAdd(): Int =
-        if (isConnected || isConnecting) activeIndex else profiles.size - 1
+        if (isConnected || isConnecting || isDisconnecting) activeIndex else profiles.size - 1
 
     private fun moveProfile(i: Int, delta: Int) {
         val j = i + delta
@@ -1318,8 +1419,10 @@ sni = www.microsoft.com
     // ── reachability (TCP connect) ───────────────────────────────────────--
 
     private fun pingActive() {
+        if (isDisconnecting) return
         val p = current() ?: return
         val idx = activeIndex
+        val epoch = reachEpoch
         reach[idx] = -2L; renderActiveProfile()
         val cfg = try { VpnConfig.parse(p.text) } catch (_: Exception) { null }
         if (cfg == null) { reach[idx] = -1L; renderActiveProfile(); return }
@@ -1332,12 +1435,16 @@ sni = www.microsoft.com
             } else {
                 probe(p)
             }
-            reach[idx] = ms
-            if (activeIndex == idx) renderActiveProfile()
+            if (epoch == reachEpoch && !isDisconnecting) {
+                reach[idx] = ms
+                if (activeIndex == idx) renderActiveProfile()
+            }
         }
     }
 
     private fun pingAll() {
+        if (isDisconnecting) return
+        val epoch = reachEpoch
         profiles.forEachIndexed { i, p ->
             val ep = endpointOf(p)
             when {
@@ -1349,8 +1456,11 @@ sni = www.microsoft.com
                 else -> {
                     reach[i] = -2L
                     lifecycleScope.launch {
-                        val ms = probe(p); reach[i] = ms
-                        if (binding.viewProfiles.visibility == View.VISIBLE) renderProfileList()
+                        val ms = probe(p)
+                        if (epoch == reachEpoch && !isDisconnecting) {
+                            reach[i] = ms
+                            if (binding.viewProfiles.visibility == View.VISIBLE) renderProfileList()
+                        }
                     }
                 }
             }
@@ -1382,65 +1492,22 @@ sni = www.microsoft.com
         return if (o.size == 4) "${o[0]}.${o[1]}.${o[2]}.1" else ip
     }
 
-    /** UDP reachability: send the SAME hybrid X25519+ML-KEM ClientHello a real
-     *  connection sends (mode-framed: raw fake-tls / QUIC-wrapped / obfs-sealed) and
-     *  treat ANY reply datagram as "server reachable". The server requires the
-     *  X25519MLKEM768 share for the PQ tunnel and silently drops a non-PQ hello, so the
-     *  probe MUST carry a real ML-KEM key to get a ServerHello back (otherwise every UDP
-     *  profile shows a false red even when reachable). We only need a reply — the derived
-     *  keys are thrown away. Correctly stays red when UDP is truly blocked (no reply). */
+    /** Native UDP first-flight diagnostic. Rust uses the same hybrid PQ ClientHello,
+     *  fragmentation, QUIC and obfs helpers as the live transport; Kotlin supplies only a
+     *  credential-free profile and displays the measured time to any server reply. */
     private suspend fun udpPing(cfg: VpnConfig, host: String): Long = withContext(Dispatchers.IO) {
-        val sock = try { DatagramSocket() } catch (_: Exception) { return@withContext -1L }
-        val mlkem = try { MlKem.generate() } catch (_: Exception) {
-            try { sock.close() } catch (_: Exception) {}; return@withContext -1L
-        }
-        try {
-            sock.soTimeout = 1500
-            sock.connect(InetSocketAddress(host, cfg.port))
-            val pub = ByteArray(32).also { SecureRandom().nextBytes(it) }
-            val sni = cfg.sni?.takeIf { it.isNotBlank() } ?: "www.microsoft.com"
-            val hello = TlsHandshake.buildClientHelloPq(pub, mlkem.encapsulationKey, sni, padToMin = 1200)
-            // Layer EXACTLY like the real UDP send (UdpTransport.send): QUIC long-header
-            // wrap first (inner), then the obfs datagram seal (outer). The old mutually-
-            // exclusive `when` sent a quic+obfs profile's probe quic-wrapped but UNSEALED,
-            // so the server's obfs-open saw garbage and dropped it → a working server showed
-            // a false "unreachable".
-            // …and FRAGMENT it, like the data plane does. The post-quantum hello is padded
-            // past 1200 bytes, so sending it whole needs IP fragmentation — which mobile and
-            // CGNAT paths drop. The probe then reported "unreachable" on exactly the networks
-            // where a real connection, which fragments at the application layer, succeeds.
-            // (Audit 2026-07-29, #16.)
-            val cid = Quic.generateConnectionId()
-            var pn = 0
-            val datagrams = UdpFrag.fragment(UdpFrag.MSG_CLIENT_HELLO, hello).map { piece ->
-                var out = if (cfg.quicEnabled) Quic.wrapLong(piece, cid, pn++, 0x00) else piece
-                if (cfg.wireMode.equals("obfs", ignoreCase = true))
-                    out = ObfsStream.datagramSeal(ObfsStream.deriveKey(cfg.obfsKey), out)
-                out
-            }
-            val recv = DatagramPacket(ByteArray(4096), 4096)
-            val t0 = System.currentTimeMillis()
-            repeat(2) { // one retry — a single UDP probe can be lost
-                datagrams.forEach { sock.send(DatagramPacket(it, it.size)) }
-                try {
-                    sock.receive(recv)
-                    if (recv.length > 0) return@withContext System.currentTimeMillis() - t0
-                } catch (_: java.net.SocketTimeoutException) { /* retry */ }
-            }
-            -1L
-        } catch (_: Exception) {
-            -1L
-        } finally {
-            try { mlkem.close() } catch (_: Exception) {}
-            try { sock.close() } catch (_: Exception) {}
-        }
+        runCatching { TransportCore.udpReachability(cfg.toTransportProbeIni(), host) }
+            .getOrDefault(-1L)
     }
 
     // ── connect / disconnect ─────────────────────────────────────────────--
 
     // Toggle: disconnect if a tunnel is up OR a connect/reconnect attempt is running
     // (so the button can interrupt an endlessly-retrying connection); else connect.
-    fun onConnectTap(v: View) { if (isConnected || isConnecting) disconnect() else connect() }
+    fun onConnectTap(v: View) {
+        if (isDisconnecting) return
+        if (isConnected || isConnecting) disconnect() else connect()
+    }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -1469,10 +1536,11 @@ sni = www.microsoft.com
     private fun maybeAutoConnect(intent: Intent?) {
         if (intent?.getBooleanExtra(EXTRA_AUTO_CONNECT, false) != true) return
         intent.removeExtra(EXTRA_AUTO_CONNECT)
-        if (!isConnected && !isConnecting) connect()
+        if (!isConnected && !isConnecting && !isDisconnecting) connect()
     }
 
     private fun connect() {
+        if (isDisconnecting) return
         val p = current() ?: return
         // `parse` only PARSES — validate() is a separate step, and connecting without it let a
         // profile saved before the range checks existed (or hand-edited since) reach the tunnel
@@ -1517,12 +1585,15 @@ sni = www.microsoft.com
 
     private fun disconnect() {
         appendLog("Disconnecting…")
-        setDisconnectedState()
+        setDisconnectingState()
         try {
             // startService (not stopService) so the service processes ACTION_DISCONNECT,
             // sets userRequestedDisconnect and tears the tunnel down cleanly.
             startService(Intent(this, VpnServiceImpl::class.java).apply { action = VpnServiceImpl.ACTION_DISCONNECT })
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            appendLog("Disconnect error: ${e.message}")
+            setErrorState(e.message)
+        }
     }
 
     private fun requestBatteryOptimizationExclusion() {
@@ -1536,7 +1607,9 @@ sni = www.microsoft.com
     // ── UI state ──────────────────────────────────────────────────────────--
 
     private fun setConnectingState() {
-        isConnected = false; isConnecting = true
+        isConnected = false; isConnecting = true; isDisconnecting = false
+        binding.btnPing.isEnabled = true
+        binding.btnCheckAll.isEnabled = true
         binding.statusIndicator.backgroundTintList = csl(R.color.status_connecting)
         binding.tvStatus.text = getString(R.string.connecting)
         binding.tvRingHint.text = getString(R.string.tap_to_cancel)
@@ -1547,8 +1620,27 @@ sni = www.microsoft.com
         startRingSpin()
     }
 
+    private fun setDisconnectingState() {
+        if (!isDisconnecting) reachEpoch++
+        isConnected = false; isConnecting = false; isDisconnecting = true
+        clientIp = ""
+        binding.btnPing.isEnabled = false
+        binding.btnCheckAll.isEnabled = false
+        binding.statusIndicator.backgroundTintList = csl(R.color.status_connecting)
+        binding.tvStatus.text = getString(R.string.disconnecting)
+        binding.tvRingHint.text = getString(R.string.disconnecting)
+        binding.tvIp.visibility = View.GONE
+        binding.tvConnectionStep.visibility = View.VISIBLE
+        binding.tvConnectionStep.text = getString(R.string.disconnecting)
+        binding.tvSpeed.visibility = View.GONE
+        binding.statsCard.visibility = View.GONE
+        startRingSpin()
+    }
+
     private fun setDisconnectedState() {
-        isConnected = false; isConnecting = false; clientIp = ""
+        isConnected = false; isConnecting = false; isDisconnecting = false; clientIp = ""
+        binding.btnPing.isEnabled = true
+        binding.btnCheckAll.isEnabled = true
         binding.statusIndicator.backgroundTintList = csl(R.color.status_disconnected)
         binding.tvStatus.text = getString(R.string.disconnected)
         binding.tvRingHint.text = getString(R.string.tap_to_connect)
@@ -1560,7 +1652,9 @@ sni = www.microsoft.com
     }
 
     private fun setConnectedState() {
-        isConnected = true; isConnecting = false
+        isConnected = true; isConnecting = false; isDisconnecting = false
+        binding.btnPing.isEnabled = true
+        binding.btnCheckAll.isEnabled = true
         binding.statusIndicator.backgroundTintList = csl(R.color.status_connected)
         binding.tvStatus.text = getString(R.string.connected)
         binding.tvRingHint.text = getString(R.string.tap_to_disconnect)
@@ -1575,7 +1669,9 @@ sni = www.microsoft.com
     }
 
     private fun setErrorState(error: String?) {
-        isConnected = false; isConnecting = false; clientIp = ""
+        isConnected = false; isConnecting = false; isDisconnecting = false; clientIp = ""
+        binding.btnPing.isEnabled = true
+        binding.btnCheckAll.isEnabled = true
         binding.statusIndicator.backgroundTintList = csl(R.color.status_error)
         binding.tvStatus.text = getString(R.string.error)
         binding.tvRingHint.text = getString(R.string.tap_to_retry)
@@ -1587,17 +1683,18 @@ sni = www.microsoft.com
     }
 
     private fun updateUi(status: String?, error: String?) {
-        val wasLocked = isConnected || isConnecting
+        val wasLocked = isConnected || isConnecting || isDisconnecting
         when (status) {
             VpnServiceImpl.STATUS_CONNECTING -> setConnectingState()
             VpnServiceImpl.STATUS_CONNECTED -> setConnectedState()
+            VpnServiceImpl.STATUS_DISCONNECTING -> setDisconnectingState()
             VpnServiceImpl.STATUS_DISCONNECTED -> setDisconnectedState()
             VpnServiceImpl.STATUS_ERROR -> setErrorState(error)
         }
         // Profile switching is locked while the tunnel is up, and the rows render that as
         // dimming — so the list has to be redrawn whenever we cross that boundary, or the
         // lock stays visible after a disconnect (and invisible after a connect).
-        if (wasLocked != (isConnected || isConnecting)) renderProfileList()
+        if (wasLocked != (isConnected || isConnecting || isDisconnecting)) renderProfileList()
         // The protection card is worded in the present tense only while connected.
         renderConnectionInfo()
     }

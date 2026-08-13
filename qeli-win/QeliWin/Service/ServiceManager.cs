@@ -1,7 +1,10 @@
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.ServiceProcess;
 
 namespace QeliWin.Service;
@@ -47,21 +50,117 @@ public static class ServiceManager
             Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
             Environment.GetFolderPath(Environment.SpecialFolder.Windows),
         };
+        bool underProtectedRoot = false;
         foreach (var root in roots)
         {
             if (string.IsNullOrEmpty(root)) continue;
             var r = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar);
             if (full.StartsWith(r + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
-                return;
+            {
+                underProtectedRoot = true;
+                break;
+            }
         }
 
-        throw new InvalidOperationException(
-            "Refusing to install the Windows service: it would run as LocalSystem at boot " +
-            $"from \"{full}\", a location a standard user can overwrite. Anyone able to " +
-            "write that file could then run code as SYSTEM on every boot." +
-            Environment.NewLine + Environment.NewLine +
-            @"Move QeliWin under Program Files (e.g. C:\Program Files\QeliWin\) and " +
-            "install the service from there.");
+        if (!underProtectedRoot)
+        {
+            throw new InvalidOperationException(
+                "Refusing to install the Windows service: it would run as LocalSystem at boot " +
+                $"from \"{full}\", a location a standard user can overwrite. Anyone able to " +
+                "write that file could then run code as SYSTEM on every boot." +
+                Environment.NewLine + Environment.NewLine +
+                @"Move QeliWin under Program Files (e.g. C:\Program Files\QeliWin\) and " +
+                "install the service from there.");
+        }
+
+        // Being UNDER Program Files is not the same as being protected.
+        //
+        // The prefix test was the whole check, and it is not sufficient: `C:\Windows\Temp`
+        // sits under a "protected" root and is writable by every user by design, and any
+        // third-party installer can create a permissive directory under Program Files. Either
+        // way a standard user replaces the binary that the SCM then launches as LocalSystem at
+        // boot — the exact escalation the prefix test exists to prevent, reached through a
+        // path that satisfies it. The macOS side already walks the real ownership/permissions
+        // (ServiceManager.EnsureProtectedLocation there); Windows only compared strings.
+        //
+        // So inspect the actual DACL of the file and of every directory above it, and refuse
+        // if any of them grants write to a non-privileged principal. (Audit 2026-08-04.)
+        foreach (var path in PathAndAncestors(full))
+        {
+            var who = NonAdminWriterOn(path);
+            if (who != null)
+            {
+                throw new InvalidOperationException(
+                    "Refusing to install the Windows service: it would run as LocalSystem at " +
+                    $"boot from \"{full}\", but \"{path}\" grants write access to \"{who}\". " +
+                    "Anyone in that group could replace the binary and run code as SYSTEM on " +
+                    "every boot." + Environment.NewLine + Environment.NewLine +
+                    @"Install under a directory only administrators can write (e.g. " +
+                    @"C:\Program Files\QeliWin\), or fix its permissions.");
+            }
+        }
+    }
+
+    /// <summary>The path itself, then each parent up to and including the drive root.</summary>
+    private static IEnumerable<string> PathAndAncestors(string full)
+    {
+        for (var p = full; !string.IsNullOrEmpty(p); p = Path.GetDirectoryName(p) ?? "")
+        {
+            yield return p;
+            if (Path.GetPathRoot(p)?.Equals(p, StringComparison.OrdinalIgnoreCase) == true) yield break;
+        }
+    }
+
+    /// <summary>Name of a non-privileged principal that can WRITE <paramref name="path"/>,
+    /// or null when only privileged accounts can. Unreadable ACLs return null: refusing on a
+    /// DACL we cannot read would block legitimate installs on locked-down systems, and the
+    /// prefix check above still applies.</summary>
+    internal static string? NonAdminWriterOn(string path)
+    {
+        const FileSystemRights Dangerous =
+            FileSystemRights.WriteData      // create files in a dir / overwrite a file
+            | FileSystemRights.AppendData   // create subdirectories
+            | FileSystemRights.Delete
+            | FileSystemRights.DeleteSubdirectoriesAndFiles
+            | FileSystemRights.ChangePermissions
+            | FileSystemRights.TakeOwnership;
+
+        // Groups that any interactive, non-elevated account is a member of. Administrators,
+        // SYSTEM, TrustedInstaller and CREATOR OWNER are all expected to have write here.
+        var untrusted = new[]
+        {
+            WellKnownSidType.WorldSid,               // Everyone
+            WellKnownSidType.AuthenticatedUserSid,   // Authenticated Users
+            WellKnownSidType.BuiltinUsersSid,        // BUILTIN\Users
+            WellKnownSidType.InteractiveSid,         // INTERACTIVE
+        };
+
+        try
+        {
+            var sec = Directory.Exists(path)
+                ? (FileSystemSecurity)new DirectoryInfo(path).GetAccessControl()
+                : new FileInfo(path).GetAccessControl();
+            foreach (FileSystemAccessRule rule in
+                     sec.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+            {
+                if (rule.AccessControlType != AccessControlType.Allow) continue;
+                if ((rule.FileSystemRights & Dangerous) == 0) continue;
+                if (rule.IdentityReference is not SecurityIdentifier sid) continue;
+                foreach (var w in untrusted)
+                {
+                    if (sid.IsWellKnown(w))
+                    {
+                        try { return sid.Translate(typeof(NTAccount)).Value; }
+                        catch { return sid.Value; }
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // No access to the DACL, or an unsupported filesystem — see the summary.
+        }
+        return null;
     }
 
     // ── Win32 SCM ────────────────────────────────────────────────────────────────
@@ -71,6 +170,8 @@ public static class ServiceManager
     private const uint SERVICE_AUTO_START = 0x2;
     private const uint SERVICE_ERROR_NORMAL = 0x1;
     private const int ERROR_SERVICE_EXISTS = 1073;
+    private const int ERROR_SERVICE_DOES_NOT_EXIST = 1060;
+    private const int ERROR_SERVICE_MARKED_FOR_DELETE = 1072;
 
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern IntPtr OpenSCManager(string? machineName, string? databaseName, uint access);
@@ -123,32 +224,70 @@ public static class ServiceManager
             else CloseServiceHandle(svc);
         }
         finally { CloseServiceHandle(scm); }
+        ServiceState.SetDesiredConnected(true);
     }
 
     public static void Uninstall()
     {
-        try { Stop(); } catch { }
+        ServiceState.SetDesiredConnected(false);
+        Stop();
         var scm = OpenSCManager(null, null, SC_MANAGER_ALL_ACCESS);
-        if (scm == IntPtr.Zero) return;
+        if (scm == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "OpenSCManager failed");
         try
         {
             var svc = OpenService(scm, ServiceName, SERVICE_ALL_ACCESS);
-            if (svc != IntPtr.Zero) { DeleteService(svc); CloseServiceHandle(svc); }
+            if (svc == IntPtr.Zero)
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (error != ERROR_SERVICE_DOES_NOT_EXIST)
+                    throw new Win32Exception(error, "OpenService failed");
+                return;
+            }
+            try
+            {
+                if (!DeleteService(svc))
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    if (error != ERROR_SERVICE_MARKED_FOR_DELETE)
+                        throw new Win32Exception(error, "DeleteService failed");
+                }
+            }
+            finally { CloseServiceHandle(svc); }
         }
         finally { CloseServiceHandle(scm); }
     }
 
     public static void Start()
     {
-        using var sc = new ServiceController(ServiceName);
-        sc.Refresh();
-        if (sc.Status is ServiceControllerStatus.Stopped or ServiceControllerStatus.StopPending)
-            sc.Start();
-        sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(20));
+        ServiceState.SetDesiredConnected(true);
+        try
+        {
+            using var sc = new ServiceController(ServiceName);
+            sc.Refresh();
+            if (sc.Status == ServiceControllerStatus.StopPending)
+            {
+                sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(20));
+                sc.Refresh();
+            }
+            if (sc.Status == ServiceControllerStatus.Stopped)
+                sc.Start();
+            sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(20));
+        }
+        catch
+        {
+            // A failed Start must not arm a surprise connection on the next boot/install.
+            ServiceState.SetDesiredConnected(false);
+            throw;
+        }
     }
 
     public static void Stop()
     {
+        // Write this before asking SCM to stop. A crash, timeout or reboot can then only
+        // produce an idle auto-started daemon, never an unsolicited VPN connection.
+        ServiceState.SetDesiredConnected(false);
+        if (!IsInstalled()) return;
         using var sc = new ServiceController(ServiceName);
         sc.Refresh();
         if (sc.CanStop)

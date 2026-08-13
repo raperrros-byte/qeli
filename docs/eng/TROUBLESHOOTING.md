@@ -1,6 +1,6 @@
 # Qeli — connection diagnostics and error reference
 
-> **These docs describe 0.7.13** — the latest released version. `qeli --version` tells you
+> **These docs describe 0.7.14** — the latest released version. `qeli --version` tells you
 > what you actually have.
 
 A detailed, practical guide: how to enable debug logging, how to read the log by
@@ -244,7 +244,7 @@ a loop with backoff. All at ERROR level.
 | `profile '<n>': obf.heartbeat.data_size_bytes (<b>) must be <= <max>` | heartbeat packet exceeds the max record size | lower `obf.heartbeat.data_size_bytes` |
 | `profile '<n>': pool.cidr '<c>': <error>` | the pool does not parse as a CIDR (no prefix, junk, too narrow) | write it as `10.9.0.0/24` |
 | `profile '<n>': invalid tun.address '<a>': … — expected a plain IPv4 address (e.g. 10.9.0.1)` | address carries a prefix/mask, or a typo | use a bare IPv4 |
-| `profile '<n>': invalid tun.netmask '<m>': … — expected a dotted mask …` | mask given as `/24` instead of `255.255.255.0` | write the mask in dotted form |
+| `profile '<n>': tun.address <a> is not a usable host inside pool.cidr <c>` | gateway is outside the VPN subnet, or is its network/broadcast address | choose a usable address inside `pool.cidr`; its prefix is the only mask setting |
 
 Non-fatal (profile still starts), WARN level — they just warn about a
 meaningless/weak setting: `obf.multipath.enabled has no effect on a UDP transport…`,
@@ -271,7 +271,6 @@ network along with SSH and ping — while the log looks like a perfectly success
 | `profile '<n>': pool.cidr <c> contains this host's DEFAULT GATEWAY <gw>…` | the pool swallows the gateway | change the pool |
 | `profile '<n>': pool.cidr <c> contains <a>, the address of interface '<if>'…` | the pool swallows the host's own address | change the pool |
 | `profile '<n>': pool.cidr <c> overlaps the existing route <r> on interface '<if>'…` | pool overlaps an already-routed network (LAN, provider subnet) | change the pool |
-| `profile '<n>': the tunnel subnet <s> (tun.address … / netmask …) overlaps the existing route <r>…` | the tunnel subnet is wider than the pool and hits someone else's route | narrow the mask or change the range |
 | `profile '<n>': pool.cidr <c> overlaps profile '<other>' pool <o>…` | two profiles share a range | separate them (`10.9.0.0/24`, `10.9.1.0/24`, …) |
 
 Inspect your own networks with `ip route` and `ip -4 addr`. To check a config **before**
@@ -441,14 +440,15 @@ retries; Android — `[SECURITY]` + stop):**
 
 ### 5.3 Liveness / reconnect (why it drops and reconnects)
 
-General model: `rxDead = max(3×heartbeat_interval, 30s)`. On a downlink loss the
-client tears the link down and reconnects. Backoff is exponential (cap 60s), retries
-are infinite by default.
+The RX watchdog counts only records that pass framing, length and AEAD authentication.
+For heartbeat its deadline is `max(3×(interval+jitter), 30s)`; for shaping it is
+`max(3×(idle_gap_max+1s), 30s)`. On an authenticated-downlink loss the client tears the
+link down and reconnects. With both mechanisms disabled there is no RX watchdog. Backoff
+is exponential (cap 60s), retries are infinite by default.
 
 | Line | Meaning |
 |---|---|
-| `uplink active but no downlink for >8s — reconnecting` | we're sending up but silent below >8s ⇒ a dead session (network change / NAT rebind / device nap). The L2 detector |
-| `no data from server for >Ns` | no data from the server longer than `rxDead` (RX watchdog). L3 |
+| `no authenticated data from server for >Ns` | no valid heartbeat, cover or data record arrived before the derived `rxDead` deadline. Raw/forged UDP does not keep the session alive |
 | `resumed after ~Ns suspend — reconnecting` | the host slept (the wall clock jumped ≫ monotonic) — immediate reconnect. L1 |
 | `Network changed — reconnecting` / `<reason> — reconnecting` | the physical network changed (Wi-Fi↔Ethernet/LTE) — a proactive `ForceReconnect`. The accompanying socket error (`recvfrom EBADF` / EBADF) is **deliberately suppressed** and not logged as an `ERR:` |
 | `Reconnect attempt N in Xs` | a normal backoff retry |
@@ -512,7 +512,7 @@ client you can lower `mtu` in the profile.
 
 ### 6.2 `Failed to parse ServerHello` on a UDP reconnect
 
-**Symptom:** the first connect succeeds, then `uplink active but no downlink…` →
+**Symptom:** the first connect succeeds, then a watchdog/network event triggers a
 reconnect → `Failed to parse ServerHello` several times; on the server you see re-auth
 from a **new** source port and `UDP writer … kicked`.
 
@@ -570,8 +570,9 @@ is alive, only the panel doesn't start. Set a password (`qeli set-web-password`)
 
 **Symptom:** the client and the server are on the **same subnet** (e.g. both on
 `192.168.50.0/24`). The handshake completes fully — `Server identity verified`,
-`Auth OK`, `TUN ready` — but no traffic flows: `uplink active but no downlink for >8s`,
-or the server tears down the idle session after ~20 s (client sees the connection reset;
+`Auth OK`, `TUN ready` — but no traffic flows: the authenticated RX watchdog fires (when
+heartbeat/shaping is enabled), or the server tears down the idle session after ~20 s
+(client sees the connection reset;
 the server reaps the inactive session) → an endless reconnect loop. **The same profile
 works from a different network (the Internet / another subnet)** — that contrast is the
 key tell.
@@ -627,22 +628,21 @@ Check (everything should belong to `qeli`):
 ls -la /etc/qeli/
 ```
 
-### 6.10 `resolvectl is not installed` / systemd-resolved is not the resolver
+### 6.10 Client refuses to change DNS: systemd-resolved is not the resolver
 
-**Symptom:** the client log warns about `resolvectl`, and the warning **does not go away
-after installing systemd-resolved**.
+**Symptom:** a connection using `dns = tunnel` stops with
+`refusing to replace /etc/resolv.conf with tunnel DNS`.
 
 **Cause.** The client picks its DNS path not by whether the binary exists, but by what
 actually **resolves** on this machine: whether `/etc/resolv.conf` points at the
 systemd-resolved stub. If the service is installed but not enabled, or `resolv.conf` was
 left as a plain file (the usual state after removing `resolvconf` on Ubuntu), then
-`resolvectl dns` is a silent no-op — so the client manages `/etc/resolv.conf` directly.
-Before 0.7.13 the message read "resolvectl unavailable", which sent operators off to
-install the package — that is, to fix the one thing that was not broken.
+`resolvectl dns` is a silent no-op.
 
-**Fixed** in 0.7.13: the message now distinguishes the two cases and states what was
-actually checked. It is **not an error** by itself — managing `/etc/resolv.conf` directly
-works. If you specifically want the per-link path through systemd-resolved:
+Starting with 0.7.15 qeli deliberately **does not replace persistent `/etc/resolv.conf`**:
+after `SIGKILL`, power loss or client removal it could retain the vanished tunnel resolver
+and break DNS for the whole host. Legacy backups are still recovered at startup, but new
+ones are not created. Enable the lifecycle-safe per-link path:
 ```bash
 sudo systemctl enable --now systemd-resolved
 sudo ln -sf ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
@@ -651,6 +651,8 @@ Check (it should be a symlink to the stub):
 ```bash
 ls -l /etc/resolv.conf
 ```
+If NetworkManager, dnsmasq or the OpenWrt platform already owns DNS, leave it there and set
+`dns = off` in the qeli profile.
 
 ### 6.11 After saving settings in the panel the service still needs a manual restart
 
@@ -677,7 +679,7 @@ ls -l /etc/polkit-1/rules.d/49-qeli.rules
 docker restart <container-name>
 ```
 
-### 6.12 Windows: slow recovery after sleep
+### 6.12 Clients: slow recovery after sleep or phone unlock
 
 **Symptom:** after waking from sleep the tunnel takes about a minute to come back;
 sometimes it disappears entirely during that window and traffic goes outside the VPN.
@@ -704,10 +706,29 @@ window was not being armed at all in the most common case: it sat behind a "tunn
 connected" guard, and after a suspend the tunnel is already dead by the time the Resume event
 lands. No action is required beyond running a current 0.7.13 build.
 
+**Mobile and headless closure in 0.7.15.** Keeping the Android CPU awake does not keep the
+Wi-Fi association or NAT mapping alive, and the same Android `Network` object can survive a
+DHCP/link change. The service now compares that network's capabilities, link addresses, routes
+and DNS, and after screen-on waits briefly for a usable physical IPv4 path before replacing the
+native transport generation while retaining the TUN. iOS now replaces an established generation
+after `PacketTunnelProvider.wake()` instead of only logging the event. Windows Service and the
+macOS launch daemon poll the filtered physical-network signature themselves, because the GUI's
+network callbacks do not own the headless tunnel. Blocking Android/iOS resolver calls are limited
+to one outstanding request, so repeated reconnects cannot accumulate resolver threads.
+
+Manual disconnect is also an asynchronous boundary in 0.7.15. Android displays
+`Disconnecting` until the Rust runner has exited and every duplicated TUN descriptor is closed;
+only then does it publish `Disconnected` and permit another connection. This matters for DNS:
+starting a new generation while the old TUN still owned Android's routes could leave the device
+resolver selected on a descriptor that no longer had a data plane. If DNS fails after a manual
+disconnect, capture the log from `Disconnecting` through the next `Connected`; a teardown warning
+longer than 5 seconds identifies a native descriptor owner that did not stop promptly.
+
 To confirm from the log (**Log** tab → **Copy log**): a resume should now produce
 `Network settling — short attempt budget 5s for the next 30s`. If that line is present and
 recovery is still slow, the time is going somewhere else — send the whole log covering
-wake → `Connected`.
+wake → `Connected`. On mobile 0.7.15 the same interval should contain `Device woke` / `Device
+wake: replacing...` (iOS) or `Device woke after ... screen-off — reconnecting` (Android).
 
 ### 6.13 Panel behind a reverse proxy: 404, or thrown to the site root
 
@@ -779,6 +800,37 @@ curl -s https://your-domain.com/qeli/login | grep -o '<base href="[^"]*"'
 Expect `<base href="/qeli/">`. If it is `/`, look in the server log for
 `panel: ignoring X-Forwarded-Prefix from … not covered by web.trusted_proxies` — it names the
 exact address to add.
+
+### 6.14 macOS: DNS `10.9.0.1` remains after removing Qeli
+
+macOS generates `/etc/resolv.conf`; do not repair it directly. Inspect the recovery journal
+first — `previousServers` may contain custom resolvers that should be restored instead of
+`empty`:
+
+```bash
+sudo cat "/Library/Application Support/Qeli/dns-override.json" 2>/dev/null
+sudo launchctl bootout system/ru.qeli.app.daemon 2>/dev/null || true
+sudo launchctl bootout system/ru.autocash.qeli.daemon 2>/dev/null || true
+sudo rm -f /Library/LaunchDaemons/ru.qeli.app.daemon.plist
+sudo rm -f /Library/LaunchDaemons/ru.autocash.qeli.daemon.plist
+networksetup -listallnetworkservices
+sudo networksetup -setdnsservers "Wi-Fi" empty
+sudo dscacheutil -flushcache
+sudo killall -HUP mDNSResponder
+networksetup -getdnsservers "Wi-Fi"
+scutil --dns
+```
+
+Replace `Wi-Fi` with the exact active service name. If `previousServers` lists addresses,
+pass those to `-setdnsservers` instead of `empty`. Remove the old journal only after the
+checks succeed:
+
+```bash
+sudo rm -f "/Library/Application Support/Qeli/dns-override.json"
+```
+
+In 0.7.15 the daemon stores Connect intent separately from installation, verifies the actual
+`launchctl bootout`, and does not confirm Disconnect until the original DNS is restored.
 
 ---
 
@@ -859,6 +911,11 @@ adb shell appops set com.qeli ACTIVATE_VPN allow   # if supported
 - Kill-switch left over after a crash? Windows:
   `Remove-NetFirewallRule -Group qeli_ks; Set-NetFirewallProfile -All -DefaultOutboundAction Allow`;
   macOS: restart / `pfctl -d` (the "Found a stale kill-switch…" line self-heals on the next start).
+- `kill-switch is owned by another live Qeli process` means a second Windows tunnel tried
+  to take over the same machine-wide firewall state. Stop the other client/service first.
+- `[SECURITY] kill-switch disengage failed; egress remains blocked` is fail-closed: the
+  recovery state and ownership remain armed so the same process (or the next startup) can
+  retry a complete three-profile firewall restore. Do not delete the recovery state by hand.
 
 ---
 

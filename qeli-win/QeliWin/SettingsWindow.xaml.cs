@@ -19,6 +19,7 @@ public partial class SettingsWindow : Window
         InitializeComponent();
         Owner = owner;
         Icon = owner.Icon;
+        Loaded += (_, _) => FitToWorkArea();
 
         // Force resizable dialog even if XAML/theme defaults ever flip SizeToContent/NoResize.
         SizeToContent = SizeToContent.Manual;
@@ -35,11 +36,14 @@ public partial class SettingsWindow : Window
         SelectByTag(LanguageBox, s.Language);
         SelectByTag(ThemeBox, s.Theme);
         SelectByTag(LogTimeBox, s.LogTimeFormat);
+        SelectByTag(LogLevelBox, s.LogLevel);
         ToastsBox.IsChecked = s.ToastsEnabled;
         UpdatesBox.IsChecked = s.CheckForUpdates;
         ProbeBox.IsChecked = s.ProbeReachability;
         ProbeIntervalBox.Text = s.ProbeIntervalSecs.ToString();
-        ServiceBox.IsChecked = s.ServiceEnabled || ServiceManager.IsInstalled();
+        // Installation only means the boot-time worker is available. It must not override
+        // the user's explicit disabled setting and silently re-enable the connection.
+        ServiceBox.IsChecked = s.ServiceEnabled;
         AutoStartBox.IsChecked = s.AutoStart;
         AutoConnectBox.IsChecked = s.AutoConnect;
         StartMinBox.IsChecked = s.StartMinimized;
@@ -141,6 +145,16 @@ public partial class SettingsWindow : Window
     private static string TagOf(System.Windows.Controls.ComboBox box) =>
         (box.SelectedItem as System.Windows.Controls.ComboBoxItem)?.Tag as string ?? "en";
 
+    private void FitToWorkArea()
+    {
+        var handle = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        var screen = System.Windows.Forms.Screen.FromHandle(handle);
+        double scale = System.Windows.Media.VisualTreeHelper.GetDpi(this).DpiScaleY;
+        double available = Math.Max(MinHeight, screen.WorkingArea.Height / scale - 32);
+        MaxHeight = available;
+        Height = Math.Min(Height, available);
+    }
+
     private void OnAutoConnectChanged(object sender, RoutedEventArgs e) => UpdateAutoProfileEnabled();
     private void OnServiceChanged(object sender, RoutedEventArgs e) => UpdateServiceProfileEnabled();
     private void OnProbeChanged(object sender, RoutedEventArgs e) => UpdateProbeIntervalEnabled();
@@ -181,6 +195,9 @@ public partial class SettingsWindow : Window
         s.LogTimeFormat =
             (LogTimeBox.SelectedItem as System.Windows.Controls.ComboBoxItem)?.Tag as string
             ?? Qeli.Shared.LogTime.Default;
+        s.LogLevel =
+            (LogLevelBox.SelectedItem as System.Windows.Controls.ComboBoxItem)?.Tag as string
+            ?? "info";
         s.ProxyRoutePreset = ProxyRoutePreset.Normalize(
             (RoutePresetBox.SelectedItem as System.Windows.Controls.ComboBoxItem)?.Tag as string);
         s.ServerPanelUrl = PanelUrlBox.Text.Trim();

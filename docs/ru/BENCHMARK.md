@@ -1,11 +1,12 @@
 # Нагрузочное тестирование qeli
 
-Документ версионирован: **свежие замеры — в разделах «Версия 0.7.x»** ниже (последний —
-**0.7.7**, 2026-07-06, свежеперезагруженный чистый хост), а развёрнутые per-mode таблицы внизу — **эталонная база
+Документ сохраняет исторические пояснения к замерам в разделах «Версия 0.7.x» ниже
+(вплоть до кандидата 0.7.11), а развёрнутые per-mode таблицы внизу — **эталонная база
 0.6.0** (2026-06-11; 2-VM лаба, release-бинарь LTO=fat/strip/panic=abort). Канонический
-[release/benchmark_results.json](../../release/benchmark_results.json) всегда содержит **последний**
-прогон (сейчас 0.7.7); датированные копии каждой версии лежат рядом
-(`benchmark_results_<дата>_v<ver>.json`, 0.6.0 — `benchmark_results_2026-06-11_v0.6.0.json`).
+[release/benchmark_results.json](../../release/benchmark_results.json) всегда содержит
+**последний структурированный прогон** — сейчас **qeli 0.7.13** от 2026-07-28.
+Датированные копии каждой версии лежат рядом (`benchmark_results_<дата>_v<ver>.json`,
+0.6.0 — `benchmark_results_2026-06-11_v0.6.0.json`).
 Оркестратор — [scripts/benchmark.py](../../scripts/benchmark.py).
 
 > Релиз **0.6.0** — рефакторинг (общий C#-слой, .NET 10, чистка); протокол, крипто и
@@ -191,11 +192,11 @@ TOFU-режимы падают, как раньше с persistent-TOFU known_hos
 |---|---|
 | **server.conf** (fake-tls, полный стек: NAT/DNS/padding/frag/heartbeat/H-1) | ✅ **PASS** — Auth OK, ping gw, **565 Мбит** |
 | **server-maxobf.conf** (reality-tls: real_tls + hand-rolled, require_proof, H-1) | ✅ **PASS** — Auth OK, ping gw, **527 Мбит** |
-| парс server.conf / server-maxobf.conf / client.conf / client-maxobf.conf / client-reality-tls.conf | ✅ OK |
+| парс server.conf / server-maxobf.conf / client.conf / client-maxobf.conf / client-reality.conf | ✅ OK |
 
 Починен баг шаблона `client-maxobf.conf` (был рассогласован с server-maxobf.conf: user
 `phone`≠`client1`, mode `fake-tls`≠real_tls) → `user=client1`, `mode=reality-tls`,
-`+reality_sid`; проверено e2e. `client-reality-tls.conf` / `client-YOUR_DEPLOY_HOST.conf`
+`+reality_sid`; проверено e2e. `client-reality.conf` / `client-YOUR_DEPLOY_HOST.conf`
 указывают на внешний сервер (только парс).
 
 ### TCP, Мбит/с (↑up / ↓down)
@@ -817,10 +818,13 @@ upload, CPU воркера сервера — delta по `/proc/<pid>/stat` (м�
 ```bash
 # с локальной машины (paramiko); flat-INI конфиги, пишут в /etc/qeli/bench-*.conf.
 # H-1 (0.7.1): benchmark.py пиннит ключ сервера во всех режимах.
-python scripts/reboot_vms.py         # чистая лаба (ребут обеих VM) — перед пристинными цифрами
-# проверка хоста перед бенчем: на VM `vmstat 1 4` — колонка `st` должна быть ~0 (иначе steal → A/B)
-python scripts/benchmark.py          # baseline + 10 режимов × {ping, iperf, CPU/RSS} ≈ 8 мин
-python scripts/reality_tls_repeat.py # reality-tls ×5 → медиана/σ (release/reality_tls_5x_*.json)
+python scripts/reboot_vms.py         # чистая лаба: гасит эмулятор/qeli/netem → ребут обеих VM → чистит СНОВА (autostart) 
+python scripts/lab_reset.py          # то же без ребута (эмулятор, qeli-юниты, iperf3, сироты TUN, tc/netem)
+python scripts/stability_gate.py     # ОБЯЗАТЕЛЬНО перед бенчем: 5 сырых замеров БЕЗ туннеля в обе стороны;
+                                     # спред >8% в любом направлении → хост шумит, цифры будут вымыслом (exit 1)
+python scripts/benchmark.py          # baseline + 12 режимов × {ping, iperf, CPU/RSS} ≈ 10 мин
+                                     # → release/benchmark_<версия>_<дата>.json (+ копия benchmark_results.json)
+python scripts/reality_tls_repeat.py # reality-tls ×5 → медиана/σ (release/reality_tls_5x_<версия>_<дата>.json)
 python scripts/ab_071_072.py         # host-нейтральный A/B (0.7.1 из тега vs 0.7.2 вперемешку) — при steal/контеншене хоста
 python scripts/ab_074_079.py         # то же для 0.7.4→0.7.9 (0.7.10-кандидат); шаблон A/B для любой пары тег↔текущий
 python scripts/ab_079_0711.py        # 0.7.9→0.7.11 (dev-batch, бамп x25519-dalek 3)

@@ -14,6 +14,7 @@
 import os, sys, io, re, time
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import paramiko
+import ssh_hostkey
 
 PW = os.environ.get("QELI_LAB_PASS", "")
 SH, CH = "10.66.116.10", "10.66.116.11"
@@ -25,7 +26,7 @@ results = []
 
 
 def conn(ip):
-    c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    c = paramiko.SSHClient(); ssh_hostkey.harden(c)
     c.connect(ip, username="root", password=PW, timeout=20, look_for_keys=False, allow_agent=False)
     return c
 
@@ -73,7 +74,7 @@ def parse_validate(s, cl):
             print("        ", o.splitlines()[-1][:160] if o else "(no output)")
         results.append((f"parse {f}", ok))
     # client configs: launch briefly, did it get past config parsing?
-    for f in ("client.conf", "client-maxobf.conf", "client-reality-tls.conf"):
+    for f in ("client.conf", "client-maxobf.conf", "client-reality.conf"):
         put_local(cl, os.path.join(CFG, f), f"/tmp/pv-{f}")
         o = out(cl, f"timeout 3 {BIN} client --config /tmp/pv-{f} 2>&1 | head -25 || true", t=20)
         low = o.lower()
@@ -88,6 +89,25 @@ def parse_validate(s, cl):
         results.append((f"parse {f}", ok))
 
 
+# Argon2id digest of PASS ("testpass123") — the same credential every other lab
+# script uses. Replaces the shipped INERT placeholder so the e2e can authenticate.
+REAL_HASH = ("$argon2id$v=19$m=16384,t=2,p=1$cWVsaVNhbHRWYWw$"
+             "CCYuTv8pvqQrvhrBQW3KjPpEN0MZaFfTKv3HOcGqB8w")
+
+
+def seed_real_password(s, *paths):
+    """Swap the all-zero placeholder digest for a working one, in place.
+
+    Flattens nested lists so callers can pass a single path or a list of extras.
+    """
+    flat = []
+    for p in paths:
+        flat.extend(p if isinstance(p, (list, tuple)) else [p])
+    for path in flat:
+        # `|` as the sed delimiter: the PHC string is full of `/` and `$`.
+        out(s, f"sed -i 's|^password_hash = .*|password_hash = {REAL_HASH}|' {path} 2>/dev/null; true")
+
+
 def e2e(s, cl, name, conf_file, port, tun_gw, mode, client_extra, profile=None, extra_files=None):
     print(f"\n=== E2E: {name} ({conf_file}) ===")
     out(s, "systemctl stop qeli-server.service 2>/dev/null; pkill -9 -x qeli 2>/dev/null; sleep 1; true")
@@ -96,6 +116,15 @@ def e2e(s, cl, name, conf_file, port, tun_gw, mode, client_extra, profile=None, 
     put_local(s, os.path.join(CFG, conf_file), f"/etc/qeli/{conf_file}")
     for ef in (extra_files or []):
         put_local(s, os.path.join(CFG, ef), f"/etc/qeli/{ef}")
+    # The shipped users.conf / [user:*] samples carry an INERT placeholder digest
+    # (all-zero, see the comment in qeli/config/users.conf): by design no password
+    # verifies against it, so an operator cannot accidentally ship a live sample
+    # credential. That is correct product behaviour, but it means the shipped
+    # configs cannot authenticate as-is — this test used to read that as a product
+    # failure ("AUTH FAIL — wrong password", 3/7) on EVERY version, 0.7.14 included.
+    # Seed the real hash for the sample password the same way `qeli add-client`
+    # would, so the e2e exercises the config, not the placeholder.
+    seed_real_password(s, f"/etc/qeli/{conf_file}", [f"/etc/qeli/{ef}" for ef in (extra_files or [])])
     key = pubkey_of(s, f"/etc/qeli/{conf_file}", profile)
     if not key:
         print("  FAIL: no server identity key from show-identity"); results.append((name, False)); return

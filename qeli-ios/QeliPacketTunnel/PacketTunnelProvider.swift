@@ -4,7 +4,7 @@ import NetworkExtension
 final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let sharedStore = SharedTunnelStore()
     private let lifecycleLock = NSLock()
-    private var engine: QeliTunnelEngine?
+    private var engine: QeliNativeTunnelEngine?
     private var startTask: Task<Void, Never>?
     private var startCompletion: ProviderStartCompletion?
     private var lifecycleGeneration: UInt64 = 0
@@ -18,7 +18,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             generation: UInt64,
             previousTask: Task<Void, Never>?,
             previousCompletion: ProviderStartCompletion?,
-            previousEngine: QeliTunnelEngine?
+            previousEngine: QeliNativeTunnelEngine?
         ) in
             lifecycleGeneration &+= 1
             let value = (lifecycleGeneration, startTask, startCompletion, engine)
@@ -33,7 +33,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let task = Task { [weak self] in
             guard let self else { completion.finish(CancellationError()); return }
             if let previousEngine = state.previousEngine { await previousEngine.stop() }
-            var startedEngine: QeliTunnelEngine?
+            var startedEngine: QeliNativeTunnelEngine?
             do {
                 try Task.checkCancellation()
                 guard isCurrent(state.generation) else { throw CancellationError() }
@@ -44,6 +44,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 let configuredID = ((protocolConfiguration as? NETunnelProviderProtocol)?
                     .providerConfiguration?["profileID"] as? String)
                     .flatMap(UUID.init(uuidString:))
+                let configuredLogLevel = ((protocolConfiguration as? NETunnelProviderProtocol)?
+                    .providerConfiguration?["logLevel"] as? String)
                 // A one-shot app request wins; automatic launches must carry the
                 // exact persisted provider UUID. Never fall back to a locally active
                 // profile when managed/provider configuration is missing or stale.
@@ -54,10 +56,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     throw PacketTunnelProviderError.profileNotFound
                 }
                 let config = try VPNConfig(parsing: profile.configText)
-                let engine = QeliTunnelEngine(
+                let engine = QeliNativeTunnelEngine(
                     provider: self,
                     profile: profile,
                     config: config,
+                    logLevel: configuredLogLevel ?? config.loggingLevel ?? "info",
                     sharedStore: sharedStore
                 )
                 startedEngine = engine
@@ -79,7 +82,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 // with On-Demand enabled iOS relaunched the provider in a loop.
                 // (Audit 2026-07-27, M4.)
                 let snapshot = engine.currentSnapshot()
-                if snapshot.phase == .error {
+                if snapshot.phase == .error && !engine.isFailClosedSecurityHold() {
                     let reason = snapshot.error ?? snapshot.message
                     throw PacketTunnelProviderError.startFailed(reason)
                 }
@@ -117,7 +120,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let state = lifecycleLock.withLock { () -> (
             task: Task<Void, Never>?,
             completion: ProviderStartCompletion?,
-            engine: QeliTunnelEngine?
+            engine: QeliNativeTunnelEngine?
         ) in
             lifecycleGeneration &+= 1
             let value = (startTask, startCompletion, engine)
@@ -167,7 +170,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         lifecycleLock.withLock { lifecycleGeneration == generation }
     }
 
-    private func install(engine newEngine: QeliTunnelEngine, generation: UInt64) -> Bool {
+    private func install(engine newEngine: QeliNativeTunnelEngine, generation: UInt64) -> Bool {
         lifecycleLock.withLock {
             guard lifecycleGeneration == generation else { return false }
             engine = newEngine
@@ -175,7 +178,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    private func clear(engine value: QeliTunnelEngine, generation: UInt64) {
+    private func clear(engine value: QeliNativeTunnelEngine, generation: UInt64) {
         lifecycleLock.withLock {
             guard lifecycleGeneration == generation, engine === value else { return }
             engine = nil

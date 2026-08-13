@@ -13,6 +13,23 @@
 
 use std::collections::HashMap;
 
+/// Best-effort source extraction for source-guard diagnostics. This deliberately
+/// understands IPv6 even though the current data plane rejects it, so logs distinguish
+/// an Android IPv6 probe from a forged IPv4 address or a malformed packet.
+pub fn packet_source(pkt: &[u8]) -> Option<std::net::IpAddr> {
+    match pkt.first().map(|byte| byte >> 4) {
+        Some(4) if pkt.len() >= 20 => Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            pkt[12], pkt[13], pkt[14], pkt[15],
+        ))),
+        Some(6) if pkt.len() >= 40 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&pkt[8..24]);
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)))
+        }
+        _ => None,
+    }
+}
+
 /// A compiled destination allow-list: `(network, mask)` pairs in host byte order.
 ///
 /// An EMPTY list means UNRESTRICTED — that is the documented semantic of an empty
@@ -158,14 +175,25 @@ impl SrcGuard {
 
     /// May this packet claim its source address?
     ///
-    /// Only IPv4 is judged. Anything else — a short packet, or a non-IPv4 version
-    /// nibble — is passed through untouched, exactly as before: this closes the
-    /// IPv4 spoofing hole without changing the handling of any other traffic. The
-    /// tunnel's address pool is IPv4, so an IPv4 source is the only thing that can
-    /// impersonate another session.
+    /// FAIL-CLOSED: anything that is not a judgeable IPv4 packet is REFUSED, matching
+    /// `DstAcl::allows_packet`.
+    ///
+    /// This used to `return true` for a short packet or any non-IPv4 version nibble, on the
+    /// reasoning that "the tunnel's address pool is IPv4, so only an IPv4 source can
+    /// impersonate another session". That is true about impersonation and beside the point
+    /// about egress. The uplink (client -> TUN) checks the version nowhere else — the only
+    /// `(pkt[0] >> 4) != 4` test is in the TUN -> client forwarder, i.e. the opposite
+    /// direction — so an authenticated client could put an IPv6 packet with any source
+    /// address it liked straight into the TUN. On a dual-stack host with
+    /// `net.ipv6.conf.all.forwarding = 1` (ordinary for a VPS) that is spoofed IPv6 egress
+    /// into whatever the server can reach, and qeli programs iptables only: `ip6tables` is
+    /// never touched, so there is no NAT and no filter on that path at all.
+    ///
+    /// The tunnel is IPv4-only by design (IPv6 is tracked for 0.8.0). Until it is not,
+    /// refusing what we cannot judge is the correct default. (Audit 2026-08-04.)
     pub fn allows_packet(&self, pkt: &[u8]) -> bool {
         if pkt.len() < 20 || (pkt[0] >> 4) != 4 {
-            return true;
+            return false;
         }
         let src = u32::from_be_bytes([pkt[12], pkt[13], pkt[14], pkt[15]]);
         if src == self.ip {
@@ -273,13 +301,46 @@ mod tests {
     }
 
     #[test]
-    fn src_guard_leaves_non_ipv4_alone() {
-        // Narrow by design: only IPv4 sources can impersonate a pool address, so
-        // everything else keeps its previous handling rather than being dropped.
+    fn src_guard_refuses_what_it_cannot_judge() {
+        // FAIL-CLOSED, matching DstAcl. This test used to assert the opposite — that a
+        // non-IPv4 or short packet was passed through untouched — on the reasoning that only
+        // an IPv4 source can impersonate a pool address. True about impersonation, wrong
+        // about egress: nothing else on the uplink checks the version, so an authenticated
+        // client could put an IPv6 packet with ANY source straight into the TUN, and on a
+        // dual-stack host with forwarding on that is spoofed IPv6 egress with no NAT and no
+        // filter (qeli programs iptables only, never ip6tables). The tunnel is IPv4-only by
+        // design, so refusing what cannot be judged is the correct default.
+        // (Audit 2026-08-04.)
         let g = SrcGuard::new("10.0.0.7".parse().unwrap(), &[], "alice");
         let mut v6 = pkt_src([10, 0, 0, 9]);
         v6[0] = 0x60;
-        assert!(g.allows_packet(&v6));
-        assert!(g.allows_packet(&pkt_src([10, 0, 0, 9])[..19]));
+        assert!(!g.allows_packet(&v6), "an IPv6 packet must be refused");
+        assert!(
+            !g.allows_packet(&pkt_src([10, 0, 0, 9])[..19]),
+            "a packet too short to carry a source address must be refused"
+        );
+        assert!(!g.allows_packet(&[]), "an empty packet must be refused");
+        // The ordinary IPv4 path is unchanged: our own address is still allowed.
+        assert!(g.allows_packet(&pkt_src([10, 0, 0, 7])));
+    }
+
+    #[test]
+    fn packet_source_describes_ipv4_ipv6_and_malformed_packets() {
+        assert_eq!(
+            packet_source(&pkt_src([10, 9, 2, 7])),
+            Some("10.9.2.7".parse().unwrap())
+        );
+
+        let mut ipv6 = [0u8; 40];
+        ipv6[0] = 0x60;
+        ipv6[8..24].copy_from_slice(
+            &"2001:db8::7"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        assert_eq!(packet_source(&ipv6), Some("2001:db8::7".parse().unwrap()));
+        assert_eq!(packet_source(&ipv6[..39]), None);
+        assert_eq!(packet_source(&[]), None);
     }
 }

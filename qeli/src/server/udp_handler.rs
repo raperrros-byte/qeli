@@ -1,16 +1,26 @@
 use crate::config::QuicMaskingConfig;
 use crate::crypto::{derive_keys_hybrid, derive_keys_hybrid_bound, Keypair};
 use crate::protocol::{
-    generate_connection_id, looks_like_quic_initial, unwrap_quic, wrap_quic_long, wrap_quic_short,
-    Obfuscator, PacketCodec,
+    generate_connection_id, looks_like_quic_initial, unwrap_quic_payload, wrap_quic_long,
+    wrap_quic_short, wrap_quic_short_into, Obfuscator, PacketCodec,
 };
 use crate::server::handler::{self, DEFAULT_HEARTBEAT_INTERVAL_MS};
-use crate::server::{lock_or_recover, ProfileRuntime, ServerState};
+use crate::server::{lock_or_recover, ProfileRuntime, ServerState, ServerTunPacket, TunIngress};
+use crate::transport_core::buffer_pool::{BufferPool, PooledBuffer};
+use crate::transport_core::udp_buffer::{
+    AggregateUdpBudgetPlan, UdpBufferController, UdpBufferCounters, UdpBufferPolicy,
+    AUTO_MAX_RECV_BYTES,
+};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, RwLock, Semaphore};
+
+/// Per-client queue for UDP upload pacing. Packets still come from the profile-wide
+/// fixed buffer pool, so this bounds queue metadata and one limited client cannot
+/// consume unbounded memory or block the shared socket receive loop.
+const UDP_UPLOAD_QUEUE_PACKETS: usize = 256;
 
 /// Upper bound on simultaneous half-open (unauthenticated, `AwaitingAuth`) UDP
 /// handshakes per worker. A connectionless listener can't trust the source
@@ -56,6 +66,15 @@ struct UdpClient {
     /// (a placeholder Arc until then) — UDP RECV used to be stuck at 0 because it
     /// was never incremented on the UDP receive path.
     bytes_recv: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Live per-user limit shared with `SessionShared`, updated by set-bandwidth.
+    /// `None` until authentication completes.
+    bandwidth_limit_mbps: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    /// Bounded path to this client's upload pacing task. Limited UDP traffic must
+    /// never sleep in the shared socket receive loop, which would stall every peer.
+    upload_tx: Option<mpsc::Sender<PooledBuffer>>,
+    /// Shared with `SessionShared::dropped`, so local ingress-pool pressure is visible in
+    /// `list-clients` instead of becoming an unexplained wire loss.
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// When the client first appeared — used to evict stale AwaitingAuth entries
     created_at: std::time::Instant,
     connection_id: [u8; 4],
@@ -114,6 +133,9 @@ struct UdpClient {
     /// reported about itself, written here by the receive loop and read by `list-clients`
     /// through the session. `None` until authenticated; `None` inside means "never said".
     client_info: Option<crate::server::handler::ClientInfoCell>,
+    /// Fixed-budget encrypted-record storage shared with this client's `SessionShared`.
+    /// `None` while the peer is half-open; allocated only after authentication succeeds.
+    wire_pool: Option<BufferPool>,
     /// Cumulative anti-amplification budget for this session — an APPROXIMATION of the wire,
     /// deliberately, and read the next paragraph before trusting either number.
     ///
@@ -189,10 +211,12 @@ const MAX_AUTH_OK_REEMITS: u8 = 5;
 /// kernel flow-hash incoming datagrams across them, so multiple workers can decrypt
 /// on separate cores. Each flow (client) sticks to one socket → one worker, so its
 /// session stays on a single thread.
-pub fn bind_reuseport(
+pub(crate) fn bind_reuseport(
     addr: &str,
     perf: &crate::config::UdpPerfConfig,
-) -> anyhow::Result<UdpSocket> {
+    counters: Arc<UdpBufferCounters>,
+    aggregate_budget: AggregateUdpBudgetPlan,
+) -> anyhow::Result<(UdpSocket, UdpBufferController)> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sa: SocketAddr = addr.parse()?;
     let domain = if sa.is_ipv4() {
@@ -205,73 +229,55 @@ pub fn bind_reuseport(
     sock.set_reuse_port(true)?;
     sock.set_nonblocking(true)?;
 
-    // Size the buffers BEFORE bind, while nothing can arrive yet.
-    //
-    // Relying on `net.core.rmem_default` was the bug: the installer raises `rmem_max`, which
-    // is only a CEILING for explicit requests and changes no socket by itself. A container, a
-    // hand-started binary or an existing install therefore ran on the 208 KB default however
-    // the installer was configured. (Audit 2026-08-02, §14.)
-    //
-    // Best-effort in both directions: a refusal degrades throughput, never correctness, so it
-    // must not fail the bind. The kernel also silently HALVES nothing but clamps to
-    // `rmem_max`, so the granted size is read back and logged — without that, a clamped buffer
-    // is indistinguishable from a working one when reading a throughput report.
-    if perf.recv_buffer_size > 0 {
-        if let Err(e) = sock.set_recv_buffer_size(perf.recv_buffer_size as usize) {
-            log::warn!("UDP {addr}: SO_RCVBUF could not be set ({e}); using the kernel default");
-        }
-    }
-    if perf.send_buffer_size > 0 {
-        if let Err(e) = sock.set_send_buffer_size(perf.send_buffer_size as usize) {
-            log::warn!("UDP {addr}: SO_SNDBUF could not be set ({e}); using the kernel default");
-        }
-    }
-    if perf.recv_buffer_size > 0 {
-        // Linux reports twice what it granted (bookkeeping overhead), hence the /2 — it is
-        // the number to compare against the request, not the raw readback.
-        if let Ok(granted) = sock.recv_buffer_size() {
-            let effective = granted / 2;
-            if effective < perf.recv_buffer_size as usize {
-                log::warn!(
-                    "UDP {}: asked for a {} KB receive buffer, the kernel granted {} KB — \
-                     raise net.core.rmem_max to lift the cap, or datagrams will be dropped \
-                     under load",
-                    addr,
-                    perf.recv_buffer_size / 1024,
-                    effective / 1024
-                );
-            } else {
-                log::info!("UDP {}: receive buffer {} KB", addr, effective / 1024);
-            }
-        }
-    }
-
     sock.bind(&sa.into())?;
-    Ok(UdpSocket::from_std(sock.into())?)
+    let socket = UdpSocket::from_std(sock.into())?;
+    let controller = UdpBufferController::configure(
+        &socket,
+        UdpBufferPolicy {
+            send_bytes: perf.send_buffer_size,
+            receive_bytes: if perf.recv_buffer_auto && perf.recv_buffer_size > 0 {
+                aggregate_budget.auto_initial_recv_bytes
+            } else {
+                perf.recv_buffer_size
+            },
+            automatic_receive: perf.recv_buffer_auto,
+            max_receive_bytes: if perf.recv_buffer_auto && perf.recv_buffer_size > 0 {
+                aggregate_budget.auto_max_recv_bytes
+            } else {
+                AUTO_MAX_RECV_BYTES
+            },
+        },
+        counters,
+        format!("server UDP {addr}"),
+    );
+    Ok((socket, controller))
 }
 
 /// How long an authenticated UDP session may go with no received datagram before
-/// it is reaped as dead. Mirrors the TCP RX-liveness window: 3×heartbeat, floored
-/// at 30s. A shorter explicit `idle_timeout` (when set) wins; a disabled
-/// `idle_timeout` (0) still gets the liveness floor so dead sessions can't leak.
-fn udp_reap_window(idle_timeout: std::time::Duration, hb_interval_ms: u64) -> std::time::Duration {
-    let liveness = std::cmp::max(
-        std::time::Duration::from_millis(hb_interval_ms.saturating_mul(3)),
-        std::time::Duration::from_secs(30),
-    );
-    if idle_timeout.as_secs() > 0 {
-        std::cmp::min(idle_timeout, liveness)
-    } else {
-        liveness
+/// it is reaped as dead. The RX-liveness deadline exists only when the client is
+/// configured to emit heartbeat/shaping traffic. Otherwise a completely idle UDP
+/// tunnel is indistinguishable from a dead one, so only an explicit idle timeout may
+/// reap it.
+fn udp_reap_window(
+    idle_timeout: std::time::Duration,
+    liveness_deadline: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    let explicit = (idle_timeout.as_secs() > 0).then_some(idle_timeout);
+    match (explicit, liveness_deadline) {
+        (Some(a), Some(b)) => Some(std::cmp::min(a, b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
     }
 }
 
-pub async fn run_udp_server(
+pub(crate) async fn run_udp_server(
     server_state: Arc<ServerState>,
     profile: Arc<ProfileRuntime>,
     socket: UdpSocket,
+    mut udp_buffer: UdpBufferController,
     worker_id: usize,
-    tun_tx: mpsc::Sender<Vec<u8>>,
+    tun_tx: TunIngress,
 ) -> anyhow::Result<()> {
     let pcfg = &profile.config;
     log::info!(
@@ -332,12 +338,21 @@ pub async fn run_udp_server(
 
     let mut cleanup_tick = tokio::time::interval(std::time::Duration::from_secs(30));
     cleanup_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut udp_buffer_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    udp_buffer_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Partial ClientHello reassembly, keyed by source address: the UDP handshake is
     // fragmented to dodge IP fragmentation on mobile / CGNAT paths (which drop IP
     // fragments). Bounded by MAX_PENDING_HANDSHAKES and aged out in the cleanup tick.
     let mut frag_pending: HashMap<SocketAddr, crate::protocol::udp_frag::Reassembler> =
         HashMap::new();
+    // Cover and heartbeat records are generated serially by this task. Keep their
+    // random padding in task-owned storage instead of allocating a fresh Vec for
+    // every client on every tick.
+    let mut padding = Vec::with_capacity(crate::protocol::packet::MAX_RECORD_SIZE);
+    let mut quic_record = Vec::with_capacity(
+        handler::server_wire_buffer_capacity(pcfg) + crate::protocol::quic::QUIC_SHORT_HEADER_MIN,
+    );
 
     loop {
         tokio::select! {
@@ -349,6 +364,7 @@ pub async fn run_udp_server(
                         continue;
                     }
                 };
+                udp_buffer.note_receive(n);
 
                 if n == 0 { continue; }  // malformed obfs frame
                 // Rate-limit only NEW UDP sessions. Applying the limiter to
@@ -375,9 +391,9 @@ pub async fn run_udp_server(
                     // profile's own `quic.enabled` is off. If detection misses, the junk
                     // still gets dropped one stage later in handle_udp_datagram (pre-crypto).
                     let is_junk = if looks_like_quic_initial(&recv_buf[..n]) {
-                        unwrap_quic(&recv_buf[..n])
+                        unwrap_quic_payload(&recv_buf[..n])
                             .ok()
-                            .map(|p| crate::protocol::udp_frag::is_junk(&p.payload))
+                            .map(crate::protocol::udp_frag::is_junk)
                             .unwrap_or(false)
                     } else {
                         crate::protocol::udp_frag::is_junk(&recv_buf[..n])
@@ -391,15 +407,18 @@ pub async fn run_udp_server(
                     }
                 }
 
-                let data = recv_buf[..n].to_vec();
-                handle_udp_datagram(&server_state, &profile, &sessions, &mut frag_pending, &socket, addr, &data, &tun_tx, quic_config, &handshake_permits, &auth_inflight).await;
+                handle_udp_datagram(&server_state, &profile, &sessions, &mut frag_pending, &socket, addr, &recv_buf[..n], &tun_tx, quic_config, &handshake_permits, &auth_inflight).await;
+            }
+
+            _ = udp_buffer_tick.tick() => {
+                udp_buffer.tick(socket.raw_socket());
             }
 
             _ = heartbeat_tick.tick(), if heartbeat_enabled || shaping_on => {
                 let now = std::time::Instant::now();
                 // Collect packets to send before any .await so non-Send types (MutexGuard,
                 // Obfuscator/ThreadRng) are guaranteed dropped before the async resume point.
-                let to_send: Vec<(std::net::SocketAddr, Vec<u8>)> = if shaping_on {
+                let to_send: Vec<(std::net::SocketAddr, PooledBuffer, bool, [u8; 4], u32)> = if shaping_on {
                     // Flow-shaping: per-client Poisson idle cover (replaces heartbeat).
                     // Needs a write lock to advance each client's cover deadline + budget.
                     let mut sessions_guard = sessions.write().await;
@@ -431,19 +450,30 @@ pub async fn run_udp_server(
                         if !client.shaper.try_spend(size, now) {
                             continue;
                         }
-                        let pkt = {
-                            let mut obf = Obfuscator::new();
-                            let padding = obf.generate_padding(size as u16, size as u16);
-                            let mut tx = lock_or_recover(&client.tx_codec, "udp::cover");
-                            let c = tx.encrypt_packet(&[], &padding).ok();
-                            drop(tx);
-                            c.map(|c| if client.quic_enabled {
-                                let pn = client.packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                wrap_quic_short(&c, &client.connection_id, pn)
-                            } else { c })
+                        let Some(mut pkt) = client
+                            .wire_pool
+                            .as_ref()
+                            .and_then(BufferPool::try_acquire)
+                        else {
+                            continue;
                         };
-                        if let Some(pkt) = pkt {
-                            out.push((*addr, pkt));
+                        let encrypted = {
+                            let mut obf = Obfuscator::new();
+                            obf.generate_padding_into(size as u16, size as u16, &mut padding);
+                            let mut tx = lock_or_recover(&client.tx_codec, "udp::cover");
+                            let ok = tx
+                                .encrypt_packet_into(&[], &padding, pkt.as_vec_mut())
+                                .is_ok();
+                            drop(tx);
+                            ok
+                        };
+                        if encrypted {
+                            let pn = if client.quic_enabled {
+                                client.packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            } else {
+                                0
+                            };
+                            out.push((*addr, pkt, client.quic_enabled, client.connection_id, pn));
                         }
                     }
                     out
@@ -472,45 +502,70 @@ pub async fn run_udp_server(
                         // only) reconnected every rx_dead. Beaconing unconditionally fixes
                         // that; the redundant beacon under an active server->client flow is
                         // one small packet per interval — negligible.
-                        let pkt = {
+                        let Some(mut pkt) = client
+                            .wire_pool
+                            .as_ref()
+                            .and_then(BufferPool::try_acquire)
+                        else {
+                            continue;
+                        };
+                        let encrypted = {
                             let mut obf = Obfuscator::new();
                             // saturating: data_size_bytes is a u16 config knob — `+ 32`
                             // would wrap in release / panic in debug at the top of range.
-                            let padding = obf.generate_padding(
+                            obf.generate_padding_into(
                                 hb_config.data_size_bytes,
                                 hb_config.data_size_bytes.saturating_add(32),
+                                &mut padding,
                             );
                             let mut tx = lock_or_recover(&client.tx_codec, "udp::heartbeat");
-                            let hb = tx.encrypt_packet(&[], &padding).ok();
+                            let ok = tx
+                                .encrypt_packet_into(&[], &padding, pkt.as_vec_mut())
+                                .is_ok();
                             drop(tx);
-                            hb.map(|hb| if client.quic_enabled {
-                                let pn = client.packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                wrap_quic_short(&hb, &client.connection_id, pn)
-                            } else { hb })
+                            ok
                         };
-                        if let Some(pkt) = pkt {
-                            out.push((*addr, pkt));
+                        if encrypted {
+                            let pn = if client.quic_enabled {
+                                client.packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            } else {
+                                0
+                            };
+                            out.push((*addr, pkt, client.quic_enabled, client.connection_id, pn));
                         }
                     }
                     out
                 };
                 // Now we can .await freely — no non-Send types in scope
-                for (addr, pkt) in to_send {
-                    let _ = socket.send_to(&pkt, addr).await;
+                for (addr, pkt, quic_enabled, connection_id, packet_number) in to_send {
+                    let data: &[u8] = if quic_enabled {
+                        wrap_quic_short_into(
+                            &pkt,
+                            &connection_id,
+                            packet_number,
+                            &mut quic_record,
+                        );
+                        &quic_record
+                    } else {
+                        &pkt
+                    };
+                    let _ = socket.send_to(data, addr).await;
                 }
             }
 
             _ = cleanup_tick.tick() => {
                 let now = std::time::Instant::now();
-                // A dead UDP client just stops sending, so its `last_activity` goes
-                // stale. Reap it on an RX-liveness window (3×heartbeat, ≥30s) the same
-                // way the TCP path does — an *alive* client keeps the session warm with
-                // its own heartbeats. This must NOT be gated on `idle_timeout` (which is
-                // 0 / disabled on most profiles), or a disconnected UDP client's session
-                // would linger forever, leaking its pool IP + client slot and showing as
-                // a ghost in `list-clients` that `kick` can't clear.
-                let hb_interval_ms = if heartbeat_enabled { hb_config.interval_ms } else { DEFAULT_HEARTBEAT_INTERVAL_MS };
-                let reap_after = udp_reap_window(idle_timeout, hb_interval_ms);
+                // Heartbeat and shaping both generate authenticated client→server
+                // traffic, so their cadence is a valid liveness contract. With both
+                // disabled only an explicit idle_timeout is meaningful.
+                let liveness_deadline = crate::protocol::liveness_deadline(
+                    heartbeat_enabled,
+                    std::time::Duration::from_millis(hb_config.interval_ms),
+                    std::time::Duration::from_millis(hb_config.jitter_ms),
+                    shaping_on,
+                    std::time::Duration::from_millis(shaping_cfg.idle_gap_max_ms),
+                );
+                let reap_after = udp_reap_window(idle_timeout, liveness_deadline);
                 let expired: Vec<SocketAddr> = {
                     let sessions_guard = sessions.read().await;
                     sessions_guard.iter()
@@ -518,9 +573,8 @@ pub async fn run_udp_server(
                             UdpSessionState::AwaitingAuth => {
                                 now.duration_since(c.created_at) > handshake_timeout
                             }
-                            UdpSessionState::Authenticated { .. } => {
-                                now.duration_since(c.last_activity) > reap_after
-                            }
+                            UdpSessionState::Authenticated { .. } => reap_after
+                                .is_some_and(|limit| now.duration_since(c.last_activity) > limit),
                         })
                         .map(|(addr, _)| *addr)
                         .collect()
@@ -737,7 +791,7 @@ async fn handle_udp_datagram(
     socket: &Arc<crate::protocol::obfs::ObfsUdp>,
     addr: SocketAddr,
     data: &[u8],
-    tun_tx: &mpsc::Sender<Vec<u8>>,
+    tun_tx: &TunIngress,
     quic_config: &QuicMaskingConfig,
     handshake_permits: &Arc<Semaphore>,
     auth_inflight: &Arc<tokio::sync::Mutex<std::collections::HashSet<SocketAddr>>>,
@@ -758,9 +812,9 @@ async fn handle_udp_datagram(
         Some(q) => q,
         None => looks_like_quic_initial(data),
     };
-    let (payload, quic_detected, _connection_id) = if treat_as_quic {
-        match unwrap_quic(data) {
-            Ok(quic_pkt) => (quic_pkt.payload.clone(), true, quic_pkt.connection_id),
+    let (payload, quic_detected) = if treat_as_quic {
+        match unwrap_quic_payload(data) {
+            Ok(payload) => (payload, true),
             Err(e) => {
                 log::debug!(
                     "UDP drop from {} on profile '{}': QUIC unwrap failed ({})",
@@ -772,14 +826,14 @@ async fn handle_udp_datagram(
             }
         }
     } else {
-        (data.to_vec(), false, [0u8; 4])
+        (data, false)
     };
 
     // AWG junk decoy — carries no real data. The receive loop already drops junk from
     // a brand-new source before the rate limiter; this also catches junk that arrived
     // reordered AFTER the first ClientHello fragment (is_new_session was false then),
     // so it is never fed to the per-source reassembler.
-    if crate::protocol::udp_frag::is_junk(&payload) {
+    if crate::protocol::udp_frag::is_junk(payload) {
         return;
     }
 
@@ -789,8 +843,8 @@ async fn handle_udp_datagram(
     // oversized chunk would also be rejected by the reassembler). Only a known session
     // is echoed (gates it to an authenticated peer); the ACK is QUIC-wrapped with the
     // session's connection id + next packet number, exactly like the heartbeat reply.
-    if crate::protocol::udp_frag::is_mtu_probe(&payload) {
-        if let Some((id, size)) = crate::protocol::udp_frag::parse_mtu_probe(&payload) {
+    if crate::protocol::udp_frag::is_mtu_probe(payload) {
+        if let Some((id, size)) = crate::protocol::udp_frag::parse_mtu_probe(payload) {
             let wrap = {
                 let guard = sessions.read().await;
                 guard.get(&addr).map(|c| {
@@ -831,12 +885,12 @@ async fn handle_udp_datagram(
             client.amp_received = client.amp_received.saturating_add(data.len() as u64);
 
             let reemit_hello = matches!(client.state, UdpSessionState::AwaitingAuth)
-                && crate::protocol::udp_frag::is_fragment(&payload);
+                && crate::protocol::udp_frag::is_fragment(payload);
             let reemit_authok = matches!(client.state, UdpSessionState::Authenticated { .. })
                 && !client.auth_ok.is_empty()
-                && payload == client.auth_request;
+                && payload == client.auth_request.as_slice();
             if reemit_hello || reemit_authok {
-                client.last_activity = std::time::Instant::now();
+                // NOTE: `last_activity` is deliberately NOT touched here — see below.
                 let hello = client.server_hello.clone();
                 let cid = client.connection_id;
                 let quic = client.quic_enabled;
@@ -892,6 +946,27 @@ async fn handle_udp_datagram(
                 } else {
                     client.auth_ok_reemits = client.auth_ok_reemits.saturating_add(1);
                 }
+                // Liveness is proven by a datagram we could DECRYPT, never by a replayed one.
+                //
+                // `last_activity` used to be bumped at the top of this branch, before the
+                // budget/count checks and without any AEAD. The trigger condition for the
+                // AuthOK path is `payload == client.auth_request` — a byte-for-byte replay of
+                // an AUTH datagram this peer sent earlier. On UDP the session map is keyed on
+                // the source address alone, so anyone who observed that datagram, or who can
+                // simply spoof the source, could retransmit it forever and keep the entry
+                // alive: `cleanup_tick` reaps on `last_activity`, so the session never aged
+                // out, and its pool address, its `max_clients` slot and its `by_ip` entry were
+                // held indefinitely after the real client had gone. Worse, the suppression
+                // above returns EARLY, so once the re-emit budget was spent the timer kept
+                // being refreshed while nothing was sent — the throttle stopped the reply and
+                // not the resource hold.
+                //
+                // The TCP path states the same rule explicitly and only moves rx-liveness
+                // after a successful decrypt. Bumping it only when we actually re-emit keeps
+                // the legitimate case working (a client whose reply was lost is genuinely
+                // there and gets MAX_AUTH_OK_REEMITS worth of grace) and bounds the abuse to
+                // that same small count. (Audit 2026-08-04.)
+                client.last_activity = std::time::Instant::now();
                 client.amp_sent = client.amp_sent.saturating_add(reply_len);
                 drop(sessions_guard);
                 if reemit_hello {
@@ -929,27 +1004,53 @@ async fn handle_udp_datagram(
                 return;
             }
             let is_awaiting_auth = matches!(client.state, UdpSessionState::AwaitingAuth);
-            let plaintext = {
-                let mut rx = lock_or_recover(&client.rx_codec, "udp::decrypt");
-                match rx.decrypt_packet(&payload) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        log::debug!(
-                            "UDP decrypt error from {} on profile '{}': {}",
-                            addr,
-                            profile.name,
-                            e
-                        );
-                        return;
-                    }
-                }
+            let Some(mut plaintext) = tun_tx.pool.try_acquire() else {
+                client
+                    .dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                profile.udp_buffer_counters.note_internal_drop();
+                log::debug!(
+                    "UDP drop from {} on profile '{}': inbound TUN pool exhausted",
+                    addr,
+                    profile.name
+                );
+                return;
             };
+            if payload.len() > plaintext.capacity() {
+                client
+                    .dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                profile.udp_buffer_counters.note_internal_drop();
+                log::debug!(
+                    "UDP drop from {} on profile '{}': {}-byte record exceeds inbound pool slot",
+                    addr,
+                    profile.name,
+                    payload.len()
+                );
+                return;
+            }
+            plaintext.as_vec_mut().extend_from_slice(payload);
+            {
+                let mut rx = lock_or_recover(&client.rx_codec, "udp::decrypt");
+                if let Err(e) = rx.decrypt_packet_in_place(plaintext.as_vec_mut()) {
+                    log::debug!(
+                        "UDP decrypt error from {} on profile '{}': {}",
+                        addr,
+                        profile.name,
+                        e
+                    );
+                    return;
+                }
+            }
             client.last_activity = std::time::Instant::now();
             // Account inbound (client->server) bytes so `list-clients` RECV is correct
             // (the UDP path never incremented this → RECV always showed 0). Captured
             // before the lock drops; counts plaintext.len() like the TCP path. For an
             // AwaitingAuth client this is a placeholder Arc that is never incremented.
             let recv_ctr = client.bytes_recv.clone();
+            let client_dropped = client.dropped.clone();
+            let bandwidth_limit = client.bandwidth_limit_mbps.clone();
+            let upload_tx = client.upload_tx.clone();
             // Captured with the lock, like recv_ctr — the ACL is consulted below after
             // the guard is dropped. Cheap: an unrestricted ACL is an empty Vec.
             let dst_acl = client.dst_acl.clone();
@@ -977,9 +1078,9 @@ async fn handle_udp_datagram(
                 let profile = profile.clone();
                 let sessions = sessions.clone();
                 let socket = socket.clone();
-                let tun_tx = tun_tx.clone();
                 let quic_config = quic_config.clone();
                 let auth_inflight = auth_inflight.clone();
+                let auth_tun_tx = tun_tx.clone();
                 let raw = payload.to_vec();
                 tokio::spawn(async move {
                     handle_udp_auth(
@@ -990,8 +1091,8 @@ async fn handle_udp_datagram(
                         addr,
                         &plaintext,
                         &raw,
-                        &tun_tx,
                         &quic_config,
+                        auth_tun_tx,
                     )
                     .await;
                     auth_inflight.lock().await.remove(&addr);
@@ -1039,16 +1140,31 @@ async fn handle_udp_datagram(
                     );
                     return;
                 }
-                // NOTE (L2): the UDP client->server (upload) path is NOT rate-throttled,
-                // unlike the TCP reader. This is deliberate: the download quota — the
-                // billed control — is enforced download-only and the server->client writer
-                // path already throttles against the per-user cap, so no quota is bypassed.
-                // The advertised bandwidth cap is therefore asymmetric between transports on
-                // upload only. Applying rate.consume here would mean carrying the session's
-                // rate bucket onto the hot ingress path; do that only if upload shaping is
-                // explicitly required and load-tested.
-                recv_ctr.fetch_add(plaintext.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                let _ = tun_tx.send(plaintext).await;
+                // Apply the user cap to UDP upload too. Limited packets go through the
+                // client's own pacing task; unlimited packets retain the direct hot path.
+                let limit = bandwidth_limit
+                    .as_ref()
+                    .map(|value| value.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(0);
+                if limit == 0 {
+                    // Preserve the direct fast path for unlimited users.
+                    recv_ctr
+                        .fetch_add(plaintext.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    let _ = tun_tx.sender.send(ServerTunPacket::Pooled(plaintext)).await;
+                } else if upload_tx
+                    .as_ref()
+                    .is_none_or(|tx| tx.try_send(plaintext).is_err())
+                {
+                    // Never await a full per-client pacing queue in this shared receive loop:
+                    // one capped peer must not head-of-line block every UDP session.
+                    client_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    profile.udp_buffer_counters.note_internal_drop();
+                    log::debug!(
+                        "UDP upload pacing queue full for {} on profile '{}'; dropping packet",
+                        addr,
+                        profile.name
+                    );
+                }
             }
             return;
         }
@@ -1057,7 +1173,7 @@ async fn handle_udp_datagram(
     // New source address: this is the ClientHello. It arrives fragmented (LTE/CGNAT
     // fix) — reassemble it; a legacy single-datagram ClientHello (no fragment magic)
     // is accepted as-is for backward compatibility. We reply in the same shape.
-    let (ch, frag_mode): (Vec<u8>, bool) = if crate::protocol::udp_frag::is_fragment(&payload) {
+    let (ch, frag_mode): (Vec<u8>, bool) = if crate::protocol::udp_frag::is_fragment(payload) {
         // Bound the reassembly map against a spoofed-source flood: evict the oldest
         // partial when full (same cap as half-open sessions). Only the full,
         // reassembled ClientHello triggers a response (anti-amplification preserved).
@@ -1070,7 +1186,7 @@ async fn handle_udp_datagram(
                 frag_pending.remove(&oldest);
             }
         }
-        match frag_pending.entry(addr).or_default().push(&payload) {
+        match frag_pending.entry(addr).or_default().push(payload) {
             Ok(Some(full)) => {
                 frag_pending.remove(&addr);
                 (full, true)
@@ -1082,7 +1198,7 @@ async fn handle_udp_datagram(
             }
         }
     } else {
-        (payload.clone(), false)
+        (payload.to_vec(), false)
     };
 
     // Bound concurrent pre-auth handshake crypto per worker. A spoofed-source
@@ -1196,8 +1312,8 @@ async fn handle_udp_auth(
     // The RAW (post-unwrap, pre-decrypt) AUTH datagram — cached on success so a
     // retransmit (i.e. a lost AuthOK) is recognised and answered idempotently.
     raw_request: &[u8],
-    _tun_tx: &mpsc::Sender<Vec<u8>>,
     _quic_config: &QuicMaskingConfig,
+    tun_tx: TunIngress,
 ) {
     let pcfg = &profile.config;
     // Auth plaintext: [client_key_proof:32]([0x00][device_id:16])?[username:password]
@@ -1272,6 +1388,14 @@ async fn handle_udp_auth(
     // Per-device key (same as the TCP path) — pool IPs + sessions are keyed by it
     // so multiple devices of one login coexist.
     let dkey = handler::device_key(&username, device_id);
+    // Addresses freed by an eviction, released ONLY under the same pool lock that allocates
+    // ours. Releasing each one immediately — as this used to — put it on the pool's `freed`
+    // stack and then dropped the lock, and `allocate` pops `freed` FIRST: a concurrent
+    // handler was handed the address we had just evicted someone from, and our
+    // `allocate_fixed` took it back in the pool's bookkeeping only, without killing that
+    // session. Two live sessions on one tunnel IP. Same defect and same fix as the TCP path.
+    // (Audit 2026-08-04.)
+    let mut deferred_release: Vec<String> = Vec::new();
 
     // Per-user session cap (0 = unlimited): evict this user's oldest device(s) so the
     // new one fits. A reconnecting device keeps its own IP (pool is per-device), so we
@@ -1321,7 +1445,7 @@ async fn handle_udp_auth(
                             }
                         };
                         sessions.write().await.remove(&peer);
-                        profile.pool.lock().await.release(&ev_dkey);
+                        deferred_release.push(ev_dkey.clone());
                         if let Some(old) = old {
                             old.kick_all();
                         }
@@ -1369,7 +1493,7 @@ async fn handle_udp_auth(
                     }
                 };
                 sessions.write().await.remove(&peer);
-                profile.pool.lock().await.release(&ev_dkey);
+                deferred_release.push(ev_dkey.clone());
                 if let Some(old) = old {
                     old.kick_all();
                 }
@@ -1383,6 +1507,9 @@ async fn handle_udp_auth(
 
     let client_ip = {
         let mut pool = profile.pool.lock().await;
+        for k in &deferred_release {
+            pool.release(k);
+        }
         let allocated = match fixed_ip {
             Some(want) => pool.allocate_fixed(&dkey, want).or_else(|| {
                 log::warn!(
@@ -1475,6 +1602,7 @@ async fn handle_udp_auth(
     // (read by list-clients) point at the SAME AtomicU64, so UDP receives are
     // accounted (RECV used to be stuck at 0 — never incremented on UDP).
     let bytes_recv = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Build the AuthOK first so the same bytes can be BOTH sent and cached for
     // idempotent re-emit. Usually one datagram; more when the pushed route list puts the
@@ -1542,11 +1670,85 @@ async fn handle_udp_auth(
             .unwrap_or_default()
     };
 
+    let wire_pool = match handler::server_wire_pool(pcfg) {
+        Ok(pool) => pool,
+        Err(error) => {
+            log::error!(
+                "UDP: cannot allocate the bounded wire-record pool for '{}' on profile '{}': {}",
+                username,
+                profile.name,
+                error
+            );
+            sessions.write().await.remove(&addr);
+            profile.pool.lock().await.release(&dkey);
+            return;
+        }
+    };
+
+    // Resolve the live per-user policy once and share it with both directions. The
+    // control socket updates the same AtomicU32, so set-bandwidth takes effect for the
+    // UDP upload pacing task and download writer without reconnecting the client.
+    let (initial_bw, client_subnets) = {
+        let db = server_state.users_db.read().await;
+        let user = db.find_user(&username);
+        (
+            user.map(|entry| entry.effective_bandwidth_limit(&db.groups))
+                .unwrap_or(0),
+            user.map(|entry| entry.client_subnets.clone())
+                .unwrap_or_default(),
+        )
+    };
+    let bandwidth_limit_mbps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(initial_bw));
+    let rates = crate::server::handler::DirectionalRateBuckets::new();
+    let revoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // UDP has one shared socket receive loop for all peers. Sleeping there would let one
+    // capped client stall the entire profile, so limited uploads are handed to a bounded
+    // per-client pacing task. Unlimited clients retain the direct fast path above.
+    let (upload_tx, mut upload_rx) = mpsc::channel::<PooledBuffer>(UDP_UPLOAD_QUEUE_PACKETS);
+    let upload_limit = bandwidth_limit_mbps.clone();
+    let upload_rate = rates.upload.clone();
+    let upload_bytes = bytes_recv.clone();
+    let upload_tun = tun_tx.clone();
+    let upload_revoked = revoked.clone();
+    tokio::spawn(async move {
+        while let Some(packet) = upload_rx.recv().await {
+            // Dropping the per-worker UdpClient closes the only long-lived sender.
+            // A kick/quota/supersede raises `revoked` even before that map entry is
+            // removed. In either case discard the queued tail instead of injecting
+            // traffic after the session has lost its IP/authorization.
+            if upload_rx.is_closed() || upload_revoked.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let limit = upload_limit.load(std::sync::atomic::Ordering::Relaxed);
+            let delay = upload_rate.consume(packet.len() as u64 * 8, limit);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            if upload_rx.is_closed() || upload_revoked.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            upload_bytes.fetch_add(packet.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            if upload_tun
+                .sender
+                .send(ServerTunPacket::Pooled(packet))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
     // Update session state now that encryption succeeded
     {
         let mut sessions_guard = sessions.write().await;
         if let Some(client) = sessions_guard.get_mut(&addr) {
             client.bytes_recv = bytes_recv.clone();
+            client.dropped = dropped.clone();
+            client.bandwidth_limit_mbps = Some(bandwidth_limit_mbps.clone());
+            client.upload_tx = Some(upload_tx);
+            client.revoked = Some(revoked.clone());
             client.state = UdpSessionState::Authenticated {
                 session_id,
                 username: username.clone(),
@@ -1569,6 +1771,7 @@ async fn handle_udp_auth(
                 &src_subnets,
                 &username,
             ));
+            client.wire_pool = Some(wire_pool.clone());
         }
     }
 
@@ -1592,26 +1795,14 @@ async fn handle_udp_auth(
     // The AuthOK is NOT sent here. It is built and cached now, and goes on the wire only
     // once `max_clients` has admitted this client — see the send below the capacity check.
 
-    let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(4096);
+    let (writer_tx, mut writer_rx) = mpsc::channel::<PooledBuffer>(wire_pool.buffer_count());
     let writer_socket = socket.clone();
     let writer_addr = addr;
     let writer_quic = quic_enabled;
     let writer_cid = connection_id;
 
-    // Per-user bandwidth cap (own value, else group, else 0 = unlimited) — UDP
-    // honoured it as 0 before, silently ignoring limits. Now the writer applies it
-    // via the session's shared token bucket, and `set-bandwidth` works on UDP too.
-    let (initial_bw, client_subnets) = {
-        let db = server_state.users_db.read().await;
-        let u = db.find_user(&username);
-        let bw = u
-            .map(|x| x.effective_bandwidth_limit(&db.groups))
-            .unwrap_or(0);
-        // #13 iroute: the subnets behind this client, registered for inbound routing below.
-        let subnets = u.map(|x| x.client_subnets.clone()).unwrap_or_default();
-        (bw, subnets)
-    };
-
+    // Per-user bandwidth cap (own value, else group, else 0 = unlimited). Upload and
+    // download use independent session-wide buckets, and `set-bandwidth` updates both.
     let (kick_tx, mut kick_rx) = mpsc::channel::<()>(1);
     // UDP is a single logical stream per session (no bonding).
     // Built before the struct literal: `username` is moved into it below.
@@ -1624,6 +1815,7 @@ async fn handle_udp_auth(
         peer: addr,
         token: [0u8; crate::server::handler::JOIN_TOKEN_LEN],
         max_streams: 1,
+        wire_pool: wire_pool.clone(),
         streams: std::sync::Mutex::new(vec![crate::server::handler::StreamHandle {
             stream_id: session_id,
             codec: writer_codec,
@@ -1638,9 +1830,9 @@ async fn handle_udp_auth(
         connected_at: std::time::Instant::now(),
         bytes_sent: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         bytes_recv,
-        dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        bandwidth_limit_mbps: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(initial_bw)),
-        rate: crate::server::handler::RateBucket::new(),
+        dropped,
+        bandwidth_limit_mbps,
+        rates,
         dst_acl: dst_acl.clone(),
         src_guard,
         // 0 = not reported yet; the receive loop fills it in from the client's in-tunnel
@@ -1649,7 +1841,7 @@ async fn handle_udp_auth(
         // None = the client has not said what it is; filled in from the same control
         // frame path as the MTU report above.
         client_info: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        revoked: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        revoked,
     });
     // The writer task outlives this function and needs the rate bucket + byte
     // counter, but `session` is moved into the profile map below — clone first.
@@ -1776,6 +1968,9 @@ async fn handle_udp_auth(
 
     let profile_name = profile.name.clone();
     tokio::spawn(async move {
+        let mut quic_record = Vec::with_capacity(
+            wire_pool.buffer_capacity() + crate::protocol::quic::QUIC_SHORT_HEADER_MIN,
+        );
         loop {
             tokio::select! {
                 biased;
@@ -1788,10 +1983,9 @@ async fn handle_udp_auth(
                         Some(d) => d,
                         None => break,
                     };
-                    // Aggregate per-session throttle (same token bucket as the TCP
-                    // path) — applies the per-user cap on UDP, which used to be
-                    // ignored. Also account outbound bytes (previously untracked on
-                    // UDP, so list-clients under-reported bytes_sent).
+                    // Aggregate per-session DOWNLOAD throttle. The independent upload
+                    // pacing task applies the same limit concurrently. Also account
+                    // outbound bytes for list-clients and quota tracking.
                     let limit = writer_session
                         .bandwidth_limit_mbps
                         .load(std::sync::atomic::Ordering::Relaxed);
@@ -1802,21 +1996,22 @@ async fn handle_udp_auth(
                     // every packet — and since the download quota is checked against this
                     // counter, that user got more than their cap. TCP already accounts the
                     // full on-wire `packet.len()`, so this also removes a UDP-vs-TCP skew.
-                    let pkt = if writer_quic {
+                    let pkt: &[u8] = if writer_quic {
                         let pn = writer_pn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        wrap_quic_short(&data, &writer_cid, pn)
+                        wrap_quic_short_into(&data, &writer_cid, pn, &mut quic_record);
+                        &quic_record
                     } else {
-                        data
+                        &data
                     };
                     let wire_len = pkt.len() as u64;
-                    let delay = writer_session.rate.consume(wire_len * 8, limit);
+                    let delay = writer_session.rates.download.consume(wire_len * 8, limit);
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
                     }
                     writer_session
                         .bytes_sent
                         .fetch_add(wire_len, std::sync::atomic::Ordering::Relaxed);
-                    let _ = writer_socket.send_to(&pkt, writer_addr).await;
+                    let _ = writer_socket.send_to(pkt, writer_addr).await;
                 }
             }
         }
@@ -1936,6 +2131,7 @@ async fn handle_new_udp_client(
             revoked: None,
             path_mtu: None,
             client_info: None,
+            wire_pool: None,
             // Seed the budget with the exchange that just happened, so the session starts
             // already accounted for rather than with a free allowance. Both sides are the
             // MESSAGE, not the datagrams: a fragmented ClientHello is undercounted by its
@@ -1947,6 +2143,9 @@ async fn handle_new_udp_client(
             auth_ok_sent: false,
             last_activity: now,
             bytes_recv: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            bandwidth_limit_mbps: None,
+            upload_tx: None,
+            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             created_at: now,
             connection_id,
             quic_enabled: quic_detected,
@@ -2109,32 +2308,33 @@ mod tests {
     }
 
     #[test]
-    fn reap_window_uses_liveness_when_idle_disabled() {
-        // idle_timeout = 0 (disabled, as on prod) must NOT mean "never reap": a dead
-        // UDP client is still reaped on the 3×heartbeat liveness window. This is the
-        // bug that left ghost UDP sessions in list-clients forever.
+    fn reap_window_uses_configured_liveness_when_idle_disabled() {
         assert_eq!(
-            udp_reap_window(Duration::ZERO, 15_000),
-            Duration::from_secs(45)
+            udp_reap_window(Duration::ZERO, Some(Duration::from_secs(45))),
+            Some(Duration::from_secs(45))
         );
-        // Liveness is floored at 30s for short heartbeat intervals.
         assert_eq!(
-            udp_reap_window(Duration::ZERO, 5_000),
-            Duration::from_secs(30)
+            udp_reap_window(Duration::ZERO, Some(Duration::from_secs(30))),
+            Some(Duration::from_secs(30))
         );
+        assert_eq!(udp_reap_window(Duration::ZERO, None), None);
     }
 
     #[test]
     fn reap_window_honors_shorter_idle_timeout() {
         // An explicit idle_timeout shorter than the liveness window wins (reap sooner).
         assert_eq!(
-            udp_reap_window(Duration::from_secs(10), 15_000),
-            Duration::from_secs(10)
+            udp_reap_window(Duration::from_secs(10), Some(Duration::from_secs(45))),
+            Some(Duration::from_secs(10))
         );
         // A longer idle_timeout is capped by the liveness window (dead detection).
         assert_eq!(
-            udp_reap_window(Duration::from_secs(600), 15_000),
-            Duration::from_secs(45)
+            udp_reap_window(Duration::from_secs(600), Some(Duration::from_secs(45))),
+            Some(Duration::from_secs(45))
+        );
+        assert_eq!(
+            udp_reap_window(Duration::from_secs(600), None),
+            Some(Duration::from_secs(600))
         );
     }
 }

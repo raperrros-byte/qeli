@@ -4,7 +4,6 @@ using System.ComponentModel;
 using System.IO;
 using System.Text;
 using System.Net.Sockets;
-using System.Security.Cryptography;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
@@ -12,8 +11,6 @@ using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Threading;
 using QeliWin.Model;
-using Qeli.Shared;
-using Qeli.Shared.Protocol;
 using QeliWin.Service;
 using QeliWin.Vpn;
 using Qeli.Shared.Model;
@@ -76,6 +73,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        _tunnel.LogLevel = AppSettings.Current.LogLevel;
         ProfilesList.ItemsSource = _profiles;
 
         Icon = Ui.Png(Branding.AppIconPng(64));
@@ -235,6 +233,7 @@ public partial class MainWindow : Window
         bool saved = SettingsWindow.Show(this, _profiles);
         if (saved)
         {
+            _tunnel.LogLevel = AppSettings.Current.LogLevel;
             ApplyServiceSettings();
             ReapplyLanguage(); // language may have changed (live)
             ConfigureProbeTimer(); // auto-poll toggle / interval may have changed
@@ -371,6 +370,7 @@ public partial class MainWindow : Window
                 }
                 // Avoid two tunnels fighting over the Wintun adapter.
                 if (_status is VpnStatus.Connected or VpnStatus.Connecting) _tunnel.Stop();
+                p.LoggingLevel = s.LogLevel;
                 ServiceState.SaveProfile(p);
                 if (!ServiceManager.IsInstalled()) ServiceManager.Install();
                 ServiceManager.Start();
@@ -392,7 +392,9 @@ public partial class MainWindow : Window
     {
         try
         {
-            if (ServiceManager.IsRunning()) ServiceManager.Stop();
+            // The auto-started service may be running but intentionally idle. Toggle the
+            // persisted connection intent, not the SCM process state.
+            if (ServiceState.DesiredConnected()) ServiceManager.Stop();
             else ServiceManager.Start();
         }
         catch (Exception ex)
@@ -956,7 +958,7 @@ public partial class MainWindow : Window
             VpnConfig? last = null;
             foreach (var cfg in list)
             {
-                cfg.Validate();
+                cfg.Validate(platformCapabilities: false);
                 cfg.Name ??= cfg.ServerAddress;
                 cfg.Id = Guid.NewGuid().ToString("N");
                 _profiles.Add(ApplyCurrentGlobal(cfg));
@@ -1134,12 +1136,22 @@ public partial class MainWindow : Window
         _ = Task.Run(async () =>
         {
             // A TCP connect can't reach a UDP-only port; UDP needs a real handshake probe.
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            bool ok = p.IsUdp
-                ? await Task.Run(() => UdpProbe(p, 1500))
-                : await TcpProbeAsync(p.ServerAddress, p.Port, 3000);
-            sw.Stop();
-            int ms = (int)sw.ElapsedMilliseconds;
+            bool ok;
+            int ms;
+            if (p.IsUdp)
+            {
+                int nativeLatency = 0;
+                ok = await Task.Run(() => NativeTransportDiagnostics.TryUdpProbe(
+                    p.ToIni(), 1500, out nativeLatency));
+                ms = nativeLatency;
+            }
+            else
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                ok = await TcpProbeAsync(p.ServerAddress, p.Port, 3000);
+                sw.Stop();
+                ms = (int)sw.ElapsedMilliseconds;
+            }
             Dispatcher.Invoke(() =>
             {
                 p.LatencyMs = ok ? ms : null;
@@ -1156,68 +1168,6 @@ public partial class MainWindow : Window
             var connect = client.ConnectAsync(host, port);
             var done = await Task.WhenAny(connect, Task.Delay(timeoutMs));
             return done == connect && client.Connected;
-        }
-        catch { return false; }
-    }
-
-    /// <summary>
-    /// UDP reachability: send the SAME hybrid X25519+ML-KEM ClientHello a real
-    /// connection sends (mode-framed — raw fake-tls / QUIC-wrapped / obfs-sealed) and
-    /// treat ANY reply datagram as "server reachable". The server requires the
-    /// X25519MLKEM768 share for the PQ tunnel and silently drops a non-PQ hello, so the
-    /// probe MUST carry a real ML-KEM key to get a ServerHello back — otherwise every
-    /// UDP profile shows a false red even when reachable. Correctly stays red when UDP
-    /// is truly blocked (no reply).
-    /// </summary>
-    private static bool UdpProbe(VpnConfig cfg, int timeoutMs)
-    {
-        try
-        {
-            using var sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-            sock.Connect(cfg.ServerAddress, cfg.Port);
-            sock.ReceiveTimeout = timeoutMs;
-
-            var pub = RandomNumberGenerator.GetBytes(32);
-            string sni = string.IsNullOrWhiteSpace(cfg.Sni) ? "www.microsoft.com" : cfg.Sni!;
-            using var mlkem = Qeli.Shared.Crypto.MlKem.Generate(); // hybrid PQ — server requires it
-            byte[] hello = TlsHandshake.BuildClientHelloPq(pub, mlkem.EncapsulationKey, sni, padToMin: 1200);
-
-            // Frame it EXACTLY as the data plane does, or the probe answers a different
-            // question than the one being asked. Three things were wrong here:
-            //   * the hello went out as ONE ≥1200-byte datagram, while the real client
-            //     fragments it via UdpFrag — mobile/CGNAT paths drop IP fragments, so the
-            //     probe reported "unreachable" on exactly the networks where a real
-            //     connection succeeds;
-            //   * QUIC and obfs were an if/else, but they are LAYERS: with `quic + obfs` the
-            //     probe sent QUIC with no outer obfs seal and the server dropped it, so that
-            //     combination could never show green;
-            //   * the long header was typed 0x02 (Handshake) while carrying Initial fields.
-            // (Audit 2026-07-29, #16.)
-            var cid = Quic.GenerateConnectionId();
-            int pn = 0;
-            byte[]? obfsKey = cfg.WireMode.Equals("obfs", StringComparison.OrdinalIgnoreCase)
-                              && cfg.ObfsKey.Length > 0
-                ? ObfsStream.DeriveKey(cfg.ObfsKey)
-                : null;
-            var datagrams = new List<byte[]>();
-            foreach (var piece in UdpFrag.Fragment(UdpFrag.MsgClientHello, hello))
-            {
-                byte[] outBuf = cfg.QuicEnabled ? Quic.WrapLong(piece, cid, pn++, 0x00) : piece;
-                if (obfsKey != null) outBuf = ObfsStream.DatagramSeal(obfsKey, outBuf);
-                datagrams.Add(outBuf);
-            }
-
-            var buf = new byte[4096];
-            for (int attempt = 0; attempt < 2; attempt++) // one retry — UDP can drop a probe
-            {
-                foreach (var d in datagrams) sock.Send(d);
-                try
-                {
-                    if (sock.Receive(buf) > 0) return true;
-                }
-                catch (SocketException) { /* timeout / port-unreachable — retry then fail */ }
-            }
-            return false;
         }
         catch { return false; }
     }

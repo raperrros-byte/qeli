@@ -81,13 +81,17 @@ bind.port = 4443
 bind.transport = tcp
 tun.name = nstun
 tun.address = 10.77.0.1
-tun.netmask = 255.255.255.0
 tun.mtu = 1400
 pool.cidr = 10.77.0.0/24
 pool.exclude = 10.77.0.1
 obf.mode = fake-tls
 perf.connection.max_clients = 8
 perf.connection.handshake_timeout_secs = 10
+# This test intentionally reconnects many clients from the same namespace address.
+# Keep the production limiter enabled, but size it above the scenario count so the
+# gateway case is testing routing/iptables rather than exhausting the default 10/min.
+perf.connection.new_session_rate_max = 100
+perf.connection.new_session_rate_window_secs = 60
 EOF
 : > "$WORK/users.conf"
 "$BIN" add-client nsuser -p nspass1234 -c "$WORK/server.conf" >/dev/null 2>&1
@@ -174,10 +178,14 @@ $extra
 level = info
 EOF
   ip netns exec qcli "$BIN" client -c "$WORK/client-$dev.conf" > "$WORK/client-$dev.log" 2>&1 &
+  # Poll below the shortest intentional reconnect window. In the two-instance
+  # kill-switch case nsc1 comes up, arms its own chain, then correctly refuses
+  # the /1 routes already owned by nsc0; a one-second poll could miss that brief
+  # interface lifetime and report a false failure even though both chain checks pass.
   local w=0
-  while [ $w -lt 20 ]; do
+  while [ $w -lt 200 ]; do
     ip netns exec qcli ip link show "$dev" >/dev/null 2>&1 && return 0
-    w=$((w+1)); sleep 1
+    w=$((w+1)); sleep 0.1
   done
   return 1
 }

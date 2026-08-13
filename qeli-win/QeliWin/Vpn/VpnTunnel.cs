@@ -11,6 +11,15 @@ namespace QeliWin.Vpn;
 public sealed class VpnTunnel : VpnTunnelBase
 {
     private NetworkConfigurator? _net;
+    private bool _useWinDivert;
+
+    // Normal profiles keep the zero-copy Rust-owned Wintun path. Per-app profiles use
+    // WinDivert as an IPacketTunDevice, so the shared ABI 1.10 packet pumps connect it to
+    // the same Rust transport core without replacing or duplicating that core.
+    protected override bool NativeWintunOwnership => !_useWinDivert;
+
+    protected override void PrepareTransport(VpnConfig config) =>
+        _useWinDivert = config.UsesAppFilter;
 
     /// <summary>Surface network steps that failed during SetupTun so the shared base can
     /// qualify the Connected status instead of showing an unconditional green. (C-17)</summary>
@@ -39,6 +48,9 @@ public sealed class VpnTunnel : VpnTunnelBase
     /// warm is already in flight (a retried attempt reuses it).</summary>
     protected override void PrewarmTun(VpnConfig config)
     {
+        // WinDivert needs the authenticated client address and is cheap to open. It is
+        // created in SetupTun; only Wintun benefits from prewarming.
+        if (_useWinDivert) return;
         if (_prewarm != null) return;
         var id = AdapterIdentity(config);
         _prewarmId = id;
@@ -53,10 +65,60 @@ public sealed class VpnTunnel : VpnTunnelBase
     {
         // persist-tun: if the adapter + routes survived the previous attempt and the
         // server re-assigned the same client IP, reuse them (no adapter flicker / route gap).
-        if (ReusePersistedTun(config, session)) return;
+        if (ReusePersistedTun(config, session))
+        {
+            if (_tun is WinDivertAdapter retained)
+            {
+                retained.Reconfigure(
+                    EffectiveDns(config, session),
+                    config.RouteLocalNetworks,
+                    config.IncludeRoutes.Concat(LoadRouteFile(config)),
+                    config.ExcludeRoutes,
+                    PushedRouteCidrs(session.RoutesJson),
+                    serverIp,
+                    config.Port,
+                    config.Protocol,
+                    EffectiveMtu(config.Mtu, session.PushedMtu));
+                retained.SetTunnelUp(true);
+            }
+            return;
+        }
+
+        if (_useWinDivert)
+        {
+            _net = null;
+            var adapter = new WinDivertAdapter(
+                IPAddress.Parse(session.ClientIp),
+                config.Apps,
+                includeMode: config.AppsMode.Equals("include", StringComparison.OrdinalIgnoreCase),
+                dnsServers: EffectiveDns(config, session),
+                allowIpv6Leak: config.AllowIpv6Leak,
+                routeLocal: config.RouteLocalNetworks,
+                includeRoutes: config.IncludeRoutes.Concat(LoadRouteFile(config)),
+                excludeRoutes: config.ExcludeRoutes,
+                pushedRoutes: PushedRouteCidrs(session.RoutesJson),
+                carrierIp: serverIp,
+                carrierPort: config.Port,
+                carrierProtocol: config.Protocol,
+                tunnelMtu: EffectiveMtu(config.Mtu, session.PushedMtu),
+                log: Log);
+            adapter.Open();
+            adapter.SetTunnelUp(true);
+            _tun = adapter;
+            Log($"Per-app split tunnel ACTIVE: mode={config.AppsMode}, apps={config.Apps.Count}; "
+                + "WinDivert packet path is attached to the common Rust transport core");
+            return;
+        }
+
         _net = new NetworkConfigurator(Log);
         uint physicalIf = _net.PhysicalIfIndexFor(serverIp);
         var gateway = _net.FindGatewayFor(serverIp);
+        // Resolve every bypass before installing the /1 capture routes. IPv4 and IPv6
+        // commonly leave through different gateways; reusing the carrier's IPv4 path made
+        // an IPv6 exclude syntactically accepted but impossible to install.
+        var bypassPaths = config.ExcludeRoutes
+            .Select(route => (route, path: _net.PhysicalPathForRoute(route)))
+            .ToArray();
 
         uint drv = WintunAdapter.RunningDriverVersion();
         // Coexistence note: if another app has already loaded the shared Wintun kernel
@@ -125,11 +187,12 @@ public sealed class VpnTunnel : VpnTunnelBase
             if (!config.AllowIpv6Leak)
                 _net.CaptureIPv6(alias);
         }
-        else
+        else if (!session.PlanIncludesClientRoutes)
         {
             foreach (var r in config.IncludeRoutes) _net.AddRoute(r, session.ClientIp, tunIndex);
-            foreach (var r in LoadRouteFile(config)) _net.AddRoute(r, session.ClientIp, tunIndex);  // OpenVPN route-file
         }
+        if (!config.IsFullTunnel)
+            foreach (var r in LoadRouteFile(config)) _net.AddRoute(r, session.ClientIp, tunIndex);  // OpenVPN route-file
 
         // Subnets the server advertised (`route = …` on the profile / per-user) are a
         // specific, explicit admin decision — always honoured, like OpenVPN's
@@ -139,7 +202,7 @@ public sealed class VpnTunnel : VpnTunnelBase
 
         // RouteLocalNetworks gates only the BLANKET RFC1918 pull, which stays off by
         // default because it would hijack the machine's own LAN (printers, NAS, router).
-        if (config.RouteLocalNetworks)
+        if (config.RouteLocalNetworks && !session.PlanIncludesClientRoutes)
         {
             foreach (var r in new[] { "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16" })
                 _net.AddRoute(r, session.ClientIp, tunIndex);
@@ -149,9 +212,10 @@ public sealed class VpnTunnel : VpnTunnelBase
         // Exclude: carve these destinations out of the tunnel. Route them via the physical
         // gateway so exclusion works even in full-tunnel (a plain delete is a no-op there);
         // fall back to a delete only when the gateway is unknown (split-tunnel).
-        foreach (var r in config.ExcludeRoutes)
+        foreach (var (r, path) in bypassPaths)
         {
-            if (gateway != null && physicalIf != 0) _net.PinBypassRoute(r, gateway, physicalIf);
+            if (path.gateway != null && path.ifIndex != 0)
+                _net.PinBypassRoute(r, path.gateway, path.ifIndex);
             else _net.DeleteRoute(r);
         }
 
@@ -177,11 +241,13 @@ public sealed class VpnTunnel : VpnTunnelBase
     {
         try
         {
-            var psi = new System.Diagnostics.ProcessStartInfo("netsh",
+            // Absolute path, not a bare name — see SystemPaths. (Audit 2026-08-04, H-05.)
+            var psi = new System.Diagnostics.ProcessStartInfo(SystemPaths.Netsh,
                 $"interface ipv4 set interface \"{alias}\" forwarding=enabled")
             {
                 UseShellExecute = false, RedirectStandardOutput = true,
                 RedirectStandardError = true, CreateNoWindow = true,
+                WorkingDirectory = SystemPaths.SystemDirectory,
             };
             using var p = System.Diagnostics.Process.Start(psi);
             p?.WaitForExit(3000);
@@ -223,6 +289,31 @@ public sealed class VpnTunnel : VpnTunnelBase
         catch (Exception e) { Log($"routes parse error: {e.Message}"); }
     }
 
+    private static IReadOnlyList<string> PushedRouteCidrs(string routesJson)
+    {
+        var routes = new List<string>();
+        if (string.IsNullOrWhiteSpace(routesJson) || routesJson == "[]") return routes;
+        try
+        {
+            if (JsonNode.Parse(routesJson) is JsonArray arr)
+                foreach (var node in arr)
+                {
+                    string cidr = (node?["cidr"] as JsonValue)?.GetValue<string>() ?? "";
+                    if (cidr.Length > 0) routes.Add(cidr);
+                }
+        }
+        catch { }
+        return routes;
+    }
+
+    protected override bool KeepTunDuringReconnect(VpnConfig config) =>
+        config.UsesAppFilter || base.KeepTunDuringReconnect(config);
+
+    protected override void OnTransportInterrupted(VpnConfig config)
+    {
+        if (_tun is WinDivertAdapter adapter) adapter.SetTunnelUp(false);
+    }
+
     // Deterministic per-PROFILE adapter identity: a stable name + GUID keyed on
     // host:port PLUS the profile's stable unique Id. This way
     //   * two profiles to the SAME server (two accounts, or two tunnels to the same
@@ -251,6 +342,16 @@ public sealed class VpnTunnel : VpnTunnelBase
         return ($"Qeli-{Convert.ToHexString(h, 0, 3)}", new Guid(h));
     }
 
+    protected override void BeforeTunDispose()
+    {
+        // DNS belongs to the Wintun interface, so reset it before its last handle closes.
+        // Retain the configurator on failure; CleanupPlatform below then retries and makes
+        // the base lifecycle report Error instead of a false clean disconnect.
+        var network = _net;
+        network?.Dispose();
+        if (ReferenceEquals(_net, network)) _net = null;
+    }
+
     protected override void CleanupPlatform()
     {
         // A prewarmed adapter that SetupTun never consumed (handshake failed before it ran)
@@ -261,8 +362,9 @@ public sealed class VpnTunnel : VpnTunnelBase
             try { _prewarm.GetAwaiter().GetResult()?.Dispose(); } catch { }
             _prewarm = null;
         }
-        try { _net?.Dispose(); } catch { }
-        _net = null;
+        var network = _net;
+        network?.Dispose();
+        if (ReferenceEquals(_net, network)) _net = null;
     }
 
     // Firewall kill-switch (full-tunnel only). Allow the Wintun adapter by its
@@ -281,6 +383,13 @@ public sealed class VpnTunnel : VpnTunnelBase
     {
         EnsureTunAdapterExists(config);
         KillSwitch.Engage(config.ServerAddress, AdapterIdentity(config).name, Log);
+    }
+
+    protected override void CarrierAddressesChanging(
+        VpnConfig config, IReadOnlyList<string> previous, IReadOnlyList<string> refreshed)
+    {
+        if (config.KillSwitch && config.IsFullTunnel && !config.UsesAppFilter)
+            KillSwitch.UpdateServerAddresses(previous, refreshed, Log);
     }
 
     /// <summary>Bring the Wintun adapter up NOW, synchronously, so a firewall rule can name

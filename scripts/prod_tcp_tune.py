@@ -10,6 +10,7 @@ revertible. Prints before/after."""
 import os, sys, io, re, time
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import paramiko
+import ssh_hostkey
 
 CONF = "/etc/qeli/server-maxobf.conf"
 BAK = "/etc/qeli/server-maxobf.conf.pretune"
@@ -23,15 +24,12 @@ net.core.wmem_max=16777216
 net.ipv4.tcp_rmem=4096 131072 16777216
 net.ipv4.tcp_wmem=4096 65536 16777216
 net.ipv4.tcp_mtu_probing=1
-# UDP profiles. Everything above only reaches TCP, which autotunes its buffers between
-# the tcp_rmem/tcp_wmem bounds. UDP has NO autotuning: the socket gets whatever
-# net.core.rmem_default says, and qeli never calls setsockopt(SO_RCVBUF) — so raising
-# rmem_max alone does nothing for it. The 208 KB default is only tens of milliseconds of
-# traffic at tunnel speeds, and each dropped datagram costs a TCP segment INSIDE the
-# tunnel (the inner connection then halves its window). Measured live: 978 drops in one
-# speedtest; raising this took that profile's uplink from 30 to 55 Mbit.
-# NOTE: qeli must be restarted after changing these — its UDP sockets take the buffer
-# size at creation time.
+# UDP has NO receive-buffer autotuning. Current qeli explicitly requests 4 MiB per UDP
+# listener, so rmem_max must permit it; the defaults below also protect older qeli builds
+# and other UDP sockets. At 208 KB one scheduling stall drops datagrams, and each lost
+# datagram costs a TCP segment INSIDE the tunnel (the inner connection then halves its
+# window). qeli logs the effective SO_RCVBUF and warns when the kernel clamps it.
+# NOTE: qeli must be restarted after changing these — SO_RCVBUF is set at socket creation.
 net.core.rmem_default=4194304
 net.core.wmem_default=4194304
 net.core.netdev_max_backlog=4000
@@ -39,7 +37,7 @@ net.core.netdev_max_backlog=4000
 
 
 def conn():
-    c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    c = paramiko.SSHClient(); ssh_hostkey.harden(c)
     c.connect("YOUR_PROD_HOST", username="root", password=os.environ["QELI_PROD_PASS"],
               timeout=25, look_for_keys=False, allow_agent=False)
     return c
@@ -75,8 +73,8 @@ print("[cc]", r("sysctl -n net.ipv4.tcp_congestion_control"),
       "| [rmem_max]", r("sysctl -n net.core.rmem_max"),
       "| [rmem_default]", r("sysctl -n net.core.rmem_default"),
       "| [mtu_probing]", r("sysctl -n net.ipv4.tcp_mtu_probing"))
-# rmem_default is what the UDP sockets actually get (no autotuning); `rb=` in `ss -ulnm`
-# is the proof it landed — rmem_max alone never shows up there.
+# qeli explicitly requests 4 MiB and may auto-grow to 8/16 MiB; `rmem_max` is the ceiling
+# and `rb=` in `ss -ulnm` is the proof of what the kernel actually granted.
 print("[udp socket rb]", r("ss -ulnm 2>/dev/null | grep -A1 -E ':(8448|8449|8450)' | grep -o 'rb[0-9]*' | sort -u | tr '\\n' ' '"))
 print("[reality-tls tun.mtu]", r(f"awk '/\\[profile:reality-tls\\]/{{f=1}} /^\\[profile:/&&!/reality-tls/{{f=0}} f&&/tun.mtu/' {CONF}"))
 print("[reality-tls padding]", r(f"awk '/\\[profile:reality-tls\\]/{{f=1}} /^\\[profile:/&&!/reality-tls/{{f=0}} f&&/obf.padding.enabled/' {CONF}"))

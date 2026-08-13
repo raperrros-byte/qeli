@@ -1,12 +1,12 @@
 # qeli load testing
 
-This document is versioned: **the fresh measurements are in the "Version 0.7.x" sections**
-below (the latest is **0.7.7**, 2026-07-06, a freshly-rebooted clean host); the detailed per-mode tables at the
-bottom are the **0.6.0 reference base** (2026-06-11; 2-VM lab, release binary
-LTO=fat/strip/panic=abort). The canonical
-[release/benchmark_results.json](../../release/benchmark_results.json) always holds the **latest**
-run (currently 0.7.7); dated per-version copies sit alongside (`benchmark_results_<date>_v<ver>.json`,
-0.6.0 in `benchmark_results_2026-06-11_v0.6.0.json`). The orchestrator —
+This document keeps the historical narrative measurements in the "Version 0.7.x" sections
+below (through the 0.7.11 candidate); the detailed per-mode tables at the bottom are the
+**0.6.0 reference base** (2026-06-11; 2-VM lab, release binary LTO=fat/strip/panic=abort).
+The canonical [release/benchmark_results.json](../../release/benchmark_results.json) always
+holds the **latest structured run** — currently **qeli 0.7.13**, 2026-07-28. Dated
+per-version copies sit alongside (`benchmark_results_<date>_v<ver>.json`, 0.6.0 in
+`benchmark_results_2026-06-11_v0.6.0.json`). The orchestrator —
 [scripts/benchmark.py](../../scripts/benchmark.py).
 
 > Release **0.6.0** is a refactoring (the shared C# layer, .NET 10, cleanup); the
@@ -199,11 +199,11 @@ A live run of every shipped default config ([scripts/config_functest.py](../../s
 |---|---|
 | **server.conf** (fake-tls, full stack: NAT/DNS/padding/frag/heartbeat/H-1) | ✅ **PASS** — Auth OK, ping gw, **565 Mbps** |
 | **server-maxobf.conf** (reality-tls: real_tls + hand-rolled, require_proof, H-1) | ✅ **PASS** — Auth OK, ping gw, **527 Mbps** |
-| parse server.conf / server-maxobf.conf / client.conf / client-maxobf.conf / client-reality-tls.conf | ✅ OK |
+| parse server.conf / server-maxobf.conf / client.conf / client-maxobf.conf / client-reality.conf | ✅ OK |
 
 Fixed a template bug in `client-maxobf.conf` (it was inconsistent with server-maxobf.conf:
 user `phone`≠`client1`, mode `fake-tls`≠real_tls) → `user=client1`, `mode=reality-tls`,
-`+reality_sid`; verified e2e. `client-reality-tls.conf` / `client-YOUR_DEPLOY_HOST.conf` point
+`+reality_sid`; verified e2e. `client-reality.conf` / `client-YOUR_DEPLOY_HOST.conf` point
 at an external server (parse only).
 
 ### TCP, Mbps (↑up / ↓down)
@@ -836,10 +836,13 @@ paid by `obfs` (moderately) and `reality-tls` (noticeably on download).
 ```bash
 # from a local machine (paramiko); flat-INI configs, write to /etc/qeli/bench-*.conf.
 # H-1 (0.7.1): benchmark.py pins the server key in every mode.
-python scripts/reboot_vms.py         # a clean lab (reboot both VMs) — before pristine numbers
-# host check before a benchmark: on the VM `vmstat 1 4` — the `st` column should be ~0 (else steal → A/B)
-python scripts/benchmark.py          # baseline + 10 modes × {ping, iperf, CPU/RSS} ≈ 8 min
-python scripts/reality_tls_repeat.py # reality-tls ×5 → median/σ (release/reality_tls_5x_*.json)
+python scripts/reboot_vms.py         # clean lab: kills emulator/qeli/netem → reboots both VMs → cleans AGAIN (autostart)
+python scripts/lab_reset.py          # same without a reboot (emulator, qeli units, iperf3, orphan TUNs, tc/netem)
+python scripts/stability_gate.py     # MANDATORY before a sweep: 5 raw no-tunnel runs in BOTH directions;
+                                     # spread >8% either way → the host is noisy and the numbers are fiction (exit 1)
+python scripts/benchmark.py          # baseline + 12 modes × {ping, iperf, CPU/RSS} ≈ 10 min
+                                     # → release/benchmark_<version>_<date>.json (+ a benchmark_results.json copy)
+python scripts/reality_tls_repeat.py # reality-tls ×5 → median/σ (release/reality_tls_5x_<version>_<date>.json)
 python scripts/ab_071_072.py         # host-neutral A/B (0.7.1 from tag vs 0.7.2 interleaved) — when the host is under steal/contention
 python scripts/ab_074_079.py         # same for 0.7.4->0.7.9 (0.7.10 candidate); A/B template for any tag<->current pair
 python scripts/ab_079_0711.py        # 0.7.9->0.7.11 (dev batch, x25519-dalek 3 bump)

@@ -12,8 +12,9 @@ namespace QeliWin;
 /// <summary>
 /// Headless command-line modes for testing without the GUI:
 ///   QeliWin.exe selftest             — crypto/codec/parse round-trips (no network, no admin)
-///   QeliWin.exe handshake &lt;link|json|file&gt; — connect + full handshake only (no admin)
-///   QeliWin.exe connect   &lt;link|json|file&gt; [seconds] — full tunnel (needs admin)
+///   QeliWin.exe packetbench [--ci]   — managed PacketCodec release benchmark
+///   QeliWin.exe handshake &lt;link|ini|file&gt; — connect + full handshake only (no admin)
+///   QeliWin.exe connect   &lt;link|ini|file&gt; [seconds] — full tunnel (needs admin)
 /// </summary>
 public static class CliRunner
 {
@@ -22,6 +23,7 @@ public static class CliRunner
         return verb.ToLowerInvariant() switch
         {
             "selftest" => SelfTest(),
+            "packetbench" => PacketCodecBenchmark.Run("csharp-windows", rest),
             "handshake" => Handshake(rest),
             "connect" => Connect(rest),
             "genassets" => GenAssets(rest),
@@ -34,7 +36,7 @@ public static class CliRunner
 
     private static int Usage()
     {
-        Console.WriteLine("Usage: QeliWin.exe [selftest | handshake <link|json|file> | connect <link|json|file> [seconds]]");
+        Console.WriteLine("Usage: QeliWin.exe [selftest | packetbench [--ci] | handshake <link|ini|file> | connect <link|ini|file> [seconds]]");
         return 2;
     }
 
@@ -173,6 +175,20 @@ public static class CliRunner
             obfsBack.ObfsFronting == "none" && obfsBack.QuicEnabled &&
             realBack.RealityShortId == "abcdef01" && realBack.WireMode == "reality-tls");
 
+        var appsRt = new VpnConfig
+        {
+            ServerAddress = "host", Port = 443, Username = "user",
+            AppsMode = "include",
+            Apps = new List<string> { @"C:\Program Files\Browser\browser.exe", "com.example.mobile" },
+        };
+        var appsIniBack = VpnConfig.FromIni(appsRt.ToIni());
+        var appsLinkBack = VpnConfig.FromQeliUri(appsRt.ToQeliUri());
+        Check("per-app INI/qeli:// round-trip",
+            appsIniBack.AppsMode == "include" && appsIniBack.Apps.SequenceEqual(appsRt.Apps)
+            && appsLinkBack.AppsMode == "include" && appsLinkBack.Apps.SequenceEqual(appsRt.Apps));
+
+        WinDivertSelfTest.RunUnit(Check);
+
         // ClientHello builds and pads to the UDP minimum.
         var hello = TlsHandshake.BuildClientHello(a.PublicKeyBytes, "www.microsoft.com", padToMin: 1200);
         Check("ClientHello builds + UDP padding (>=1200B, type 0x16)", hello.Length >= 1200 && hello[0] == 0x16);
@@ -202,7 +218,7 @@ public static class CliRunner
 
     // ── live handshake / connect ──────────────────────────────────────────────────
     // Accepts a file path OR an inline config, in any format: flat-INI (current),
-    // a qeli:// link, or legacy JSON.
+    // an INI file/text or a qeli:// link. Retired formats are rejected by VpnConfig.Parse.
     private static VpnConfig LoadConfig(string arg) =>
         VpnConfig.Parse(File.Exists(arg) ? File.ReadAllText(arg) : arg);
 

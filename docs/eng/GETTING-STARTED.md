@@ -1,6 +1,6 @@
 # Qeli — installation & getting started (step by step)
 
-> **These docs describe 0.7.13** — the latest released version. `qeli --version` tells you
+> **These docs describe 0.7.14** — the latest released version. `qeli --version` tells you
 > what you actually have.
 
 A complete from-scratch guide: from standing up the server to creating users with
@@ -119,10 +119,14 @@ A single `qeli` binary plays both roles: `qeli server` and `qeli client`.
 >   `iptables -t mangle -S OUTPUT | grep TCPMSS` — if it prints nothing, install
 >   `iptables-persistent` or reinstate the rule from your own unit. The symptom of a
 >   missing clamp is downloads that stall dead for mobile clients.
-> - **Enables the HTTPS web panel and binds it to `0.0.0.0:8080`**, generating a password
->   and printing it **once** at the end. That is the only time you see it — save it right
->   away. If you don't want the panel, disable it afterwards (`[web] enabled = false`) or
->   don't open 8080 in your cloud firewall.
+> - **Enables the HTTPS web panel on `127.0.0.1:8080` (loopback only)**, generating a
+>   password and printing it **once** at the end. That is the only time you see it — save it
+>   right away. Reach it over an SSH forward:
+>   `ssh -L 8080:127.0.0.1:8080 root@<server>`, then open `https://127.0.0.1:8080`.
+>   Publishing it is a deliberate act and needs BOTH `QELI_PANEL_PUBLIC=1` and
+>   `QELI_PANEL_ALLOWED_IPS=<ip[,ip…]>`; a public bind without a source allowlist is
+>   REFUSED by the installer. If you don't want the panel at all, disable it afterwards
+>   (`[web] enabled = false`).
 > - Writes `/etc/qeli/client-links/CONNECTION-STRINGS.txt` containing the **plaintext
 >   passwords of all five users** (directory `0700`, files `0600`).
 > - If you don't pass a public address, it discovers one by calling external services
@@ -139,14 +143,14 @@ home directory:
 
 ```bash
 cd /tmp
-curl -fLO https://github.com/litvinovtd/qeli/releases/download/v0.7.13/qeli_0.7.13_amd64.deb
-# or copy it from your workstation:  scp qeli_0.7.13_amd64.deb root@server:/tmp/
+curl -fLO https://github.com/litvinovtd/qeli/releases/download/v0.7.14/qeli_0.7.14_amd64.deb
+# or copy it from your workstation:  scp qeli_0.7.14_amd64.deb root@server:/tmp/
 ```
 
 > **Why `/tmp`.** `apt` downloads and unpacks as the unprivileged `_apt` user, which cannot
 > read `/root` or home directories. Installing from `/root` still works, but prints:
 > ```
-> N: Download is performed unsandboxed as root as file '/root/qeli_0.7.13_amd64.deb'
+> N: Download is performed unsandboxed as root as file '/root/qeli_0.7.14_amd64.deb'
 >    couldn't be accessed by user '_apt'. - pkgAcquire::Run (13: Permission denied)
 > ```
 > It is only a warning (apt falls back to running as root), but from `/tmp` it never appears.
@@ -154,14 +158,14 @@ curl -fLO https://github.com/litvinovtd/qeli/releases/download/v0.7.13/qeli_0.7.
 #### A.2. Install
 
 ```bash
-sudo apt install /tmp/qeli_0.7.13_amd64.deb     # installs and pulls dependencies
+sudo apt install /tmp/qeli_0.7.14_amd64.deb     # installs and pulls dependencies
 ```
 
 Give a **full path** (or `./name.deb`) — without a slash apt looks for a repository package
 of that name instead. If apt is unavailable:
 
 ```bash
-sudo dpkg -i /tmp/qeli_0.7.13_amd64.deb
+sudo dpkg -i /tmp/qeli_0.7.14_amd64.deb
 sudo apt-get -f install -y          # pull the dependencies (iproute2, iptables, libcap2-bin)
 ```
 
@@ -182,7 +186,7 @@ What the package does:
   `qeli set-service-user`. Answer non-interactively (automation / preseed) with:
   ```bash
   echo "qeli qeli/run-as select root" | sudo debconf-set-selections
-  sudo apt install /tmp/qeli_0.7.13_amd64.deb
+  sudo apt install /tmp/qeli_0.7.14_amd64.deb
   ```
   Changeable at any time afterwards — `sudo qeli set-service-user root|qeli` (§10.4),
   where the trade-offs of `root` are spelled out.
@@ -353,14 +357,11 @@ bind.transport = tcp
 # the tunnel's virtual network
 # the server's address inside the tunnel (gateway)
 tun.address  = 10.9.0.1
-tun.netmask  = 255.255.255.0
 # pushed to clients; for production TCP see §12 and CONFIG.md
 tun.mtu      = 1400
 
-# pool of addresses handed out to clients
+# VPN subnet and pool; its prefix also configures the server and clients
 pool.cidr    = 10.9.0.0/24
-# never hand out the gateway
-pool.exclude = 10.9.0.1
 
 # on-the-wire masking mode (see §11)
 obf.mode = fake-tls
@@ -708,7 +709,7 @@ gateway     = false
 route_local = false
 # block leaks while the tunnel is down (full-tunnel)
 kill_switch = false
-# tunnel = manage /etc/resolv.conf; off = don't touch it
+# tunnel = per-link DNS through systemd-resolved; off = platform-managed DNS
 dns         = tunnel
 ```
 
@@ -733,21 +734,43 @@ sudo qeli set-web-password                    # random password, printed once
 # or your own:  sudo qeli set-web-password --password 'PANELPASS'
 ```
 
-Fill in the `[web]` section for access over a public IP and restart:
+Fill in the `[web]` section and restart. **Start with loopback** — this is the default and
+needs nothing opened in any firewall:
 
 ```ini
 [web]
 enabled = true
-# or 127.0.0.1 for SSH-tunnel-only access
-bind = 0.0.0.0
+bind = 127.0.0.1
 port = 8080
 # native HTTPS (self-signed auto; the browser warns once)
 tls  = true
-# (recommended) put your own IP on the allowlist
-# allowed_ips = 203.0.113.4
 # default host for share links
 # public_host = vpn.example.com
 ```
+
+Reach it from your own machine over an SSH forward:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 root@<server>   # then open https://127.0.0.1:8080
+```
+
+Only if you genuinely need the panel on a public address, publish it **with an allowlist —
+not without one**. `allowed_ips` is the only thing besides the password standing between the
+open internet and an interface that manages users, rewrites the config, rotates identity
+keys and restores backups:
+
+```ini
+[web]
+enabled = true
+bind = 0.0.0.0
+port = 8080
+tls  = true
+allowed_ips = 203.0.113.4          # REQUIRED here — your own address(es)
+# public_host = vpn.example.com
+```
+
+`install-qeli-server.sh` refuses to create the public variant without an allowlist; do not
+hand-write what the installer declines to produce.
 
 ```bash
 sudo systemctl restart qeli
@@ -1025,7 +1048,7 @@ A detailed comparison, REALITY setup (short_ids, handrolled), multipath bonding 
   local address, every outbound packet dies in the tunnel, and the server drops off the
   network entirely — SSH and ping included — leaving the provider's console as the only way
   back. Fix by moving the tunnel to a free range (`tun.address = 10.9.0.1`, `pool.cidr =
-  10.9.0.0/24`, `pool.exclude = 10.9.0.1`). Inspect your own networks with `ip route` and
+  10.9.0.0/24`). Inspect your own networks with `ip route` and
   `ip -4 addr`, and verify a config **before** starting with `qeli check-config --config
   /etc/qeli/server.conf` — it runs the same check against the current host.
 - **Installed the .deb and "nothing works": the profile won't bind, users and panel

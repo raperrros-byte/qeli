@@ -4,9 +4,11 @@ use crate::crypto::{
 };
 use crate::protocol::obfs::SplitStream;
 use crate::protocol::{
-    read_record, read_tls_record, FakeTlsHandshake, Framing, Obfuscator, PacketCodec,
+    read_record, read_record_into, read_tls_record, FakeTlsHandshake, Framing, Obfuscator,
+    PacketCodec,
 };
-use crate::server::{lock_or_recover, ProfileRuntime, ServerState};
+use crate::server::{lock_or_recover, ProfileRuntime, ServerState, ServerTunPacket, TunIngress};
+use crate::transport_core::buffer_pool::{BufferPool, PooledBuffer};
 use rand::prelude::*;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -17,6 +19,40 @@ use tokio::sync::mpsc;
 
 /// Default fallback heartbeat interval when none is configured.
 pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
+
+/// Per-session encrypted-record budget for server→client traffic. The pool is shared by
+/// every bonded stream, so multipath cannot multiply queued memory by its stream count.
+const SERVER_WIRE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const SERVER_WIRE_RECORD_OVERHEAD: usize = crate::protocol::packet::TLS_RECORD_HEADER
+    + crate::protocol::packet::NONCE_SIZE
+    + crate::protocol::packet::COUNTER_SIZE
+    + crate::protocol::packet::TAG_SIZE
+    + 2;
+
+/// Size a server-owned outbound record for what this profile can actually emit. A 1400-byte
+/// TUN must not reserve the protocol's ~16 KiB absolute receive ceiling for every queued packet:
+/// doing that reduced a 4 MiB pool to 251 records (about 5 ms at lab throughput) and caused
+/// avoidable inner-TCP retransmits. Cover and heartbeat maxima participate because UDP uses the
+/// same pool for them. The absolute wire ceiling remains unchanged.
+pub(crate) fn server_wire_buffer_capacity(pcfg: &crate::config::server::ProfileConfig) -> usize {
+    let mtu = usize::try_from(pcfg.tun.mtu)
+        .unwrap_or(crate::protocol::packet::MAX_TUNNEL_MTU)
+        .clamp(1, crate::protocol::packet::MAX_TUNNEL_MTU);
+    let heartbeat = usize::from(pcfg.obfuscation.heartbeat.data_size_bytes).saturating_add(32);
+    let cover = usize::from(pcfg.obfuscation.traffic_shaping.max_size);
+    let inner_budget = mtu
+        .max(heartbeat)
+        .max(cover)
+        .min(crate::protocol::packet::MAX_TUNNEL_MTU);
+    SERVER_WIRE_RECORD_OVERHEAD + inner_budget
+}
+
+pub(crate) fn server_wire_pool(
+    pcfg: &crate::config::server::ProfileConfig,
+) -> std::io::Result<BufferPool> {
+    let buffer_capacity = server_wire_buffer_capacity(pcfg);
+    BufferPool::new(SERVER_WIRE_BUFFER_BYTES / buffer_capacity, buffer_capacity)
+}
 
 // Stream-bonding wire constants live in `crate::protocol` (shared with the
 // client); re-export here so existing `server::handler::JOIN_*` paths still work.
@@ -31,6 +67,32 @@ pub use crate::protocol::{DEVICE_ID_LEN, JOIN_MAGIC, JOIN_TOKEN_LEN};
 /// (tokens can go negative) so bursts still average to `limit_mbps` over time.
 pub struct RateBucket {
     state: std::sync::Mutex<RateState>,
+}
+
+/// Independent aggregate upload/download budgets for one logical session.
+///
+/// A single shared bucket would cap the sum of both directions. A per-user
+/// `limit_mbps` instead applies to each direction concurrently, while every
+/// bonded stream in that direction still shares one aggregate allowance.
+#[derive(Clone)]
+pub struct DirectionalRateBuckets {
+    pub upload: Arc<RateBucket>,
+    pub download: Arc<RateBucket>,
+}
+
+impl Default for DirectionalRateBuckets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DirectionalRateBuckets {
+    pub fn new() -> Self {
+        Self {
+            upload: Arc::new(RateBucket::new()),
+            download: Arc::new(RateBucket::new()),
+        }
+    }
 }
 
 struct RateState {
@@ -79,8 +141,12 @@ impl RateBucket {
     }
 }
 
-/// (codec, writer-channel) of the stream chosen for an outgoing packet.
-pub type StreamPick = (Arc<std::sync::Mutex<PacketCodec>>, mpsc::Sender<Vec<u8>>);
+/// (codec, writer-channel, shared record pool) of the stream chosen for an outgoing packet.
+pub(crate) type StreamPick = (
+    Arc<std::sync::Mutex<PacketCodec>>,
+    mpsc::Sender<PooledBuffer>,
+    BufferPool,
+);
 
 /// One bonded connection within a [`SessionShared`]. Each stream has its own
 /// independent crypto (its connection did its own key exchange) and its own write
@@ -88,7 +154,7 @@ pub type StreamPick = (Arc<std::sync::Mutex<PacketCodec>>, mpsc::Sender<Vec<u8>>
 pub struct StreamHandle {
     pub stream_id: u64,
     pub codec: Arc<std::sync::Mutex<PacketCodec>>,
-    pub writer: mpsc::Sender<Vec<u8>>,
+    pub(crate) writer: mpsc::Sender<PooledBuffer>,
     pub kick_tx: mpsc::Sender<()>,
     /// Stops the READER half. `kick_tx` only reaches the writer, so a kicked or
     /// superseded client kept uploading into the TUN until it chose to close the
@@ -179,6 +245,9 @@ pub struct SessionShared {
     pub peer: SocketAddr,
     pub token: [u8; JOIN_TOKEN_LEN],
     pub max_streams: u32,
+    /// Fixed-budget encrypted-record storage shared by every bonded writer in this session.
+    /// A checked-out allocation returns here only after the socket writer drops it.
+    pub(crate) wire_pool: BufferPool,
     /// Active bonded streams; outgoing traffic is flow-pinned across them
     /// (see [`SessionShared::pick_stream`]).
     pub streams: std::sync::Mutex<Vec<StreamHandle>>,
@@ -190,9 +259,10 @@ pub struct SessionShared {
     /// loss is observable instead of silent.
     pub dropped: Arc<AtomicU64>,
     pub bandwidth_limit_mbps: Arc<AtomicU32>,
-    /// Aggregate (all-streams) bandwidth token bucket — enforces
-    /// `bandwidth_limit_mbps` across the whole session, not per stream.
-    pub rate: RateBucket,
+    /// Independent aggregate (all-streams) upload/download token buckets. Each
+    /// direction enforces `bandwidth_limit_mbps` across the whole session, not
+    /// per stream, without consuming the other direction's allowance.
+    pub rates: DirectionalRateBuckets,
     /// Compiled `allowed_networks` (user's own, else the group's) — the destination
     /// ACL applied to every inner packet before it reaches the TUN. Empty =
     /// unrestricted, which is the documented default and costs nothing per packet.
@@ -278,17 +348,21 @@ impl SessionShared {
         lock_or_recover(&self.client_info, "reported_client").clone()
     }
 
-    /// Pick the (codec, writer) of the bonded stream this packet's flow is pinned
+    /// Pick the (codec, writer, record pool) of the bonded stream this packet's flow is pinned
     /// to (`flow_hash`). Pinning a flow to one stream keeps that inner connection's
     /// packets ordered (round-robin striping reordered them); returns `None` only
     /// if every stream has detached (session is dying).
-    pub fn pick_stream(&self, flow_hash: u64) -> Option<StreamPick> {
+    pub(crate) fn pick_stream(&self, flow_hash: u64) -> Option<StreamPick> {
         let streams = lock_or_recover(&self.streams, "pick_stream");
         if streams.is_empty() {
             return None;
         }
         let i = (flow_hash % streams.len() as u64) as usize;
-        Some((streams[i].codec.clone(), streams[i].writer.clone()))
+        Some((
+            streams[i].codec.clone(),
+            streams[i].writer.clone(),
+            self.wire_pool.clone(),
+        ))
     }
 
     /// All streams' kick channels (used by control-plane kick / supersede).
@@ -354,12 +428,12 @@ enum FirstMessage {
     },
 }
 
-pub async fn handle_client<S>(
+pub(crate) async fn handle_client<S>(
     server_state: Arc<ServerState>,
     profile: Arc<ProfileRuntime>,
     mut stream: S,
     addr: SocketAddr,
-    tun_tx: mpsc::Sender<Vec<u8>>,
+    tun_tx: TunIngress,
     // Admission permit taken by the accept loop before spawning this task. Dropped as
     // soon as the client is authenticated, so the gate bounds concurrent HANDSHAKES and
     // an established session never occupies a slot. `None` for callers with no gate
@@ -541,12 +615,23 @@ where
                     }
                 }
             }
-            // Return evicted devices' addresses to the pool now the write lock is gone
-            // (lock order: sessions → pool), else those slots leak until a restart.
+            // Notify (opt-in): forcibly evicted (static-IP steal / session-cap).
+            // Already out of by_ip, so the TCP teardown guard won't double-fire.
+            //
+            // The addresses themselves are NOT released here any more — see the single
+            // pool-lock block below. This loop used to release each one under its own
+            // `profile.pool.lock()`, i.e. released → dropped the lock → hit at least two
+            // more await points (`sessions.read()`, then re-taking the pool lock) before
+            // allocating our own. `IpPool::release` pushes onto `freed` and `allocate` pops
+            // `freed` FIRST, so a concurrent handler in that window was HANDED the address
+            // we had just evicted someone from. Our `allocate_fixed` then took it back — but
+            // only in the pool's bookkeeping (`user_allocations.retain`), because killing the
+            // session is the caller's job and this caller only knew about the holders it
+            // had seen under the earlier write lock. Result: two live sessions on one tunnel
+            // IP. The orphan keeps injecting packets with that source while all return
+            // traffic — including replies to its own connections — is routed to the other
+            // client. (Audit 2026-08-04.)
             for s in &cap_evicted {
-                profile.pool.lock().await.release(&s.device_key);
-                // Notify (opt-in): forcibly evicted (static-IP steal / session-cap).
-                // Already out of by_ip, so the TCP teardown guard won't double-fire.
                 crate::server::notify::fire_disconnect(&s.username, &profile.name, s.peer);
             }
 
@@ -564,7 +649,14 @@ where
 
             let session_id = rand::random::<u64>();
             let client_ip = {
+                // ONE pool lock for "give back what we evicted, then take ours". Splitting
+                // the two — as this used to — leaves the freed address on the pool's `freed`
+                // stack across an await, and `allocate` pops that stack first. See the
+                // eviction loop above. (Audit 2026-08-04.)
                 let mut pool = profile.pool.lock().await;
+                for s in &cap_evicted {
+                    pool.release(&s.device_key);
+                }
                 let ip = match fixed_ip {
                     // Fixed address for this user; if it's out of the pool / excluded,
                     // allocate_fixed returns None and we fall back to a dynamic address.
@@ -614,6 +706,19 @@ where
                 );
             }
 
+            let wire_pool = match server_wire_pool(pcfg) {
+                Ok(pool) => pool,
+                Err(error) => {
+                    profile.pool.lock().await.release(&dkey);
+                    return Err(anyhow::anyhow!(
+                        "cannot allocate the bounded wire-record pool for user '{}' on profile '{}': {}",
+                        username,
+                        profile.name,
+                        error
+                    ));
+                }
+            };
+
             let session = Arc::new(SessionShared {
                 session_id,
                 username: username.clone(),
@@ -622,13 +727,14 @@ where
                 peer: addr,
                 token,
                 max_streams,
+                wire_pool,
                 streams: std::sync::Mutex::new(Vec::new()),
                 connected_at: Instant::now(),
                 bytes_sent: Arc::new(AtomicU64::new(0)),
                 bytes_recv: Arc::new(AtomicU64::new(0)),
                 dropped: Arc::new(AtomicU64::new(0)),
                 bandwidth_limit_mbps: Arc::new(AtomicU32::new(initial_bandwidth_mbps)),
-                rate: RateBucket::new(),
+                rates: DirectionalRateBuckets::new(),
                 dst_acl,
                 src_guard,
                 // 0 = the client has not reported a path MTU. Every pre-#13 client stays
@@ -946,7 +1052,7 @@ async fn run_stream<R, W>(
     profile: Arc<ProfileRuntime>,
     session: Arc<SessionShared>,
     addr: SocketAddr,
-    tun_tx: mpsc::Sender<Vec<u8>>,
+    tun_tx: TunIngress,
     mut read_half: R,
     mut write_half: W,
     server_tx: Arc<std::sync::Mutex<PacketCodec>>,
@@ -966,7 +1072,7 @@ async fn run_stream<R, W>(
     });
     let idle_timeout = Duration::from_secs(pcfg.performance.connection.idle_timeout_secs);
 
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4096);
+    let (tx, mut rx) = mpsc::channel::<PooledBuffer>(session.wire_pool.buffer_count());
     let (kick_tx, mut kick_rx) = mpsc::channel::<()>(1);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let stream_id = rand::random::<u64>();
@@ -1005,19 +1111,32 @@ async fn run_stream<R, W>(
         let mut shutdown_rx = shutdown_rx;
         tokio::spawn(async move {
             loop {
-                // Race the read against the shutdown signal: a kicked client that
-                // simply stops sending would otherwise sit here forever.
+                // Acquire before reading so queue depth and allocation count are one fixed
+                // budget. Race both the pool wait and the socket read against shutdown: a
+                // kicked client must not remain parked on either resource.
+                let mut plaintext = tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => break,
+                    packet = tun_tx.pool.acquire() => match packet {
+                        Some(packet) => packet,
+                        None => break,
+                    },
+                };
                 let record = tokio::select! {
                     biased;
                     _ = shutdown_rx.changed() => break,
-                    r = read_record(&mut read_half, framing) => r,
+                    result = read_record_into(
+                        &mut read_half,
+                        framing,
+                        plaintext.as_vec_mut(),
+                    ) => result,
                 };
                 match record {
-                    Ok(record) => {
+                    Ok(()) => {
                         let now = base.elapsed().as_millis() as u64;
                         last_act.store(now, Ordering::Relaxed);
-                        match server_rx.decrypt_packet(&record) {
-                            Ok(plaintext) => {
+                        match server_rx.decrypt_packet_in_place(plaintext.as_vec_mut()) {
+                            Ok(()) => {
                                 // rx-liveness advances ONLY on a successful decrypt:
                                 // undecryptable traffic must not keep a dead session
                                 // (and its pool IP) alive past the rx-dead reaper.
@@ -1051,8 +1170,11 @@ async fn run_stream<R, W>(
                                     // reasons about this session's rights.
                                     if !session_r.src_guard.allows_packet(&plaintext) {
                                         log::debug!(
-                                            "dropped packet from '{}' — forged source address (not {} nor a routed subnet)",
+                                            "dropped packet from '{}' — disallowed inner source {} (expected {} or a routed subnet)",
                                             session_r.username,
+                                            crate::server::acl::packet_source(&plaintext)
+                                                .map(|source| source.to_string())
+                                                .unwrap_or_else(|| "<malformed>".to_string()),
                                             session_r.client_ip
                                         );
                                         continue;
@@ -1066,14 +1188,15 @@ async fn run_stream<R, W>(
                                         );
                                         continue;
                                     }
-                                    // Throttle client->server upload against the SAME
-                                    // aggregate per-session bucket as the outbound arm
-                                    // (stealth-rate is outbound-only). Apply the returned
-                                    // sleep as backpressure before draining to the TUN.
+                                    // Throttle client->server upload against the aggregate
+                                    // per-session upload bucket. It is shared by all bonded
+                                    // readers but independent from the download allowance.
                                     let limit =
                                         session_r.bandwidth_limit_mbps.load(Ordering::Relaxed);
-                                    let delay =
-                                        session_r.rate.consume(plaintext.len() as u64 * 8, limit);
+                                    let delay = session_r
+                                        .rates
+                                        .upload
+                                        .consume(plaintext.len() as u64 * 8, limit);
                                     if !delay.is_zero() {
                                         tokio::time::sleep(delay).await;
                                     }
@@ -1084,7 +1207,12 @@ async fn run_stream<R, W>(
                                         plaintext.len(),
                                         stream_id,
                                     );
-                                    if tun_tx.send(plaintext).await.is_err() {
+                                    if tun_tx
+                                        .sender
+                                        .send(ServerTunPacket::Pooled(plaintext))
+                                        .await
+                                        .is_err()
+                                    {
                                         break;
                                     }
                                 }
@@ -1133,9 +1261,19 @@ async fn run_stream<R, W>(
     );
     let shaping_on = shaper.enabled();
     let heartbeat_enabled = heartbeat_enabled && !shaping_on;
+    let rx_dead_ms = crate::protocol::liveness_deadline(
+        heartbeat_enabled,
+        heartbeat_interval,
+        Duration::from_millis(hb_config.jitter_ms),
+        shaping_on,
+        Duration::from_millis(pcfg.obfuscation.traffic_shaping.idle_gap_max_ms),
+    )
+    .map(|deadline| u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX));
     // NB: never hold a `ThreadRng` (it is `!Send`) across the loop's `.await`s —
     // pass a fresh temporary at each call so the select future stays `Send`.
     let mut cover_deadline = tokio::time::Instant::now() + shaper.next_gap(&mut rand::rng());
+    let mut padding = Vec::with_capacity(crate::protocol::packet::MAX_RECORD_SIZE);
+    let mut cover_record = Vec::with_capacity(session.wire_pool.buffer_capacity());
 
     loop {
         tokio::select! {
@@ -1149,8 +1287,9 @@ async fn run_stream<R, W>(
                 crate::trace::record(
                     crate::trace::Dir::Tx, "server.stream", packet.len(), stream_id,
                 );
-                // Aggregate per-session throttle: the shared token bucket enforces the
-                // cap across ALL bonded streams, so multipath can't multiply it by N.
+                // Aggregate per-session download throttle: all bonded writers share this
+                // bucket, so multipath cannot multiply the cap by N. Upload has an
+                // independent bucket, allowing the configured rate in both directions.
                 // Stealth mode caps the data plane to the (lower) stealth rate so the
                 // flow stops looking like a line-rate bulk download.
                 let bw = session.bandwidth_limit_mbps.load(Ordering::Relaxed);
@@ -1160,7 +1299,10 @@ async fn run_stream<R, W>(
                 } else {
                     bw
                 };
-                let delay = session.rate.consume(packet.len() as u64 * 8, limit);
+                let delay = session
+                    .rates
+                    .download
+                    .consume(packet.len() as u64 * 8, limit);
                 if shaping_on && shaper.stealth() && !delay.is_zero() {
                     // STEALTH: instead of one smooth sleep (which evens the spacing
                     // into a metronome — a WORSE tell), fill the rate-cap gap with
@@ -1170,18 +1312,22 @@ async fn run_stream<R, W>(
                     let mut remaining = delay;
                     while remaining > Duration::from_millis(6) {
                         let csize = shaper.next_size(&mut rand::rng());
-                        let cover = if shaper.try_spend(csize, std::time::Instant::now()) {
+                        let cover_ready = if shaper.try_spend(csize, std::time::Instant::now()) {
                             let mut obf = Obfuscator::new();
-                            let padding = obf.generate_padding(csize as u16, csize as u16);
+                            obf.generate_padding_into(
+                                csize as u16,
+                                csize as u16,
+                                &mut padding,
+                            );
                             let mut codec = lock_or_recover(&server_tx, "handler::stealth_cover");
-                            codec.encrypt_packet(&[], &padding).ok()
+                            codec
+                                .encrypt_packet_into(&[], &padding, &mut cover_record)
+                                .is_ok()
                         } else {
-                            None
+                            false
                         };
-                        if let Some(c) = cover {
-                            if write_half.write_all(&c).await.is_err() {
-                                break;
-                            }
+                        if cover_ready && write_half.write_all(&cover_record).await.is_err() {
+                            break;
                         }
                         let step = Duration::from_millis(rand::rng().random_range(4..=18));
                         let s = step.min(remaining);
@@ -1216,19 +1362,20 @@ async fn run_stream<R, W>(
                 };
                 tokio::time::sleep(jitter).await;
 
-                let heartbeat = {
+                let heartbeat_ready = {
                     let mut obf = Obfuscator::new();
-                    let padding = obf.generate_padding(
+                    obf.generate_padding_into(
                         hb_config.data_size_bytes,
                         hb_config.data_size_bytes.saturating_add(32),
+                        &mut padding,
                     );
                     let mut codec = lock_or_recover(&server_tx, "handler::heartbeat");
-                    codec.encrypt_packet(&[], &padding).ok()
+                    codec
+                        .encrypt_packet_into(&[], &padding, &mut cover_record)
+                        .is_ok()
                 };
-                if let Some(hb) = heartbeat {
-                    if write_half.write_all(&hb).await.is_err() {
-                        break;
-                    }
+                if heartbeat_ready && write_half.write_all(&cover_record).await.is_err() {
+                    break;
                 }
                 let now_ms = base.elapsed().as_millis() as u64;
                 last_act.store(now_ms, Ordering::Relaxed);
@@ -1243,14 +1390,20 @@ async fn run_stream<R, W>(
                 if shaper.stealth() || now_ms.saturating_sub(last_tx_ms) >= 50 {
                     let size = shaper.next_size(&mut rand::rng());
                     if shaper.try_spend(size, std::time::Instant::now()) {
-                        let cover = {
+                        let cover_ready = {
                             let mut obf = Obfuscator::new();
-                            let padding = obf.generate_padding(size as u16, size as u16);
+                            obf.generate_padding_into(
+                                size as u16,
+                                size as u16,
+                                &mut padding,
+                            );
                             let mut codec = lock_or_recover(&server_tx, "handler::cover");
-                            codec.encrypt_packet(&[], &padding).ok()
+                            codec
+                                .encrypt_packet_into(&[], &padding, &mut cover_record)
+                                .is_ok()
                         };
-                        if let Some(pkt) = cover {
-                            if write_half.write_all(&pkt).await.is_err() {
+                        if cover_ready {
+                            if write_half.write_all(&cover_record).await.is_err() {
                                 break;
                             }
                             let n = base.elapsed().as_millis() as u64;
@@ -1276,11 +1429,15 @@ async fn run_stream<R, W>(
                     && now.saturating_sub(last_act.load(Ordering::Relaxed)) > idle_ms {
                     break;
                 }
-                let rx_dead = hb_ms.saturating_mul(3).max(120_000);
-                if now.saturating_sub(last_rx.load(Ordering::Relaxed)) > rx_dead {
-                    log::info!("Stream {} ({}) reaped: no inbound for >{}s on profile '{}'",
-                        addr, session.username, rx_dead / 1000, profile.name);
-                    break;
+                // An RX deadline is meaningful only while the client promises
+                // heartbeat/shaping traffic. With both disabled a healthy TCP tunnel
+                // may legitimately be silent for hours; the old 120 s fallback reaped it.
+                if let Some(rx_dead) = rx_dead_ms {
+                    if now.saturating_sub(last_rx.load(Ordering::Relaxed)) > rx_dead {
+                        log::info!("Stream {} ({}) reaped: no inbound for >{}s on profile '{}'",
+                            addr, session.username, rx_dead / 1000, profile.name);
+                        break;
+                    }
                 }
             }
         }
@@ -1863,7 +2020,7 @@ pub fn build_auth_ok(
     // AdGuard / NextDNS box) directly. Otherwise push the proxy's listen IP only when
     // the proxy runs (its default 10.9.0.1 resolves nowhere — pushing it would black-
     // hole client name resolution). Empty => the client keeps its own resolvers. The
-    // client strict-IP-validates the pushed value before touching resolv.conf.
+    // client strict-IP-validates the pushed value before applying platform DNS.
     let pushed_dns = if let Some(ip) = pcfg.dns.push_servers.first() {
         ip.as_str()
     } else if pcfg.dns.enabled {
@@ -1872,11 +2029,12 @@ pub fn build_auth_ok(
         ""
     };
     // Push the VPN subnet prefix length so the client sets the correct on-link
-    // netmask instead of assuming /24. Derived from the pool CIDR; falls back to
-    // 24 if it cannot be parsed (a non-/24 pool would otherwise break client↔client
-    // on-link routing). Additive: older clients ignore the field and default to 24.
-    let prefix: u8 = crate::server::pool::parse_cidr(&pcfg.pool.cidr)
-        .map(|(_, p)| p)
+    // prefix instead of assuming /24. Derived from the canonical pool CIDR parser;
+    // falls back to 24 if it cannot be parsed (a non-/24 pool would otherwise break
+    // client↔client on-link routing). Additive: older clients ignore the field and
+    // default to 24.
+    let prefix: u8 = crate::config::server::pool_subnet(&pcfg.pool.cidr)
+        .map(|subnet| subnet.prefix)
         .unwrap_or(24);
     let body = serde_json::json!({
         "client_ip": client_ip,
@@ -1889,10 +2047,9 @@ pub fn build_auth_ok(
         "dns": pushed_dns,
         // ALWAYS 53, never pcfg.dns.port. No client platform can express a different one —
         // VpnService.Builder and NEDNSSettings take an address and nothing else, Windows and
-        // macOS configure resolvers by IP, and the Rust client only manages it via resolvectl's
-        // `IP#port` form, which is lost the moment it falls back to writing resolv.conf. Pushing
-        // the real port therefore black-holed DNS on every client but one. The proxy keeps its
-        // own port; `nat::enable_dns_redirect` bridges 53 to it inside the tunnel.
+        // macOS configure resolvers by IP, while the Rust client uses resolvectl's `IP#port`
+        // form. Pushing the real port therefore black-holed DNS on every client but one. The
+        // proxy keeps its own port; `nat::enable_dns_redirect` bridges 53 to it inside the tunnel.
         // (Audit 2026-07-31.)
         "dns_port": 53,
         "routes": routes,
@@ -1907,6 +2064,29 @@ pub fn build_auth_ok(
         "multipath_adaptive": max_streams > 1 && pcfg.obfuscation.multipath.adaptive,
     });
     format!("OK:{}", serde_json::to_string(&body).unwrap_or_default())
+}
+
+#[cfg(test)]
+mod auth_ok_prefix_tests {
+    use super::{build_auth_ok, JOIN_TOKEN_LEN};
+
+    #[test]
+    fn pool_cidr_prefix_is_pushed_without_a_24_fallback() {
+        let mut profile = crate::config::server::ProfileConfig::baseline();
+        profile.pool.cidr = "10.20.0.0/16".into();
+        profile.tun.address = "10.20.0.1".into();
+
+        let message = build_auth_ok("10.20.0.2", &profile, "[]", &[0; JOIN_TOKEN_LEN], 1);
+        let body: serde_json::Value = serde_json::from_str(
+            message
+                .strip_prefix("OK:")
+                .expect("auth response must carry the OK marker"),
+        )
+        .unwrap();
+
+        assert_eq!(body["prefix"], 16);
+        assert_eq!(body["server_ip"], "10.20.0.1");
+    }
 }
 
 /// Program (add on connect / delete on disconnect) a kernel route that sends `cidr` into
@@ -2098,7 +2278,8 @@ mod device_id_tests {
 
 #[cfg(test)]
 mod rate_bucket_tests {
-    use super::RateBucket;
+    use super::{DirectionalRateBuckets, RateBucket};
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
@@ -2119,6 +2300,57 @@ mod rate_bucket_tests {
             "expected ~1s throttle on an empty bucket, got {:?}",
             d
         );
+    }
+
+    #[test]
+    fn upload_and_download_have_independent_allowances() {
+        let rates = DirectionalRateBuckets::new();
+        assert!(!Arc::ptr_eq(&rates.upload, &rates.download));
+
+        // Each direction starts with its own empty bucket. Half a megabit at 1 Mbps
+        // therefore costs about 500 ms in BOTH directions. With the former shared
+        // bucket the second call inherited the first call's deficit and cost ~1 s.
+        let upload = rates.upload.consume(500_000, 1);
+        let download = rates.download.consume(500_000, 1);
+        assert!(upload > Duration::from_millis(250));
+        assert!(download > Duration::from_millis(250));
+        assert!(upload < Duration::from_millis(750));
+        assert!(download < Duration::from_millis(750));
+    }
+}
+
+#[cfg(test)]
+mod server_wire_pool_tests {
+    use super::{server_wire_pool, SERVER_WIRE_BUFFER_BYTES};
+
+    #[test]
+    fn bounded_pool_exhausts_and_reuses_the_returned_record() {
+        let profile = crate::config::server::ProfileConfig::default();
+        let pool = server_wire_pool(&profile).unwrap();
+        let count = pool.buffer_count();
+        let capacity = pool.buffer_capacity();
+        assert!(
+            count > 2_000,
+            "a normal-MTU pool must retain useful queue depth"
+        );
+        assert!(count * capacity <= SERVER_WIRE_BUFFER_BYTES);
+        assert!((count + 1) * capacity > SERVER_WIRE_BUFFER_BYTES);
+
+        let mut held = Vec::with_capacity(count);
+        for _ in 0..count {
+            held.push(pool.try_acquire().expect("every configured slot exists"));
+        }
+        assert!(pool.try_acquire().is_none(), "no fallback allocation");
+
+        let allocation = held[0].as_ptr();
+        assert_eq!(held[0].capacity(), capacity);
+        drop(held.swap_remove(0));
+
+        let reused = pool
+            .try_acquire()
+            .expect("dropping a record must return its allocation");
+        assert!(reused.is_empty());
+        assert_eq!(reused.as_ptr(), allocation);
     }
 }
 

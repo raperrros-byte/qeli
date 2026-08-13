@@ -9,9 +9,9 @@
     <key>CFBundleIdentifier</key>
     <string>ru.qeli.app</string>
     <key>CFBundleVersion</key>
-    <string>0.7.14</string>
+    <string>0.7.15</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.7.14</string>
+    <string>0.7.15</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
@@ -26,6 +26,8 @@
     <string>public.app-category.utilities</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <key>NSSystemExtensionUsageDescription</key>
+    <string>Qeli uses a network system extension to route only applications selected in a VPN profile.</string>
     <key>LSArchitecturePriority</key>
     <array>
         <string>__ARCH__</string>

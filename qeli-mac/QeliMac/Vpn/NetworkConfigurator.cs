@@ -1,6 +1,9 @@
 using System.Diagnostics;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
+using QeliMac.Model;
+using QeliMac.Service;
 
 namespace QeliMac.Vpn;
 
@@ -17,6 +20,11 @@ public sealed class NetworkConfigurator : IDisposable
     private readonly Action<string> _log;
     private readonly List<Action> _undo = new();
     private readonly List<string> _degraded = new();
+    private Action? _dnsRelease;
+
+    private static readonly string DnsStatePath = Path.Combine(Paths.ServiceDir, "dns-override.json");
+
+    [DllImport("libc")] private static extern uint geteuid();
 
     /// <summary>
     /// Network setup steps that FAILED without aborting the connect. `optional: true`
@@ -46,6 +54,43 @@ public sealed class NetworkConfigurator : IDisposable
 
     public NetworkConfigurator(Action<string> log) => _log = log;
 
+    /// <summary>
+    /// Restore a DNS override left by a crashed prior process. Safe to call on every app
+    /// start; only a privileged macOS process can mutate the network service. SetDns repeats
+    /// this check immediately before acquisition, so non-standard/test entry points are
+    /// protected too.
+    /// </summary>
+    public static void SweepDns(Action<string>? log = null, bool requireReleased = false)
+    {
+        if (!OperatingSystem.IsMacOS() || geteuid() != 0 || !File.Exists(DnsStatePath)) return;
+        ServiceState.EnsureDir();
+        var journal = SystemDnsJournal(log ?? (_ => { }));
+        DnsJournal.RecoveryResult result = DnsJournal.RecoveryResult.NothingToDo;
+        int attempts = requireReleased ? 20 : 3;
+        for (int attempt = 1; attempt <= attempts; attempt++)
+        {
+            result = journal.RecoverStale();
+            bool retry = result == DnsJournal.RecoveryResult.Failed ||
+                         (requireReleased && result == DnsJournal.RecoveryResult.LiveOwner);
+            if (!retry) break;
+            if (attempt < attempts) Thread.Sleep(250);
+        }
+        if (result == DnsJournal.RecoveryResult.Failed ||
+            (requireReleased && result == DnsJournal.RecoveryResult.LiveOwner))
+            throw new InvalidOperationException(
+                result == DnsJournal.RecoveryResult.LiveOwner
+                    ? "a live qeli process still owns the system DNS override"
+                    : $"the system DNS could not be restored; recovery state remains at {DnsStatePath}");
+    }
+
+    private static DnsJournal SystemDnsJournal(Action<string> log) => new(
+        DnsStatePath,
+        ReadSystemDns,
+        WriteSystemDns,
+        DnsJournal.IsOwnerAlive,
+        DnsJournal.CurrentOwner(),
+        log);
+
     /// <summary>The physical path used to reach <paramref name="serverIp"/>: (interface, gateway).</summary>
     public (string? iface, IPAddress? gateway) PathToServer(IPAddress serverIp)
     {
@@ -65,6 +110,17 @@ public sealed class NetworkConfigurator : IDisposable
         }
         catch (Exception e) { _log($"route get error: {e.Message}"); }
         return (iface, gw);
+    }
+
+    /// <summary>Resolve a bypass prefix before full-tunnel routes replace its best path.</summary>
+    public (string? iface, IPAddress? gateway) PhysicalPathForRoute(string cidr)
+    {
+        var (addr, _) = ParseCidr(cidr);
+        if (addr == null || !IPAddress.TryParse(addr, out var destination)) return (null, null);
+        if (destination.Equals(IPAddress.Any)) destination = IPAddress.Parse("1.1.1.1");
+        else if (destination.Equals(IPAddress.IPv6Any))
+            destination = IPAddress.Parse("2606:4700:4700::1111");
+        return PathToServer(destination);
     }
 
     /// <summary>
@@ -195,13 +251,15 @@ public sealed class NetworkConfigurator : IDisposable
         var (addr, prefix) = ParseCidr(cidr);
         if (addr == null) { _log($"bad route {cidr}"); return; }
         string net = $"{addr}/{prefix}";
+        string family = IPAddress.Parse(addr).AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6
+            ? "-inet6" : "-inet";
         // Logging "via tunnel" after a failed add was simply untrue. (C-17)
-        if (!Run("/sbin/route", $"-n add -inet -net {net} -interface {dev}", optional: true))
+        if (!Run("/sbin/route", $"-n add {family} -net {net} -interface {dev}", optional: true))
         {
             Degrade($"route {cidr} NOT programmed — traffic to it stays outside the tunnel");
             return;
         }
-        _undo.Add(() => Run("/sbin/route", $"-n delete -inet -net {net}", optional: true));
+        _undo.Add(() => Run("/sbin/route", $"-n delete {family} -net {net}", optional: true));
         _log($"route {cidr} via tunnel");
     }
 
@@ -211,7 +269,9 @@ public sealed class NetworkConfigurator : IDisposable
     {
         var (addr, prefix) = ParseCidr(cidr);
         if (addr == null) { _log($"bad exclude route {cidr}"); return; }
-        Run("/sbin/route", $"-n delete -inet -net {addr}/{prefix}", optional: true);
+        string family = IPAddress.Parse(addr).AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6
+            ? "-inet6" : "-inet";
+        Run("/sbin/route", $"-n delete {family} -net {addr}/{prefix}", optional: true);
         _log($"exclude {cidr} from tunnel");
     }
 
@@ -219,22 +279,31 @@ public sealed class NetworkConfigurator : IDisposable
     /// destination reaches the network directly even in full-tunnel (where a plain
     /// DeleteRoute is a no-op — the two-halves splits still cover it). The specific prefix
     /// beats the /1 halves by longest-prefix match. Undone on disconnect.</summary>
-    public void PinBypassRoute(string cidr, IPAddress gateway)
+    public void PinBypassRoute(string cidr, IPAddress? gateway, string? physicalInterface)
     {
         var (addr, prefix) = ParseCidr(cidr);
         if (addr == null) { _log($"bad exclude route {cidr}"); return; }
         string net = $"{addr}/{prefix}";
-        Run("/sbin/route", $"-n delete -inet -net {net}", optional: true);  // clear any tunnel copy
+        bool v6 = IPAddress.Parse(addr).AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6;
+        string family = v6 ? "-inet6" : "-inet";
+        if (gateway != null && gateway.AddressFamily != (v6
+                ? System.Net.Sockets.AddressFamily.InterNetworkV6
+                : System.Net.Sockets.AddressFamily.InterNetwork))
+            gateway = null;
+        Run("/sbin/route", $"-n delete {family} -net {net}", optional: true);  // clear any tunnel copy
         // In full-tunnel the /1 halves cover this prefix, so a failed pin leaves the
         // destination INSIDE the tunnel — the opposite of the requested exclude, and for
         // the server-IP bypass that is exactly what wedges a reconnect. (C-17)
-        if (!Run("/sbin/route", $"-n add -inet -net {net} {gateway}", optional: true))
+        string? nextHop = gateway != null ? gateway.ToString()
+            : !string.IsNullOrWhiteSpace(physicalInterface) ? $"-interface {physicalInterface}"
+            : null;
+        if (nextHop == null || !Run("/sbin/route", $"-n add {family} -net {net} {nextHop}", optional: true))
         {
             Degrade($"bypass route {cidr} via {gateway} NOT programmed — it stays inside the tunnel");
             return;
         }
-        _undo.Add(() => Run("/sbin/route", $"-n delete -inet -net {net}", optional: true));
-        _log($"exclude {cidr} via physical gateway {gateway}");
+        _undo.Add(() => Run("/sbin/route", $"-n delete {family} -net {net}", optional: true));
+        _log($"exclude {cidr} via physical path {nextHop}");
     }
 
     /// <summary>
@@ -296,35 +365,92 @@ public sealed class NetworkConfigurator : IDisposable
             return;
         }
 
-        string previous = "empty";
-        try
-        {
-            var (cur, _) = RunOut("/usr/sbin/networksetup", $"-getdnsservers \"{service}\"");
-            var ips = cur.Split('\n').Select(l => l.Trim())
-                .Where(l => IPAddress.TryParse(l, out _)).ToList();
-            if (ips.Count > 0) previous = string.Join(" ", ips);
-        }
-        catch { /* default to clearing on restore */ }
-
-        if (!Run("/usr/sbin/networksetup",
-                 $"-setdnsservers \"{service}\" {string.Join(" ", servers)}", optional: true))
+        // networksetup changes the PHYSICAL service, not the disposable utun. Persist the
+        // exact previous list before applying the override so SIGKILL/native crash
+        // can be recovered by the next privileged qeli start. The journal also refuses a
+        // second live owner and preserves a newer user/system DNS change after a crash.
+        ServiceState.EnsureDir();
+        var journal = SystemDnsJournal(_log);
+        if (!journal.TryTakeOver(service, servers, out var release, out var error))
         {
             Degrade($"DNS NOT applied to “{service}” — queries will use the system resolver, " +
-                    $"not the tunnel's ({string.Join(", ", servers)})");
+                    $"not the tunnel's ({string.Join(", ", servers)}): {error}");
             return;
         }
-        _undo.Add(() => Run("/usr/sbin/networksetup", $"-setdnsservers \"{service}\" {previous}", optional: true));
+        _dnsRelease = release;
         _log($"DNS set to {string.Join(", ", servers)} on “{service}”");
     }
 
     public void Dispose()
     {
-        // Undo in reverse order, best-effort.
+        // DNS was the last host-wide change during setup, so restore it first. Its release
+        // keeps the on-disk journal when networksetup fails, allowing this process and the
+        // next privileged start to retry. A failed restore is NOT silently converted into a
+        // successful disconnect: callers must know the host resolver is still owned by qeli.
+        Exception? dnsError = null;
+        var release = _dnsRelease;
+        if (release != null)
+        {
+            for (int attempt = 1; attempt <= 3; attempt++)
+            {
+                try
+                {
+                    release.Invoke();
+                    if (ReferenceEquals(_dnsRelease, release)) _dnsRelease = null;
+                    dnsError = null;
+                    break;
+                }
+                catch (Exception e)
+                {
+                    dnsError = e;
+                    _log($"DNS restore attempt {attempt}/3 failed: {e.Message}");
+                    if (attempt < 3) Thread.Sleep(250);
+                }
+            }
+        }
+
+        // Undo the remaining changes in reverse order, best-effort.
         for (int i = _undo.Count - 1; i >= 0; i--)
         {
             try { _undo[i](); } catch (Exception e) { _log($"undo error: {e.Message}"); }
         }
         _undo.Clear();
+
+        if (dnsError != null)
+            throw new InvalidOperationException(
+                "Disconnect was incomplete because the original macOS DNS settings could not be restored. " +
+                $"The recovery journal was kept at {DnsStatePath} and the next privileged cleanup will retry.",
+                dnsError);
+    }
+
+    private static DnsJournal.ReadResult ReadSystemDns(string service)
+    {
+        var (stdout, stderr, code) = Exec("/usr/sbin/networksetup",
+            new[] { "-getdnsservers", service });
+        if (code != 0)
+            return new(false, Array.Empty<string>(),
+                $"exit {code}: {(stdout + stderr).Trim()}");
+
+        // With DHCP/no explicit resolver networksetup prints a sentence rather than an IP;
+        // an empty list is the exact state restored with the special `empty` argument.
+        var servers = stdout.Split('\n')
+            .Select(line => line.Trim())
+            .Where(line => IPAddress.TryParse(line, out _))
+            .ToList();
+        return new(true, servers, "");
+    }
+
+    private static DnsJournal.WriteResult WriteSystemDns(
+        string service,
+        IReadOnlyList<string> servers)
+    {
+        var args = new List<string> { "-setdnsservers", service };
+        if (servers.Count == 0) args.Add("empty");
+        else args.AddRange(servers);
+        var (stdout, stderr, code) = Exec("/usr/sbin/networksetup", args);
+        return code == 0
+            ? new(true, "")
+            : new(false, $"exit {code}: {(stdout + stderr).Trim()}");
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -408,6 +534,30 @@ public sealed class NetworkConfigurator : IDisposable
         return (Drain(outTask), Drain(errTask), p.ExitCode);
     }
 
+    /// <summary>ArgumentList overload for network service names and resolver arrays. Unlike
+    /// a preformatted argument string it cannot reinterpret quotes/spaces in a user-renamed
+    /// macOS network service as additional networksetup arguments.</summary>
+    private static (string stdout, string stderr, int code) Exec(
+        string exe,
+        IReadOnlyList<string> args)
+    {
+        var psi = new ProcessStartInfo(exe)
+        {
+            UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardOutput = true, RedirectStandardError = true,
+        };
+        foreach (var arg in args) psi.ArgumentList.Add(arg);
+        using var p = Process.Start(psi)!;
+        var outTask = p.StandardOutput.ReadToEndAsync();
+        var errTask = p.StandardError.ReadToEndAsync();
+        if (!p.WaitForExit(CommandTimeoutMs))
+        {
+            try { p.Kill(entireProcessTree: true); } catch { /* already gone */ }
+            return ("", $"{exe} -> timed out after {CommandTimeoutMs} ms", -1);
+        }
+        return (Drain(outTask), Drain(errTask), p.ExitCode);
+    }
+
     /// <summary>Collect an already-exited child's pipe text without ever blocking
     /// indefinitely (the process is gone, so EOF is imminent; the bound is paranoia).</summary>
     private static string Drain(Task<string> t)
@@ -424,10 +574,15 @@ public sealed class NetworkConfigurator : IDisposable
         // [0-9A-Fa-f:.]) with an in-range prefix; anything else returns (null, ..) so
         // AddRoute logs "bad route" and drops it.
         int slash = cidr.IndexOf('/');
-        if (slash < 0) return IsStrictIp(cidr) ? (cidr, 32) : (null, 0);
+        if (slash < 0)
+        {
+            if (!IsStrictIp(cidr) || !IPAddress.TryParse(cidr, out var bare)) return (null, 0);
+            return (cidr, bare.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 ? 128 : 32);
+        }
         string addr = cidr[..slash];
-        if (!IsStrictIp(addr)) return (null, 0);
-        return int.TryParse(cidr[(slash + 1)..], out int prefix) && prefix is >= 0 and <= 32
+        if (!IsStrictIp(addr) || !IPAddress.TryParse(addr, out var parsed)) return (null, 0);
+        int maxPrefix = parsed.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 ? 128 : 32;
+        return int.TryParse(cidr[(slash + 1)..], out int prefix) && prefix >= 0 && prefix <= maxPrefix
             ? (addr, prefix) : (null, 0);
     }
 

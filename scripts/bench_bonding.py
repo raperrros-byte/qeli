@@ -16,6 +16,7 @@ Run from the local machine:  source scripts/lab_env.sh && python scripts/bench_b
 import os, sys, io, time, json, re
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import paramiko
+import ssh_hostkey
 
 PW = os.environ["QELI_LAB_PASS"]
 SRV = ("10.66.116.10", "root", PW)
@@ -57,7 +58,6 @@ bind.port = {PORT}
 bind.transport = tcp
 tun.name = mp0
 tun.address = {SIP}
-tun.netmask = 255.255.255.0
 tun.mtu = 1400
 pool.cidr = 10.62.0.0/24
 pool.exclude = {SIP}
@@ -93,7 +93,7 @@ file = {CLI_LOG}
 
 
 def conn(h):
-    c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    c = paramiko.SSHClient(); ssh_hostkey.harden(c)
     c.connect(h[0], username=h[1], password=h[2], timeout=25, look_for_keys=False, allow_agent=False)
     return c
 

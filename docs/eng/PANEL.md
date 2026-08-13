@@ -1,6 +1,6 @@
 # qeli web panel — installation & usage
 
-> **These docs describe 0.7.13** — the latest released version. `qeli --version` tells you
+> **These docs describe 0.7.14** — the latest released version. `qeli --version` tells you
 > what you actually have.
 
 The daemon's built-in admin UI: profiles, users/groups, live clients, identity
@@ -221,6 +221,18 @@ nothing parses `/proc` per request.
 Below them are the *Connected clients / Active profiles / Total sent / Total received*
 tiles, the per-profile cards and the live-client table (10 s refresh).
 
+### Transport Health
+The **Transport health** sidebar page joins the worker's live sessions with a deliberately
+secret-free projection of the configuration currently on disk. Every profile card shows its
+listener, state, sessions, bonded streams, traffic and server backpressure drops. Expanding it
+shows TUN address/pool/MTU/queues, routing/NAT, DNS, masking/heartbeat/shaping/multipath,
+socket/TUN buffers and connection limits. Alerts call out an unavailable worker, missing
+`iptables` for requested NAT, observed drops and liveness combinations that could retain a dead
+peer. The page refreshes every 5 s and pauses background polling in a hidden browser tab.
+
+The projection selects safe fields individually: obfs/reality credentials, passwords, identity
+private keys and session keys are never returned by `/api/transport/health`.
+
 ### Per-client actions (Kick, Set bandwidth)
 Each row of the live-client table carries two operations; both go to the data plane over
 the control socket and take effect immediately.
@@ -229,7 +241,11 @@ the control socket and take effect immediately.
   session that user has on that profile. If they aren't connected the panel answers
   "user … not connected".
 - **Set bandwidth** (`POST /api/clients/{username}/bandwidth`) — a limit in Mbps, whole
-  number, `0` = unlimited. The value is applied to the live sessions **and written to the
+  number, `0` = unlimited. The same cap is applied **independently and concurrently** to
+  upload and download: for example, `50` means up to 50 Mbps in each direction (up to
+  100 Mbps aggregate at full duplex). All multipath streams of a session share their
+  direction's allowance; TCP and UDP behave the same. The value is applied to the live
+  sessions **and written to the
   users file**, so it survives a restart; if that write fails the panel says plainly that
   the limit only applies to the live session and will be lost on restart. A fractional,
   negative or oversized value is rejected with an error instead of silently becoming
@@ -241,20 +257,32 @@ The **⤓ Backup** and **⤒ Restore** buttons in the header of the *Host load* 
 - **Backup** (`GET /api/backup`) — the browser downloads
   `qeli-backup-<unixtime>.tar.gz`: a `tar czf` of the whole **`/etc/qeli`** directory —
   the server config, the users file, the **per-profile identity keys**,
-  `panel-secret.key`, `usage.json`, `notify.json`, the client profiles and the panel's
-  TLS cert. Leftovers from earlier restores (`.pre-restore-*`, `.restore-*`) are
-  excluded so an archive can't nest inside the next one. The file lands **off the box**,
-  on your machine. If any critical file (identity, `server.conf`, `panel-secret.key`, the
-  users database) turned out to be unreadable, the download is **refused** with an
+  `usage.json`, `notify.json`, the client profiles and the panel's TLS cert. Leftovers
+  from earlier restores (`.pre-restore-*`, `.restore-*`) are
+  excluded so an archive can't nest inside the next one; local editor rollback history
+  (`.config-history`) is excluded as well, so superseded credentials do not accumulate in
+  portable backups. The file lands **off the box**,
+  on your machine. If any critical file (identity, `server.conf`, the users database)
+  turned out to be unreadable, the download is **refused** with an
   explanation rather than handing you an archive that only looks complete.
   > **The archive holds secrets.** Private identity keys, argon2 password hashes, the
-  > reversibly-encrypted user passwords (`panel-secret.key` is the key **those** are
-  > encrypted with) and client profiles with a plaintext password in them. Treat it as key
-  > material — encrypted storage, not a shared drive and not a repository.
+  > reversibly-encrypted `password_enc` values and client profiles with a plaintext
+  > password in them. Treat it as key material — encrypted storage, not a shared drive and
+  > not a repository.
   >
-  > **What the archive does NOT contain: the panel's session-signing key.** That is a
-  > separate file, and it is easy to confuse with `panel-secret.key` since both are "panel
-  > keys". The session key lives at `$STATE_DIRECTORY/session.key` — under systemd that is
+  > **What the archive does NOT contain: the key that decrypts `password_enc`.**
+  > `/var/lib/qeli/panel-secret.key` deliberately lives outside `/etc/qeli`, so an
+  > unencrypted panel archive never carries both ciphertext and its key.
+  > After restoring only a panel archive onto another machine, the Argon2 hashes still
+  > authenticate users, but the old passwords cannot be decrypted and re-issued in a
+  > `qeli://` link/QR; reset the password to do that. A complete manual disaster-recovery
+  > backup must also preserve `/var/lib/qeli`, and the resulting archive must be protected
+  > as containing the decryption key. On upgrade the legacy
+  > `/etc/qeli/panel-secret.key` is migrated automatically.
+  >
+  > **The panel's session-signing key is not in the ordinary archive either.** It is a
+  > separate file, easy to confuse with `panel-secret.key` because both are "panel keys".
+  > The session key lives at `$STATE_DIRECTORY/session.key` — under systemd that is
   > `/var/lib/qeli/session.key`, outside the `/etc/qeli` tree the archive captures; the
   > fallback without `StateDirectory` is `/etc/qeli/.session_key`, and only then is it
   > included. In practice: after restoring onto a different machine, every panel login has
@@ -291,16 +319,23 @@ transport, the port and one line on what the mode does.
 What **Launch** does:
 1. reads the current config and **checks the port**: if that port+transport is already
    taken by a DIFFERENT profile you get a "Port already in use" popup with a link to
-   Config (re-launching the SAME mode just replaces its own profile, which is allowed);
-2. asks for confirmation, then builds a profile on top of the server's canonical defaults
-   (`/api/config/defaults`): bind `0.0.0.0:<port>`, its own TUN `vpn<N>`, its own
-   `10.9.<N>.0/24` subnet and pool, in-tunnel DNS, NAT egress and the obfuscation stack
-   for that mode;
-3. saves the config (`PUT /api/config`) and restarts the server.
+   Config (re-launching the SAME mode is allowed);
+2. asks for confirmation. On the **first** launch it builds a profile on top of the
+   server's canonical defaults (`/api/config/defaults`): bind `0.0.0.0:<port>`, its own
+   TUN `vpn<N>`, its own `10.9.<N>.0/24` subnet and pool, in-tunnel DNS, NAT egress and
+   the obfuscation stack for that mode. On a **repeat** launch it only enables the
+   existing profile: credentials and all manual settings are preserved, so previously
+   issued client links keep working. Use the explicit Config actions for an intentional
+   rotation or reset;
+3. sends the expected config revision to `POST /api/config/quickstart/{mode}`. The server holds
+   the config writer lock while it re-reads, builds, validates, snapshots and atomically writes
+   the profile; a concurrent panel/SSH edit produces a conflict instead of being overwritten.
+   Only after that successful operation does the page restart the server.
 
 When it's done a modal shows the profile name and endpoint plus, for the modes that need
-them, the generated **REALITY short_id** and **obfs pre-shared key** with a Copy button —
-these have to go into every client. The same modal reminds you that clients also need the
+them, the newly generated (first launch) or preserved (repeat launch) **REALITY short_id**
+and **obfs pre-shared key** with a Copy button — these have to go into every client. The
+same modal reminds you that clients also need the
 server's pinned public key (`qeli show-identity`, or Config → Global → Server identity
 keys), and for the TCP modes it repeats the mobile/LTE path-MTU warning.
 
@@ -325,6 +360,13 @@ gets through its network).
 - **Saving:** `Save to Disk` (writes the config, applied on next restart) or
   `Apply & Restart` (save + restart now). `Form` / `JSON` / `Raw INI` views (raw
   saves verbatim — comments preserved).
+- **Safe editing:** all views share a revision of the exact INI bytes (comments included).
+  A save refuses to overwrite a newer panel-tab or hand edit, and switching raw/structured,
+  Reload or leaving the page warns before discarding unsaved work. Before confirmation the
+  panel lists changed JSON paths or raw line numbers. Every changing panel write creates a
+  private rollback snapshot in `/etc/qeli/.config-history` (`0700` directory, `0600` files;
+  newest ten retained); **History** validates and restores one while first preserving the
+  current file as another snapshot. A restart is still required for data-plane changes.
 
 > **`Apply & Restart` needs permission to restart the service.** It runs
 > `systemctl restart <unit>`. A **root** service can do this directly; the hardened
@@ -425,8 +467,10 @@ config/link to all of that profile's clients, so don't do it "just in case".
   **calendar date** (*Or until date*, the two fields stay in sync). On/after the expiry
   the user can no longer connect and any live session is dropped, and a *Quota breach*
   notification fires. The ↺ button resets the lifetime usage counter.
-  - **The cap counts DOWNLOAD only** (server→client). Uploads are unmetered, so a user
-    can't be locked out by sending. The usage column shows the two directions separately —
+  - **The data quota counts DOWNLOAD only** (server→client). Upload does not count toward
+    that quota, so a user cannot be locked out by sending. This is separate from the
+    `bandwidth.limit_mbps` rate cap, which limits both directions. The usage column shows
+    the two directions separately —
     `↓` download (the metered one, drawn against the cap) and `↑` upload — and the bar
     tracks download vs the cap.
 - Actions: Enable/Disable (kicks sessions), Delete.
@@ -496,7 +540,10 @@ connecting *to* this machine.
 - The TUN device, unless you set one, is auto-assigned: the lowest free `vpnN` that is
   claimed neither by another client profile nor by an interface that already exists on the
   host (including a server profile's TUN).
-- Each tunnel's log: `/var/log/qeli/client-<name>.log`, truncated on every Connect.
+- Each tunnel's log: `/var/log/qeli/client-<name>.log`, appended across reconnects/connects and
+  trimmed from the oldest half after 4 MiB.
+- Structured diagnostics: beside the control socket, `client-<name>.status.json` (`0600`). It
+  contains only state/retry, negotiated `NetworkPlan` and TX/RX/UDP counters — never credentials.
 
 **Connect / Disconnect.** Connect spawns `qeli client -c <file>` as a child of the
 supervisor (inheriting its privileges, so it can bring up its TUN and routes). Disconnect
@@ -504,11 +551,20 @@ sends SIGTERM — the client restores DNS and routes and exits; if it hasn't lef
 it is SIGKILLed. **Delete** disconnects first, then removes the profile and its log. A
 profile with `autostart = true` is connected when the supervisor starts.
 
-**The status is honest, not "is the process alive".** The list refreshes every 5 s and the
-state is derived from the log tail: **● Connected**, **◌ Connecting…**, **⚠ Error —
+**The status is honest, not "is the process alive".** The list refreshes every 5 s and reads
+the Rust client's structured status: **● Connected**, **◌ Connecting…**, **⚠ Error —
 retrying** (the process is alive but the tunnel is looping on reconnect — e.g.
-`reality-tls` with no short_id) or **○ Disconnected**. Next to it are the assigned
-internal tunnel IP and the last few log lines.
+`reality-tls` with no short_id) or **○ Disconnected**. **Details** shows carrier/tunnel
+addresses, MTU, DNS, effective routes, full-tunnel/kill-switch/multipath decisions and
+TX/RX/UDP buffer/drop counters. The short log tail remains a human audit trail and a
+compatibility fallback for a client process started by an older binary.
+
+### Panel source and visual checks
+`python3 scripts/check_panel.py` is a dependency-free CI gate for shared control styling,
+keyboard-operable custom switches, duplicate RU keys and missing translations in controls or
+`qeliT`/`qeliTf` calls. A seeded lab can run `scripts/panel_visual_regression.py` to capture or
+compare all panel pages in the 72-case RU/EN × dark/light × desktop/mobile matrix; the script is
+opt-in because it needs a running authenticated panel and reviewed baselines.
 
 > **Full-tunnel is dangerous on a server.** The "Full-tunnel (route ALL traffic)" checkbox
 > reroutes ALL of this box's traffic through the remote server and can cut off this very
@@ -602,9 +658,11 @@ Authentication uses the **argon2id hash** (irreversible). To allow **re-issuing*
 a config for an existing user without knowing the password, a **reversibly-
 encrypted** copy of the password is also kept:
 
-- Cipher: ChaCha20-Poly1305, panel key `/etc/qeli/panel-secret.key` (`0600`,
+- Cipher: ChaCha20-Poly1305, panel key `/var/lib/qeli/panel-secret.key` (`0600`,
   auto-generated). Stored as `password_enc` (base64) in the users file; **never
-  returned over the API**.
+  returned over the API**. The key is deliberately excluded from the panel-generated
+  `/etc/qeli` backup; the legacy `/etc/qeli/panel-secret.key` is migrated automatically
+  on upgrade.
 - **Trade-off (deliberate):** a server compromise (key + users file) can recover
   these passwords. They're VPN-only credentials; this is how most VPN panels work.
   For a hash-only model with no re-issue, don't set passwords via the panel/CLI

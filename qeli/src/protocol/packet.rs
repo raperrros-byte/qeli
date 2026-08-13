@@ -244,6 +244,46 @@ impl ReplayWindow {
 }
 
 impl PacketCodec {
+    fn record_sizes(
+        &self,
+        data_len: usize,
+        padding_len: usize,
+    ) -> Result<(usize, usize, usize), PacketError> {
+        let padding_len = padding_len.min(u16::MAX as usize);
+        let plaintext_len = COUNTER_SIZE
+            .checked_add(data_len)
+            .and_then(|len| len.checked_add(padding_len))
+            .and_then(|len| len.checked_add(2))
+            .ok_or(PacketError::PacketTooLarge)?;
+        let record_payload_len = NONCE_SIZE
+            .checked_add(plaintext_len)
+            .and_then(|len| len.checked_add(TAG_SIZE))
+            .ok_or(PacketError::PacketTooLarge)?;
+        if record_payload_len > MAX_RECORD_SIZE {
+            return Err(PacketError::PacketTooLarge);
+        }
+        let header_len = match self.framing {
+            Framing::Tls => TLS_RECORD_HEADER,
+            Framing::Raw => RAW_RECORD_HEADER,
+        };
+        Ok((padding_len, plaintext_len, header_len))
+    }
+
+    /// Exact storage required by [`Self::encrypt_packet_into`] for these input lengths.
+    /// Callers with a hard memory budget can reject an undersized pooled slot before `Vec`
+    /// has a chance to grow beyond that budget.
+    // The qeli binary's server forwarder uses this. Native `--lib`/cdylib builds compile the
+    // codec (sometimes with default `server` features) without that binary call site.
+    #[allow(dead_code)]
+    pub(crate) fn encrypted_record_len(
+        &self,
+        data_len: usize,
+        padding_len: usize,
+    ) -> Result<usize, PacketError> {
+        let (_, plaintext_len, header_len) = self.record_sizes(data_len, padding_len)?;
+        Ok(header_len + NONCE_SIZE + plaintext_len + TAG_SIZE)
+    }
+
     pub fn new(key: [u8; 32]) -> Self {
         let mut nonce_seed = [0u8; 4];
         rand::rng().fill_bytes(&mut nonce_seed);
@@ -271,7 +311,19 @@ impl PacketCodec {
         c
     }
 
-    pub fn encrypt_packet(&mut self, data: &[u8], padding: &[u8]) -> Result<Vec<u8>, PacketError> {
+    /// Encrypt one packet into storage owned by the caller.
+    ///
+    /// `record` is cleared before use and retains its allocation afterwards, allowing a
+    /// sequential TCP/UDP writer to pay for its wire buffer once per connection rather than
+    /// once per packet. On every validation error it is left empty, so a caller cannot
+    /// accidentally retransmit the previous successful record.
+    pub fn encrypt_packet_into(
+        &mut self,
+        data: &[u8],
+        padding: &[u8],
+        record: &mut Vec<u8>,
+    ) -> Result<(), PacketError> {
+        record.clear();
         if self.counter >= u64::MAX - 1000 {
             return Err(PacketError::CounterExhausted);
         }
@@ -291,24 +343,10 @@ impl PacketCodec {
         // than letting `as u16` silently wrap (which would desync the receiver's
         // padding-strip). Callers cap padding well under u16::MAX; this is a
         // defensive guard against a future caller passing an oversized buffer.
-        let padding_len = padding.len().min(u16::MAX as usize);
+        let (padding_len, plaintext_len, header_len) =
+            self.record_sizes(data.len(), padding.len())?;
         let padding = &padding[..padding_len];
-
-        // Inner plaintext = counter(8) || data || padding || padding_len(2); the
-        // ciphertext is that plus the 16-byte AEAD tag.
-        let plaintext_len = COUNTER_SIZE + data.len() + padding_len + 2;
-        // Guard against `as u16` silently wrapping the length prefix if a caller ever
-        // passes an oversized `data` (mirror of the receiver's MAX_RECORD_SIZE cap): the
-        // whole record payload must fit both the u16 field and the peer's per-record
-        // ceiling. Callers feed MTU-bounded TUN packets, so this never fires in practice.
         let record_payload_len = NONCE_SIZE + plaintext_len + TAG_SIZE;
-        if record_payload_len > MAX_RECORD_SIZE {
-            return Err(PacketError::PacketTooLarge);
-        }
-        let header_len = match self.framing {
-            Framing::Tls => TLS_RECORD_HEADER,
-            Framing::Raw => RAW_RECORD_HEADER,
-        };
         let payload_len = record_payload_len as u16;
 
         // Build the whole on-wire record in ONE allocation. The plaintext is
@@ -316,7 +354,7 @@ impl PacketCodec {
         // detached tag is appended — the old path allocated three Vecs (the
         // plaintext, the AEAD output, and the record). Byte-for-byte identical
         // output to the previous allocating path.
-        let mut record = Vec::with_capacity(header_len + NONCE_SIZE + plaintext_len + TAG_SIZE);
+        record.reserve(header_len + NONCE_SIZE + plaintext_len + TAG_SIZE);
         if self.framing == Framing::Tls {
             // TLS application-data record header (type=0x17, version=0x0303).
             record.push(0x17);
@@ -332,16 +370,30 @@ impl PacketCodec {
 
         self.counter = self.counter.wrapping_add(1);
 
-        let tag = self
+        let tag = match self
             .cipher
             .encrypt_in_place_detached(&nonce, &mut record[ct_start..])
-            .map_err(|_| PacketError::EncryptFailed)?;
+        {
+            Ok(tag) => tag,
+            Err(_) => {
+                record.clear();
+                return Err(PacketError::EncryptFailed);
+            }
+        };
         record.extend_from_slice(&tag);
 
+        Ok(())
+    }
+
+    /// Allocating compatibility wrapper for control/handshake paths and external callers.
+    /// Data-plane writers should prefer [`Self::encrypt_packet_into`] and reuse their buffer.
+    pub fn encrypt_packet(&mut self, data: &[u8], padding: &[u8]) -> Result<Vec<u8>, PacketError> {
+        let mut record = Vec::new();
+        self.encrypt_packet_into(data, padding, &mut record)?;
         Ok(record)
     }
 
-    pub fn decrypt_packet(&mut self, record: &[u8]) -> Result<Vec<u8>, PacketError> {
+    fn framed_record_bounds(&self, record: &[u8]) -> Result<(usize, usize), PacketError> {
         let header_len = match self.framing {
             Framing::Tls => TLS_RECORD_HEADER,
             Framing::Raw => RAW_RECORD_HEADER,
@@ -372,61 +424,77 @@ impl PacketCodec {
         if payload_len > MAX_RECORD_SIZE {
             return Err(PacketError::PacketTooLarge);
         }
-        if record.len() < header_len + payload_len {
+        let record_len = header_len + payload_len;
+        if record.len() < record_len {
             return Err(PacketError::PacketTooShort);
         }
+        Ok((header_len, record_len))
+    }
 
-        let payload = &record[header_len..header_len + payload_len];
+    /// Decrypt a record in its existing allocation.
+    ///
+    /// On success `record` contains only the tunnel plaintext (the framing, nonce, counter,
+    /// padding trailer and tag are removed in place). On error it is empty while retaining
+    /// its capacity, preventing a caller from accidentally forwarding stale ciphertext.
+    pub fn decrypt_packet_in_place(&mut self, record: &mut Vec<u8>) -> Result<(), PacketError> {
+        let result = self.decrypt_packet_in_place_inner(record);
+        if result.is_err() {
+            record.clear();
+        }
+        result
+    }
+
+    fn decrypt_packet_in_place_inner(&mut self, record: &mut Vec<u8>) -> Result<(), PacketError> {
+        let (header_len, record_len) = self.framed_record_bounds(record)?;
 
         // `payload_len` is attacker-controlled (the record's own length field) and
         // is only bounded ABOVE (MAX_RECORD_SIZE) and against `record.len()`, not
         // below. On the UDP path a datagram whose length field is < NONCE_SIZE
         // still clears those checks, so slice with `get(..)` rather than `[..N]`
         // (which would panic — and abort the process under `panic = "abort"`).
-        let nonce: [u8; NONCE_SIZE] = payload
-            .get(..NONCE_SIZE)
+        let nonce_end = header_len + NONCE_SIZE;
+        let nonce: [u8; NONCE_SIZE] = record
+            .get(header_len..nonce_end)
             .and_then(|s| s.try_into().ok())
             .ok_or(PacketError::PacketTooShort)?;
 
-        let ciphertext = &payload[NONCE_SIZE..];
-
         // Split the trailing 16-byte AEAD tag from the ciphertext body, then
-        // decrypt the body in place in a buffer we own. The record is a borrowed
-        // read buffer, so one copy is unavoidable — but the old path allocated
-        // TWICE (once inside the allocating `decrypt`, and again below to strip
-        // the counter prefix). `ciphertext.len()` may be < TAG_SIZE for a crafted
-        // short record; reject rather than under-slice.
-        if ciphertext.len() < TAG_SIZE {
-            return Err(PacketError::PacketTooShort);
-        }
-        let (ct_body, tag) = ciphertext.split_at(ciphertext.len() - TAG_SIZE);
-        let tag: [u8; TAG_SIZE] = tag.try_into().map_err(|_| PacketError::PacketTooShort)?;
-        let mut plaintext = ct_body.to_vec();
+        // decrypt the body directly in the caller-owned record. `payload_len` may
+        // be shorter than nonce+tag for a crafted record; checked arithmetic keeps
+        // that input on the error path instead of under-slicing.
+        let tag_start = record_len
+            .checked_sub(TAG_SIZE)
+            .filter(|start| *start >= nonce_end)
+            .ok_or(PacketError::PacketTooShort)?;
+        let tag: [u8; TAG_SIZE] = record
+            .get(tag_start..record_len)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(PacketError::PacketTooShort)?;
+        record.truncate(record_len);
         self.cipher
-            .decrypt_in_place_detached(&nonce, &mut plaintext, &tag)
+            .decrypt_in_place_detached(&nonce, &mut record[nonce_end..tag_start], &tag)
             .map_err(|_| PacketError::DecryptFailed)?;
 
-        if plaintext.len() < COUNTER_SIZE + 2 {
+        let plaintext_len = tag_start - nonce_end;
+        if plaintext_len < COUNTER_SIZE + 2 {
             return Err(PacketError::PacketTooShort);
         }
 
         let packet_counter = u64::from_be_bytes([
-            plaintext[0],
-            plaintext[1],
-            plaintext[2],
-            plaintext[3],
-            plaintext[4],
-            plaintext[5],
-            plaintext[6],
-            plaintext[7],
+            record[nonce_end],
+            record[nonce_end + 1],
+            record[nonce_end + 2],
+            record[nonce_end + 3],
+            record[nonce_end + 4],
+            record[nonce_end + 5],
+            record[nonce_end + 6],
+            record[nonce_end + 7],
         ]);
 
-        let padding_len = u16::from_be_bytes([
-            plaintext[plaintext.len() - 2],
-            plaintext[plaintext.len() - 1],
-        ]) as usize;
+        let padding_len =
+            u16::from_be_bytes([record[tag_start - 2], record[tag_start - 1]]) as usize;
 
-        if COUNTER_SIZE + padding_len + 2 > plaintext.len() {
+        if COUNTER_SIZE + padding_len + 2 > plaintext_len {
             return Err(PacketError::InvalidPadding);
         }
 
@@ -438,20 +506,38 @@ impl PacketCodec {
             return Err(PacketError::ReplayDetected);
         }
 
-        let data_len = plaintext.len() - COUNTER_SIZE - 2 - padding_len;
-        // Strip the trailer (padding + its 2-byte length) then the 8-byte counter
-        // prefix, reusing the decrypt buffer in place — the old path allocated a
-        // second Vec here just to return the data slice.
-        plaintext.truncate(COUNTER_SIZE + data_len);
-        plaintext.drain(..COUNTER_SIZE);
+        let data_len = plaintext_len - COUNTER_SIZE - 2 - padding_len;
+        let data_start = nonce_end + COUNTER_SIZE;
+        let data_end = data_start + data_len;
+        record.copy_within(data_start..data_end, 0);
+        record.truncate(data_len);
 
+        Ok(())
+    }
+
+    /// Allocating compatibility wrapper. Receive data planes that already own their framed
+    /// record should prefer [`Self::decrypt_packet_in_place`].
+    pub fn decrypt_packet(&mut self, record: &[u8]) -> Result<Vec<u8>, PacketError> {
+        // Validate attacker-controlled framing before allocating, and copy only the declared
+        // record. This preserves the old API's allocation-DoS bound even if a caller supplies
+        // a very large slice with a small valid record followed by unrelated trailing bytes.
+        let (_, record_len) = self.framed_record_bounds(record)?;
+        let mut plaintext = record[..record_len].to_vec();
+        self.decrypt_packet_in_place(&mut plaintext)?;
         Ok(plaintext)
     }
 }
 
-pub async fn read_tls_record<R: tokio::io::AsyncRead + Unpin>(
+/// Read one TLS-dressed record into caller-owned storage.
+///
+/// `record` is cleared on every error while retaining its capacity. Callers that reserve
+/// [`TLS_RECORD_HEADER`] + [`MAX_RECORD_SIZE`] once therefore perform no record allocation on
+/// the receive hot path.
+pub async fn read_tls_record_into<R: tokio::io::AsyncRead + Unpin>(
     stream: &mut R,
-) -> Result<Vec<u8>, PacketError> {
+    record: &mut Vec<u8>,
+) -> Result<(), PacketError> {
+    record.clear();
     let mut header = [0u8; TLS_RECORD_HEADER];
     stream
         .read_exact(&mut header)
@@ -463,23 +549,36 @@ pub async fn read_tls_record<R: tokio::io::AsyncRead + Unpin>(
         return Err(PacketError::PacketTooLarge);
     }
 
-    let mut record = Vec::with_capacity(TLS_RECORD_HEADER + payload_len);
     record.extend_from_slice(&header);
     record.resize(TLS_RECORD_HEADER + payload_len, 0);
-    stream
+    if stream
         .read_exact(&mut record[TLS_RECORD_HEADER..])
         .await
-        .map_err(|_| PacketError::ConnectionClosed)?;
+        .is_err()
+    {
+        record.clear();
+        return Err(PacketError::ConnectionClosed);
+    }
 
+    Ok(())
+}
+
+pub async fn read_tls_record<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
+) -> Result<Vec<u8>, PacketError> {
+    let mut record = Vec::new();
+    read_tls_record_into(stream, &mut record).await?;
     Ok(record)
 }
 
 /// Read one raw (`plain`-mode) record: a 2-byte big-endian length prefix followed
 /// by that many payload bytes. Returns the whole record including the 2-byte
 /// header, so `PacketCodec::decrypt_packet` (in `Framing::Raw`) parses it directly.
-pub async fn read_raw_record<R: tokio::io::AsyncRead + Unpin>(
+pub async fn read_raw_record_into<R: tokio::io::AsyncRead + Unpin>(
     stream: &mut R,
-) -> Result<Vec<u8>, PacketError> {
+    record: &mut Vec<u8>,
+) -> Result<(), PacketError> {
+    record.clear();
     let mut header = [0u8; RAW_RECORD_HEADER];
     stream
         .read_exact(&mut header)
@@ -491,14 +590,25 @@ pub async fn read_raw_record<R: tokio::io::AsyncRead + Unpin>(
         return Err(PacketError::PacketTooLarge);
     }
 
-    let mut record = Vec::with_capacity(RAW_RECORD_HEADER + payload_len);
     record.extend_from_slice(&header);
     record.resize(RAW_RECORD_HEADER + payload_len, 0);
-    stream
+    if stream
         .read_exact(&mut record[RAW_RECORD_HEADER..])
         .await
-        .map_err(|_| PacketError::ConnectionClosed)?;
+        .is_err()
+    {
+        record.clear();
+        return Err(PacketError::ConnectionClosed);
+    }
 
+    Ok(())
+}
+
+pub async fn read_raw_record<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
+) -> Result<Vec<u8>, PacketError> {
+    let mut record = Vec::new();
+    read_raw_record_into(stream, &mut record).await?;
     Ok(record)
 }
 
@@ -510,6 +620,18 @@ pub async fn read_record<R: tokio::io::AsyncRead + Unpin>(
     match framing {
         Framing::Tls => read_tls_record(stream).await,
         Framing::Raw => read_raw_record(stream).await,
+    }
+}
+
+/// Caller-owned variant of [`read_record`].
+pub async fn read_record_into<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
+    framing: Framing,
+    record: &mut Vec<u8>,
+) -> Result<(), PacketError> {
+    match framing {
+        Framing::Tls => read_tls_record_into(stream, record).await,
+        Framing::Raw => read_raw_record_into(stream, record).await,
     }
 }
 
@@ -719,6 +841,107 @@ mod tests {
             PacketCodec::new(key).encrypt_packet(&big, &[]),
             Err(PacketError::PacketTooLarge)
         ));
+    }
+
+    #[test]
+    fn encrypt_into_matches_allocating_wrapper_byte_for_byte() {
+        let key = [0x61u8; 32];
+        let seed = [1, 2, 3, 4];
+        let prp_key = [0xA5u8; 32];
+        let mut allocating = conformance_codec(key, seed, prp_key, false);
+        let mut reusable = conformance_codec(key, seed, prp_key, false);
+        let padding = [0xEEu8; 37];
+
+        let expected = allocating
+            .encrypt_packet(b"caller-owned wire storage", &padding)
+            .unwrap();
+        let mut record = Vec::new();
+        reusable
+            .encrypt_packet_into(b"caller-owned wire storage", &padding, &mut record)
+            .unwrap();
+
+        assert_eq!(record, expected);
+    }
+
+    #[test]
+    fn encrypt_into_reuses_capacity_and_clears_stale_record_on_error() {
+        let key = [0x62u8; 32];
+        let mut codec = PacketCodec::new(key);
+        let mut record = Vec::with_capacity(TLS_RECORD_HEADER + MAX_RECORD_SIZE);
+
+        codec
+            .encrypt_packet_into(&[0x11; 1400], &[0x22; 64], &mut record)
+            .unwrap();
+        let allocation = record.as_ptr();
+        codec
+            .encrypt_packet_into(&[0x33; 1280], &[], &mut record)
+            .unwrap();
+        assert_eq!(
+            record.as_ptr(),
+            allocation,
+            "wire allocation must be reused"
+        );
+
+        let oversized = vec![0u8; MAX_RECORD_SIZE + 1];
+        assert!(matches!(
+            codec.encrypt_packet_into(&oversized, &[], &mut record),
+            Err(PacketError::PacketTooLarge)
+        ));
+        assert!(
+            record.is_empty(),
+            "an error must not expose the previous record"
+        );
+        assert_eq!(
+            record.as_ptr(),
+            allocation,
+            "an error must retain reusable capacity"
+        );
+    }
+
+    #[test]
+    fn decrypt_in_place_reuses_record_allocation_for_tls_and_raw() {
+        let key = [0x63u8; 32];
+        let data = vec![0xB4; 1400];
+        let padding = vec![0xC5; 73];
+
+        for framing in [Framing::Tls, Framing::Raw] {
+            let mut enc = match framing {
+                Framing::Tls => PacketCodec::new(key),
+                Framing::Raw => PacketCodec::new_raw(key),
+            };
+            let mut dec = match framing {
+                Framing::Tls => PacketCodec::new(key),
+                Framing::Raw => PacketCodec::new_raw(key),
+            };
+            let mut record = enc.encrypt_packet(&data, &padding).unwrap();
+            let allocation = record.as_ptr();
+
+            dec.decrypt_packet_in_place(&mut record).unwrap();
+
+            assert_eq!(record, data, "{framing:?} plaintext");
+            assert_eq!(
+                record.as_ptr(),
+                allocation,
+                "{framing:?} decrypt must retain the record allocation"
+            );
+        }
+    }
+
+    #[test]
+    fn decrypt_in_place_clears_failed_record_but_retains_capacity() {
+        let mut enc = PacketCodec::new([0x64u8; 32]);
+        let mut wrong_key = PacketCodec::new([0x65u8; 32]);
+        let mut record = enc
+            .encrypt_packet(b"must not survive failure", &[])
+            .unwrap();
+        let allocation = record.as_ptr();
+
+        assert!(matches!(
+            wrong_key.decrypt_packet_in_place(&mut record),
+            Err(PacketError::DecryptFailed)
+        ));
+        assert!(record.is_empty());
+        assert_eq!(record.as_ptr(), allocation);
     }
 
     #[test]
@@ -998,6 +1221,65 @@ mod tests {
                     "{framing:?} chunk={chunk}: expected clean EOF after all records"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_owned_reader_reuses_allocation_and_clears_on_eof() {
+        let key = [0x73u8; 32];
+        for framing in [Framing::Tls, Framing::Raw] {
+            let mk = || match framing {
+                Framing::Tls => PacketCodec::new(key),
+                Framing::Raw => PacketCodec::new_raw(key),
+            };
+            let payloads = [vec![0x11; 1400], vec![0x22; 777]];
+            let mut enc = mk();
+            let mut wire = Vec::new();
+            for payload in &payloads {
+                wire.extend_from_slice(&enc.encrypt_packet(payload, &[]).unwrap());
+            }
+
+            let mut reader = ChunkedReader::new(wire, 7);
+            let mut record = Vec::with_capacity(TLS_RECORD_HEADER + MAX_RECORD_SIZE);
+            let allocation = record.as_ptr();
+            let mut dec = mk();
+            for payload in &payloads {
+                read_record_into(&mut reader, framing, &mut record)
+                    .await
+                    .unwrap();
+                assert_eq!(record.as_ptr(), allocation);
+                dec.decrypt_packet_in_place(&mut record).unwrap();
+                assert_eq!(&record, payload);
+            }
+
+            assert!(matches!(
+                read_record_into(&mut reader, framing, &mut record).await,
+                Err(PacketError::ConnectionClosed)
+            ));
+            assert!(record.is_empty());
+            assert_eq!(record.as_ptr(), allocation);
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_owned_reader_clears_partial_record_body() {
+        for framing in [Framing::Tls, Framing::Raw] {
+            let mut wire = match framing {
+                Framing::Tls => vec![0x17, 0x03, 0x03, 0x00, 0x20],
+                Framing::Raw => vec![0x00, 0x20],
+            };
+            wire.extend_from_slice(&[0xAA; 3]);
+            let mut reader = ChunkedReader::new(wire, 1);
+            let mut record = Vec::with_capacity(TLS_RECORD_HEADER + MAX_RECORD_SIZE);
+            record.extend_from_slice(b"stale record");
+            let allocation = record.as_ptr();
+
+            assert!(matches!(
+                read_record_into(&mut reader, framing, &mut record).await,
+                Err(PacketError::ConnectionClosed)
+            ));
+            assert!(record.is_empty());
+            assert_eq!(record.as_ptr(), allocation);
         }
     }
 

@@ -4,12 +4,13 @@ import os
 import sys
 import io
 import paramiko
+import ssh_hostkey
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 ssh = paramiko.SSHClient()
-ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+ssh_hostkey.harden(ssh)
 ssh.connect("YOUR_DEPLOY_HOST", username="root", password=os.environ.get("QELI_DEPLOY_PASS", ""), timeout=15)
 
 def run(cmd, timeout=30):
@@ -53,10 +54,10 @@ print("[7] TCP congestion control:")
 print(run("sysctl net.ipv4.tcp_congestion_control"))
 print()
 
-# 7b. UDP socket buffers. rmem_max is NOT what a UDP socket gets — UDP has no autotuning,
-# so it takes rmem_default verbatim. `rb=` in `ss -ulnm` is the only proof it landed, and
-# `d<N>` there (plus "receive buffer errors") is how a too-small buffer shows up.
-print("[7b] UDP socket buffers (expect rb4194304, not rb212992):")
+# 7b. UDP socket buffers. qeli requests 4 MiB and may auto-grow to 8/16 MiB; rmem_max is
+# the ceiling. `rb=` is the proof of what was granted, while `d<N>` (plus "receive buffer
+# errors") is how a too-small queue shows up.
+print("[7b] UDP socket buffers (expect rb4194304..16777216, not rb212992):")
 print(run("sysctl net.core.rmem_default net.core.wmem_default"))
 print(run("ss -ulnm 2>/dev/null | grep -A1 -E ':(8448|8449|8450)' | grep -oE 'rb[0-9]+|d[0-9]+' | sort -u | tr '\\n' ' '"))
 print(run("netstat -su 2>/dev/null | grep -i 'receive buffer errors'"))

@@ -23,6 +23,13 @@
       [/^(\d+) lines$/, '$1 строк'],
       [/^(\d+) entries$/, '$1 записей'],
       [/^(\d+) outbound profile\(s\)$/, '$1 исходящих профилей'],
+      [/^(\d+) shown · (\d+) total · (\d+) online$/, '$1 показано · $2 всего · $3 в сети'],
+      [/^Showing (\d+)–(\d+) of (\d+) sessions$/, 'Показано $1–$2 из $3 сессий'],
+      [/^Showing (\d+)–(\d+) of (\d+) users$/, 'Показано $1–$2 из $3 пользователей'],
+      [/^Page (\d+) of (\d+)$/, 'Страница $1 из $2'],
+      [/^(\d+) selected$/, 'Выбрано: $1'],
+      [/^● Online ×(\d+)$/, '● В сети ×$1'],
+      [/^(\d+) outbound packet\(s\) were dropped by server backpressure\.$/, '$1 исходящих пакетов потеряно из-за backpressure сервера.'],
     ],
   };
 
@@ -68,8 +75,8 @@
 
       // ── quick start page ──
       'Quick start — launch any masking mode in one click': 'Быстрый старт — запуск любого режима маскировки в один клик',
-      'Each row is a complete masking mode. Click Launch and the panel builds a ready profile — TUN interface, NAT egress, in-tunnel DNS, an IP pool and the full obfuscation stack with the curated stealth posture (Poisson flow-shaping instead of a fixed heartbeat, MTU 1280, stream bonding on TCP) — then saves it and restarts the server.':
-        'Каждая строка — полноценный режим маскировки. Нажмите Launch, и панель соберёт готовый профиль: интерфейс TUN, NAT-выход, DNS внутри туннеля, пул IP и полный стек обфускации с подобранной stealth-постурой (пуассоновский шейпинг вместо фиксированного heartbeat, MTU 1280, бондинг потоков на TCP) — затем сохранит его и перезапустит сервер.',
+      'Each row is a complete masking mode. Click Launch and the panel builds a ready profile — TUN interface, NAT egress, in-tunnel DNS, an IP pool and the full obfuscation stack with the curated stealth posture (Poisson flow-shaping instead of a fixed heartbeat, MTU 1400, stream bonding on TCP) — then saves it and restarts the server.':
+        'Каждая строка — полноценный режим маскировки. Нажмите Launch, и панель соберёт готовый профиль: интерфейс TUN, NAT-выход, DNS внутри туннеля, пул IP и полный стек обфускации с подобранной stealth-постурой (пуассоновский шейпинг вместо фиксированного heartbeat, MTU 1400, бондинг потоков на TCP) — затем сохранит его и перезапустит сервер.',
       'Each mode gets its own interface, subnet and port, so they never collide — launch as many as you like and clients pick whichever port suits their network. After a server is up, add users and share a qeli:// link or QR; for full manual control over every option, open the config.':
         'У каждого режима свой интерфейс, подсеть и порт, поэтому они не конфликтуют — поднимайте сколько угодно, клиенты сами выберут подходящий их сети порт. После запуска сервера добавьте пользователей и поделитесь ссылкой qeli:// или QR; для полного ручного контроля над каждым параметром откройте конфигурацию.',
       'Modes are independent — running several at once is the recommended production layout (it is exactly what server-multiprofile.conf.example ships). A client connects to whichever port gets through its network.':
@@ -92,6 +99,99 @@
       'Port {port} is already used by profile {name}. Change its port in Configuration first, then launch again.':
         'Порт {port} уже занят профилем {name}. Сначала измените его порт в Конфигурации, затем запустите снова.',
 
+      // ── transport health / structured client diagnostics ──
+      'Transport health': 'Состояние транспорта',
+      'Live server sessions joined with the effective, secret-free transport configuration. Open a profile to inspect MTU, DNS, routing, buffers and masking.':
+        'Текущие серверные сессии вместе с эффективной конфигурацией транспорта без секретов. Откройте профиль, чтобы проверить MTU, DNS, маршрутизацию, буферы и маскировку.',
+      'Total profiles': 'Всего профилей',
+      'Profiles with clients': 'Профили с клиентами',
+      'Active sessions': 'Активные сессии',
+      'Warnings': 'Предупреждения',
+      'Server to clients': 'Сервер → клиенты',
+      'Clients to server': 'Клиенты → сервер',
+      'Dropped by server': 'Отброшено сервером',
+      'Configured transport profiles, including disabled profiles.': 'Настроенные транспортные профили, включая отключённые.',
+      'Profiles that currently have at least one authenticated session.': 'Профили, в которых сейчас есть хотя бы одна аутентифицированная сессия.',
+      'Authenticated client sessions across all profiles.': 'Аутентифицированные клиентские сессии во всех профилях.',
+      'Current configuration or runtime warnings across all profiles.': 'Текущие предупреждения конфигурации или выполнения во всех профилях.',
+      'IP payload sent by the server to connected clients.': 'IP-данные, отправленные сервером подключённым клиентам.',
+      'IP payload received by the server from connected clients.': 'IP-данные, полученные сервером от подключённых клиентов.',
+      'Outbound packets dropped by server backpressure or rate limiting.': 'Исходящие пакеты, отброшенные сервером из-за обратного давления или ограничения скорости.',
+      'To clients': 'К клиентам',
+      'From clients': 'От клиентов',
+      'Live server sessions joined with the effective, secret-free transport configuration. Expand a profile to inspect MTU, DNS, routing, buffers and masking.':
+        'Текущие серверные сессии вместе с эффективной конфигурацией транспорта без секретов. Разверните профиль, чтобы проверить MTU, DNS, маршрутизацию, буферы и маскировку.',
+      'Search profiles': 'Поиск профилей',
+      'Filter by state': 'Фильтр по состоянию',
+      'All states': 'Все состояния',
+      'Active': 'Активен',
+      'Ready': 'Готов',
+      'Unavailable': 'Недоступен',
+      'Refreshing…': 'Обновление…',
+      'Sessions': 'Сессии',
+      'Alerts': 'Предупреждения',
+      'Sent': 'Отправлено',
+      'Received': 'Принято',
+      'Dropped': 'Потеряно',
+      'Data-plane worker unavailable': 'Рабочий процесс data plane недоступен',
+      'Configured profiles are shown, but their listeners and sessions cannot be verified.':
+        'Настроенные профили показаны, но проверить их слушатели и сессии невозможно.',
+      'No profiles match the current filter.': 'Нет профилей, соответствующих фильтру.',
+      'Streams': 'Потоки',
+      'Hide details': 'Скрыть подробности',
+      'Show details': 'Показать подробности',
+      'Tunnel and routing': 'Туннель и маршрутизация',
+      'Device': 'Устройство',
+      'Address / pool': 'Адрес / пул',
+      'Queues': 'Очереди',
+      'Automatic': 'Автоматически',
+      'TX queue': 'Очередь TX',
+      'Advertised routes': 'Анонсируемые маршруты',
+      'DNS and wire': 'DNS и транспорт',
+      'DNS proxy': 'DNS-прокси',
+      'DNS listen': 'DNS-слушатель',
+      'DNS upstreams': 'Внешние DNS',
+      'None': 'Нет',
+      'Heartbeat': 'Heartbeat',
+      'Fragmentation': 'Фрагментация',
+      'Traffic shaping': 'Шейпинг трафика',
+      'Buffers and limits': 'Буферы и лимиты',
+      'TCP send / receive': 'TCP отправка / приём',
+      'UDP send / receive': 'UDP отправка / приём',
+      'TUN read': 'Чтение TUN',
+      'Max clients': 'Макс. клиентов',
+      'Handshake timeout': 'Тайм-аут рукопожатия',
+      'Idle timeout': 'Тайм-аут простоя',
+      'Updated': 'Обновлено',
+      'Transport health is unavailable': 'Состояние транспорта недоступно',
+      'Failed to load transport health: ': 'Не удалось загрузить состояние транспорта: ',
+      'The data-plane worker is unavailable; this profile cannot accept tunnels.':
+        'Рабочий процесс data plane недоступен; профиль не может принимать туннели.',
+      'NAT is enabled but iptables is unavailable; full-tunnel internet egress will fail.':
+        'NAT включён, но iptables недоступен; выход в интернет через full-tunnel не заработает.',
+      'UDP receive buffering is automatic but starts from the OS default; verify kernel buffer ceilings under load.':
+        'Буфер приёма UDP автоматический, но начинается со значения ОС; проверьте потолки буферов ядра под нагрузкой.',
+      'Heartbeat, shaping and idle timeout are all disabled; a dead peer may remain allocated indefinitely.':
+        'Heartbeat, шейпинг и тайм-аут простоя выключены; мёртвый peer может остаться выделенным навсегда.',
+      'Transport diagnostics': 'Диагностика транспорта',
+      'Details': 'Подробнее',
+      'State': 'Состояние',
+      'Last reported state': 'Последнее переданное состояние',
+      'Reconnects': 'Переподключения',
+      'Negotiated network plan': 'Согласованный сетевой план',
+      'Carrier address': 'Внешний адрес',
+      'Tunnel address': 'Адрес туннеля',
+      'Gateway': 'Шлюз',
+      'Full tunnel': 'Полный туннель',
+      'Kill switch': 'Kill switch',
+      'Multipath': 'Multipath',
+      'UDP kernel drops': 'Потери UDP в ядре',
+      'UDP internal drops': 'Внутренние потери UDP',
+      'UDP receive buffer': 'Буфер приёма UDP',
+      'DNS servers': 'DNS-серверы',
+      'Effective routes': 'Эффективные маршруты',
+      'Connection decisions': 'Решения при подключении',
+
       // ── dashboard: stats / clients ──
       'Connected clients': 'Подключённые клиенты',
       'Active profiles': 'Активные профили',
@@ -99,7 +199,20 @@
       'Total received': 'Принято всего',
       'Connected Clients': 'Подключённые клиенты',
       'No clients connected': 'Нет подключённых клиентов',
+      'No matching clients': 'Нет клиентов, соответствующих фильтру',
       'All profiles': 'Все профили',
+      'Search clients…': 'Поиск клиентов…',
+      'Longest online': 'Дольше всех в сети',
+      'Username A–Z': 'Имя А–Я',
+      'Username Z–A': 'Имя Я–А',
+      'Profile A–Z': 'Профиль А–Я',
+      'Most traffic': 'Больше всего трафика',
+      'Most drops': 'Больше всего потерь',
+      '25 rows': '25 строк',
+      '50 rows': '50 строк',
+      '100 rows': '100 строк',
+      'Previous': 'Назад',
+      'Next': 'Далее',
       'Refresh': 'Обновить',
       'Profile': 'Профиль',
       'IP Address': 'IP-адрес',
@@ -119,6 +232,17 @@
       // ── users ──
       'Add User': 'Добавить пользователя',
       'No users configured': 'Пользователи не настроены',
+      'No matching users': 'Нет пользователей, соответствующих фильтру',
+      'Search users…': 'Поиск пользователей…',
+      'All statuses': 'Все статусы',
+      'Online': 'В сети',
+      'Offline': 'Не в сети',
+      '● Online': '● В сети',
+      '○ Offline': '○ Не в сети',
+      'Online first': 'Сначала в сети',
+      'Most data used': 'Больше всего трафика',
+      'Recently seen': 'Недавно активные',
+      'Group A–Z': 'Группа А–Я',
       'Status': 'Статус',
       'Static IP': 'Статический IP',
       'Group': 'Группа',
@@ -179,8 +303,10 @@
       'Quick start failed: ': 'Быстрый старт не удался: ',
       'Users referencing it will fall back to their own values.':
         'Пользователи, ссылающиеся на неё, вернутся к собственным значениям.',
-      'This adds or updates the profile and brings the server up.':
-        'Профиль будет добавлен или обновлён, сервер — поднят.',
+      'This creates the profile with new credentials and brings the server up.':
+        'Профиль будет создан с новыми учётными данными, сервер — поднят.',
+      'This profile already exists. Quick Start will keep its credentials and manual settings, enable it and restart the server.':
+        'Этот профиль уже существует. Быстрый старт сохранит его учётные данные и ручные настройки, включит его и перезапустит сервер.',
       'Every client of this profile must update its pinned server key, and a restart is needed for it to take effect.':
         'Каждый клиент этого профиля должен обновить запиненный ключ сервера; для применения нужен перезапуск.',
       'This OVERWRITES the current config, users and identity keys. A pre-restore snapshot is saved on the server first. A restart is needed to apply.':
@@ -248,7 +374,6 @@
       'Scan the QR with the qeli app, or paste the link to import the profile.':
         'Отсканируйте QR в приложении qeli или вставьте ссылку, чтобы импортировать профиль.',
       'Generate QR': 'Сгенерировать QR',
-      'Copy': 'Копировать',
       '(plaintext)': '(открытым текстом)',
       'Issues a connection link/QR for an': 'Создаёт ссылку/QR подключения для',
       'user from the password stored on the server —': 'пользователя из сохранённого на сервере пароля —',
@@ -266,6 +391,51 @@
       'Raw INI': 'Сырой INI',
       'Unsaved changes': 'Несохранённые изменения',
       'Reload': 'Перезагрузить',
+      'History': 'История',
+      'Configuration editor view': 'Режим редактора конфигурации',
+      'Toggle navigation': 'Открыть или закрыть навигацию',
+      'Self-reported by the client, not verified by the server': 'Сообщено клиентом и не проверено сервером',
+      'Planned — has no effect yet': 'Запланировано — пока не действует',
+      'Restore a private snapshot created before a panel save': 'Восстановить приватный снимок, созданный перед сохранением панели',
+      'Configuration history': 'История конфигурации',
+      'Private snapshots created before panel writes; newest ten are retained.':
+        'Приватные снимки создаются перед записью из панели; сохраняются десять последних.',
+      'Loading history…': 'Загрузка истории…',
+      'No snapshots yet.': 'Снимков пока нет.',
+      'Restoring…': 'Восстановление…',
+      'Discard unsaved changes': 'Отбросить несохранённые изменения',
+      'Reload the configuration from disk and discard every unsaved edit?':
+        'Перечитать конфигурацию с диска и отбросить все несохранённые изменения?',
+      'Discard and reload': 'Отбросить и перечитать',
+      'Switching between the structured and raw editors reloads the configuration from disk. Discard the unsaved edits?':
+        'Переключение между структурированным и сырым редакторами перечитывает конфигурацию с диска. Отбросить несохранённые правки?',
+      'Discard and switch': 'Отбросить и переключить',
+      'Review configuration changes': 'Проверка изменений конфигурации',
+      'Review raw configuration changes': 'Проверка изменений сырой конфигурации',
+      '… and {} more': '… и ещё {}',
+      '{} setting(s) will change:\n\n{}{}\n\nA private rollback snapshot will be created before the write.':
+        'Будет изменено настроек: {}.\n\n{}{}\n\nПеред записью будет создан приватный снимок для отката.',
+      'line {}': 'строка {}',
+      '{} line(s) differ:\n\n{}{}\n\nA private rollback snapshot will be created before the write.':
+        'Отличаются строки: {}.\n\n{}{}\n\nПеред записью будет создан приватный снимок для отката.',
+      'Save raw config': 'Сохранить сырой конфиг',
+      'Failed to load history': 'Не удалось загрузить историю',
+      'Unknown time': 'Время неизвестно',
+      'Restore configuration snapshot': 'Восстановление снимка конфигурации',
+      'Restore the snapshot from {}?\n\nThe current config will be snapshotted first. A restart is required to apply the restored version.':
+        'Восстановить снимок от {}?\n\nСначала будет сохранён снимок текущего конфига. Для применения восстановленной версии нужен перезапуск.',
+      'Restore snapshot': 'Восстановить снимок',
+      'Restore failed': 'Не удалось восстановить',
+      'Snapshot restored': 'Снимок восстановлен',
+      'The server configuration changed after this page was loaded. Reload and review the newer version before saving.':
+        'Конфигурация сервера изменилась после загрузки страницы. Перечитайте и проверьте новую версию перед сохранением.',
+      'The server configuration changed on disk while this save was being prepared. Nothing was written; reload and review the newer version.':
+        'Конфигурация сервера изменилась на диске во время подготовки сохранения. Ничего не записано; перечитайте и проверьте новую версию.',
+      'Configuration snapshot restored — restart to apply it.':
+        'Снимок конфигурации восстановлен — перезапустите сервер для применения.',
+      'Existing profile enabled; credentials and manual settings preserved.':
+        'Существующий профиль включён; реквизиты и ручные настройки сохранены.',
+      'Quick Start profile created.': 'Профиль Quick Start создан.',
       'Save to Disk': 'Сохранить на диск',
       'Apply & Restart': 'Применить и перезапустить',
       'Restarting…': 'Перезапуск…',
@@ -306,6 +476,16 @@
       'Wire Mode': 'Режим канала',
       'TLS Masking': 'TLS-маскировка',
       'Connection Limits': 'Лимиты подключений',
+      'aes-256-gcm (AES-NI)': 'aes-256-gcm (AES-NI)',
+      'argon2id (recommended)': 'argon2id (рекомендуется)',
+      'chacha20-poly1305 (recommended)': 'chacha20-poly1305 (рекомендуется)',
+      'datetime — 2026-07-18 18:10:03.259 (local)': 'datetime — 2026-07-18 18:10:03.259 (локальное)',
+      'epoch — 1782000603.259 (unix)': 'epoch — 1782000603.259 (unix)',
+      'json (structured) — not implemented yet': 'json (структурированный) — пока не реализован',
+      'none — journald/syslog stamps it already': 'none — journald/syslog уже добавляет время',
+      'plain (human-readable)': 'plain (для чтения человеком)',
+      'rfc3339 — 2026-07-18T18:10:03.259Z (UTC)': 'rfc3339 — 2026-07-18T18:10:03.259Z (UTC)',
+      'time — 18:10:03.259 (no date)': 'time — 18:10:03.259 (без даты)',
       'TCP Settings': 'Настройки TCP',
       'TUN Buffer': 'Буфер TUN',
       'Brute-force Protection': 'Защита от брутфорса',
@@ -429,8 +609,6 @@
       'Max packet size. 1400–1480 avoids fragmentation with encapsulation overhead.': 'Макс. размер пакета. 1400–1480 избегает фрагментации с учётом инкапсуляции.',
       'Gateway IP (server address)': 'Шлюз (адрес сервера)',
       'IP of this server on the VPN network': 'IP этого сервера в VPN-сети',
-      'Subnet mask': 'Маска подсети',
-      'Defines the VPN subnet': 'Определяет подсеть VPN',
       'TX queue length': 'Длина очереди TX',
       'Kernel transmit queue size. Higher = more buffering.': 'Размер очереди передачи в ядре. Больше = больше буферизации.',
       'TUN queues (multi-queue)': 'Очереди TUN (multi-queue)',
@@ -438,8 +616,8 @@
         'IFF_MULTI_QUEUE: 0 = авто (число CPU), ядро RSS-распределяет пакеты по ядрам. 1 = одна очередь.',
 
       // ── config: pool ──
-      'Pool CIDR': 'CIDR пула',
-      'Subnet from which client IPs are assigned. Must contain the gateway IP.': 'Подсеть, из которой выдаются IP клиентам. Должна содержать IP шлюза.',
+      'VPN subnet (CIDR)': 'Подсеть VPN (CIDR)',
+      'Single source for the server and client prefix, address pool, and DHCP. Must contain the gateway IP; /16 means 255.255.0.0.': 'Единый источник префикса сервера и клиентов, пула адресов и DHCP. Должна содержать IP шлюза; /16 означает 255.255.0.0.',
       'Lease time (seconds)': 'Время аренды (сек)',
       'How long an IP is reserved for a user': 'Сколько IP зарезервирован за пользователем',
       'Excluded IPs': 'Исключённые IP',
@@ -734,8 +912,8 @@
       'What it does': 'Что делает',
       'Launch': 'Запустить',
       'Action': 'Действие',
-      'Pick a masking mode below. The panel builds a ready profile for you — TUN interface, NAT egress, in-tunnel DNS, an IP pool and the full obfuscation stack with the curated stealth posture (Poisson flow-shaping instead of a fixed heartbeat, MTU 1280, stream bonding on TCP) — saves it, and restarts the server.':
-        'Выберите режим маскировки ниже. Панель соберёт готовый профиль — интерфейс TUN, NAT-выход, DNS в туннеле, пул IP и полный стек обфускации с боевой stealth-постурой (Poisson flow-shaping вместо фиксированного heartbeat, MTU 1280, объединение потоков на TCP) — сохранит и перезапустит сервер.',
+      'Pick a masking mode below. The panel builds a ready profile for you — TUN interface, NAT egress, in-tunnel DNS, an IP pool and the full obfuscation stack with the curated stealth posture (Poisson flow-shaping instead of a fixed heartbeat, MTU 1400, stream bonding on TCP) — saves it, and restarts the server.':
+        'Выберите режим маскировки ниже. Панель соберёт готовый профиль — интерфейс TUN, NAT-выход, DNS в туннеле, пул IP и полный стек обфускации с боевой stealth-постурой (Poisson flow-shaping вместо фиксированного heartbeat, MTU 1400, объединение потоков на TCP) — сохранит и перезапустит сервер.',
       'Genuine TLS 1.3 carries the tunnel — indistinguishable from a real HTTPS site, beats active probing. Best default.':
         'Туннель внутри настоящего TLS 1.3 — неотличимо от реального HTTPS-сайта, устойчив к активному зондированию. Лучший выбор по умолчанию.',
       'REALITY proxy: foreign / prober traffic is bridged to a real site; our clients are recognised by a short_id token (fake-TLS, no inner TLS).':
@@ -816,8 +994,6 @@
       // ── i18n audit: config misc / users modal / placeholders ──
       '● Unsaved changes': '● Несохранённые изменения',
       'Wire-breaking.': 'Несовместимо по проводу.',
-      'Per-profile server identity (private key). Empty = default /etc/qeli/identity/<name>.key':
-        'Идентичность сервера для профиля (приватный ключ). Пусто = по умолчанию /etc/qeli/identity/<name>.key',
       'recommended': 'рекомендуется',
       'gateway (optional)': 'шлюз (необязательно)',
       'new admin password': 'новый пароль администратора',
@@ -836,7 +1012,9 @@
       'Prefixed to every notification so several servers reporting to one Telegram chat / webhook are distinguishable (e.g. "[prod-eu] …"). Empty = omit.':
         'Подставляется в начало каждого уведомления, чтобы различать несколько серверов, шлющих в один Telegram-чат / webhook (например, «[prod-eu] …»). Пусто = не добавлять.',
       'Send messages through a Telegram bot.': 'Отправка сообщений через Telegram-бота.',
+      'Telegram notifications': 'Уведомления Telegram',
       'POST a JSON payload to any HTTP(S) endpoint.': 'POST JSON на любой HTTP(S)-эндпоинт.',
+      'Webhook notifications': 'Уведомления webhook',
       'Notify on': 'Уведомлять о',
       'Save changes': 'Сохранить изменения',
       'Test sent — see the result': 'Тест отправлен — см. результат',
@@ -890,7 +1068,6 @@
         'Действует и на вход в веб-панель, и на аутентификацию VPN',
       'After this many failed attempts within the window, a source IP is locked out for the lockout duration.':
         'После стольких неудачных попыток в течение окна IP-адрес источника блокируется на заданное время.',
-      'Window (seconds)': 'Окно (секунды)',
       'Lockout (seconds)': 'Блокировка (секунды)',
       'Save policy': 'Сохранить политику',
       'Saving applies live and resets the current counters.':
@@ -1108,7 +1285,7 @@
   };
 
   const STORAGE_KEY = 'qeli_lang';
-  const ATTRS = ['placeholder', 'title'];
+  const ATTRS = ['placeholder', 'title', 'aria-label'];
   const origText = new WeakMap(); // text node -> original EN string
   let lang = localStorage.getItem(STORAGE_KEY) || 'en';
   let observer = null;
@@ -1134,7 +1311,13 @@
     const p = node.parentNode;
     if (!p) return;
     const tag = p.nodeName;
-    if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'TEXTAREA' || tag === 'OPTION') return;
+    if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'TEXTAREA') return;
+    // Select options with an explicit value are presentation labels and are safe
+    // to translate. Options without one may use their text as the submitted
+    // config value, so translating those would change behaviour. Runtime profile
+    // names opt out explicitly even after Alpine reflects :value into the DOM.
+    if ((p.closest && p.closest('[data-i18n-skip]')) ||
+        (tag === 'OPTION' && !p.hasAttribute('value'))) return;
     if (!origText.has(node)) {
       if (!node.nodeValue || !node.nodeValue.trim()) return;
       origText.set(node, node.nodeValue);

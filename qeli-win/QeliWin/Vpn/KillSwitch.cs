@@ -5,18 +5,16 @@ using System.Text;
 namespace QeliWin.Vpn;
 
 /// <summary>
-/// Windows firewall kill-switch (Windows Filtering Platform via the NetSecurity
-/// PowerShell cmdlets). While engaged, the profile DefaultOutboundAction is set to
-/// Block and a small "qeli_ks" rule group ALLOWS only: the VPN tun adapter, the
-/// server IP(s), DNS and DHCP (loopback is always permitted by Windows). So when
-/// the tunnel drops, nothing of substance leaks onto the physical NIC during the
-/// reconnect window. Explicit Allow rules beat the Block default, so this is true
-/// allow-list egress (no "block rule vs allow rule" precedence trap).
+/// Two-layer Windows kill-switch. The firewall default-block and qeli allow rules
+/// provide crash persistence; a WinDivert kernel DROP gate enforces the same
+/// physical-interface allow-list ahead of pre-existing explicit firewall Allow
+/// rules, which otherwise override DefaultOutboundAction.
 ///
-/// FAIL-SAFE: the rules + default-block stay up across reconnects and are lifted
-/// only on a clean Stop(). A crash leaves them in place (the host stays locked — no
-/// leak) until qeli runs again: <see cref="Sweep"/> at startup restores egress from
-/// the saved state. To clear manually:
+/// FAIL-SAFE: the firewall rules + default-block stay up across reconnects and are
+/// lifted only on a clean Stop(). A crash closes the process-bound strict WinDivert
+/// gate but leaves the firewall fallback in place until <see cref="Sweep"/> restores
+/// the saved state; unrelated explicit WFP Allow rules are therefore a documented
+/// residual only in that post-crash interval. To clear manually:
 ///   Remove-NetFirewallRule -Group qeli_ks; Set-NetFirewallProfile -All -DefaultOutboundAction Allow
 ///
 /// REQUIRES admin (the VPN already does, for Wintun). RUNTIME-UNVERIFIED in this
@@ -26,6 +24,15 @@ namespace QeliWin.Vpn;
 public static class KillSwitch
 {
     private const string Group = "qeli_ks";
+    private const string OwnerMarkerName = @"Global\Qeli.KillSwitch.Owner.v1";
+    private const string OperationMutexName = @"Global\Qeli.KillSwitch.Operation.v1";
+    private static readonly object StrictGateLock = new();
+    private static readonly object OwnerLock = new();
+    private static WinDivertKillSwitchGate? _strictGate;
+    private static EventWaitHandle? _ownerMarker;
+    private static string? _strictTunAlias;
+    private static string[] _strictServers = Array.Empty<string>();
+    private static string[] _strictDns = Array.Empty<string>();
 
     private static string StatePath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -37,100 +44,155 @@ public static class KillSwitch
     /// host out with no path to the server).</summary>
     public static void Engage(string serverAddress, string tunAlias, Action<string> log)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(tunAlias);
         var ips = ResolveIps(serverAddress);
         if (ips.Count == 0)
             throw new InvalidOperationException(
                 $"kill-switch: cannot resolve server '{serverAddress}' to an IP to allow through");
 
-        // Save the current per-profile outbound actions so Disengage/Sweep can
-        // restore them, BEFORE we change anything.
-        var prior = GetOutboundActions();
-        Directory.CreateDirectory(Path.GetDirectoryName(StatePath)!);
-        // Stamp the state with THIS process's identity (pid + start-time) so the startup
-        // Sweep can tell a genuine crash (owner gone) from a still-live tunnel owned by
-        // ANOTHER qeli instance — a second launch must NOT sweep away an active
-        // kill-switch. (C-04) The `pid=`/`start=` lines are ignored by ReadState (they are
-        // not valid profile names), so the restore path is unaffected.
-        var self = Process.GetCurrentProcess();
-        var stateLines = new List<string> { $"pid={self.Id}", $"start={self.StartTime.Ticks}" };
-        stateLines.AddRange(prior.Select(kv => $"{kv.Key}={kv.Value}"));
-        File.WriteAllText(StatePath, string.Join("\n", stateLines));
+        // Serialize state/firewall mutations. The separate named event remains open for the
+        // complete engaged lifetime: unlike a Mutex it is not owned by an OS thread (this
+        // synchronous method is normally entered and left by different async-pool threads),
+        // but its kernel object still disappears automatically if the process crashes.
+        using var operation = AcquireOperation();
+        if (OwnerMarkerExists() || (File.Exists(StatePath) && OwnerAlive()))
+            throw new InvalidOperationException(
+                "kill-switch is owned by another live Qeli process; stop that tunnel first");
+        if (File.Exists(StatePath))
+            RestoreStaleState(log);
+        AcquireOwnership();
+        Dictionary<string, string>? prior = null;
+        bool firewallTouched = false;
+        try
+        {
+            // Save the current per-profile outbound actions so Disengage/Sweep can
+            // restore them, BEFORE we change anything.
+            prior = GetOutboundActions();
+            WriteState(prior);
+            // Stamp the state with THIS process's identity (pid + start-time) so the startup
+            // Sweep can tell a genuine crash (owner gone) from a still-live tunnel owned by
+            // ANOTHER qeli instance — a second launch must NOT sweep away an active
+            // kill-switch. (C-04) The `pid=`/`start=` lines are ignored by ReadState (they are
+            // not valid profile names), so the restore path is unaffected.
+            // Clear any leftovers from a crashed run, then add the allow rules FIRST so
+            // they already exist when the default flips to Block (no lockout window).
+            // All of this runs in ONE PowerShell invocation (was ~7 process launches per
+            // connect — each powershell.exe cold-start is ~100-300ms). Behaviour is
+            // unchanged: the script has $ErrorActionPreference='Stop' (see Ps), so any
+            // failing New-NetFirewallRule terminates the script BEFORE the default flips
+            // to Block — same fail-closed guarantee as the per-command version, and
+            // Remove-NetFirewallRule keeps its own -ErrorAction SilentlyContinue so a
+            // missing group is still a no-op.
+            var dnsServers = ResolveDnsServers();
+            var script = new StringBuilder();
+            script.AppendLine($"Remove-NetFirewallRule -Group '{Group}' -ErrorAction SilentlyContinue");
+            foreach (var ip in ips)
+                script.AppendLine($"New-NetFirewallRule -DisplayName 'qeli kill-switch: server {ip}' -Group '{Group}' " +
+                   $"-Direction Outbound -RemoteAddress {ip} -Action Allow -Profile Any | Out-Null");
+            // tunAlias can be a user-set config.DevNode: escape single-quotes (PowerShell
+            // doubles them inside a '...' literal) so a `'` can't break out of the argument.
+            script.AppendLine($"New-NetFirewallRule -DisplayName 'qeli kill-switch: tun' -Group '{Group}' " +
+               $"-Direction Outbound -InterfaceAlias '{tunAlias.Replace("'", "''")}' -Action Allow -Profile Any | Out-Null");
+            // DNS: scope port 53 to the system's configured resolvers, NEVER to any remote
+            // address. An unrestricted `RemotePort 53` rule let every app's DNS query egress in
+            // cleartext on the physical NIC during the tunnel-down window — the metadata leak the
+            // kill-switch is meant to stop. DNS is still permitted on the physical path only so the
+            // server hostname can be RE-RESOLVED on reconnect, so we allow it only to the resolvers
+            // in use. Fail closed: no resolvers -> no rule, reconnect uses the allowed cached
+            // server IP(s) above. Residual (accepted): an app querying those same resolvers still
+            // leaks its query; removing that would break re-resolution while down. (client-audit LOW)
+            foreach (var r in dnsServers)
+            {
+                script.AppendLine($"New-NetFirewallRule -DisplayName 'qeli kill-switch: dns-udp {r}' -Group '{Group}' " +
+                   $"-Direction Outbound -Protocol UDP -RemotePort 53 -RemoteAddress {r} -Action Allow -Profile Any | Out-Null");
+                script.AppendLine($"New-NetFirewallRule -DisplayName 'qeli kill-switch: dns-tcp {r}' -Group '{Group}' " +
+                   $"-Direction Outbound -Protocol TCP -RemotePort 53 -RemoteAddress {r} -Action Allow -Profile Any | Out-Null");
+            }
+            script.AppendLine($"New-NetFirewallRule -DisplayName 'qeli kill-switch: dhcp' -Group '{Group}' " +
+               $"-Direction Outbound -Protocol UDP -RemotePort 67 -Action Allow -Profile Any | Out-Null");
+            // Now flip the default outbound action to Block — the allow rules above let
+            // the permitted traffic through. Reached only if every rule above succeeded.
+            script.AppendLine("Set-NetFirewallProfile -All -DefaultOutboundAction Block");
+            ReplaceStrictGate(tunAlias, ips, dnsServers);
+            firewallTouched = true;
+            Ps(script.ToString(), critical: true);
 
-        // Clear any leftovers from a crashed run, then add the allow rules FIRST so
-        // they already exist when the default flips to Block (no lockout window).
-        // All of this runs in ONE PowerShell invocation (was ~7 process launches per
-        // connect — each powershell.exe cold-start is ~100-300ms). Behaviour is
-        // unchanged: the script has $ErrorActionPreference='Stop' (see Ps), so any
-        // failing New-NetFirewallRule terminates the script BEFORE the default flips
-        // to Block — same fail-closed guarantee as the per-command version, and
-        // Remove-NetFirewallRule keeps its own -ErrorAction SilentlyContinue so a
-        // missing group is still a no-op.
-        var script = new StringBuilder();
-        script.AppendLine($"Remove-NetFirewallRule -Group '{Group}' -ErrorAction SilentlyContinue");
-        foreach (var ip in ips)
-            script.AppendLine($"New-NetFirewallRule -DisplayName 'qeli kill-switch: server {ip}' -Group '{Group}' " +
-               $"-Direction Outbound -RemoteAddress {ip} -Action Allow -Profile Any | Out-Null");
-        // tunAlias can be a user-set config.DevNode: escape single-quotes (PowerShell
-        // doubles them inside a '...' literal) so a `'` can't break out of the argument.
-        script.AppendLine($"New-NetFirewallRule -DisplayName 'qeli kill-switch: tun' -Group '{Group}' " +
-           $"-Direction Outbound -InterfaceAlias '{(tunAlias ?? "").Replace("'", "''")}' -Action Allow -Profile Any | Out-Null");
-        // DNS: scope port 53 to the system's configured resolvers, NEVER to any remote
-        // address. An unrestricted `RemotePort 53` rule let every app's DNS query egress in
-        // cleartext on the physical NIC during the tunnel-down window — the metadata leak the
-        // kill-switch is meant to stop. DNS is still permitted on the physical path only so the
-        // server hostname can be RE-RESOLVED on reconnect, so we allow it only to the resolvers
-        // in use. Fail closed: no resolvers -> no rule, reconnect uses the allowed cached
-        // server IP(s) above. Residual (accepted): an app querying those same resolvers still
-        // leaks its query; removing that would break re-resolution while down. (client-audit LOW)
-        var dnsServers = ResolveDnsServers();
-        foreach (var r in dnsServers)
-        {
-            script.AppendLine($"New-NetFirewallRule -DisplayName 'qeli kill-switch: dns-udp {r}' -Group '{Group}' " +
-               $"-Direction Outbound -Protocol UDP -RemotePort 53 -RemoteAddress {r} -Action Allow -Profile Any | Out-Null");
-            script.AppendLine($"New-NetFirewallRule -DisplayName 'qeli kill-switch: dns-tcp {r}' -Group '{Group}' " +
-               $"-Direction Outbound -Protocol TCP -RemotePort 53 -RemoteAddress {r} -Action Allow -Profile Any | Out-Null");
+            log($"Kill-switch ENGAGED: egress restricted to tun '{tunAlias}', {string.Join(", ", ips)}, DHCP, and " +
+                $"DNS to {(dnsServers.Count > 0 ? string.Join(", ", dnsServers) : "<none — physical DNS blocked>")}. " +
+                $"Stays up across reconnects; lifted only on a clean stop. A crash leaves it " +
+                $"(no leak) — clear with: Remove-NetFirewallRule -Group {Group}; " +
+                $"Set-NetFirewallProfile -All -DefaultOutboundAction Allow");
         }
-        script.AppendLine($"New-NetFirewallRule -DisplayName 'qeli kill-switch: dhcp' -Group '{Group}' " +
-           $"-Direction Outbound -Protocol UDP -RemotePort 67 -Action Allow -Profile Any | Out-Null");
-        // Now flip the default outbound action to Block — the allow rules above let
-        // the permitted traffic through. Reached only if every rule above succeeded.
-        script.AppendLine("Set-NetFirewallProfile -All -DefaultOutboundAction Block");
-        try { Ps(script.ToString(), critical: true); }
-        catch
+        catch (Exception engageError)
         {
-            // The default outbound action is flipped by the LAST line, so a failure here means
-            // it was never applied and there is nothing to restore — egress is untouched. But
-            // the allow rules created before the failure, and the state file written above,
-            // would linger; and because THIS process is still alive, the next startup Sweep
-            // would read that state, see a live owner and deliberately leave the leftovers in
-            // place (C-04). Undo our own partial work before failing closed.
-            try { Ps($"Remove-NetFirewallRule -Group '{Group}' -ErrorAction SilentlyContinue", critical: false); } catch { }
-            try { File.Delete(StatePath); } catch { }
+            // A timeout can happen AFTER PowerShell changed the default policy, so assuming
+            // that a failed Engage left egress untouched is unsafe. Restore from the journal
+            // transactionally. If restoration itself fails, keep the state file, strict gate
+            // and mutex intact: losing recovery data would turn a recoverable fail-closed
+            // state into a permanent host lockout.
+            try
+            {
+                if (prior != null && firewallTouched)
+                    RestoreFirewall(prior);
+                DeleteState();
+                CloseStrictGate();
+                ReleaseOwnership();
+            }
+            catch (Exception restoreError)
+            {
+                throw new AggregateException(
+                    "kill-switch engage failed and firewall restoration also failed; " +
+                    "egress remains fail-closed and the recovery state was retained",
+                    engageError,
+                    restoreError);
+            }
             throw;
         }
+    }
 
-        log($"Kill-switch ENGAGED: egress restricted to tun '{tunAlias}', {string.Join(", ", ips)}, DHCP, and " +
-            $"DNS to {(dnsServers.Count > 0 ? string.Join(", ", dnsServers) : "<none — physical DNS blocked>")}. " +
-            $"Stays up across reconnects; lifted only on a clean stop. A crash leaves it " +
-            $"(no leak) — clear with: Remove-NetFirewallRule -Group {Group}; " +
-            $"Set-NetFirewallProfile -All -DefaultOutboundAction Allow");
+    /// <summary>Replace only the server-IP portion of an already engaged allowlist. New
+    /// addresses are added before obsolete ones are removed, so DDNS refresh never creates
+    /// a window in which neither generation can reach the server. The saved pre-qeli firewall
+    /// state and every non-server rule remain untouched.</summary>
+    public static void UpdateServerAddresses(
+        IReadOnlyList<string> previous, IReadOnlyList<string> refreshed, Action<string> log)
+    {
+        var oldSet = previous.ToHashSet(StringComparer.Ordinal);
+        var newSet = refreshed.ToHashSet(StringComparer.Ordinal);
+        if (newSet.Count == 0)
+            throw new InvalidOperationException("kill-switch: refusing an empty server allowlist");
+
+        var added = newSet.Except(oldSet).ToArray();
+        var removed = oldSet.Except(newSet).ToArray();
+        if (added.Length == 0 && removed.Length == 0) return;
+
+        var script = new StringBuilder();
+        foreach (var ip in added)
+            script.AppendLine($"New-NetFirewallRule -DisplayName 'qeli kill-switch: server {ip}' -Group '{Group}' " +
+                $"-Direction Outbound -RemoteAddress {ip} -Action Allow -Profile Any | Out-Null");
+        foreach (var ip in removed)
+            script.AppendLine($"Remove-NetFirewallRule -DisplayName 'qeli kill-switch: server {ip}' " +
+                "-ErrorAction SilentlyContinue");
+        Ps(script.ToString(), critical: true);
+        ReplaceStrictGate(_strictTunAlias
+            ?? throw new InvalidOperationException("kill-switch: strict gate has no tunnel interface"),
+            refreshed, ResolveDnsServers());
+        log($"Kill-switch server allowlist refreshed: {string.Join(", ", refreshed)}");
     }
 
     /// <summary>Lift the kill-switch: remove our rules and restore the saved
-    /// per-profile outbound actions. Best-effort; safe to call when not engaged.</summary>
+    /// per-profile outbound actions. A failed restore remains fail-closed and retains
+    /// the state journal for the next retry/startup sweep.</summary>
     public static void Disengage(Action<string>? log = null)
     {
-        Ps($"Remove-NetFirewallRule -Group '{Group}' -ErrorAction SilentlyContinue", critical: false);
+        using var operation = AcquireOperation();
         var prior = ReadState();
-        if (prior.Count > 0)
-            foreach (var kv in prior)
-                Ps($"Set-NetFirewallProfile -Name {kv.Key} -DefaultOutboundAction {kv.Value}", critical: false);
-        else
-            // No saved state (shouldn't happen) — restore the NEUTRAL Windows default
-            // (NotConfigured), NOT an explicit Allow that could weaken a pre-existing
-            // firewall policy we have no record of. (C-05)
-            Ps("Set-NetFirewallProfile -All -DefaultOutboundAction NotConfigured", critical: false);
-        try { File.Delete(StatePath); } catch { }
+        RestoreFirewall(prior);
+        // Restore firewall policy first. Until that is done the kernel gate remains
+        // active, so stopping the tunnel cannot create a transient egress window.
+        DeleteState();
+        CloseStrictGate();
+        ReleaseOwnership();
         log?.Invoke("Kill-switch disengaged (egress restored)");
     }
 
@@ -139,17 +201,17 @@ public static class KillSwitch
     /// firewalled. Call once at app start.</summary>
     public static void Sweep(Action<string>? log = null)
     {
+        using var operation = AcquireOperation();
         if (!File.Exists(StatePath)) return;
         // Only a CRASHED run's kill-switch should be swept. If the state's owning process
         // is still alive, it is an active tunnel (possibly another qeli instance) — leave
         // its kill-switch engaged rather than tearing down its protection. (C-04)
-        if (OwnerAlive())
+        if (OwnerMarkerExists() || OwnerAlive())
         {
             log?.Invoke("Kill-switch is owned by another live qeli process — leaving it engaged");
             return;
         }
-        log?.Invoke("Found a stale kill-switch from a crashed run — restoring egress");
-        Disengage(log);
+        RestoreStaleState(log);
     }
 
     /// <summary>Parse the owning process's pid + start-time recorded in the state file.</summary>
@@ -190,11 +252,195 @@ public static class KillSwitch
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
+    private static void ReplaceStrictGate(
+        string tunAlias, IEnumerable<string> servers, IEnumerable<string> dnsServers)
+    {
+        var nextServers = servers.ToArray();
+        var nextDns = dnsServers.ToArray();
+        lock (StrictGateLock)
+        {
+            // WinDivert filters are immutable. Close then replace under one lock; the
+            // persistent firewall default-block remains active during this tiny swap.
+            var oldAlias = _strictTunAlias;
+            var oldServers = _strictServers;
+            var oldDns = _strictDns;
+            bool hadOld = _strictGate != null;
+            _strictGate?.Dispose();
+            _strictGate = null;
+            try
+            {
+                _strictGate = WinDivertKillSwitchGate.Open(tunAlias, nextServers, nextDns);
+                _strictTunAlias = tunAlias;
+                _strictServers = nextServers;
+                _strictDns = nextDns;
+            }
+            catch
+            {
+                // A DDNS refresh must not downgrade a working strict gate merely
+                // because the replacement filter could not be opened. Restore the
+                // previous generation best-effort, then surface the original error.
+                if (hadOld && oldAlias != null)
+                {
+                    try
+                    {
+                        _strictGate = WinDivertKillSwitchGate.Open(oldAlias, oldServers, oldDns);
+                        _strictTunAlias = oldAlias;
+                        _strictServers = oldServers;
+                        _strictDns = oldDns;
+                    }
+                    catch { }
+                }
+                throw;
+            }
+        }
+    }
+
+    private static void CloseStrictGate()
+    {
+        lock (StrictGateLock)
+        {
+            _strictGate?.Dispose();
+            _strictGate = null;
+            _strictTunAlias = null;
+            _strictServers = Array.Empty<string>();
+            _strictDns = Array.Empty<string>();
+        }
+    }
+
+    private static void AcquireOwnership()
+    {
+        lock (OwnerLock)
+        {
+            if (_ownerMarker != null)
+                throw new InvalidOperationException(
+                    "kill-switch is already engaged by another tunnel in this Qeli process");
+
+            var marker = new EventWaitHandle(
+                initialState: false,
+                EventResetMode.ManualReset,
+                OwnerMarkerName,
+                out bool createdNew);
+            if (!createdNew)
+            {
+                marker.Dispose();
+                throw new InvalidOperationException(
+                    "kill-switch is owned by another live Qeli process; stop that tunnel first");
+            }
+            _ownerMarker = marker;
+        }
+    }
+
+    private static void ReleaseOwnership()
+    {
+        lock (OwnerLock)
+        {
+            _ownerMarker?.Dispose();
+            _ownerMarker = null;
+        }
+    }
+
+    private static bool OwnerMarkerExists()
+    {
+        if (!EventWaitHandle.TryOpenExisting(OwnerMarkerName, out var marker)) return false;
+        marker.Dispose();
+        return true;
+    }
+
+    private sealed class OperationLease(Mutex mutex) : IDisposable
+    {
+        private Mutex? _mutex = mutex;
+
+        public void Dispose()
+        {
+            var current = Interlocked.Exchange(ref _mutex, null);
+            if (current == null) return;
+            try { current.ReleaseMutex(); }
+            finally { current.Dispose(); }
+        }
+    }
+
+    private static OperationLease AcquireOperation()
+    {
+        var mutex = new Mutex(initiallyOwned: false, OperationMutexName);
+        bool acquired;
+        try { acquired = mutex.WaitOne(TimeSpan.FromSeconds(30)); }
+        catch (AbandonedMutexException) { acquired = true; }
+        catch
+        {
+            mutex.Dispose();
+            throw;
+        }
+        if (!acquired)
+        {
+            mutex.Dispose();
+            throw new TimeoutException(
+                "kill-switch: timed out waiting for another firewall operation to finish");
+        }
+        return new OperationLease(mutex);
+    }
+
+    private static void WriteState(IReadOnlyDictionary<string, string> prior)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(StatePath)!);
+        var self = Process.GetCurrentProcess();
+        var stateLines = new List<string> { $"pid={self.Id}", $"start={self.StartTime.Ticks}" };
+        stateLines.AddRange(prior.Select(kv => $"{kv.Key}={kv.Value}"));
+        string temp = StatePath + ".tmp-" + Guid.NewGuid().ToString("N");
+        try
+        {
+            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (var writer = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))
+            {
+                writer.Write(string.Join("\n", stateLines));
+                writer.Flush();
+                stream.Flush(flushToDisk: true);
+            }
+            File.Move(temp, StatePath, overwrite: true);
+        }
+        catch
+        {
+            try { File.Delete(temp); } catch { }
+            throw;
+        }
+    }
+
+    private static void RestoreFirewall(IReadOnlyDictionary<string, string> prior) =>
+        Ps(BuildRestoreScript(prior), critical: true);
+
+    private static void RestoreStaleState(Action<string>? log)
+    {
+        log?.Invoke("Found a stale kill-switch from a crashed run — restoring egress");
+        RestoreFirewall(ReadState());
+        DeleteState();
+        log?.Invoke("Stale kill-switch restored");
+    }
+
+    internal static string BuildRestoreScriptForTest(IReadOnlyDictionary<string, string> prior) =>
+        BuildRestoreScript(prior);
+
+    private static string BuildRestoreScript(IReadOnlyDictionary<string, string> prior)
+    {
+        var script = new StringBuilder();
+        foreach (string profile in new[] { "Domain", "Private", "Public" })
+        {
+            string action = prior.TryGetValue(profile, out var saved) ? saved : "NotConfigured";
+            script.AppendLine(
+                $"Set-NetFirewallProfile -Name {profile} -DefaultOutboundAction {action}");
+        }
+        // Remove our allow rules only after every profile default has been restored. If any
+        // Set command fails, ErrorActionPreference=Stop leaves both the strict gate and the
+        // rules in place and Ps throws; Disengage therefore cannot report false success.
+        script.AppendLine($"Remove-NetFirewallRule -Group '{Group}' -ErrorAction SilentlyContinue");
+        return script.ToString();
+    }
+
+    private static void DeleteState() => File.Delete(StatePath);
+
     private static Dictionary<string, string> GetOutboundActions()
     {
         var outp = Ps(
             "Get-NetFirewallProfile -All | ForEach-Object { \"$($_.Name)=$($_.DefaultOutboundAction)\" }",
-            critical: false);
+            critical: true);
         var d = new Dictionary<string, string>();
         foreach (var raw in outp.Split('\n'))
         {
@@ -211,6 +457,10 @@ public static class KillSwitch
             else act = "Allow";
             if (name.Length > 0) d[name] = act;
         }
+        foreach (string profile in new[] { "Domain", "Private", "Public" })
+            if (!d.ContainsKey(profile))
+                throw new InvalidOperationException(
+                    $"kill-switch: could not read the current {profile} firewall profile action");
         return d;
     }
 
@@ -257,7 +507,15 @@ public static class KillSwitch
                 d[profile] = action;
             }
         }
-        catch { /* missing/unreadable -> caller falls back */ }
+        catch (Exception error)
+        {
+            throw new InvalidOperationException(
+                "kill-switch: cannot read the firewall recovery state", error);
+        }
+        foreach (string profile in validProfiles)
+            if (!d.ContainsKey(profile))
+                throw new InvalidOperationException(
+                    $"kill-switch: recovery state is missing the {profile} firewall profile; refusing an unsafe guess");
         return d;
     }
 
@@ -280,13 +538,16 @@ public static class KillSwitch
               "\n} catch { [Console]::Out.WriteLine('QELI_ERR: ' + $_.Exception.Message); exit 1 }"
             : "$ErrorActionPreference='Stop'; " + command;
         var enc = Convert.ToBase64String(Encoding.Unicode.GetBytes(full));
-        var psi = new ProcessStartInfo("powershell.exe",
+        // Absolute path, not a bare name: CreateProcessW searches the calling image's
+        // directory before System32, and this runs elevated. (Audit 2026-08-04, H-05.)
+        var psi = new ProcessStartInfo(SystemPaths.PowerShell,
             $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {enc}")
         {
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            WorkingDirectory = SystemPaths.SystemDirectory,
         };
         using var p = Process.Start(psi)!;
         // Drain both pipes ASYNCHRONOUSLY before waiting: a sequential ReadToEnd(stdout)

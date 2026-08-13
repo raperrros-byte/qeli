@@ -59,16 +59,23 @@ pub async fn share_link(
     // Host: explicit param wins; otherwise fall back to the configured default
     // (web.public_host, live copy) so the admin needn't retype it for every link.
     let default_host = state.live_web.read().await.public_host.clone();
-    let host = params
+    let host_input = params
         .get("host")
         .cloned()
         .filter(|h| !h.is_empty())
         .unwrap_or(default_host);
-    if host.is_empty() {
+    if host_input.is_empty() {
         return Json(super::err_json(
             "no host: pass `host` or set web.public_host (the server's public address)",
         ));
     }
+    // Validate before a legacy user's password is reset below. A bad/IPv6 endpoint must not
+    // perform that destructive action and only then discover that no usable link can be made.
+    let (host, port) =
+        match crate::config::share::supported_public_endpoint(&host_input, profile.bind.client_port()) {
+            Ok(endpoint) => endpoint,
+            Err(error) => return Json(super::err_json(error)),
+        };
     let user = params.get("user").cloned().unwrap_or_default();
     if user.is_empty() {
         return Json(super::err_json("user query param required"));
@@ -145,15 +152,6 @@ pub async fn share_link(
     // Every profile-dependent field (wire mode, rsid, sni, obfs key, fronting, quic, awg)
     // comes from the shared builder, so this endpoint and `qeli share-link` / `add-client
     // --link` can never disagree about what a profile's clients need.
-    // Prefer an explicit `host:port` in the request; else bind.public_port (nginx /
-    // reverse-proxy front); else the listen port.
-    let (host, host_port) = match host.rsplit_once(':') {
-        Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
-            (h.to_string(), p.parse::<u16>().ok())
-        }
-        _ => (host, None),
-    };
-    let port = host_port.unwrap_or_else(|| profile.bind.client_port());
     let link = crate::config::share::ClientLink::for_profile(
         profile,
         host,

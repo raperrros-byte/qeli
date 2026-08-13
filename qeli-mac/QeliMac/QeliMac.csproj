@@ -18,7 +18,7 @@
     <AssemblyName>QeliMac</AssemblyName>
     <RootNamespace>QeliMac</RootNamespace>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Version>0.7.14</Version>
+    <Version>0.7.15</Version>
     <!-- The runtime identifier is supplied on publish (osx-arm64 / osx-x64). -->
     <BuiltInComInteropSupport>false</BuiltInComInteropSupport>
     <!-- Avalonia's compiled-XAML + trimming-friendly settings. -->
@@ -26,25 +26,24 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Platform-neutral shared core (crypto/protocol/model). BouncyCastle flows
-         transitively from here — no direct package ref needed. See docs/REFACTOR-PLAN.md. -->
+    <!-- Platform-neutral lifecycle/model plus retained conformance diagnostics.
+         Production transport is the embedded Rust core. -->
     <ProjectReference Include="..\..\qeli-shared\QeliShared\QeliShared.csproj" />
   </ItemGroup>
 
   <ItemGroup>
     <!-- Cross-platform XAML UI (the macOS analogue of WPF). 11.3.x for current-macOS
          (Tahoe / macOS 26) Cocoa-backend compatibility. -->
-    <PackageReference Include="Avalonia" Version="11.3.18" />
-    <PackageReference Include="Avalonia.Desktop" Version="11.3.18" />
-    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.18" />
-    <PackageReference Include="Avalonia.Fonts.Inter" Version="11.3.18" />
+    <PackageReference Include="Avalonia" Version="11.3.19" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.3.19" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.19" />
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="11.3.19" />
     <!-- Diagnostics only in Debug. -->
-    <PackageReference Include="Avalonia.Diagnostics" Version="11.3.18" Condition="'$(Configuration)' == 'Debug'" />
+    <PackageReference Include="Avalonia.Diagnostics" Version="11.3.19" Condition="'$(Configuration)' == 'Debug'" />
     <!-- Offscreen rendering for the `uishot` verb (UI screenshots without a display). -->
-    <PackageReference Include="Avalonia.Headless" Version="11.3.18" />
+    <PackageReference Include="Avalonia.Headless" Version="11.3.19" />
 
-    <!-- BouncyCastle (X25519 / ChaCha20-Poly1305 / ChaCha20) now comes transitively
-         from the QeliShared ProjectReference above. -->
+    <!-- BouncyCastle for retained conformance/reachability diagnostics flows transitively. -->
     <!-- QR generation for profile sharing (pure managed, PNG output). -->
     <PackageReference Include="QRCoder" Version="1.8.0" />
     <!-- Brand-mark / icon / tray rendering (paths, gradients, text → PNG). The macOS
@@ -55,7 +54,7 @@
     <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="2.88.9" />
   </ItemGroup>
 
-  <!-- Native REALITY core (Rust realtls FFI, src/protocol/realtls/ffi.rs). A
+  <!-- Native whole-client Rust core (transport ABI 1.10 plus realtls C ABI). A
        universal (arm64+x86_64) dylib cross-built by build_dylib.sh, copied next
        to QeliMac so DllImport("qeli") resolves it inside the .app bundle. The
        Condition lets the project build for dev before the dylib is produced. -->

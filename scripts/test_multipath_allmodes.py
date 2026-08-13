@@ -6,6 +6,7 @@ aggregates into ONE session — verified by 1 AUTH + 3 JOINs per mode in the log
 import os, sys, io, time
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import paramiko
+import ssh_hostkey
 
 SRV = ("10.66.116.10", "root", os.environ["QELI_LAB_PASS"])
 CLI = ("10.66.116.11", "root", os.environ["QELI_LAB_PASS"])
@@ -38,7 +39,6 @@ bind.port = {port}
 bind.transport = tcp
 tun.name = {tun}
 tun.address = {sub}.1
-tun.netmask = 255.255.255.0
 tun.mtu = 1280
 pool.cidr = {sub}.0/24
 pool.exclude = {sub}.1
@@ -68,7 +68,7 @@ def client_conf(mode):
 
 
 def conn(h):
-    c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    c = paramiko.SSHClient(); ssh_hostkey.harden(c)
     c.connect(h[0], username=h[1], password=h[2], timeout=25, look_for_keys=False, allow_agent=False)
     return c
 

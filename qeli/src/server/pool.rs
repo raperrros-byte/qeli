@@ -2,16 +2,13 @@ use crate::config::server::PoolConfig;
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 
-#[allow(dead_code)] // gateway/subnet_mask retained for DHCP/reporting use
 pub struct IpPool {
-    pub gateway: Ipv4Addr,
-    pub subnet_mask: u8,
     pub start_ip: u32,
     pub end_ip: u32,
     pub excluded: HashSet<u32>,
     static_reservations: Vec<(String, u32)>,
     /// `pool.reservation.<user>` addresses: skipped by dynamic allocation, but assignable
-    /// by `allocate_fixed` to the user they belong to (see IpPool::new).
+    /// by `allocate_fixed` to the user they belong to (see `IpPool::new_with_tun`).
     reserved: HashSet<u32>,
     allocated: HashSet<u32>,
     user_allocations: HashMap<String, u32>,
@@ -25,7 +22,16 @@ pub struct IpPool {
 }
 
 impl IpPool {
+    #[cfg(test)]
     pub fn new(config: &PoolConfig) -> anyhow::Result<Self> {
+        let (network, _) = parse_cidr(&config.cidr)?;
+        Self::new_with_tun(config, ip_from_u32(network | 1))
+    }
+
+    /// Build the client-address allocator around the actual server-side TUN address.
+    /// `tun.address` is allowed to be any usable host in `pool.cidr`; it must therefore be
+    /// excluded explicitly instead of assuming that the server always owns network + 1.
+    pub fn new_with_tun(config: &PoolConfig, tun_address: Ipv4Addr) -> anyhow::Result<Self> {
         let (network, subnet_mask) = parse_cidr(&config.cidr)?;
 
         if subnet_mask > 30 {
@@ -39,8 +45,17 @@ impl IpPool {
             .checked_shl((32 - subnet_mask) as u32)
             .ok_or_else(|| anyhow::anyhow!("invalid subnet mask"))?;
 
-        let start_ip = network | 2;
+        let start_ip = network | 1;
         let end_ip = network | total_ips.saturating_sub(2);
+
+        let tun_ip = u32_from_ip(tun_address);
+        if tun_ip < start_ip || tun_ip > end_ip {
+            anyhow::bail!(
+                "tun.address {} is not a usable host inside pool.cidr {}",
+                tun_address,
+                config.cidr
+            );
+        }
 
         let mut excluded = HashSet::new();
         excluded.insert(network);
@@ -60,7 +75,7 @@ impl IpPool {
             }
         }
 
-        excluded.insert(network | 1);
+        excluded.insert(tun_ip);
 
         // Reserved addresses go in their OWN set, NOT in `excluded`. They must be kept out
         // of DYNAMIC allocation (nobody else may be handed them), but `allocate_fixed` has
@@ -119,8 +134,6 @@ impl IpPool {
         }
 
         Ok(IpPool {
-            gateway: ip_from_u32(network | 1),
-            subnet_mask,
             start_ip,
             end_ip,
             excluded,
@@ -325,25 +338,8 @@ impl IpPool {
 }
 
 pub fn parse_cidr(cidr: &str) -> anyhow::Result<(u32, u8)> {
-    let parts: Vec<&str> = cidr.split('/').collect();
-    if parts.len() != 2 {
-        anyhow::bail!("invalid CIDR: {}", cidr);
-    }
-    let ip: Ipv4Addr = parts[0].parse()?;
-    let prefix: u8 = parts[1].parse()?;
-    // Validate BEFORE the shift: `32 - prefix` underflows (u8) for prefix > 32, which
-    // panics in debug and produces a wrong mask in release on a config typo like /40.
-    if prefix > 32 {
-        anyhow::bail!("invalid CIDR prefix (>32): {}", cidr);
-    }
-    let ip_val = u32_from_ip(ip);
-    let mask = if prefix == 0 {
-        0
-    } else {
-        !0u32 << (32 - prefix)
-    };
-    let network = ip_val & mask;
-    Ok((network, prefix))
+    let subnet = crate::config::server::pool_subnet(cidr).map_err(anyhow::Error::msg)?;
+    Ok((u32::from(subnet.network), subnet.prefix))
 }
 
 pub fn u32_from_ip(ip: Ipv4Addr) -> u32 {
@@ -371,6 +367,20 @@ mod tests {
             exclude: Vec::new(),
             static_reservations: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn actual_tun_address_is_never_allocated() {
+        let mut pool =
+            IpPool::new_with_tun(&pool_config("10.9.0.0/29"), "10.9.0.2".parse().unwrap()).unwrap();
+        let assigned: Vec<_> = (0..5)
+            .map(|i| pool.allocate(&format!("user-{i}")).unwrap())
+            .collect();
+        assert!(!assigned.contains(&"10.9.0.2".parse().unwrap()));
+        assert_eq!(assigned[0], "10.9.0.1".parse::<Ipv4Addr>().unwrap());
+        assert!(pool
+            .excluded
+            .contains(&u32_from_ip("10.9.0.2".parse().unwrap())));
     }
 
     /// A sub-range allocation must come FROM that sub-range, and must keep working.

@@ -22,16 +22,21 @@ public partial class SettingsWindow : Window
     public SettingsWindow(Window owner, IReadOnlyList<VpnConfig> profiles) : this()
     {
         Icon = owner.Icon;
+        Opened += (_, _) => FitToWorkArea();
 
         var s = AppSettings.Current;
         SelectByTag(LanguageBox, s.Language);
         SelectByTag(ThemeBox, s.Theme);
         SelectByTag(LogTimeBox, s.LogTimeFormat);
+        SelectByTag(LogLevelBox, s.LogLevel);
         ToastsBox.IsChecked = s.ToastsEnabled;
         UpdatesBox.IsChecked = s.CheckForUpdates;
         ProbeBox.IsChecked = s.ProbeReachability;
         ProbeIntervalBox.Text = s.ProbeIntervalSecs.ToString();
-        ServiceBox.IsChecked = s.ServiceEnabled || Service.ServiceManager.IsInstalled();
+        // The plist is observed state, not the user's preference. A stale LaunchDaemon left
+        // by an interrupted uninstall must not silently turn ServiceEnabled back on when the
+        // settings dialog is saved; ApplyServiceSettings will now remove it and verify DNS.
+        ServiceBox.IsChecked = s.ServiceEnabled;
         AutoStartBox.IsChecked = s.AutoStart;
         AutoConnectBox.IsChecked = s.AutoConnect;
         StartMinBox.IsChecked = s.StartMinimized;
@@ -128,6 +133,15 @@ public partial class SettingsWindow : Window
     private static string TagOf(ComboBox box) =>
         (box.SelectedItem as ComboBoxItem)?.Tag as string ?? "en";
 
+    private void FitToWorkArea()
+    {
+        var screen = Screens.ScreenFromWindow(this) ?? Screens.Primary ?? Screens.All.FirstOrDefault();
+        if (screen == null) return;
+        double available = Math.Max(MinHeight, screen.WorkingArea.Height / screen.Scaling - 32);
+        MaxHeight = available;
+        Height = Math.Min(Height, available);
+    }
+
     private void OnAutoConnectChanged(object? sender, RoutedEventArgs e) => UpdateAutoProfileEnabled();
     private void OnServiceChanged(object? sender, RoutedEventArgs e) => UpdateServiceProfileEnabled();
     private void OnProbeChanged(object? sender, RoutedEventArgs e) => UpdateProbeIntervalEnabled();
@@ -169,6 +183,7 @@ public partial class SettingsWindow : Window
             ?? Qeli.Shared.LogTime.Default;
         s.ProxyRoutePreset = ProxyRoutePreset.Normalize(
             (RoutePresetBox.SelectedItem as ComboBoxItem)?.Tag as string);
+        s.LogLevel = (LogLevelBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "info";
         s.ToastsEnabled = ToastsBox.IsChecked == true;
         s.CheckForUpdates = UpdatesBox.IsChecked == true;
         s.ProbeReachability = ProbeBox.IsChecked == true;

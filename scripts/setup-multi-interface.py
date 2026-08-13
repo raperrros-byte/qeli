@@ -1,12 +1,17 @@
+raise SystemExit(
+    "RETIRED: this root-SSH script installs obsolete vpn-obfuscated systemd units. "
+    "Use qeli/config/server-multiprofile.conf and install-qeli-server.sh."
+)
 import os
 import sys
 import io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
 import paramiko
+import ssh_hostkey
 
 ssh = paramiko.SSHClient()
-ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+ssh_hostkey.harden(ssh)
 ssh.connect('10.66.116.10', username='root', password=os.environ.get("QELI_LAB_PASS", ""), timeout=15)
 
 # Simpler approach: keep current architecture, make config fully dynamic

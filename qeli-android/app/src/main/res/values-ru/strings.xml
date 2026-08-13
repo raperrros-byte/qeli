@@ -10,6 +10,7 @@
     <string name="connect">Подключиться</string>
     <string name="disconnect">Отключиться</string>
     <string name="connecting">Подключение…</string>
+    <string name="disconnecting">Отключение…</string>
     <string name="connected">Подключено</string>
     <string name="disconnected">Отключено</string>
     <string name="error">Ошибка</string>
@@ -46,6 +47,9 @@
     <string name="per_app_include">Только выбранные</string>
     <string name="per_app_exclude">Все, кроме выбранных</string>
     <string name="log_time_format">Время в логе</string>
+    <string name="log_detail">Подробность журнала</string>
+    <string name="log_compact">Краткий</string>
+    <string name="log_detailed">Подробная диагностика</string>
     <string name="log_time_short">Только время (18:10:03.259)</string>
     <string name="log_time_datetime">Дата и время (2026-07-18 18:10:03.259)</string>
     <string name="log_time_rfc3339">RFC 3339, UTC (2026-07-18T18:10:03.259Z)</string>
@@ -104,6 +108,7 @@
     <string name="scan_qr_prompt">Отсканируйте QR-код qeli://</string>
     <string name="paste_link_title">Вставьте ссылку qeli://</string>
     <string name="paste_link_hint">qeli://…</string>
+    <string name="paste_link_hint_multi">Одна или несколько ссылок qeli://, либо несколько секций [qeli]</string>
     <string name="duplicate_suffix">%1$s (копия)</string>
     <string name="active_profile_toast">Активен: %1$s</string>
     <string name="switch_blocked">Сначала отключитесь, чтобы сменить профиль</string>
@@ -111,6 +116,14 @@
     <string name="import_profile_title">Импортировать профиль?</string>
     <string name="import_profile_msg">Добавить «%1$s» из полученной ссылки?</string>
     <string name="imported_toast">Импортирован «%1$s»</string>
+    <string name="imported_many_toast">Импортировано профилей: %1$d</string>
+    <string name="profile_failover">Автопереключение профиля при недоступности</string>
+    <string name="geo_route_preset">Гео-маршрутизация (обход в TUN)</string>
+    <string name="geo_status">Гео-файлы: %1$s</string>
+    <string name="geo_download">Скачать geosite/geoip…</string>
+    <string name="geo_downloading">Загрузка…</string>
+    <string name="geo_download_ok">Гео-файлы загружены</string>
+    <string name="geo_download_fail">Ошибка загрузки гео: %1$s</string>
     <string name="share_title">Поделиться «%1$s»</string>
     <string name="share_chooser">Поделиться профилем</string>
     <string name="copy">Копировать</string>
@@ -228,4 +241,9 @@
     <string name="notif_connecting">Подключение…</string>
     <string name="notif_reconnecting">Переподключение… (попытка %1$d)</string>
     <string name="notif_connected">Подключено: %1$s</string>
+    <string name="kill_switch_android_too_old">Kill switch требует Android 10 или новее, чтобы Qeli мог проверить системную блокировку.</string>
+    <string name="kill_switch_enable_always_on">Kill switch требует Always-on VPN. Откройте системные настройки VPN, выберите Qeli и включите Always-on VPN.</string>
+    <string name="kill_switch_enable_lockdown">Kill switch требует «Блокировать соединения без VPN». Откройте системные настройки VPN, выберите Qeli и включите Always-on VPN вместе с блокировкой.</string>
+    <string name="kill_switch_active">Kill switch активен: системная блокировка Android проверена</string>
+    <string name="kill_switch_split_ignored">ПРИМЕЧАНИЕ: kill_switch не действует в split-tunnel; он защищает только full-tunnel профили</string>
 </resources>

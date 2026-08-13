@@ -4,6 +4,7 @@
     <string name="connect">Connect</string>
     <string name="disconnect">Disconnect</string>
     <string name="connecting">Connecting…</string>
+    <string name="disconnecting">Disconnecting…</string>
     <string name="connected">Connected</string>
     <string name="disconnected">Disconnected</string>
     <string name="error">Error</string>
@@ -41,6 +42,9 @@
     <string name="per_app_exclude">All except selected</string>
     <!-- Log timestamp — same value names as the server's [logging] time_format. -->
     <string name="log_time_format">Log timestamp</string>
+    <string name="log_detail">Log detail</string>
+    <string name="log_compact">Compact</string>
+    <string name="log_detailed">Detailed diagnostics</string>
     <string name="log_time_short">Time only (18:10:03.259)</string>
     <string name="log_time_datetime">Date and time (2026-07-18 18:10:03.259)</string>
     <string name="log_time_rfc3339">RFC 3339, UTC (2026-07-18T18:10:03.259Z)</string>
@@ -92,6 +96,7 @@
     <string name="scan_qr_prompt">Scan a qeli:// QR code</string>
     <string name="paste_link_title">Paste qeli:// link</string>
     <string name="paste_link_hint">qeli://…</string>
+    <string name="paste_link_hint_multi">One or more qeli:// links, or several [qeli] sections</string>
     <string name="duplicate_suffix">%1$s (copy)</string>
     <string name="active_profile_toast">Active: %1$s</string>
     <string name="switch_blocked">Disconnect first to switch profile</string>
@@ -99,6 +104,14 @@
     <string name="import_profile_title">Import profile?</string>
     <string name="import_profile_msg">Add “%1$s” from the shared link?</string>
     <string name="imported_toast">Imported “%1$s”</string>
+    <string name="imported_many_toast">Imported %1$d profile(s)</string>
+    <string name="profile_failover">Auto-switch profile if unreachable (failover)</string>
+    <string name="geo_route_preset">Geo routing (TUN bypass)</string>
+    <string name="geo_status">Geo files: %1$s</string>
+    <string name="geo_download">Download geosite/geoip…</string>
+    <string name="geo_downloading">Downloading…</string>
+    <string name="geo_download_ok">Geo files downloaded</string>
+    <string name="geo_download_fail">Geo download failed: %1$s</string>
     <string name="share_title">Share “%1$s”</string>
     <string name="share_chooser">Share profile</string>
     <string name="copy">Copy</string>
@@ -193,6 +206,11 @@
     <string name="notif_connecting">Connecting…</string>
     <string name="notif_reconnecting">Reconnecting… (attempt %1$d)</string>
     <string name="notif_connected">Connected: %1$s</string>
+    <string name="kill_switch_android_too_old">Kill switch requires Android 10 or newer so Qeli can verify system lockdown.</string>
+    <string name="kill_switch_enable_always_on">Kill switch requires Always-on VPN. Open Android VPN settings, select Qeli, and enable Always-on VPN.</string>
+    <string name="kill_switch_enable_lockdown">Kill switch requires “Block connections without VPN”. Open Android VPN settings, select Qeli, and enable Always-on VPN plus blocking.</string>
+    <string name="kill_switch_active">Kill switch active: Android system lockdown verified</string>
+    <string name="kill_switch_split_ignored">NOTE: kill_switch is ignored in split-tunnel mode; it protects full-tunnel profiles only</string>
     <!-- ── Protection detail sheet ──
          Rows below the fold: the negotiated ones (DNS/MTU/streams/routes/lockdown) are
          shown only while connected, because only then are they known. -->
