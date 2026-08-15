@@ -305,6 +305,11 @@ impl IniDoc {
         self.sections.iter().find(|s| s.kind == kind)
     }
 
+    /// Mutable variant of [`Self::section`] — used when rewriting keys (e.g. SNI override).
+    pub fn section_mut(&mut self, kind: &str) -> Option<&mut Section> {
+        self.sections.iter_mut().find(|s| s.kind == kind)
+    }
+
     /// All sections of a given `kind`, in source order — the array-of-tables
     /// view (e.g. every `[profile:*]`).
     pub fn sections_of<'a>(&'a self, kind: &'a str) -> impl Iterator<Item = &'a Section> + 'a {

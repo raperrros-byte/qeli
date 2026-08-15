@@ -4,10 +4,14 @@
 //! It intentionally selects fields one by one: serializing a whole profile would expose the
 //! obfs pre-shared key and other deployment credentials to a page that only needs diagnostics.
 
+use crate::config::auto_transport::{self, SNI_PRESETS};
 use crate::server::web::auth::{self, AuthError};
 use crate::server::ServerState;
-use axum::extract::State;
+use axum::extract::{Query, State};
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -131,6 +135,7 @@ pub async fn health(
                 "transport": profile.bind.transport,
                 "address": profile.bind.address,
                 "port": profile.bind.port,
+                "public_port": profile.bind.client_port(),
                 "additional_listeners": profile.bind.listen,
             },
             "tunnel": {
@@ -168,6 +173,12 @@ pub async fn health(
                 "multipath": profile.obfuscation.multipath.enabled,
                 "multipath_adaptive": profile.obfuscation.multipath.adaptive,
                 "max_streams": profile.obfuscation.multipath.max_streams,
+                "sni": profile.obfuscation.tls.server_name.clone(),
+                "transport_label": auto_transport::transport_label(
+                    &profile.bind.transport,
+                    &profile.obfuscation.mode,
+                    profile.obfuscation.quic.enabled,
+                ),
             },
             "buffers": {
                 "tcp_send": profile.performance.tcp.send_buffer_size,
@@ -211,5 +222,118 @@ pub async fn health(
             "dropped": total_dropped,
         },
         "profiles": profiles,
+        "auto_transport": {
+            "order": auto_transport::DEFAULT_ORDER,
+            "sni_presets": SNI_PRESETS,
+        },
     })))
+}
+
+/// List listen modes the server exposes — clients use this to build an auto-transport set.
+pub async fn modes(
+    State(state): State<Arc<ServerState>>,
+    _guard: auth::AuthGuard,
+) -> Result<Json<Value>, AuthError> {
+    let Some(config) = super::status::current_config(&state).await else {
+        return Ok(Json(super::err_json(
+            "cannot read the current server configuration",
+        )));
+    };
+    let mut modes = Vec::new();
+    for profile in &config.profiles {
+        if !profile.enabled {
+            continue;
+        }
+        let label = auto_transport::transport_label(
+            &profile.bind.transport,
+            &profile.obfuscation.mode,
+            profile.obfuscation.quic.enabled,
+        );
+        modes.push(json!({
+            "profile": profile.name,
+            "label": label,
+            "preference": auto_transport::preference_rank(&label, auto_transport::DEFAULT_ORDER),
+            "transport": profile.bind.transport,
+            "mode": profile.obfuscation.mode,
+            "quic": profile.obfuscation.quic.enabled,
+            "port": profile.bind.client_port(),
+            "listen_port": profile.bind.port,
+            "sni": profile.obfuscation.tls.server_name.clone(),
+            "reality": profile.obfuscation.mode == "reality-tls",
+        }));
+    }
+    modes.sort_by(|a, b| {
+        let pa = a.get("preference").and_then(Value::as_u64).unwrap_or(999);
+        let pb = b.get("preference").and_then(Value::as_u64).unwrap_or(999);
+        pa.cmp(&pb).then_with(|| {
+            let na = a.get("profile").and_then(Value::as_str).unwrap_or("");
+            let nb = b.get("profile").and_then(Value::as_str).unwrap_or("");
+            na.cmp(nb)
+        })
+    });
+    Ok(Json(json!({
+        "ok": true,
+        "order": auto_transport::DEFAULT_ORDER,
+        "modes": modes,
+    })))
+}
+
+/// SNI / TLS front-host presets plus any server-configured decoy name.
+pub async fn sni_presets(
+    State(state): State<Arc<ServerState>>,
+    _guard: auth::AuthGuard,
+) -> Result<Json<Value>, AuthError> {
+    let mut presets: Vec<String> = SNI_PRESETS.iter().map(|s| (*s).to_string()).collect();
+    if let Some(config) = super::status::current_config(&state).await {
+        for profile in &config.profiles {
+            let name = profile.obfuscation.tls.server_name.trim();
+            if !name.is_empty() && !presets.iter().any(|p| p.eq_ignore_ascii_case(name)) {
+                presets.push(name.to_string());
+            }
+        }
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "presets": presets,
+        "allow_custom": true,
+        "hint": "Clients may override sni= in the profile; custom hosts are allowed.",
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SpeedtestQuery {
+    /// Payload size in bytes (clamped). Default 1 MiB.
+    #[serde(default = "default_speedtest_bytes")]
+    pub bytes: u64,
+}
+
+fn default_speedtest_bytes() -> u64 {
+    1_048_576
+}
+
+/// Authenticated download probe for client speed tests (zeros, Content-Length set).
+pub async fn speedtest(
+    _guard: auth::AuthGuard,
+    Query(q): Query<SpeedtestQuery>,
+) -> Result<Response, AuthError> {
+    const MAX: u64 = 16 * 1024 * 1024;
+    const MIN: u64 = 64 * 1024;
+    let n = q.bytes.clamp(MIN, MAX) as usize;
+    let body = vec![0u8; n];
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        header::HeaderValue::from_str(&body.len().to_string())
+            .unwrap_or_else(|_| header::HeaderValue::from_static("0")),
+    );
+    headers.insert(
+        header::HeaderName::from_static("x-qeli-speedtest-bytes"),
+        header::HeaderValue::from_str(&body.len().to_string())
+            .unwrap_or_else(|_| header::HeaderValue::from_static("0")),
+    );
+    Ok((StatusCode::OK, headers, body).into_response())
 }

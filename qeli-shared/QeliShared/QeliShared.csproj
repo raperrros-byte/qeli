@@ -31,4 +31,8 @@
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\sni_hosts.txt" LogicalName="Qeli.Shared.Assets.sni_hosts.txt" />
+  </ItemGroup>
+
 </Project>

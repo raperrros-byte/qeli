@@ -100,6 +100,7 @@ public partial class MainWindow : Window
         UpdateEmptyHint();
         ApplyTileLabels();
         InitTrafficModeUi();
+        InitTransportAutoUi();
         SyncProfilesToGlobalTrafficMode(reconnect: false);
         CheckReachabilityAll();
         ConfigureProbeTimer(); // start auto-poll (no-op when auto is off)
@@ -882,6 +883,7 @@ public partial class MainWindow : Window
         var p = Selected;
         ConnectBtn.IsEnabled = _serviceMode || p != null;
         if (p == null) return;
+        RefreshSniField();
 
         // Connected/Connecting: switching profiles is REFUSED — it used to silently tear the
         // live tunnel down and restart it on the newly picked profile. Checked FIRST, before
@@ -1370,6 +1372,16 @@ public partial class MainWindow : Window
             }
             var p = Selected;
             if (p == null) return;
+            if (AppSettings.Current.AutoPickOnConnect
+                && _status is not (VpnStatus.Connected or VpnStatus.Connecting))
+            {
+                p = await AutoPickModeAndSniAsync() ?? p;
+            }
+            else if (AppSettings.Current.AutoTransport && _profiles.Count > 1
+                && _status is not (VpnStatus.Connected or VpnStatus.Connecting))
+            {
+                p = await PickBestTransportAsync() ?? p;
+            }
             ClearLog(p);
             _activeProfile = p;
             await Task.Run(() => _tunnel.Start(p)); // Start() calls Stop() internally too
@@ -1380,4 +1392,281 @@ public partial class MainWindow : Window
             ConnectBtn.IsEnabled = true;
         }
     }
+
+    private void OnOpenSniSpeed(object sender, RoutedEventArgs e)
+    {
+        var win = new SniSpeedWindow(_profiles.ToList()) { Owner = this };
+        if (win.ShowDialog() == true && win.LastBest is { } pick)
+            _ = ApplySniToProfile(pick.Profile, pick.Sni, reconnect: true);
+        RefreshSniField();
+    }
+
+    private void InitTransportAutoUi()
+    {
+        var s = AppSettings.Current;
+        AutoTransportCheck.IsChecked = s.AutoTransport;
+        AutoPickConnectCheck.IsChecked = s.AutoPickOnConnect;
+        SniPresetBox.Items.Clear();
+        SniPresetBox.Items.Add(Loc.T("FieldSni"));
+        foreach (var host in SniCatalog.Merge(s.CustomSniHosts).Take(40))
+            SniPresetBox.Items.Add(host);
+        SniPresetBox.SelectedIndex = 0;
+        RefreshSniField();
+    }
+
+    private void RefreshSniField()
+    {
+        var p = Selected;
+        SniEditBox.Text = p?.Sni ?? "";
+        var idx = 0;
+        if (!string.IsNullOrWhiteSpace(p?.Sni))
+        {
+            for (var i = 1; i < SniPresetBox.Items.Count; i++)
+            {
+                if (SniPresetBox.Items[i] is string h &&
+                    string.Equals(h, p!.Sni, StringComparison.OrdinalIgnoreCase))
+                {
+                    idx = i;
+                    break;
+                }
+            }
+        }
+        SniPresetBox.SelectedIndex = idx;
+    }
+
+    private void OnAutoTransportChanged(object sender, RoutedEventArgs e)
+    {
+        var s = AppSettings.Current;
+        s.AutoTransport = AutoTransportCheck.IsChecked == true;
+        if (s.AutoTransport) s.ProfileFailover = true;
+        s.Save();
+    }
+
+    private void OnAutoPickConnectChanged(object sender, RoutedEventArgs e)
+    {
+        var s = AppSettings.Current;
+        s.AutoPickOnConnect = AutoPickConnectCheck.IsChecked == true;
+        if (s.AutoPickOnConnect)
+        {
+            s.AutoTransport = true;
+            s.ProfileFailover = true;
+            AutoTransportCheck.IsChecked = true;
+        }
+        s.Save();
+    }
+
+    private void OnSniPresetChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (SniPresetBox.SelectedIndex <= 0) return;
+        if (SniPresetBox.SelectedItem is string host)
+            SniEditBox.Text = host;
+    }
+
+    private async void OnApplySni(object sender, RoutedEventArgs e)
+    {
+        var host = (SniEditBox.Text ?? "").Trim();
+        if (host.Length == 0)
+        {
+            Toast.Show(ToastKind.Error, Loc.T("FieldSni"), "SNI is empty");
+            return;
+        }
+        var p = Selected;
+        if (p == null) return;
+        await ApplySniToProfile(p, host, reconnect: true);
+    }
+
+    private async Task ApplySniToProfile(VpnConfig p, string host, bool reconnect)
+    {
+        try
+        {
+            var edited = p.WithEditorFields(
+                p.Name, p.ServerAddress, p.Port, p.Protocol, p.WireMode,
+                p.ObfsKey, p.ObfsFronting, p.RealityShortId, host, p.QuicEnabled,
+                p.Username, p.Password, p.ServerPublicKeyHex,
+                p.RoutingMode, p.AddDefaultGateway, p.RouteLocalNetworks,
+                p.Mtu, p.DnsServers,
+                p.PaddingEnabled, p.PaddingMin, p.PaddingMax,
+                p.HeartbeatEnabled, p.HeartbeatIntervalMs, p.HeartbeatJitterMs,
+                p.ProxyEnabled, p.ProxyListen, p.ProxyMode,
+                p.AppsMode, p.Apps);
+            var idx = _profiles.IndexOf(p);
+            if (idx < 0)
+            {
+                for (var i = 0; i < _profiles.Count; i++)
+                {
+                    var x = _profiles[i];
+                    if (x.ServerAddress == p.ServerAddress && x.Port == p.Port &&
+                        x.WireMode == p.WireMode && x.Protocol == p.Protocol &&
+                        x.Username == p.Username)
+                    {
+                        idx = i;
+                        break;
+                    }
+                }
+            }
+            if (idx < 0) return;
+            _profiles[idx] = edited;
+            ProfileStore.Save(_profiles);
+            Programmatic(() => ProfilesList.SelectedItem = edited);
+            AppendLog($"SNI → {host} ({edited.DisplayName})");
+            SniEditBox.Text = host;
+            if (reconnect && _status is VpnStatus.Connected or VpnStatus.Connecting)
+            {
+                await Task.Run(() => { try { _tunnel.Stop(); } catch { } });
+                _activeProfile = edited;
+                await Task.Run(() => _tunnel.Start(edited));
+            }
+        }
+        catch (Exception ex)
+        {
+            Toast.Show(ToastKind.Error, Loc.T("FieldSni"), ex.Message);
+        }
+    }
+
+    private async void OnSpeedTest(object sender, RoutedEventArgs e)
+    {
+        var p = Selected;
+        if (p == null) return;
+        var s = AppSettings.Current;
+        SpeedTestResult.Text = Loc.T("UpdateChecking");
+        try
+        {
+            var mbps = await Task.Run(() => PanelSpeedTest.Mbps(
+                s.ServerPanelUrl,
+                s.ServerPanelUser,
+                s.ServerPanelPassword,
+                1_048_576,
+                p.ServerAddress));
+            SpeedTestResult.Text = $"{mbps:F2} Mbit/s";
+            AppendLog($"Speed test: {mbps:F2} Mbit/s");
+        }
+        catch (Exception ex)
+        {
+            var msg = ex.GetBaseException().Message;
+            SpeedTestResult.Text = msg;
+            AppendLog($"Speed test failed: {msg}");
+        }
+    }
+
+    private async Task<VpnConfig?> AutoPickModeAndSniAsync()
+    {
+        AppendLog(Loc.T("AutoPicking"));
+        StatusText.Text = Loc.T("AutoPicking");
+        var s = AppSettings.Current;
+        var hosts = (s.SniSpeedSelection != null && s.SniSpeedSelection.Count > 0)
+            ? s.SniSpeedSelection.ToList()
+            : TransportAuto.SniPresets.Take(8).ToList();
+        var delay = Math.Clamp(s.SniProbeDelayMs, 0, 60_000);
+        var snapshot = _profiles.ToList();
+        if (snapshot.Count == 0) return null;
+
+        VpnConfig? bestProfile = null;
+        string? bestSni = null;
+        long bestScore = long.MaxValue;
+        double bestMbps = -1;
+
+        var modeRtt = new Dictionary<int, long?>();
+        for (var i = 0; i < snapshot.Count; i++)
+        {
+            modeRtt[i] = await Task.Run(async () =>
+            {
+                try
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    using var c = new System.Net.Sockets.TcpClient();
+                    using var cts = new CancellationTokenSource(3_000);
+                    await c.ConnectAsync(snapshot[i].ServerAddress, snapshot[i].Port, cts.Token);
+                    return (long?)sw.ElapsedMilliseconds;
+                }
+                catch { return null; }
+            });
+        }
+
+        var sniCache = new Dictionary<string, SniSpeedRow>(StringComparer.OrdinalIgnoreCase);
+        var first = true;
+        foreach (var host in hosts)
+        {
+            if (!first && delay > 0) await Task.Delay(delay);
+            first = false;
+            if (!sniCache.ContainsKey(host))
+                sniCache[host] = await Task.Run(() => SniSpeedProbe.ProbeAsync(host).GetAwaiter().GetResult());
+        }
+
+        for (var i = 0; i < snapshot.Count; i++)
+        {
+            if (modeRtt[i] == null) continue;
+            var pref = TransportAuto.PreferenceRank(
+                TransportAuto.TransportLabel(snapshot[i].Protocol, snapshot[i].WireMode, snapshot[i].QuicEnabled));
+            foreach (var host in hosts)
+            {
+                var sni = sniCache[host];
+                if (!sni.Ok) continue;
+                // Prefer fast TLS, then mode RTT, then preferred transport order, then Mbps.
+                var score = (sni.TlsMs ?? 9_999) * 1000
+                    + (modeRtt[i] ?? 9_999)
+                    + pref * 10;
+                var mbps = sni.Mbps ?? 0;
+                if (score < bestScore || (score == bestScore && mbps > bestMbps))
+                {
+                    bestScore = score;
+                    bestMbps = mbps;
+                    bestProfile = snapshot[i];
+                    bestSni = host;
+                }
+            }
+        }
+
+        if (bestProfile == null || bestSni == null)
+        {
+            AppendLog("auto-pick: no reachable mode×SNI combo");
+            return await PickBestTransportAsync();
+        }
+
+        await ApplySniToProfile(bestProfile, bestSni, reconnect: false);
+        var selected = Selected ?? bestProfile;
+        AppendLog(Loc.F("AutoPicked", selected.DisplayName, bestSni));
+        Toast.Show(ToastKind.Success, Loc.T("AutoPickConnect"), Loc.F("AutoPicked", selected.DisplayName, bestSni));
+        return selected;
+    }
+
+    private async Task<VpnConfig?> PickBestTransportAsync()
+    {
+        AppendLog(Loc.T("AutoTransport"));
+        var labels = new List<string>();
+        var ok = new List<bool>();
+        var rtts = new List<long?>();
+        var snapshot = _profiles.ToList();
+        foreach (var p in snapshot)
+        {
+            labels.Add(TransportAuto.TransportLabel(p.Protocol, p.WireMode, p.QuicEnabled));
+            long? ms = null;
+            try
+            {
+                // Reuse existing probe: wait briefly for Reachability update.
+                CheckReachability(p, manual: true);
+                await Task.Delay(600);
+                if (p.Reachability == ProfileReachability.Reachable)
+                    ms = p.LatencyMs is int v and > 0 ? v : 1;
+            }
+            catch { /* probe failed */ }
+            ok.Add(ms != null);
+            rtts.Add(ms);
+        }
+        var ranked = TransportAuto.Rank(labels, ok, rtts);
+        if (ranked.Count == 0)
+        {
+            AppendLog("auto-transport: no reachable profile");
+            return null;
+        }
+        var best = snapshot[ranked[0].Index];
+        Programmatic(() => ProfilesList.SelectedItem = best);
+        AppendLog($"auto-transport → {best.DisplayName}");
+        return best;
+    }
+
+    private void AppendLog(string line)
+    {
+        OnLog(line);
+    }
 }
+

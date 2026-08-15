@@ -24,6 +24,14 @@ pub struct ClientConfig {
     /// runtime itself ignores it — it's read by the panel's client manager at boot.
     #[serde(default)]
     pub autostart: bool,
+    /// When true (and the config file has several profiles), probe every profile and
+    /// connect to the best reachable masking mode; on failure, fail over hot.
+    /// Also enabled by CLI `--auto-transport` / env `QELI_AUTO_TRANSPORT=1`.
+    #[serde(default)]
+    pub auto_transport: bool,
+    /// Optional preference order override: `reality-tls,fake-tls,obfs,plain,quic`.
+    #[serde(default)]
+    pub auto_transport_order: Option<String>,
     /// Local SOCKS/HTTP proxy: apps connect to proxy_listen, traffic exits via the tunnel.
     #[serde(default)]
     pub proxy: ClientProxyConfig,
@@ -714,6 +722,11 @@ impl ClientConfig {
         // case-SENSITIVE and knew no false-spellings, so `autostart = TRUE` read as false and
         // `autostart = ture` was never recorded as unparseable. (Audit 2026-07-31, §9.)
         cfg.autostart = q.bool_or("autostart", false);
+        cfg.auto_transport = q.bool_or("auto_transport", false);
+        cfg.auto_transport_order = q
+            .get("auto_transport_order")
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
 
         cfg.proxy.enabled = q.bool_or("proxy", cfg.proxy.enabled);
         if let Some(s) = q.get("proxy_listen").filter(|s| !s.is_empty()) {

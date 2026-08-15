@@ -33,7 +33,18 @@ public sealed class AppSettings
     public string ServerPanelUrl { get; set; } = "";
     public string ServerPanelUser { get; set; } = "admin";
     public string ServerPanelPassword { get; set; } = "";
-
+    /// <summary>Probe all profiles and pick the best masking mode; enable failover on cut path.</summary>
+    public bool AutoTransport { get; set; } = false;
+    /// <summary>Next to Connect: on connect, probe modes×SNI and pick the best combo automatically.</summary>
+    public bool AutoPickOnConnect { get; set; } = false;
+    /// <summary>Shadowrocket-like: on give-up, try the next profile.</summary>
+    public bool ProfileFailover { get; set; } = false;
+    /// <summary>User-added SNI / TLS front hosts (merged with the built-in catalog).</summary>
+    public List<string> CustomSniHosts { get; set; } = new();
+    /// <summary>Hosts selected for the last SNI speed-test run.</summary>
+    public List<string> SniSpeedSelection { get; set; } = new();
+    /// <summary>Pause between sequential SNI / matrix probes (ms).</summary>
+    public int SniProbeDelayMs { get; set; } = 750;
     private static readonly string Dir =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "QeliWin");
     private static readonly string FilePath = Path.Combine(Dir, "settings.json");

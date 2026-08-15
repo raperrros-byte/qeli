@@ -1,0 +1,132 @@
+<Window x:Class="QeliWin.SniSpeedWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:QeliWin"
+        Title="{local:Loc SniSpeedTitle}" Height="680" Width="980"
+        MinHeight="480" MinWidth="760" ResizeMode="CanResize"
+        Background="{DynamicResource Bg}" FontFamily="{DynamicResource UiFont}"
+        WindowStartupLocation="CenterOwner">
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" Text="{local:Loc SniSpeedHint}" TextWrapping="Wrap"
+                   Foreground="{DynamicResource FgDim}" FontSize="12.5" Margin="0,0,0,10"/>
+
+        <Grid Grid.Row="1" Margin="0,0,0,10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="220"/>
+                <ColumnDefinition Width="12"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <DockPanel Grid.Column="0" LastChildFill="True">
+                <TextBlock DockPanel.Dock="Top" Text="{local:Loc SniModesTitle}"
+                           FontWeight="SemiBold" Margin="0,0,0,6"/>
+                <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,6">
+                    <Button Content="{local:Loc SniSelectAll}" Padding="10,4" Margin="0,0,6,0" Click="OnSelectAllModes"/>
+                    <Button Content="{local:Loc SniSelectNone}" Padding="10,4" Click="OnClearModes"/>
+                </StackPanel>
+                <ListBox x:Name="ModesList" SelectionMode="Extended"
+                         BorderBrush="{DynamicResource PanelBorder}" BorderThickness="1"
+                         Background="{DynamicResource Panel}"
+                         MaxHeight="160">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <CheckBox Content="{Binding Label}" IsChecked="{Binding Selected, Mode=TwoWay}"
+                                      Margin="2,2"/>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </DockPanel>
+
+            <DockPanel Grid.Column="2" LastChildFill="True">
+                <TextBlock DockPanel.Dock="Top" Text="{local:Loc SniHostsTitle}"
+                           FontWeight="SemiBold" Margin="0,0,0,6"/>
+                <Grid DockPanel.Dock="Top" Margin="0,0,0,6">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="8"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="8"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="8"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="8"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBox x:Name="CustomHostBox" Grid.Column="0" VerticalContentAlignment="Center"
+                             Padding="8,6" ToolTip="{local:Loc SniCustomHint}"/>
+                    <Button Grid.Column="2" Content="{local:Loc SniAddHost}" Padding="12,6" Click="OnAddHost"/>
+                    <Button Grid.Column="4" Content="{local:Loc SniSelectAll}" Padding="12,6" Click="OnSelectAllHosts"/>
+                    <Button Grid.Column="6" Content="{local:Loc SniSelectTop}" Padding="12,6" Click="OnSelectTop"/>
+                    <Button Grid.Column="8" Content="{local:Loc SniSelectNone}" Padding="12,6" Click="OnClearHosts"/>
+                </Grid>
+                <ListBox x:Name="HostsList" SelectionMode="Extended"
+                         BorderBrush="{DynamicResource PanelBorder}" BorderThickness="1"
+                         Background="{DynamicResource Panel}"
+                         MaxHeight="160">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <CheckBox Content="{Binding Host}" IsChecked="{Binding Selected, Mode=TwoWay}"
+                                      Margin="2,2"/>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </DockPanel>
+        </Grid>
+
+        <Grid Grid.Row="2" Margin="0,0,0,10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="90"/>
+                <ColumnDefinition Width="16"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" Text="{local:Loc SniProbeDelay}" VerticalAlignment="Center" Margin="0,0,8,0"
+                       Foreground="{DynamicResource FgDim}"/>
+            <TextBox x:Name="DelayBox" Grid.Column="1" Text="750" VerticalContentAlignment="Center" Padding="6,4"/>
+            <Button x:Name="RunBtn" Grid.Column="4" Content="{local:Loc SniRunTest}"
+                    Style="{StaticResource AccentButton}" Padding="18,7" Click="OnRun"/>
+        </Grid>
+
+        <DataGrid x:Name="Grid" Grid.Row="3"
+                  AutoGenerateColumns="False" IsReadOnly="True"
+                  CanUserAddRows="False" CanUserDeleteRows="False"
+                  HeadersVisibility="Column" GridLinesVisibility="Horizontal"
+                  SelectionMode="Single" SelectionUnit="FullRow"
+                  Background="{DynamicResource Panel}"
+                  BorderBrush="{DynamicResource PanelBorder}" BorderThickness="1"
+                  RowBackground="{DynamicResource Panel}"
+                  AlternatingRowBackground="{DynamicResource Hover}"
+                  Foreground="{DynamicResource Fg}">
+            <DataGrid.Columns>
+                <DataGridTextColumn Header="{local:Loc SniColMode}" Binding="{Binding ModeLabel}" Width="160"/>
+                <DataGridTextColumn Header="{local:Loc SniColHost}" Binding="{Binding Host}" Width="*"/>
+                <DataGridTextColumn Header="{local:Loc SniColModeRtt}" Binding="{Binding ModeRttText}" Width="90"/>
+                <DataGridTextColumn Header="{local:Loc SniColTls}" Binding="{Binding TlsText}" Width="80"/>
+                <DataGridTextColumn Header="{local:Loc SniColMbps}" Binding="{Binding MbpsText}" Width="100"/>
+                <DataGridTextColumn Header="{local:Loc SniColStatus}" Binding="{Binding Status}" Width="180"/>
+            </DataGrid.Columns>
+        </DataGrid>
+
+        <Grid Grid.Row="4" Margin="0,12,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock x:Name="StatusLine" VerticalAlignment="Center"
+                       Foreground="{DynamicResource FgDim}" FontSize="12" TextWrapping="Wrap"/>
+            <Button Grid.Column="1" Content="{local:Loc ApplySni}" Padding="14,6" Click="OnApplyBest"/>
+            <Button Grid.Column="3" Content="{local:Loc Close}" Padding="14,6" Click="OnClose"/>
+        </Grid>
+    </Grid>
+</Window>

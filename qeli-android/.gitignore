@@ -5,8 +5,11 @@ keystore.properties
 
 # Build output / local Gradle state.
 .gradle/
+.gradle-docker/
+.android-sdk-docker/
 build/
 app/build/
+dist/
 local.properties
 *.iml
 .idea/

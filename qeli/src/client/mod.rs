@@ -548,13 +548,102 @@ impl ClientPlatform for LinuxCoreAdapter {
 }
 
 #[cfg(target_os = "linux")]
-pub async fn run_client(config_path: &str, profile: Option<&str>) -> anyhow::Result<()> {
+/// Options for auto transport selection / SNI override on `run_client`.
+#[derive(Debug, Clone, Default)]
+pub struct AutoTransportOpts {
+    pub enabled: bool,
+    pub sni_override: Option<String>,
+    pub order: Option<String>,
+    pub probe_timeout_secs: u64,
+}
+
+pub async fn run_client(
+    config_path: &str,
+    profile: Option<&str>,
+    opts: AutoTransportOpts,
+) -> anyhow::Result<()> {
     // SIGUSR1 dumps the packet trace, when one is armed (no-op otherwise).
     tokio::spawn(trace::watch());
 
     let file_content = std::fs::read_to_string(config_path)?;
-    let (profile_name, config_content) =
-        crate::config::client_profiles::resolve_client_profile(&file_content, profile)?;
+    let auto_from_env = std::env::var("QELI_AUTO_TRANSPORT")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+
+    let profiles = crate::config::client_profiles::split_client_profiles(&file_content)?;
+    let want_auto = opts.enabled
+        || auto_from_env
+        || profiles.iter().any(|p| {
+            crate::config::format::IniDoc::parse(&p.body)
+                .ok()
+                .and_then(|doc| {
+                    doc.section("qeli")
+                        .map(|q| q.bool_or("auto_transport", false))
+                })
+                .unwrap_or(false)
+        });
+
+    let (profile_name, mut config_content) =
+        if want_auto && profiles.len() > 1 && profile.is_none() {
+            let candidates = crate::config::auto_transport::candidates_from_bundle(&file_content)?;
+            let order_from_ini = profiles.iter().find_map(|p| {
+                crate::config::format::IniDoc::parse(&p.body)
+                    .ok()
+                    .and_then(|doc| {
+                        doc.section("qeli")
+                            .and_then(|q| q.get("auto_transport_order"))
+                            .map(str::to_string)
+                    })
+            });
+            let order_owned = crate::config::auto_transport::parse_order(
+                opts.order.as_deref().or(order_from_ini.as_deref()),
+            );
+            let order_refs: Vec<&str> = order_owned.iter().map(String::as_str).collect();
+            let timeout = std::time::Duration::from_secs(opts.probe_timeout_secs.max(1));
+            let outcomes = crate::config::auto_transport::probe_all(&candidates, timeout);
+            for o in &outcomes {
+                if o.ok {
+                    log::info!(
+                        "auto-transport probe ok '{}' rtt={}ms",
+                        o.name,
+                        o.rtt_ms.unwrap_or(0)
+                    );
+                } else {
+                    log::info!(
+                        "auto-transport probe fail '{}': {}",
+                        o.name,
+                        o.error.as_deref().unwrap_or("unreachable")
+                    );
+                }
+            }
+            let ranked =
+                crate::config::auto_transport::rank(&candidates, &outcomes, &order_refs);
+            let pick = ranked.first().ok_or_else(|| {
+                anyhow::anyhow!("auto-transport: no reachable profile in the bundle")
+            })?;
+            log::info!(
+                "auto-transport selected '{}' ({}/{}{} preference={})",
+                pick.candidate.name,
+                pick.candidate.protocol,
+                pick.candidate.mode,
+                if pick.candidate.quic { "+quic" } else { "" },
+                pick.preference
+            );
+            let failover = ranked
+                .iter()
+                .map(|p| p.candidate.name.clone())
+                .collect::<Vec<_>>()
+                .join(",");
+            std::env::set_var("QELI_AUTO_TRANSPORT_FAILOVER", failover);
+            (pick.candidate.name.clone(), pick.candidate.body.clone())
+        } else {
+            crate::config::client_profiles::resolve_client_profile(&file_content, profile)?
+        };
+    if let Some(ref sni) = opts.sni_override {
+        config_content = crate::config::auto_transport::apply_sni_override(&config_content, sni)?;
+        log::info!("SNI override applied: {sni}");
+    }
+
     if std::env::var("QELI_CLIENT_PROFILE").is_err() {
         std::env::set_var("QELI_CLIENT_PROFILE", &profile_name);
     }

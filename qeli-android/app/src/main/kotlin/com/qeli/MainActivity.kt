@@ -140,6 +140,12 @@ class MainActivity : AppCompatActivity() {
         const val DEFAULT_LOG_LEVEL = "info"
         /** Shadowrocket-like: on give-up, try the next profile in the list. */
         const val PREF_FAILOVER = "profile_failover"
+        /** Probe all profiles and pick the best masking mode before connect. */
+        const val PREF_AUTO_TRANSPORT = "auto_transport"
+        const val PREF_CUSTOM_SNI = "custom_sni_hosts"
+        const val PREF_SNI_SPEED_SEL = "sni_speed_selection"
+        // Cap visible/tested SNI rows — full catalog stays in assets, not in the view tree.
+        private const val SNI_UI_ROW_CAP = 40
         /** Geo routing preset id (proxy-all / bypass-ru / …). */
         const val PREF_GEO_PRESET = "geo_route_preset"
         // Flat-INI template — the same `[qeli]` schema the Rust client reads.
@@ -190,9 +196,12 @@ sni = www.microsoft.com
 
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
+            // Activity may already be finishing; touching views after destroy crashes.
+            if (isFinishing || isDestroyed) return
             if (intent.action == VpnServiceImpl.BROADCAST_FAILOVER) {
                 val idx = intent.getIntExtra(VpnServiceImpl.EXTRA_FAILOVER_INDEX, -1)
                 runOnUiThread {
+                    if (isFinishing || isDestroyed) return@runOnUiThread
                     loadProfiles()
                     if (idx in profiles.indices) activeIndex = idx
                     persist(); renderProfileList(); renderActiveProfile()
@@ -205,6 +214,7 @@ sni = www.microsoft.com
             val error = intent.getStringExtra(VpnServiceImpl.EXTRA_ERROR)
             val log = intent.getStringExtra(VpnServiceImpl.EXTRA_LOG)
             runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
                 log?.let { appendLog(it) }
                 if (status == VpnServiceImpl.STATUS_STATS) {
                     updateSpeed(
@@ -284,6 +294,8 @@ sni = www.microsoft.com
         binding.btnSettings.setOnClickListener { showSettingsDialog() }
 
         setupGeoRouting()
+        setupTransportAuto()
+        setupSniSpeedTab()
 
         // Reuses the existing per-app picker rather than a second entry point for the same
         // setting; it edits the ACTIVE profile, which is what the card describes.
@@ -324,10 +336,12 @@ sni = www.microsoft.com
     private fun showTab(pos: Int) {
         binding.viewConnection.visibility = if (pos == 0) View.VISIBLE else View.GONE
         binding.viewProfiles.visibility = if (pos == 1) View.VISIBLE else View.GONE
-        binding.viewLog.visibility = if (pos == 2) View.VISIBLE else View.GONE
+        binding.viewSniSpeed.visibility = if (pos == 2) View.VISIBLE else View.GONE
+        binding.viewLog.visibility = if (pos == 3) View.VISIBLE else View.GONE
         when (pos) {
             1 -> { renderProfileList(); pingAll() }
             0 -> { renderActiveProfile(); pingActive() }
+            2 -> ensureSniSpeedReady()
         }
     }
 
@@ -441,6 +455,317 @@ sni = www.microsoft.com
     private fun current(): Profile? = profiles.getOrNull(activeIndex)
 
     private var geoSpinnerInitializing = false
+
+    private var sniSpinnerInitializing = false
+
+    private fun setupTransportAuto() {
+        val prefs = getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
+        binding.switchAutoTransport.isChecked = prefs.getBoolean(PREF_AUTO_TRANSPORT, false)
+        binding.switchAutoTransport.setOnCheckedChangeListener { _, checked ->
+            prefs.edit().putBoolean(PREF_AUTO_TRANSPORT, checked).apply()
+            // Auto-pick implies failover so a cut path can rotate on the fly.
+            if (checked) prefs.edit().putBoolean(PREF_FAILOVER, true).apply()
+        }
+
+        val presets = listOf(getString(R.string.sni_custom_hint)) +
+            SniCatalog.merge(this, loadCustomSni()).take(40)
+        binding.spinnerSniPreset.adapter = android.widget.ArrayAdapter(
+            this, android.R.layout.simple_spinner_item, presets
+        ).apply { setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
+        binding.spinnerSniPreset.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (sniSpinnerInitializing || position <= 0) return
+                binding.editSni.setText(presets[position])
+            }
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+        binding.btnApplySni.setOnClickListener { applySniFromUi() }
+        binding.btnSpeedTest.setOnClickListener { runSpeedTest() }
+        refreshSniField()
+    }
+
+    private fun refreshSniField() {
+        val p = current() ?: return
+        val cfg = runCatching { VpnConfig.parse(p.text) }.getOrNull() ?: return
+        sniSpinnerInitializing = true
+        binding.editSni.setText(cfg.sni.orEmpty())
+        val adapter = binding.spinnerSniPreset.adapter
+        var presetIdx = 0
+        if (adapter != null && !cfg.sni.isNullOrBlank()) {
+            for (i in 1 until adapter.count) {
+                if (adapter.getItem(i)?.toString().equals(cfg.sni, ignoreCase = true)) {
+                    presetIdx = i
+                    break
+                }
+            }
+        }
+        binding.spinnerSniPreset.setSelection(presetIdx, false)
+        sniSpinnerInitializing = false
+    }
+
+    private data class SniRowState(
+        val host: String,
+        var selected: Boolean,
+        var tlsMs: Long? = null,
+        var mbps: Double? = null,
+        var status: String = "",
+        var ok: Boolean = false,
+    )
+
+    private val sniRows = mutableListOf<SniRowState>()
+    private var sniSpeedReady = false
+
+    private fun loadCustomSni(): List<String> {
+        val raw = getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
+            .getString(PREF_CUSTOM_SNI, "") ?: ""
+        return raw.split('\n', ',', ';').mapNotNull { SniCatalog.normalize(it) }
+    }
+
+    private fun saveCustomSni(hosts: List<String>) {
+        getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
+            .edit().putString(PREF_CUSTOM_SNI, hosts.joinToString("\n")).apply()
+    }
+
+    private fun loadSniSelection(): Set<String> {
+        val raw = getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
+            .getString(PREF_SNI_SPEED_SEL, "") ?: ""
+        val set = raw.split('\n', ',', ';').mapNotNull { SniCatalog.normalize(it) }.toMutableSet()
+        if (set.isEmpty()) set.addAll(TransportAuto.SNI_PRESETS.take(8))
+        return set
+    }
+
+    private fun saveSniSelection(hosts: Collection<String>) {
+        getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
+            .edit().putString(PREF_SNI_SPEED_SEL, hosts.joinToString("\n")).apply()
+    }
+
+    private fun setupSniSpeedTab() {
+        binding.btnSniAdd.setOnClickListener {
+            val n = SniCatalog.normalize(binding.editSniCustom.text?.toString())
+            if (n == null) {
+                Toast.makeText(this, getString(R.string.sni_empty), Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val custom = loadCustomSni().toMutableList()
+            if (custom.none { it.equals(n, true) }) {
+                custom.add(n)
+                saveCustomSni(custom)
+            }
+            val sel = loadSniSelection().toMutableSet()
+            sel.add(n)
+            saveSniSelection(sel)
+            binding.editSniCustom.setText("")
+            sniSpeedReady = false
+            ensureSniSpeedReady()
+            sniRows.find { it.host.equals(n, true) }?.selected = true
+            renderSniSpeedList()
+        }
+        binding.btnSniSelectTop.setOnClickListener {
+            val top = SniCatalog.merge(this, loadCustomSni()).take(20)
+            saveSniSelection(top)
+            sniRows.clear()
+            for (h in top) sniRows += SniRowState(h, selected = true)
+            sniSpeedReady = true
+            binding.tvSniSpeedStatus.text = getString(R.string.sni_catalog_count, sniRows.size, SniCatalog.builtin(this).size)
+            renderSniSpeedList()
+        }
+        binding.btnSniRun.setOnClickListener { runSniSpeedTest() }
+        binding.btnSniApplyBest.setOnClickListener { applyBestSniFromTable() }
+    }
+
+    private fun ensureSniSpeedReady() {
+        if (sniSpeedReady && sniRows.isNotEmpty()) {
+            renderSniSpeedList()
+            return
+        }
+        // Never inflate the full catalog (~300 hosts) into a LinearLayout — that OOMs
+        // low-memory devices when the SNI tab opens. Only the active test set is shown.
+        val catalogSize = SniCatalog.merge(this, loadCustomSni()).size
+        val selected = loadSniSelection().toList()
+        sniRows.clear()
+        for (h in selected) {
+            sniRows += SniRowState(h, selected = true)
+        }
+        sniSpeedReady = true
+        binding.tvSniSpeedStatus.text = getString(R.string.sni_catalog_count, sniRows.size, catalogSize)
+        renderSniSpeedList()
+    }
+
+    private fun renderSniSpeedList() {
+        if (isFinishing || isDestroyed) return
+        val container = binding.listSniSpeed
+        container.removeAllViews()
+        val inflater = LayoutInflater.from(this)
+        // Hard cap: UI rows only — probing more than this is rare and rebuilds the list.
+        val visible = sniRows.take(SNI_UI_ROW_CAP)
+        for (row in visible) {
+            val item = inflater.inflate(R.layout.item_sni_speed, container, false)
+            val cb = item.findViewById<android.widget.CheckBox>(R.id.cbSniSelect)
+            val host = item.findViewById<TextView>(R.id.tvSniHost)
+            val meta = item.findViewById<TextView>(R.id.tvSniMeta)
+            host.text = row.host
+            val tls = row.tlsMs?.let { "$it ms" } ?: "—"
+            val mbps = row.mbps?.let { String.format("%.2f", it) } ?: "—"
+            meta.text = "$tls · $mbps · ${row.status.ifBlank { "—" }}"
+            cb.setOnCheckedChangeListener(null)
+            cb.isChecked = row.selected
+            cb.setOnCheckedChangeListener { _, checked -> row.selected = checked }
+            container.addView(item)
+        }
+    }
+
+    private fun runSniSpeedTest() {
+        val targets = sniRows.filter { it.selected }.take(SNI_UI_ROW_CAP)
+        if (targets.isEmpty()) {
+            Toast.makeText(this, getString(R.string.sni_select_some), Toast.LENGTH_SHORT).show()
+            return
+        }
+        saveSniSelection(targets.map { it.host })
+        binding.btnSniRun.isEnabled = false
+        binding.tvSniSpeedStatus.text = getString(R.string.sni_testing, targets.size)
+        lifecycleScope.launch {
+            try {
+                for (row in targets) {
+                    if (isFinishing || isDestroyed) return@launch
+                    val result = withContext(Dispatchers.IO) {
+                        runCatching { SniSpeedProbe.probe(row.host) }
+                            .getOrElse { SniSpeedRow(row.host, false, error = it.message ?: "error") }
+                    }
+                    row.ok = result.ok
+                    row.tlsMs = result.tlsMs
+                    row.mbps = result.mbps
+                    row.status = result.status
+                    renderSniSpeedList()
+                }
+                if (isFinishing || isDestroyed) return@launch
+                // Sort selected results to the top by quality.
+                val selected = sniRows.filter { it.selected }
+                    .sortedWith(compareByDescending<SniRowState> { it.ok }
+                        .thenBy { it.tlsMs ?: Long.MAX_VALUE }
+                        .thenByDescending { it.mbps ?: 0.0 })
+                val rest = sniRows.filter { !it.selected }
+                sniRows.clear()
+                sniRows.addAll(selected)
+                sniRows.addAll(rest)
+                renderSniSpeedList()
+                val best = selected.firstOrNull { it.ok }
+                binding.tvSniSpeedStatus.text = if (best == null) {
+                    getString(R.string.sni_none_ok)
+                } else {
+                    getString(
+                        R.string.sni_best,
+                        best.host,
+                        best.tlsMs?.toString() ?: "-",
+                        best.mbps?.let { String.format("%.2f", it) } ?: "-"
+                    )
+                }
+            } finally {
+                if (!isFinishing && !isDestroyed) binding.btnSniRun.isEnabled = true
+            }
+        }
+    }
+
+    private fun applyBestSniFromTable() {
+        val best = sniRows.filter { it.selected && it.ok }
+            .sortedWith(compareBy<SniRowState> { it.tlsMs ?: Long.MAX_VALUE }
+                .thenByDescending { it.mbps ?: 0.0 })
+            .firstOrNull()
+        if (best == null) {
+            Toast.makeText(this, getString(R.string.sni_none_ok), Toast.LENGTH_SHORT).show()
+            return
+        }
+        binding.editSni.setText(best.host)
+        applySniFromUi()
+        binding.tabs.getTabAt(0)?.select()
+    }
+
+    private fun applySniFromUi() {
+        val host = binding.editSni.text?.toString()?.trim().orEmpty()
+        if (host.isEmpty()) {
+            Toast.makeText(this, getString(R.string.sni_empty), Toast.LENGTH_SHORT).show()
+            return
+        }
+        val idx = activeIndex
+        if (idx !in profiles.indices) return
+        try {
+            val updated = TransportAuto.applySniToIni(profiles[idx].text, host)
+            VpnConfig.parse(updated).validate()
+            profiles[idx] = profiles[idx].copy(text = updated)
+            persist()
+            renderActiveProfile()
+            Toast.makeText(this, getString(R.string.sni_applied, host), Toast.LENGTH_SHORT).show()
+            appendLog("SNI → $host")
+            if (isConnected || isConnecting) {
+                connect()
+            }
+        } catch (e: Exception) {
+            Toast.makeText(this, e.message ?: "SNI error", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun runSpeedTest() {
+        val p = current() ?: return
+        val cfg = runCatching { VpnConfig.parse(p.text) }.getOrNull() ?: return
+        val host = cfg.serverAddress.trim()
+        if (host.isEmpty()) return
+        val base = if (host.contains('.') && host.any { it.isLetter() }) {
+            "https://$host"
+        } else {
+            "http://$host:8080"
+        }
+        binding.tvSpeedTestResult.visibility = View.VISIBLE
+        binding.tvSpeedTestResult.text = getString(R.string.speed_test_running)
+        binding.btnSpeedTest.isEnabled = false
+        lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { panelSpeedTestMbps(base, bytes = 1_048_576) }
+            }
+            binding.btnSpeedTest.isEnabled = true
+            result.onSuccess { mbps ->
+                binding.tvSpeedTestResult.text = String.format("%.2f Mbit/s via %s", mbps, base)
+                appendLog("Speed test: %.2f Mbit/s ($base)".format(mbps))
+            }.onFailure { e ->
+                binding.tvSpeedTestResult.text = e.message ?: "speed test failed"
+                appendLog("Speed test failed: ${e.message}")
+            }
+        }
+    }
+
+    /** Authenticated download against panel `/api/speedtest` (uses stored panel creds if any). */
+    private fun panelSpeedTestMbps(base: String, bytes: Int): Double {
+        val prefs = getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
+        val user = prefs.getString("panel_user", "admin") ?: "admin"
+        val pass = prefs.getString("panel_password", "") ?: ""
+        val cookieManager = java.net.CookieManager()
+        java.net.CookieHandler.setDefault(cookieManager)
+        if (pass.isNotEmpty()) {
+            val login = java.net.URL("$base/api/login").openConnection() as java.net.HttpURLConnection
+            login.connectTimeout = 8_000
+            login.readTimeout = 8_000
+            login.requestMethod = "POST"
+            login.doOutput = true
+            login.setRequestProperty("Content-Type", "application/json")
+            login.outputStream.use { os ->
+                os.write("""{"username":"$user","password":"$pass"}""".toByteArray())
+            }
+            if (login.responseCode !in 200..299) {
+                throw IllegalStateException("panel login HTTP ${login.responseCode}")
+            }
+            login.inputStream.use { it.readBytes() }
+        }
+        val url = java.net.URL("$base/api/speedtest?bytes=$bytes")
+        val conn = url.openConnection() as java.net.HttpURLConnection
+        conn.connectTimeout = 10_000
+        conn.readTimeout = 60_000
+        conn.requestMethod = "GET"
+        val t0 = System.nanoTime()
+        val n = conn.inputStream.use { it.readBytes().size }
+        val secs = (System.nanoTime() - t0) / 1e9
+        if (conn.responseCode !in 200..299) {
+            throw IllegalStateException("speedtest HTTP ${conn.responseCode}")
+        }
+        return (n * 8.0) / secs.coerceAtLeast(0.001) / 1_000_000.0
+    }
 
     private fun setupGeoRouting() {
         val presets = com.qeli.geo.ProxyRoutePreset.ALL
@@ -947,6 +1272,7 @@ sni = www.microsoft.com
         applyReach(binding.activeReachDot, binding.tvActiveReach, p, ms)
         renderConnectionInfo()
         renderGeoRouting()
+        refreshSniField()
     }
 
     /**
@@ -1585,6 +1911,54 @@ sni = www.microsoft.com
 
     private fun connect() {
         if (isDisconnecting) return
+        val prefs = getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
+        if (prefs.getBoolean(PREF_AUTO_TRANSPORT, false) && profiles.size > 1) {
+            pickBestTransportThenConnect()
+            return
+        }
+        connectActiveProfile()
+    }
+
+    private fun pickBestTransportThenConnect() {
+        appendLog(getString(R.string.auto_picking))
+        setConnectingState()
+        lifecycleScope.launch {
+            val labels = ArrayList<String>()
+            val okFlags = ArrayList<Boolean>()
+            val rtts = ArrayList<Long?>()
+            for (p in profiles) {
+                val cfg = runCatching { VpnConfig.parse(p.text).also { it.validate() } }.getOrNull()
+                if (cfg == null) {
+                    labels += "invalid"
+                    okFlags += false
+                    rtts += null
+                    continue
+                }
+                labels += TransportAuto.transportLabel(cfg.protocol, cfg.wireMode, cfg.quicEnabled)
+                val ms = withContext(Dispatchers.IO) { runCatching { probe(p) }.getOrNull() }
+                okFlags += ms != null && ms >= 0
+                rtts += ms
+            }
+            val ranked = TransportAuto.rank(labels, okFlags, rtts)
+            if (ranked.isEmpty()) {
+                appendLog("auto-transport: no reachable profile")
+                Toast.makeText(this@MainActivity, "No reachable transport", Toast.LENGTH_LONG).show()
+                setDisconnectedState()
+                return@launch
+            }
+            val best = ranked.first()
+            activeIndex = best.index
+            persist()
+            renderProfileList()
+            renderActiveProfile()
+            val name = profiles[best.index].name
+            appendLog(getString(R.string.auto_picked, name))
+            Toast.makeText(this@MainActivity, getString(R.string.auto_picked, name), Toast.LENGTH_SHORT).show()
+            connectActiveProfile()
+        }
+    }
+
+    private fun connectActiveProfile() {
         val p = current() ?: return
         // `parse` only PARSES — validate() is a separate step, and connecting without it let a
         // profile saved before the range checks existed (or hand-edited since) reach the tunnel
@@ -1616,7 +1990,13 @@ sni = www.microsoft.com
 
     private fun startVpnService() {
         try {
-            val cfg = VpnConfig.parse(current()!!.text)
+            val profile = current()
+            if (profile == null) {
+                appendLog("Service error: no active profile")
+                setDisconnectedState()
+                return
+            }
+            val cfg = VpnConfig.parse(profile.text)
             val intent = Intent(this, VpnServiceImpl::class.java).apply {
                 action = VpnServiceImpl.ACTION_CONNECT
                 putExtra(VpnServiceImpl.EXTRA_CONFIG, cfg)

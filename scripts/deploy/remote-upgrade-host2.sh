@@ -18,10 +18,14 @@ sshpass -p "$PASS" scp -o StrictHostKeyChecking=no /w/update-qeli-server.sh "roo
 sshpass -p "$PASS" ssh -o StrictHostKeyChecking=no "root@${HOST}" bash -s <<'EOF'
 set -eu
 chmod +x /tmp/update-qeli-server.sh
-# Root unit cannot read qeli:qeli-owned /etc/qeli — fix before restart.
-chown -R root:root /etc/qeli /var/log/qeli /var/lib/qeli
-chmod 600 /etc/qeli/users.conf /etc/qeli/web-tls-key.pem /var/lib/qeli/panel-secret.key 2>/dev/null || true
 QELI_DEB=/tmp/qeli_0.7.15_amd64.deb QELI_FORCE=1 bash /tmp/update-qeli-server.sh
+# Deb postinst may restore qeli:qeli ownership; lab unit runs as root and the
+# process drops to the package user for ACL — normalize after install.
+chown -R root:root /etc/qeli /var/log/qeli /var/lib/qeli
+chmod 600 /etc/qeli/users.conf /etc/qeli/web-tls-key.pem /etc/qeli/panel-secret.key /var/lib/qeli/panel-secret.key 2>/dev/null || true
+systemctl reset-failed qeli || true
+systemctl restart qeli
+sleep 2
 systemctl is-active qeli
 systemctl is-active nginx || true
 /usr/bin/qeli --version 2>/dev/null || qeli --version

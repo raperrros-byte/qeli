@@ -8,10 +8,18 @@
 >
 > Maintained by: Daniil Nekrasov \<raperrros@yandex.ru\>
 >
-> Updated: 2026-08-13
+> Updated: 2026-08-15
 >
 > База сравнения — upstream `v0.7.15`. В форке добавлено (новые сверху):
 >
+> - **Вкладка SNI speed (Win/Android):** таблица TLS+HTTPS probe по каталогу
+>   front-хостов (~285 из GitHub Reality SNI lists + CDN); свои хосты; Apply best.
+>   Источники: meower1/Reality-SNI-Finder, Reza-shojaei fork, evkir/reality-probe.
+> - **Авто-подбор транспорта.** Клиент прощупывает профили (plain ⇄ fake-tls ⇄
+>   reality-tls ⇄ obfs ⇄ QUIC) и выбирает рабочий режим; при обрыве — failover.
+>   CLI: `--auto-transport` / `auto_transport=true`, `qeli probe-transports`,
+>   `qeli speedtest`. Панель: `GET /api/transport/modes`, `/api/transport/sni-presets`,
+>   `/api/speedtest`. SNI/TLS host и speed test — на главном экране Win/Android.
 > - **Клиент Win/mac: REALITY seal для профиля `reality` (:8443).** Профиль
 >   `mode=fake-tls` + `reality_sid` вставляет AEAD-токен в ClientHello `session_id`
 >   (как Rust-клиент). Без этого сервер считает пробу и отдаёт ответ decoy →

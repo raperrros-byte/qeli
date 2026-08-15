@@ -73,8 +73,41 @@ enum Commands {
         /// Profile to connect (required when the config file defines several).
         #[arg(long)]
         profile: Option<String>,
+        /// Probe all profiles and pick the best reachable masking mode (hot failover).
+        #[arg(long, default_value_t = false)]
+        auto_transport: bool,
+        /// Override SNI / TLS front host for this connect (also written into the chosen profile).
+        #[arg(long)]
+        sni: Option<String>,
         #[command(subcommand)]
         action: Option<ClientAction>,
+    },
+    /// Probe every profile in a client bundle and print ranked transport picks.
+    #[command(name = "probe-transports")]
+    ProbeTransports {
+        #[arg(short, long, default_value = "/etc/qeli/client.conf")]
+        config: PathBuf,
+        /// Connect timeout per candidate, seconds.
+        #[arg(long, default_value_t = 3)]
+        timeout: u64,
+        /// Optional preference order override (comma-separated labels).
+        #[arg(long)]
+        order: Option<String>,
+    },
+    /// Download speedtest payload from a panel (`/api/speedtest`).
+    Speedtest {
+        /// Panel base URL, e.g. http://127.0.0.1:8080
+        #[arg(long)]
+        panel: String,
+        /// Panel username.
+        #[arg(long, default_value = "admin")]
+        user: String,
+        /// Panel password (prefer env QELI_PANEL_PASSWORD).
+        #[arg(long)]
+        password: Option<String>,
+        /// Bytes to download (64 KiB .. 16 MiB).
+        #[arg(long, default_value_t = 1_048_576)]
+        bytes: u64,
     },
     /// List profile names from a client config (one per line; for scripts)
     #[command(name = "client-profiles")]
@@ -489,6 +522,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Client {
             config,
             profile,
+            auto_transport,
+            sni,
             action,
         } => match action {
             Some(ClientAction::Ls) => {
@@ -501,10 +536,41 @@ async fn main() -> anyhow::Result<()> {
                     let config_str = config.to_str().ok_or_else(|| {
                         anyhow::anyhow!("config path is not valid UTF-8: {}", config.display())
                     })?;
-                    client::run_client(config_str, profile.as_deref()).await?;
+                    let opts = client::AutoTransportOpts {
+                        enabled: auto_transport
+                            || std::env::var("QELI_AUTO_TRANSPORT")
+                                .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+                                .unwrap_or(false),
+                        sni_override: sni,
+                        order: None,
+                        probe_timeout_secs: 3,
+                    };
+                    client::run_client(config_str, profile.as_deref(), opts).await?;
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = (config, profile, auto_transport, sni);
+                    anyhow::bail!("qeli client is only supported on Linux");
                 }
             }
         },
+
+        Commands::ProbeTransports {
+            config,
+            timeout,
+            order,
+        } => {
+            run_probe_transports(&config, timeout, order.as_deref())?;
+        }
+
+        Commands::Speedtest {
+            panel,
+            user,
+            password,
+            bytes,
+        } => {
+            run_panel_speedtest(&panel, &user, password.as_deref(), bytes).await?;
+        }
 
         Commands::ClientProfiles { config } => {
             let path = config.display().to_string();
@@ -1714,6 +1780,179 @@ fn print_list_clients(resp: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn run_probe_transports(
+    config: &std::path::Path,
+    timeout_secs: u64,
+    order: Option<&str>,
+) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(config)
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", config.display()))?;
+    let candidates = config::auto_transport::candidates_from_bundle(&text)?;
+    let order_owned = config::auto_transport::parse_order(order);
+    let order_refs: Vec<&str> = order_owned.iter().map(String::as_str).collect();
+    let timeout = std::time::Duration::from_secs(timeout_secs.max(1));
+    let outcomes = config::auto_transport::probe_all(&candidates, timeout);
+    let ranked = config::auto_transport::rank(&candidates, &outcomes, &order_refs);
+
+    println!(
+        "{:<28} {:<8} {:>7}  {}",
+        "PROFILE", "LABEL", "RTT_MS", "STATUS"
+    );
+    for (i, c) in candidates.iter().enumerate() {
+        let label = config::auto_transport::transport_label(&c.protocol, &c.mode, c.quic);
+        let o = &outcomes[i];
+        let status = if o.ok {
+            "ok"
+        } else {
+            o.error.as_deref().unwrap_or("fail")
+        };
+        println!(
+            "{:<28} {:<8} {:>7}  {}",
+            c.name,
+            label,
+            o.rtt_ms
+                .map(|ms| ms.to_string())
+                .unwrap_or_else(|| "-".into()),
+            status
+        );
+    }
+    println!();
+    if ranked.is_empty() {
+        println!("No reachable transports.");
+        anyhow::bail!("auto-transport probe found no working candidates");
+    }
+    println!("Recommended order:");
+    for (rank, pick) in ranked.iter().enumerate() {
+        println!(
+            "  {}. {} ({} ms, preference {})",
+            rank + 1,
+            pick.candidate.name,
+            pick.rtt_ms.unwrap_or(0),
+            pick.preference
+        );
+    }
+    Ok(())
+}
+
+async fn run_panel_speedtest(
+    panel: &str,
+    user: &str,
+    password: Option<&str>,
+    bytes: u64,
+) -> anyhow::Result<()> {
+    let password = password
+        .map(str::to_string)
+        .or_else(|| std::env::var("QELI_PANEL_PASSWORD").ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!("panel password required (--password or QELI_PANEL_PASSWORD)")
+        })?;
+    let base = panel.trim_end_matches('/');
+    let login_url = format!("{base}/api/login");
+    let speed_url = format!("{base}/api/speedtest?bytes={bytes}");
+
+    // Minimal HTTP/1.1 client (no extra deps): login for session cookie, then GET payload.
+    let cookie = http_json_post_cookie(
+        &login_url,
+        &serde_json::json!({"username": user, "password": password}).to_string(),
+    )?;
+    let started = std::time::Instant::now();
+    let n = http_get_bytes(&speed_url, &cookie)?;
+    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    let mbps = (n as f64 * 8.0) / elapsed / 1_000_000.0;
+    println!(
+        "speedtest: downloaded {n} bytes in {elapsed:.3}s → {mbps:.2} Mbit/s (panel {base})"
+    );
+    Ok(())
+}
+
+fn http_json_post_cookie(url: &str, body: &str) -> anyhow::Result<String> {
+    let (host, port, path, tls) = split_http_url(url)?;
+    if tls {
+        anyhow::bail!("https speedtest via CLI not implemented; use http:// panel URL");
+    }
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect((host.as_str(), port))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(15)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(15)))?;
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes())?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf);
+    let (headers, _) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("malformed HTTP response from login"))?;
+    if !headers.contains("200") {
+        anyhow::bail!("panel login failed: {}", headers.lines().next().unwrap_or(""));
+    }
+    for line in headers.lines() {
+        let lower = line.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("set-cookie:") {
+            let raw = line.split_once(':').map(|(_, v)| v.trim()).unwrap_or(rest.trim());
+            let cookie = raw.split(';').next().unwrap_or(raw).trim();
+            return Ok(cookie.to_string());
+        }
+    }
+    anyhow::bail!("panel login returned no Set-Cookie");
+}
+
+fn http_get_bytes(url: &str, cookie: &str) -> anyhow::Result<usize> {
+    let (host, port, path, tls) = split_http_url(url)?;
+    if tls {
+        anyhow::bail!("https speedtest via CLI not implemented; use http:// panel URL");
+    }
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect((host.as_str(), port))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(60)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(15)))?;
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes())?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf)?;
+    let sep = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("malformed HTTP response from speedtest"))?;
+    let headers = String::from_utf8_lossy(&buf[..sep]);
+    if !headers.contains("200") {
+        anyhow::bail!(
+            "speedtest failed: {}",
+            headers.lines().next().unwrap_or("")
+        );
+    }
+    Ok(buf.len().saturating_sub(sep + 4))
+}
+
+fn split_http_url(url: &str) -> anyhow::Result<(String, u16, String, bool)> {
+    let url = url.trim();
+    let (tls, rest) = if let Some(r) = url.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (false, r)
+    } else {
+        anyhow::bail!("URL must start with http:// or https://");
+    };
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, format!("/{p}")),
+        None => (rest, "/".into()),
+    };
+    let (host, port) = if let Some((h, p)) = authority.rsplit_once(':') {
+        (
+            h.to_string(),
+            p.parse::<u16>()
+                .map_err(|_| anyhow::anyhow!("bad port in URL"))?,
+        )
+    } else {
+        (authority.to_string(), if tls { 443 } else { 80 })
+    };
+    Ok((host, port, path, tls))
 }
 
 fn format_duration(secs: u64) -> String {

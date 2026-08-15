@@ -2,6 +2,7 @@ pub mod server;
 // Config data definitions + qeli:// link helpers: several fields/methods are
 // declarative API surface or used only by tests / the Android port.
 #[allow(dead_code)]
+pub mod auto_transport;
 pub mod client;
 pub mod client_profiles;
 pub mod format;

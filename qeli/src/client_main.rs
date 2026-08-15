@@ -113,5 +113,11 @@ async fn main() -> anyhow::Result<()> {
         anyhow::anyhow!("config path is not valid UTF-8: {}", cli.config.display())
     })?;
     log::info!("Starting qeli client with config: {}", cli.config.display());
-    qeli::client::run_client(config_str, cli.profile.as_deref()).await
+    let opts = qeli::client::AutoTransportOpts {
+        enabled: std::env::var("QELI_AUTO_TRANSPORT")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false),
+        ..Default::default()
+    };
+    qeli::client::run_client(config_str, cli.profile.as_deref(), opts).await
 }
