@@ -1,7 +1,8 @@
 # Клиентский конфиг: 0.7.14 → 0.7.15
 
 Эта таблица фиксирует контракт **всех 73 допустимых ключей** секции `[qeli]` для пяти
-клиентов. «До» означает поведение выпущенной 0.7.14, «после» — итоговый контракт 0.7.15
+клиентов (плюс ключи форка `auto_transport` / `auto_transport_order`). «До» означает
+поведение выпущенной 0.7.14, «после» — итоговый контракт 0.7.15
 после переноса транспорта в общее Rust-ядро.
 
 Обозначения:
@@ -19,6 +20,7 @@ fail-closed. GUI-клиенты 0.7.15 сохраняют любой извес�
 
 | Ключи | CLI | Windows | macOS | Android | iOS | Что изменилось в 0.7.15 |
 |---|:-:|:-:|:-:|:-:|:-:|---|
+| `auto_transport` `auto_transport_order` | —→A | —→A\* | —→A\* | —→A\* | —→C | Форк: авто-ранжирование режимов / профилей; GUI Win/Android — тумблер и матрица Mode×SNI; CLI — `--auto-transport`, `probe-transports`. |
 | `server` `proto` `user` `pass` `key` `bind_static` `mode` `sni` `obfs_key` `front` `reality_sid` `quic` `awg` `jc` `jmin` `jmax` `mtu` `mtu_probe` `gateway` `route_local` `include` `exclude` `dns` `allow_ipv6_leak` | A→A | A→A | A→A | A→A | A→A | Внешняя семантика сохранена; на границе GUI→Rust теперь явно передаются платформенные дефолты `gateway`, поэтому Rust-дефолт split не меняет телефонный/desktop full-tunnel. |
 | `reconnect` `reconnect_retries` `reconnect_base_delay` `reconnect_max_delay` | R→R | A→A | A→A | A→A | A→A | Реконнект остаётся платформенным lifecycle-контуром; Rust-ядро владеет попыткой соединения, но не решением GUI о следующем запуске. В 0.7.15 iOS adapter действительно создаёт следующую generation; до аудита ключи сохранялись, но любая native/pump ошибка была terminal. |
 | `timeout` | R→A | A→A | A→A | A→A | A→A | Таймаут соединения перенесён в Rust и теперь действительно доходит до общего ядра. |

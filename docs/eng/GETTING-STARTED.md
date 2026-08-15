@@ -658,6 +658,13 @@ dns.push_servers = ""        # empty → clients get the proxy address (dns.list
    appears with all parameters and the **server key pinned**.
 3. Tap the connect ring. Done.
 
+**Fork — auto-transport and SNI.** On Windows, an **Auto** checkbox next to **Connect**
+runs a modes × selected-SNI matrix; the main screen also has an auto-transport toggle,
+and ⚡ opens the SNI/mode probe window. On Android: the **SNI** tab, auto-transport and
+Apply SNI on the home screen. CLI: `auto_transport = true`, `qeli probe-transports`,
+`qeli speedtest`. Panel: `/api/transport/modes`, `/api/transport/sni-presets`,
+`/api/speedtest` — see [PANEL.md](PANEL.md) and [CHANGELOG.md](../../CHANGELOG.md).
+
 Full-tunnel and "route local networks" are toggles in the app.
 
 The timestamp shape in the log pane is **Settings → Log timestamp** (the same five

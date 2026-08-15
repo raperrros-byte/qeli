@@ -22,7 +22,11 @@ Android-клиент qeli: системный VPN через `VpnService` (ве�
 
 ```
 app/src/main/kotlin/com/qeli/
-├── MainActivity.kt        — UI: профили, импорт (QR/ссылка/файл), лог, настройки, бэкап
+├── MainActivity.kt        — UI: профили, импорт (QR/ссылка/файл), лог, настройки, бэкап,
+│                            авто-транспорт, SNI, вкладка SNI speed
+├── TransportAuto.kt       — ранжирование режимов (зеркало Rust auto_transport)
+├── SniCatalog.kt          — каталог front-хостов из assets/sni_hosts.txt
+├── SniSpeedProbe.kt       — TLS + HTTPS download probe
 ├── QeliService.kt         — platform adapter: protect/trust, NetworkPlan/TUN, reconnect
 ├── TransportCore.kt       — JNI owner общего Rust transport и native UDP diagnostic
 ├── ProfileStore.kt        — хранилище профилей (EncryptedSharedPreferences)
@@ -39,6 +43,9 @@ app/src/main/kotlin/com/qeli/
 | Возможность | Как работает |
 |---|---|
 | **Импорт профиля** | QR-код (камера), вставка `qeli://`-ссылки, тап по `qeli://`-ссылке (deep link), файл в формате flat-INI или legacy-JSON |
+| **Авто-транспорт** | Проба профилей / режимов и выбор лучшего; failover при обрыве |
+| **SNI на главном** | Пресет / свой host, Apply SNI, panel `/api/speedtest` |
+| **Вкладка SNI** | Каталог ~285 хостов, Top-20, TLS+HTTPS probe, Apply best (без OOM на полном списке) |
 | **Per-app split tunnel** | Выбор приложений в режиме «только эти» (`addAllowedApplication`) или «кроме этих» (`addDisallowedApplication`) |
 | **Плитка Quick Settings** | Подключение/отключение из шторки |
 | **Виджет** | Статус и переключение с рабочего стола |

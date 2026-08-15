@@ -1211,6 +1211,8 @@ but not applied on this platform, **✓\*** with a caveat (footnote).
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
 | `mode` | `fake-tls` | ✓ | ✓ | ✓ | ✓ | ✓ | wire mode: `fake-tls`/`obfs`/`reality-tls`/`plain` |
 | `sni` | — | ✓ | ✓ | ✓ | ✓ | ✓ | SNI for fake-tls / reality-tls |
+| `auto_transport` | `false` | ✓ | ✓\* | ✓\* | ✓\* | — | when `true`, probe available profiles/modes and pick the best (GUI: toggle / **Auto** next to Connect on Windows) |
+| `auto_transport_order` | built-in | ✓ | ✓\* | ✓\* | ✓\* | — | CSV preference order, e.g. `reality-tls,fake-tls,obfs,plain,quic` |
 | `obfs_key` | — | ✓ | ✓ | ✓ | ✓ | ✓ | PSK for `mode = obfs` |
 | `front` | `websocket` | ✓ | ✓ | ✓ | ✓ | ✓ | anti-FET fronting for obfs: `websocket`/`none` |
 | `reality_sid` | — | ✓ | ✓ | ✓ | ✓ | ✓ | REALITY short_id for `reality-tls` |

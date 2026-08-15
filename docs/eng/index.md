@@ -17,6 +17,9 @@ operator need first, then internal and historical material.
 | [GETTING-STARTED.md](GETTING-STARTED.md) | Installation and first run, step by step from scratch |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Connection diagnostics and error reference |
 
+> Fork: auto-transport, Mode×SNI, panel `/api/speedtest` — see
+> [CHANGELOG.md](../../CHANGELOG.md) (fork section) and [PANEL.md](PANEL.md).
+
 ## 🛠 For server operators
 
 | Document | What it covers |

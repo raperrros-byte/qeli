@@ -6,6 +6,35 @@
 
 ## [0.7.15] — не выпущен
 
+### Форк [raperrros-byte/qeli](https://github.com/raperrros-byte/qeli) — 2026-08-15
+
+Maintained by: Daniil Nekrasov \<raperrros@yandex.ru\>
+
+- **Авто-подбор транспорта.** Клиент ранжирует профили
+  (reality-tls → fake-tls → obfs → plain → QUIC/UDP) по TCP-probe и preference-order,
+  выбирает рабочий режим; при обрыве — failover на следующий профиль.
+  CLI: `auto_transport` / `auto_transport_order`, `--auto-transport`,
+  `qeli probe-transports`, `qeli speedtest`.
+- **Режим × SNI матрица (Windows).** Окно ⚡: все выбранные профили × все выбранные
+  SNI, «Выбрать все», пауза между пробами (мс), Apply best. Рядом с **Подключить** —
+  чекбокс **Авто**: при коннекте сам прогоняет матрицу и применяет лучшую связку.
+- **Вкладка SNI (Android).** Каталог front-хостов (~285 из community Reality SNI lists +
+  CDN), тест TLS+HTTPS (LibreSpeed-стиль), Top-20 / Apply best; на главном экране —
+  авто-транспорт, SNI и panel speedtest. Исправлен OOM при отрисовке всего каталога
+  в `LinearLayout` и битый `activity_main.xml`.
+- **Панель API.** `GET /api/transport/modes`, `GET /api/transport/sni-presets`,
+  `GET /api/speedtest?bytes=…`; `/api/transport/health` дополнен блоком
+  `auto_transport`. Smoke: `scripts/smoke_transport_auto_api.py`.
+- **Каталог SNI.** `scripts/build_sni_catalog.py` →
+  `qeli-shared/…/sni_hosts.txt` и Android `assets/sni_hosts.txt`
+  (meower1 / Reza-shojaei / evkir + CDN seeds).
+- **Panel speedtest (Windows):** обход self-signed/mismatched TLS, fallback URL
+  (`http://IP:8080`, `https://host`, …), показ root-exception вместо
+  «SSL connection could not be established».
+- **Lab deploy host2:** `remote-upgrade-host2.sh` делает `chown root` **после**
+  `dpkg`, иначе postinst возвращает `qeli:qeli` и unit под root падает на
+  `users.conf` Permission denied.
+
 - Подготовлено единое двуязычное описание GitHub Release `0.7.15`: сначала английская, затем
   русская версия с обязательными действиями перед обновлением, ключевыми изменениями общего
   Rust transport core, per-app routing, lifecycle/DNS, панели и безопасности, результатами

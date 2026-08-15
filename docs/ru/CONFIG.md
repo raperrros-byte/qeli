@@ -1166,6 +1166,8 @@ CLI-профиль и сохранить его больше не значит �
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
 | `mode` | `fake-tls` | ✓ | ✓ | ✓ | ✓ | ✓ | wire-режим: `fake-tls`/`obfs`/`reality-tls`/`plain` |
 | `sni` | — | ✓ | ✓ | ✓ | ✓ | ✓ | SNI для fake-tls / reality-tls |
+| `auto_transport` | `false` | ✓ | ✓\* | ✓\* | ✓\* | — | при `true` клиент прощупывает доступные профили/режимы и выбирает лучший (GUI: тумблер / **Авто** у Connect на Windows) |
+| `auto_transport_order` | built-in | ✓ | ✓\* | ✓\* | ✓\* | — | CSV-порядок предпочтений, напр. `reality-tls,fake-tls,obfs,plain,quic` |
 | `obfs_key` | — | ✓ | ✓ | ✓ | ✓ | ✓ | PSK для `mode = obfs` |
 | `front` | `websocket` | ✓ | ✓ | ✓ | ✓ | ✓ | anti-FET фронтинг obfs: `websocket`/`none` |
 | `reality_sid` | — | ✓ | ✓ | ✓ | ✓ | ✓ | REALITY short_id для `reality-tls` |

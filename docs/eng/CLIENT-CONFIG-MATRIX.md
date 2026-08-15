@@ -1,6 +1,7 @@
 # Client config: 0.7.14 → 0.7.15
 
-This table records the contract of **all 73 accepted `[qeli]` keys** for the five clients.
+This table records the contract of **all 73 accepted `[qeli]` keys** for the five clients
+(plus fork keys `auto_transport` / `auto_transport_order`).
 “Before” is the released 0.7.14 behavior; “after” is the final 0.7.15 contract following the
 move of transport into the shared Rust core.
 
@@ -19,6 +20,7 @@ can apply it.
 
 | Keys | CLI | Windows | macOS | Android | iOS | 0.7.15 change |
 |---|:-:|:-:|:-:|:-:|:-:|---|
+| `auto_transport` `auto_transport_order` | —→A | —→A\* | —→A\* | —→A\* | —→C | Fork: auto-rank modes/profiles; Win/Android GUI toggle and Mode×SNI matrix; CLI `--auto-transport`, `probe-transports`. |
 | `server` `proto` `user` `pass` `key` `bind_static` `mode` `sni` `obfs_key` `front` `reality_sid` `quic` `awg` `jc` `jmin` `jmax` `mtu` `mtu_probe` `gateway` `route_local` `include` `exclude` `dns` `allow_ipv6_leak` | A→A | A→A | A→A | A→A | A→A | External semantics are unchanged. GUI→Rust boundaries now make platform `gateway` defaults explicit, so Rust's split default cannot change a phone/desktop full tunnel. |
 | `reconnect` `reconnect_retries` `reconnect_base_delay` `reconnect_max_delay` | R→R | A→A | A→A | A→A | A→A | Reconnect remains a platform lifecycle concern. Rust owns one connection attempt, not the GUI's decision to start the next one. The 0.7.15 iOS adapter now actually creates the next generation; before the audit these keys round-tripped but every native/pump failure was terminal. |
 | `timeout` | R→A | A→A | A→A | A→A | A→A | The connect timeout moved into Rust and now reaches the shared core. |

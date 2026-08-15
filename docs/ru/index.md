@@ -17,6 +17,9 @@
 | [GETTING-STARTED.md](GETTING-STARTED.md) | Установка и начало работы, пошагово с нуля |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Диагностика подключения и справочник ошибок |
 
+> Форк: авто-транспорт, Mode×SNI, panel `/api/speedtest` — кратко в
+> [CHANGELOG.md](../../CHANGELOG.md) (секция форка) и [PANEL.md](PANEL.md).
+
 ## 🛠 Администратору сервера
 
 | Документ | О чём |

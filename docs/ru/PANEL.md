@@ -229,6 +229,22 @@ backpressure. В развёрнутой части видны TUN-адрес/п�
 Проекция выбирает безопасные поля по одному: obfs/reality credentials, пароли, приватные
 identity-ключи и session keys `/api/transport/health` никогда не возвращает.
 
+### Авто-транспорт и SNI / speedtest API (форк)
+
+Дополнения к REST для клиентов с авто-подбором транспорта и SNI-матрицей
+(см. [CHANGELOG.md](../../CHANGELOG.md), секция форка):
+
+| Метод | Путь | Назначение |
+|---|---|---|
+| `GET` | `/api/transport/modes` | Список живых профилей/режимов + рекомендуемый `order` |
+| `GET` | `/api/transport/sni-presets` | Пресеты SNI / TLS front-хостов (`allow_custom`) |
+| `GET` | `/api/transport/health` | Как раньше + блок `auto_transport` (order, sni_presets) |
+| `GET` | `/api/speedtest?bytes=N` | Сырая загрузка `N` байт (после login cookie) для замера downlink |
+
+Smoke-скрипт: [`scripts/smoke_transport_auto_api.py`](../../scripts/smoke_transport_auto_api.py)
+(читает `scripts/.lab_secrets`). Каталог SNI собирается
+[`scripts/build_sni_catalog.py`](../../scripts/build_sni_catalog.py).
+
 ### Действия над живым клиентом (Kick, Set bandwidth)
 В таблице живых клиентов у каждой строки две операции; обе уходят в дата-плейн через
 control-сокет и применяются сразу.

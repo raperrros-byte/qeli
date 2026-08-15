@@ -31,7 +31,8 @@ qeli-win/
 │   ├── Model/         VpnConfig (INI + qeli://), ProfileStore
 │   ├── Vpn/           Wintun lifecycle, NetworkConfigurator, ABI 1.10 adapter
 │   ├── App.xaml(.cs)  точка входа + headless CLI
-│   ├── MainWindow.*   интерфейс
+│   ├── MainWindow.*   интерфейс (авто-транспорт, SNI, **Авто** у Connect)
+│   ├── SniSpeedWindow.*  матрица Mode × SNI (Select all, пауза, Apply best)
 │   ├── InputDialog.cs модальный ввод
 │   ├── CliRunner.cs   режимы selftest / handshake / connect / genassets
 │   ├── Branding.cs    логотип + иконки (GDI+), NativeLoader (вшитый Wintun)
@@ -104,6 +105,10 @@ ChaCha20) и `reality-tls` (настоящий Chrome-TLS 1.3, туннель в
 |----------|----------|
 | Wire-режим | fake-tls / obfs / reality-tls |
 | SNI | пресеты доменов + произвольный |
+| Авто-транспорт | тумблер на главном экране + failover между профилями |
+| **Авто** у Connect | матрица режимы × выбранные SNI → лучшая связка → connect |
+| SNI speed (⚡) | Select all / Top-20 / пауза (мс) / Apply best |
+| Panel speedtest | `/api/speedtest` с TLS-bypass и URL-fallback |
 | QUIC-маскировка | вкл/выкл (для UDP) |
 | Паддинг (маскировка размера) | выкл / стандартный / усиленный / максимальный |
 | Heartbeat (keep-alive) | выкл / 15с / 30с / 60с |

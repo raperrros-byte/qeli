@@ -12,14 +12,18 @@
 >
 > База сравнения — upstream `v0.7.15`. В форке добавлено (новые сверху):
 >
-> - **Вкладка SNI speed (Win/Android):** таблица TLS+HTTPS probe по каталогу
->   front-хостов (~285 из GitHub Reality SNI lists + CDN); свои хосты; Apply best.
->   Источники: meower1/Reality-SNI-Finder, Reza-shojaei fork, evkir/reality-probe.
-> - **Авто-подбор транспорта.** Клиент прощупывает профили (plain ⇄ fake-tls ⇄
->   reality-tls ⇄ obfs ⇄ QUIC) и выбирает рабочий режим; при обрыве — failover.
->   CLI: `--auto-transport` / `auto_transport=true`, `qeli probe-transports`,
->   `qeli speedtest`. Панель: `GET /api/transport/modes`, `/api/transport/sni-presets`,
->   `/api/speedtest`. SNI/TLS host и speed test — на главном экране Win/Android.
+> - **Авто у кнопки Connect (Windows):** чекбокс **Авто** прогоняет все режимы ×
+>   выбранные SNI и подключается на лучшей связке; отдельно — авто-транспорт + failover.
+> - **Матрица Mode × SNI (Windows ⚡):** Select all / Top-20 / пауза между пробами (мс),
+>   лимит комбинаций, Apply best на профиль. Panel speedtest с TLS-bypass и URL-fallback
+>   (фикс «SSL connection could not be established»).
+> - **Вкладка SNI (Android):** каталог ~285 front-хостов, TLS+HTTPS probe, Apply best;
+>   авто-транспорт и SNI на главном экране; фикс OOM/layout при открытии вкладки.
+> - **Авто-подбор транспорта (все клиенты + CLI).** Ранжирование
+>   reality-tls → fake-tls → obfs → plain → QUIC; CLI `--auto-transport`,
+>   `probe-transports`, `speedtest`. Панель:
+>   `GET /api/transport/modes|sni-presets`, `GET /api/speedtest`, health.`auto_transport`.
+> - **Каталог SNI** из GitHub Reality lists (`scripts/build_sni_catalog.py`).
 > - **Клиент Win/mac: REALITY seal для профиля `reality` (:8443).** Профиль
 >   `mode=fake-tls` + `reality_sid` вставляет AEAD-токен в ClientHello `session_id`
 >   (как Rust-клиент). Без этого сервер считает пробу и отдаёт ответ decoy →
@@ -28,6 +32,8 @@
 >   (не IP), клиент берёт `https://{host}` вместо устаревшего `http://{host}:8080`.
 > - **Чистая переустановка lab:** [`scripts/deploy/clean-reinstall-lab.sh`](scripts/deploy/clean-reinstall-lab.sh)
 >   (wipe conf/users/identity → `.deb` → nginx SNI → пользователь + share-links).
+> - **Lab upgrade host2:** после `.deb` снова `chown root` на `/etc/qeli` (см.
+>   `scripts/deploy/remote-upgrade-host2.sh`).
 > - **Режим трафика на главном экране (Windows):** туннель XOR локальный SOCKS/HTTP
 >   прокси (порт/режим) применяется сразу ко **всем** профилям; при активном
 >   соединении выполняется reconnect.

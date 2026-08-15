@@ -233,6 +233,22 @@ peer. The page refreshes every 5 s and pauses background polling in a hidden bro
 The projection selects safe fields individually: obfs/reality credentials, passwords, identity
 private keys and session keys are never returned by `/api/transport/health`.
 
+### Auto-transport and SNI / speedtest APIs (fork)
+
+REST additions for clients that auto-pick transport and run SNI matrices
+(see [CHANGELOG.md](../../CHANGELOG.md), fork section):
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/transport/modes` | Live profiles/modes plus recommended `order` |
+| `GET` | `/api/transport/sni-presets` | SNI / TLS front-host presets (`allow_custom`) |
+| `GET` | `/api/transport/health` | As before, plus an `auto_transport` block |
+| `GET` | `/api/speedtest?bytes=N` | Raw `N`-byte download (after login cookie) for downlink timing |
+
+Smoke script: [`scripts/smoke_transport_auto_api.py`](../../scripts/smoke_transport_auto_api.py)
+(reads `scripts/.lab_secrets`). SNI catalog builder:
+[`scripts/build_sni_catalog.py`](../../scripts/build_sni_catalog.py).
+
 ### Per-client actions (Kick, Set bandwidth)
 Each row of the live-client table carries two operations; both go to the data plane over
 the control socket and take effect immediately.
