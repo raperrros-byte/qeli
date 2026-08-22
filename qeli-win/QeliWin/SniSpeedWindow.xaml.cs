@@ -33,6 +33,11 @@ public partial class SniSpeedWindow : Window
         HostsList.ItemsSource = _hosts;
         Grid.ItemsSource = _rows;
         DelayBox.Text = Math.Clamp(AppSettings.Current.SniProbeDelayMs, 0, 60_000).ToString();
+        MeasureBox.Text = (Math.Clamp(AppSettings.Current.SniProbeMinDurationMs, 500, 60_000) / 1000.0)
+            .ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
+        MaxMbBox.Text = (Math.Clamp(AppSettings.Current.SniProbeBytes, 256 * 1024, 8 * 1024 * 1024)
+            / (1024.0 * 1024.0))
+            .ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
         Reload();
     }
 
@@ -144,9 +149,24 @@ public partial class SniSpeedWindow : Window
         if (!int.TryParse(DelayBox.Text?.Trim(), out var delayMs))
             delayMs = 750;
         delayMs = Math.Clamp(delayMs, 0, 60_000);
+
+        if (!double.TryParse(MeasureBox.Text?.Trim(), System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var measureSec)
+            && !double.TryParse(MeasureBox.Text?.Trim(), out measureSec))
+            measureSec = 3;
+        var minDurationMs = Math.Clamp((int)Math.Round(measureSec * 1000), 500, 60_000);
+
+        if (!double.TryParse(MaxMbBox.Text?.Trim(), System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var maxMb)
+            && !double.TryParse(MaxMbBox.Text?.Trim(), out maxMb))
+            maxMb = 2;
+        var probeBytes = Math.Clamp((int)Math.Round(maxMb * 1024 * 1024), 256 * 1024, 8 * 1024 * 1024);
+
         var s = AppSettings.Current;
         s.SniSpeedSelection = hosts;
         s.SniProbeDelayMs = delayMs;
+        s.SniProbeMinDurationMs = minDurationMs;
+        s.SniProbeBytes = probeBytes;
         s.Save();
 
         _cts?.Cancel();
@@ -174,7 +194,8 @@ public partial class SniSpeedWindow : Window
 
                     if (!sniCache.TryGetValue(host, out var sniRow))
                     {
-                        sniRow = await SniSpeedProbe.ProbeAsync(host, ct: ct).ConfigureAwait(true);
+                        sniRow = await SniSpeedProbe.ProbeAsync(
+                            host, probeBytes, minDurationMs, ct: ct).ConfigureAwait(true);
                         sniCache[host] = sniRow;
                     }
 

@@ -21,17 +21,20 @@ data class SniSpeedRow(
     val status: String
         get() = when {
             ok && mbps != null -> String.format("%.2f Mbit/s", mbps)
-            ok -> "ok"
+            ok && bytes >= SniSpeedProbe.MIN_BODY_FOR_MBPS -> "ok"
+            ok -> "tls ok"
             else -> error ?: "fail"
         }
 }
 
 /**
- * LibreSpeed-style probe: TCP + TLS (SNI = host) + short HTTPS download.
- * Trusts any cert — we measure front-host reachability, not PKI for that site.
+ * LibreSpeed-style probe: TCP + TLS (SNI = host) + HTTPS download for at least
+ * [minDurationMs] (or until [bytes] cap).
  */
 object SniSpeedProbe {
-    const val DEFAULT_BYTES = 512 * 1024
+    const val DEFAULT_BYTES = 2 * 1024 * 1024
+    const val DEFAULT_MIN_DURATION_MS = 3_000
+    const val MIN_BODY_FOR_MBPS = 256 * 1024
 
     private val trustAll = arrayOf<X509TrustManager>(object : X509TrustManager {
         override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
@@ -39,19 +42,27 @@ object SniSpeedProbe {
         override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
     })
 
-    fun probe(host: String, bytes: Int = DEFAULT_BYTES, timeoutMs: Int = 12_000): SniSpeedRow {
+    fun probe(
+        host: String,
+        bytes: Int = DEFAULT_BYTES,
+        minDurationMs: Int = DEFAULT_MIN_DURATION_MS,
+        timeoutMs: Int = 0,
+    ): SniSpeedRow {
         val normalized = SniCatalog.normalize(host)
             ?: return SniSpeedRow(host, false, error = "invalid host")
-        val want = bytes.coerceIn(64 * 1024, 4 * 1024 * 1024)
+        val want = bytes.coerceIn(256 * 1024, 8 * 1024 * 1024)
+        val minMs = minDurationMs.coerceIn(500, 60_000)
+        val timeout = if (timeoutMs > 0) timeoutMs
+        else (minMs + 12_000 + want / (256 * 1024) * 1000).coerceIn(15_000, 120_000)
         return try {
             val t0 = System.nanoTime()
             val plain = Socket()
-            plain.connect(InetSocketAddress(normalized, 443), timeoutMs)
-            plain.soTimeout = timeoutMs
+            plain.connect(InetSocketAddress(normalized, 443), timeout)
+            plain.soTimeout = timeout
             val ctx = SSLContext.getInstance("TLS")
             ctx.init(null, trustAll, SecureRandom())
             val ssl = ctx.socketFactory.createSocket(plain, normalized, 443, true) as SSLSocket
-            ssl.soTimeout = timeoutMs
+            ssl.soTimeout = timeout
             ssl.startHandshake()
             val tlsMs = (System.nanoTime() - t0) / 1_000_000
 
@@ -67,9 +78,9 @@ object SniSpeedProbe {
             val tDl = System.nanoTime()
             ssl.outputStream.write(req)
             ssl.outputStream.flush()
-            val total = readBody(ssl.inputStream, want)
+            val total = readBody(ssl.inputStream, want, minMs)
             val secs = max(0.001, (System.nanoTime() - tDl) / 1e9)
-            val mbps = if (total > 0) total * 8.0 / secs / 1_000_000.0 else null
+            val mbps = if (total >= MIN_BODY_FOR_MBPS) total * 8.0 / secs / 1_000_000.0 else null
             runCatching { ssl.close() }
             SniSpeedRow(normalized, true, tlsMs, mbps, total)
         } catch (e: Exception) {
@@ -77,27 +88,54 @@ object SniSpeedProbe {
         }
     }
 
-    private fun readBody(input: InputStream, limit: Int): Long {
-        val buf = ByteArray(16 * 1024)
-        var total = 0L
+    private fun readBody(input: InputStream, limit: Int, minDurationMs: Int): Long {
+        val buf = ByteArray(32 * 1024)
+        val pending = ByteArray(16 * 1024)
+        var pendingLen = 0
         var headerDone = false
-        val header = StringBuilder()
-        while (total < limit) {
+        var total = 0L
+        val t0 = System.nanoTime()
+        while (true) {
             val n = input.read(buf)
             if (n <= 0) break
-            if (!headerDone) {
-                header.append(String(buf, 0, n, Charsets.ISO_8859_1))
-                val sep = header.indexOf("\r\n\r\n")
-                if (sep >= 0) {
-                    headerDone = true
-                    val bodyStart = sep + 4
-                    val already = header.length - bodyStart
-                    if (already > 0) total += already.toLong().coerceAtMost(limit.toLong())
+            var offset = 0
+            while (offset < n) {
+                if (headerDone) {
+                    total += (n - offset).toLong()
+                    offset = n
+                    continue
                 }
-            } else {
-                total += n.toLong()
+                val take = minOf(n - offset, pending.size - pendingLen)
+                System.arraycopy(buf, offset, pending, pendingLen, take)
+                pendingLen += take
+                offset += take
+                val sep = indexOfHeaderEnd(pending, pendingLen)
+                if (sep < 0) {
+                    if (pendingLen >= pending.size) {
+                        headerDone = true
+                        total += pendingLen.toLong()
+                        pendingLen = 0
+                    }
+                    continue
+                }
+                headerDone = true
+                total += (pendingLen - (sep + 4)).toLong()
+                pendingLen = 0
             }
+            val elapsedMs = (System.nanoTime() - t0) / 1_000_000
+            if (total >= limit) break
+            if (elapsedMs >= minDurationMs && total >= MIN_BODY_FOR_MBPS) break
         }
         return total.coerceAtMost(limit.toLong())
+    }
+
+    private fun indexOfHeaderEnd(data: ByteArray, len: Int): Int {
+        if (len < 4) return -1
+        for (i in 0..len - 4) {
+            if (data[i] == '\r'.code.toByte() && data[i + 1] == '\n'.code.toByte() &&
+                data[i + 2] == '\r'.code.toByte() && data[i + 3] == '\n'.code.toByte())
+                return i
+        }
+        return -1
     }
 }

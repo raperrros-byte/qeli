@@ -1713,9 +1713,9 @@ fn print_client_profiles_table(config: &PathBuf) -> anyhow::Result<()> {
         match cfg {
             Ok(c) => {
                 row.server = format!("{}:{}", c.server.address, c.server.port);
-                row.proto = c.server.protocol;
-                row.mode = c.obfuscation.mode;
-                row.user = c.auth.username;
+                row.proto = c.server.protocol.clone();
+                row.mode = c.obfuscation.mode.clone();
+                row.user = c.auth.username.clone();
                 row.sni = dash(c.obfuscation.sni.as_deref().unwrap_or(""));
                 row.sid = dash(c.obfuscation.reality_short_id.as_deref().unwrap_or(""));
                 row.dev = dash(&c.tun.name);

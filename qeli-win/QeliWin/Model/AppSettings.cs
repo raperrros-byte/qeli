@@ -45,6 +45,10 @@ public sealed class AppSettings
     public List<string> SniSpeedSelection { get; set; } = new();
     /// <summary>Pause between sequential SNI / matrix probes (ms).</summary>
     public int SniProbeDelayMs { get; set; } = 750;
+    /// <summary>Minimum HTTPS download window per SNI host (ms) — stable Mbps.</summary>
+    public int SniProbeMinDurationMs { get; set; } = 3_000;
+    /// <summary>Max bytes to download per SNI host (Range cap).</summary>
+    public int SniProbeBytes { get; set; } = 2 * 1024 * 1024;
     private static readonly string Dir =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "QeliWin");
     private static readonly string FilePath = Path.Combine(Dir, "settings.json");

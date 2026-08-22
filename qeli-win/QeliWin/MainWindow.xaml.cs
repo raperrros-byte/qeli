@@ -1623,6 +1623,8 @@ public partial class MainWindow : Window
             ? s.SniSpeedSelection.ToList()
             : TransportAuto.SniPresets.Take(8).ToList();
         var delay = Math.Clamp(s.SniProbeDelayMs, 0, 60_000);
+        var probeBytes = Math.Clamp(s.SniProbeBytes, 256 * 1024, 8 * 1024 * 1024);
+        var minDurationMs = Math.Clamp(s.SniProbeMinDurationMs, 500, 60_000);
         var snapshot = _profiles.ToList();
         if (snapshot.Count == 0) return null;
 
@@ -1655,7 +1657,8 @@ public partial class MainWindow : Window
             if (!first && delay > 0) await Task.Delay(delay);
             first = false;
             if (!sniCache.ContainsKey(host))
-                sniCache[host] = await Task.Run(() => SniSpeedProbe.ProbeAsync(host).GetAwaiter().GetResult());
+                sniCache[host] = await Task.Run(() =>
+                    SniSpeedProbe.ProbeAsync(host, probeBytes, minDurationMs).GetAwaiter().GetResult());
         }
 
         for (var i = 0; i < snapshot.Count; i++)

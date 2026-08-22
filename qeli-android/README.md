@@ -87,16 +87,71 @@ Full-tunnel, «маршрутизировать локальные сети», L
 
 ## Сборка из исходников
 
+### Debug (быстро, для разработки)
+
 Нужен Android SDK и JDK 17+.
 
 ```bash
 cd qeli-android
-./gradlew assembleDebug        # APK: app/build/outputs/apk/debug/app-debug.apk
-./gradlew testDebugUnitTest    # юнит-тесты config/UI adapters и бэкапа
+./gradlew assembleDebug        # app/build/outputs/apk/debug/app-debug.apk
+./gradlew testDebugUnitTest
 ```
 
-Нативное ядро (`libqeli.so`) в репозитории уже собрано — пересобирать его нужно только при
-изменении Rust-кода (см. `scripts/` в корне репозитория).
+### Release APK (sideload, обновление поверх)
 
-> Инкрементальная сборка иногда раздувает APK — если размер вырос неожиданно, сделайте
-> `./gradlew clean` и пересоберите.
+**Windows (рекомендуется, без локального JDK):**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/agent/build_android_apk.ps1
+```
+
+**Артефакт для телефона:**
+
+```
+qeli-android/dist/qeli-android-<version>.apk
+```
+
+Пример: `qeli-android/dist/qeli-android-0.7.16.apk`
+
+#### Подпись и in-place update
+
+Samsung / Android 14 **не ставят unsigned** release (`app-release-unsigned.apk` → «Приложение не установлено»).
+
+Скрипт `build_android_apk.ps1` при **первом** запуске создаёт локальные файлы (в git не попадают):
+
+| Файл | Зачем |
+|------|--------|
+| `qeli-dev-release.jks` | Постоянный dev-ключ подписи |
+| `keystore.properties` | Пароли к keystore (шаблон: `keystore.properties.example`) |
+
+**Чтобы обновлять поверх без удаления:**
+
+1. Всегда собирать через **тот же** `qeli-dev-release.jks` (не удалять).
+2. Перед каждым релизом поднимать `versionCode` в `app/build.gradle.kts` (720 → 721 → …).
+3. `applicationId` не менять (`com.qeli`).
+
+Если на телефоне уже стоит Qeli с **другой** подписью (debug с другого ПК, старый unsigned, GitHub release с production keystore) — **один раз** удалите приложение и поставьте dev APK. Дальше все сборки с `qeli-dev-release.jks` обновляются поверх; профили сохраняются только если делали backup внутри Qeli.
+
+Без `keystore.properties` Gradle подписывает release **debug-ключом** (fallback в `build.gradle.kts`) — подходит только если на телефоне стоял debug с **этого же** ПК.
+
+#### Production keystore
+
+Для публикации в store / GitHub Releases — свой `qeli-release.jks` по [`keystore.properties.example`](keystore.properties.example). **Не коммитить** keystore и пароли.
+
+#### Docker вручную
+
+```powershell
+docker run --rm -v "c:/projects/home/qeli/qeli-android:/project" -w /project `
+  -e ANDROID_HOME=/opt/android-sdk-linux `
+  ghcr.io/cirruslabs/android-sdk:35 bash -lc "./gradlew --no-daemon assembleRelease"
+```
+
+Нужны `keystore.properties` + `.jks` в каталоге проекта (volume mount).
+
+---
+
+Нативное ядро (`libqeli.so`) в репозитории уже собрано — пересобирать только при изменении Rust-клиента (см. `scripts/build_android_so_11.py`, `native-libs/README.md`).
+
+Runbook агента: [`../scripts/AGENT_DEB_BUILD_DEPLOY.md`](../scripts/AGENT_DEB_BUILD_DEPLOY.md) · [`../scripts/agent/README.md`](../scripts/agent/README.md)
+
+> Инкрементальная сборка иногда раздувает APK — `./gradlew clean` и пересобрать.

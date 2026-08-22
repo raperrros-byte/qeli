@@ -1567,7 +1567,7 @@ sni = www.microsoft.com
                 profiles.add(Profile(label!!, cfg.toIni(label)))
                 added++
             }
-            activeIndex = activeAfterAdd()
+            activeIndex = activeAfterAdd(profiles.size)
             persist(); renderProfileList(); renderActiveProfile(); pingActive()
             binding.tabs.getTabAt(0)?.select()
             appendLog("Imported $added profile(s)")

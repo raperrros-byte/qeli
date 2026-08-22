@@ -8,7 +8,7 @@
 >
 > Maintained by: Daniil Nekrasov \<raperrros@yandex.ru\>
 >
-> Updated: 2026-08-15
+> Updated: 2026-08-22
 >
 > База сравнения — upstream `v0.7.15`. В форке добавлено (новые сверху):
 >
@@ -423,7 +423,8 @@ Releases — для форка собирайте `.deb` локально (ша�
 | `qeli-android/` | Android — [README](qeli-android/README.md) |
 | `qeli-shared/` | Общее ядро C# (клиенты + REALITY seal) |
 | `scripts/deploy/` | nginx SNI, clean-reinstall, lab systemd unit |
-| `scripts/AGENT_DEB_BUILD_DEPLOY.md` | Runbook сборки `.deb` и деплоя |
+| `scripts/AGENT_DEB_BUILD_DEPLOY.md` | Runbook сборки `.deb`, деплоя, Win/Android |
+| `scripts/agent/` | Pipeline-скрипты (`release_flow.ps1`, `build_android_apk.ps1`, …) |
 | `release/docker/` | **Docker-образ** сервера/клиента — [README](release/docker/README.md) |
 | `docs/` | Документация RU/EN |
 

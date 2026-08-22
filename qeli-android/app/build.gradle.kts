@@ -24,7 +24,7 @@ android {
         applicationId = "com.qeli"
         minSdk = 28
         targetSdk = 37
-        versionCode = 719
+        versionCode = 720
         versionName = "0.7.16"
     }
 
@@ -58,10 +58,12 @@ android {
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            // Sign the release only when a keystore is configured; otherwise the
-            // APK is left unsigned (so CI / fresh clones still build).
-            if (keystorePropsFile.exists()) {
-                signingConfig = signingConfigs.getByName("release")
+            // Signed release: keystore.properties → release key (updates over prior release builds).
+            // Without it → debug key (updates over prior debug/sideload builds on the same machine).
+            signingConfig = if (keystorePropsFile.exists()) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
             }
         }
     }

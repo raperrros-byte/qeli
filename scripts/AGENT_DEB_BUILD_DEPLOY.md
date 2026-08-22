@@ -1,12 +1,14 @@
-# Runbook агента: сборка `.deb` (Docker) и деплой lab VPS
+# Runbook агента: сборка, деплой и клиенты (Windows + Docker)
 
 Maintained by: Daniil Nekrasov <raperrros@yandex.ru>  
-Updated: 2026-08-13
+Updated: 2026-08-22
 
 Для AI-агентов в `c:\projects\home\qeli` (Windows + Docker Desktop).  
 **Не собирать на VPS.** `.deb` — локально в Docker, на сервер только копирование + установка.
 
-Секреты: скопируйте [`lab_secrets.example`](lab_secrets.example) → `scripts/.lab_secrets` (в git не коммитить).
+Скрипты pipeline: [`agent/README.md`](agent/README.md). Android подробно: [`../qeli-android/README.md`](../qeli-android/README.md).
+
+Секреты: [`lab_secrets.example`](lab_secrets.example) → `scripts/.lab_secrets` (в git не коммитить).
 
 ---
 
@@ -16,7 +18,36 @@ Updated: 2026-08-13
 2. Поставить на Debian lab VPS.
 3. Поднять VPN (все профили) + панель на домене через **nginx stream SNI**, без поломки **reality-tls**.
 
-База: Debian 12/13, пакет `0.7.14`, образ `rust:1.88-bookworm`.
+База: Debian 12/13, версия из `qeli/debian/control`, образ `rust:1.88-bookworm`.
+
+### Быстрый pipeline (рекомендуется)
+
+Один скрипт: deb → docker smoke → host2 deploy → Win + Android:
+
+```powershell
+pwsh -File scripts/agent/release_flow.ps1
+```
+
+Только сборка + локальный smoke (без деплоя):
+
+```powershell
+pwsh -File scripts/agent/release_flow.ps1 -SkipDeploy -SkipClients
+```
+
+Отдельные шаги:
+
+```powershell
+# .deb (PowerShell — см. build_deb_docker.sh или release_flow.ps1)
+powershell -ExecutionPolicy Bypass -File scripts/agent/release_flow.ps1 -SkipDeploy -SkipClients
+
+powershell -ExecutionPolicy Bypass -File scripts/agent/docker_smoke_local.ps1
+
+docker run --rm -v "c:/projects/home/qeli:/w" -w /w alpine:3.20 sh /w/scripts/deploy/remote-upgrade-host2.sh
+docker run --rm -v "c:/projects/home/qeli:/w" -w /w alpine:3.20 sh /w/scripts/deploy/remote-smoke-api-host2.sh
+
+# Android (подписанный APK → qeli-android/dist/)
+powershell -ExecutionPolicy Bypass -File scripts/agent/build_android_apk.ps1
+```
 
 ---
 
@@ -247,10 +278,27 @@ systemctl restart qeli
 | `Failed to parse hybrid ServerHello` на `:8443` | нет `rsid` / старый Win-клиент | импорт с `rsid=`; клиент с RealitySession seal |
 | CPU/RAM «—» в Win | Panel URL `:8080` / нет пароля | Settings → `https://PANEL_DOMAIN` + admin |
 | reality-tls link на `:4430` | нет `bind.public_port` | `upgrade-public-port.sh` / nginx-panel-sni.sh |
+| Android «Приложение не установлено» | unsigned APK или другая подпись | `build_android_apk.ps1`; см. [`../qeli-android/README.md`](../qeli-android/README.md) |
+| Android не обновляется поверх | другой keystore / тот же `versionCode` | тот же `qeli-dev-release.jks`; поднять `versionCode` |
 
 ---
 
-## 6. Справка
+## 6. Android release APK
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/agent/build_android_apk.ps1
+```
+
+- **Выход:** `qeli-android/dist/qeli-android-<version>.apk` (подписан).
+- **Первый запуск:** создаёт `qeli-dev-release.jks` + `keystore.properties` (git-ignored).
+- **Обновление на телефоне:** тот же `.jks` + `versionCode` выше установленного.
+- **Один раз удалить** старый Qeli, если раньше стояла другая подпись (debug/unsigned/GitHub).
+
+Подробности, Samsung S24, backup профилей: [`../qeli-android/README.md`](../qeli-android/README.md) § Release APK.
+
+---
+
+## 7. Справка
 
 - Упаковка: `qeli/debian/Makefile` (`make deb`).
 - Инсталлятор: `install-qeli-server.sh` — все профили по умолчанию; `QELI_PANEL_DOMAIN` для loopback panel.
