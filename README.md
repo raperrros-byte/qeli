@@ -10,8 +10,23 @@
 >
 > Updated: 2026-08-22
 >
-> База сравнения — upstream `v0.7.15`. В форке добавлено (новые сверху):
+> База сравнения — upstream [`v0.7.16`](https://github.com/litvinovtd/qeli/releases/tag/v0.7.16).
+> Версия форка: **0.7.16** (`qeli/debian/control`). В форке добавлено (новые сверху):
 >
+> - **GitHub Release [`v0.7.16-fork.1`](https://github.com/raperrros-byte/qeli/releases/tag/v0.7.16-fork.1)**
+>   (pre-release): `.deb`, `qeli-linux-amd64`, Android APK, Windows exe ×2, `SHA256SUMS`.
+>   macOS / OpenWrt / Keenetic clients — upstream [`v0.7.16`](https://github.com/litvinovtd/qeli/releases/tag/v0.7.16).
+> - **Agent pipeline (Windows + Docker):** [`scripts/agent/release_flow.ps1`](scripts/agent/release_flow.ps1)
+>   — `.deb` → docker smoke → host2 deploy → Win + Android; runbooks
+>   [`scripts/AGENT_DEB_BUILD_DEPLOY.md`](scripts/AGENT_DEB_BUILD_DEPLOY.md),
+>   [`scripts/agent/README.md`](scripts/agent/README.md).
+> - **SNI speed probe (Win/Android):** Measure (s) / Max (MB) / Delay (ms); минимум 3 с загрузки;
+>   Mbps только при body ≥ 256 КиБ; фикс ложных 0.01 Mbit/s на коротких HTTP-ответах.
+> - **Android release APK:** sideload через `build_android_apk.ps1`, dev keystore
+>   (`qeli-dev-release.jks`, git-ignored), `versionCode` 720 — см.
+>   [`qeli-android/README.md`](qeli-android/README.md).
+> - **Fallback public DNS:** если сервер не пушит `dns_servers`, клиенты используют
+>   `1.1.1.1` / `8.8.8.8`.
 > - **Авто у кнопки Connect (Windows):** чекбокс **Авто** прогоняет все режимы ×
 >   выбранные SNI и подключается на лучшей связке; отдельно — авто-транспорт + failover.
 > - **Матрица Mode × SNI (Windows ⚡):** Select all / Top-20 / пауза между пробами (мс),
@@ -20,7 +35,7 @@
 > - **Вкладка SNI (Android):** каталог ~285 front-хостов, TLS+HTTPS probe, Apply best;
 >   авто-транспорт и SNI на главном экране; фикс OOM/layout при открытии вкладки.
 > - **Авто-подбор транспорта (все клиенты + CLI).** Ранжирование
->   reality-tls → fake-tls → obfs → plain → QUIC; CLI `--auto-transport`,
+>   `reality-tls` → `fake-tls` → `obfs` → `plain` → `udp-quic`; CLI `--auto-transport`,
 >   `probe-transports`, `speedtest`. Панель:
 >   `GET /api/transport/modes|sni-presets`, `GET /api/speedtest`, health.`auto_transport`.
 > - **Каталог SNI** из GitHub Reality lists (`scripts/build_sni_catalog.py`).
@@ -32,8 +47,8 @@
 >   (не IP), клиент берёт `https://{host}` вместо устаревшего `http://{host}:8080`.
 > - **Чистая переустановка lab:** [`scripts/deploy/clean-reinstall-lab.sh`](scripts/deploy/clean-reinstall-lab.sh)
 >   (wipe conf/users/identity → `.deb` → nginx SNI → пользователь + share-links).
-> - **Lab upgrade host2:** после `.deb` снова `chown root` на `/etc/qeli` (см.
->   `scripts/deploy/remote-upgrade-host2.sh`).
+> - **Lab upgrade host2:** `remote-upgrade-host2.sh` — `chown root:root` на `/etc/qeli`
+>   до/после `dpkg -i` (unit от root); см. также [`remote-smoke-api-host2.sh`](scripts/deploy/remote-smoke-api-host2.sh).
 > - **Режим трафика на главном экране (Windows):** туннель XOR локальный SOCKS/HTTP
 >   прокси (порт/режим) применяется сразу ко **всем** профилям; при активном
 >   соединении выполняется reconnect.
@@ -45,10 +60,9 @@
 >   reference-counted маршруты `/32` через Wintun на время соединения; при закрытии или
 >   disconnect они снимаются. Иначе физический default route перехватывает сокеты,
 >   привязанные к адресу туннеля.
-> - **Пресеты маршрутизации прокси в стиле v2rayN:** proxy all, bypass Russia,
->   только заблокированные в РФ, bypass mainland China, GFW blacklist. Окно Settings
->   скачивает `geosite.dat` / `geoip.dat`; каждое соединение классифицируется как
->   proxy / direct / blocked.
+> - **Пресеты маршрутизации прокси v2rayN-стиля (Win/mac + Android):** proxy all, bypass Russia,
+>   blocked RU, bypass CN, GFW blacklist. Settings скачивает `geosite.dat` / `geoip.dat`;
+>   Android — встроенные индексы `geo/*`. Классификация: proxy / direct / blocked.
 > - **Журнал соединений** для proxy и TUN: принятые SOCKS/HTTP цели, решения
 >   proxy/direct, TCP/UDP потоки через TUN и DNS-цели туннеля видны в логе десктопа.
 > - **Мультипрофильный импорт/экспорт.** Windows/macOS принимают несколько секций
@@ -98,23 +112,26 @@
 >
 > ### Шаг 1. Собрать `.deb` (на своём ПК)
 >
+> Версия из `qeli/debian/control` (сейчас **0.7.16**). Артефакт:
+> `qeli/debian/qeli_<version>_amd64.deb`.
+>
+> **Рекомендуется (Linux / macOS / Git Bash):**
+>
 > ```bash
-> # Linux / macOS — из корня репозитория
-> docker run --rm -v "$PWD:/w" -w /w rust:1.88-bookworm bash -c '
->   set -euo pipefail
->   export PATH=/usr/local/cargo/bin:$PATH DEBIAN_FRONTEND=noninteractive
->   apt-get update -qq && apt-get install -y --no-install-recommends make dpkg-dev binutils xz-utils >/dev/null
->   make -C qeli/debian deb
->   make -C qeli/debian stage BINARY=../target/release/qeli \
->     DEB_DIR=/tmp/qeli_pkg/qeli_0.7.15_amd64 BUILD_DIR=/tmp/qeli_pkg
->   find /tmp/qeli_pkg -type d -exec chmod 755 {} \;
->   find /tmp/qeli_pkg -type f -exec chmod 644 {} \;
->   dpkg-deb --root-owner-group -Zxz --build /tmp/qeli_pkg/qeli_0.7.15_amd64 /w/qeli/debian/qeli_0.7.15_amd64.deb
-> '
+> bash scripts/agent/build_deb_docker.sh
 > ```
 >
-> Windows: те же команды, путь `c:/projects/home/qeli:/w` — см.
-> [`scripts/AGENT_DEB_BUILD_DEPLOY.md`](scripts/AGENT_DEB_BUILD_DEPLOY.md).
+> **Windows (Docker Desktop, без bash):** inline-команды §1.1–1.2 в
+> [`scripts/AGENT_DEB_BUILD_DEPLOY.md`](scripts/AGENT_DEB_BUILD_DEPLOY.md)
+> (stage в `/tmp` — fix прав на Windows mount).
+>
+> **Полный pipeline** (deb → smoke → host2 → Win + Android):
+>
+> ```powershell
+> powershell -ExecutionPolicy Bypass -File scripts/agent/release_flow.ps1
+> ```
+>
+> Только сборка без деплоя: `-SkipDeploy` (клиенты: `-SkipClients`).
 >
 > ### Шаг 2a. Установка **без nginx** (простой вариант)
 >
@@ -247,11 +264,29 @@
 >
 > ### Шаг 3. Клиент (Windows / macOS / Android)
 >
-> 1. Скачайте/соберите клиент: Windows — `qeli-win/dist/QeliWin.exe` (или `dist-build/`).
-> 2. Импортируйте `qeli://` из `/etc/qeli/client-links/` на сервере или из панели
+> **Скачать:** [GitHub Release `v0.7.16-fork.1`](https://github.com/raperrros-byte/qeli/releases/tag/v0.7.16-fork.1)
+>
+> | Платформа | Файл | Примечание |
+> |-----------|------|------------|
+> | Windows | `QeliWin-standalone.exe` | self-contained, ~75 МБ |
+> | Windows | `QeliWin-net-required.exe` | нужен [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) |
+> | Android | `qeli-android-0.7.16.apk` | dev-signed; см. ниже |
+> | Linux server | `qeli_0.7.16_amd64.deb` | из шага 1 или release |
+>
+> **Собрать локально:** `release_flow.ps1 -SkipDeploy` или
+> [`qeli-win/README.md`](qeli-win/README.md) · [`qeli-android/README.md`](qeli-android/README.md).
+>
+> **Android:** APK подписан **dev keystore** форка (`qeli-dev-release.jks`). Если на телефоне
+> стоял upstream/debug/unsigned Qeli — **удалите один раз**, дальше обновления поверх при том
+> же ключе. Сборка: `scripts/agent/build_android_apk.ps1`.
+>
+> **macOS / OpenWrt / Keenetic** — в fork release не пересобирались; возьмите upstream
+> [`v0.7.16`](https://github.com/litvinovtd/qeli/releases/tag/v0.7.16).
+>
+> 1. Импортируйте `qeli://` из `/etc/qeli/client-links/` на сервере или из панели
 >    (для профиля `reality` на `:8443` в ссылке **обязателен** `rsid=`).
-> 3. Подключитесь (для reality-tls хост = домен/`SERVER_PUBLIC_IP`, порт `443`).
-> 4. Метрики CPU/RAM: Settings → Panel URL `https://panel.example.com`, admin + пароль.
+> 2. Подключитесь (для reality-tls хост = домен/`SERVER_PUBLIC_IP`, порт `443`).
+> 3. Метрики CPU/RAM: Settings → Panel URL `https://panel.example.com`, admin + пароль.
 >
 > ### Шаг 3a. Linux CLI-клиент
 >
@@ -399,10 +434,12 @@ panel.
 
 | Способ | Когда |
 |--------|--------|
+| [GitHub Release `v0.7.16-fork.1`](https://github.com/raperrros-byte/qeli/releases/tag/v0.7.16-fork.1) | готовые Win/Android/.deb (pre-release) |
 | `.deb` + `install-qeli-server.sh` (шаги 1–2a в блоке выше) | production VPS, systemd |
 | nginx SNI + панель на домене (шаг 2b) | `:443` = панель + reality-tls |
 | Docker (шаг 2c) | lab, multiprofile, без systemd |
 | [`clean-reinstall-lab.sh`](scripts/deploy/clean-reinstall-lab.sh) | wipe + nginx + пользователь |
+| [`release_flow.ps1`](scripts/agent/release_flow.ps1) | полный CI-like цикл на Windows |
 
 Upstream one-liner (`curl …/litvinovtd/qeli/…`) ставит **upstream** `.deb` с GitHub
 Releases — для форка собирайте `.deb` локально (шаг 1) или образ из **этого** репо.
@@ -430,8 +467,11 @@ Releases — для форка собирайте `.deb` локально (ша�
 
 ## Статус
 
-Pre-1.0 / beta. Релизы форка: [GitHub Releases](https://github.com/raperrros-byte/qeli/releases)
-(если опубликованы) или локальная сборка `.deb` / Docker из `main`.
+Pre-1.0 / beta. Текущий релиз форка:
+[`v0.7.16-fork.1`](https://github.com/raperrros-byte/qeli/releases/tag/v0.7.16-fork.1) (pre-release).
+Версия в дереве: **0.7.16**. macOS / OpenWrt / Keenetic clients — upstream
+[`v0.7.16`](https://github.com/litvinovtd/qeli/releases/tag/v0.7.16).
+Все релизы: [GitHub Releases](https://github.com/raperrros-byte/qeli/releases).
 
 Native cores (`libqeli.so`, `qeli.dll`, …) — в `native-libs/` с pin в `SHA256SUMS`.
 

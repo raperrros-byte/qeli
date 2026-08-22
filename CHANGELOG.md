@@ -10,14 +10,82 @@
 
 Maintained by: Daniil Nekrasov \<raperrros@yandex.ru\>
 
-- Merge upstream `v0.7.16` с сохранением fork-фич: auto-transport, Mode×SNI matrix, SNI tab Android, geo routing, local proxy.
-
-Подробное двуязычное описание и примечания по обновлению:
+База — upstream [`v0.7.16`](https://github.com/litvinovtd/qeli/releases/tag/v0.7.16).
+Ниже — только отличия форка; полный upstream changelog — секции ниже и
 [`release/RELEASE_NOTES_0.7.16.md`](release/RELEASE_NOTES_0.7.16.md).
 
-- GitHub Release `v0.7.16` подготовлен как beta/prerelease: 16 платформенных payload-файлов и
-  `SHA256SUMS` публикуются только после повторной сверки всех GitHub asset digest с локальным
-  кандидатом; tag, `dev` и `main` указывают на один проверенный release-коммит.
+- Merge upstream `v0.7.16` с сохранением fork-фич (auto-transport, Mode×SNI, geo routing,
+  local proxy, nginx SNI, lab deploy).
+
+#### Auto-transport и SNI
+
+- **Авто-подбор транспорта** во всех клиентах и CLI: ранжирование
+  `reality-tls` → `fake-tls` → `obfs` → `plain` → `udp-quic`; флаги `--auto-transport`,
+  `probe-transports`, `speedtest`. Панель: `GET /api/transport/modes|sni-presets`,
+  `GET /api/speedtest`, health.`auto_transport`.
+- **Каталог SNI** (~285 front-хостов) из GitHub Reality lists
+  (`scripts/build_sni_catalog.py`, `qeli-shared/Assets/sni_hosts.txt`).
+- **Windows — матрица Mode × SNI (⚡):** Select all / Top-20, пауза между пробами (мс),
+  лимит комбинаций, Apply best на профиль; чекбокс **Авто** у Connect прогоняет режимы × SNI
+  и подключается на лучшей связке.
+- **Android — вкладка SNI:** TLS+HTTPS probe, Apply best; auto-transport и SNI на главном экране;
+  фикс OOM/layout при открытии вкладки.
+- **SNI speed probe (Win/Android/shared):** минимум 3 с загрузки, cap 2 МиБ по умолчанию;
+  Mbps только при body ≥ 256 КиБ (иначе `tls ok`); отдельные поля Measure (s), Max (MB),
+  Delay (ms) — пауза между пробами, не длительность download; исправлен парсинг multi-chunk
+  HTTP headers (ложные 0.01–0.04 Mbit/s на коротких ответах).
+
+#### Локальный proxy, geo routing и мультипрофиль
+
+- **Локальный SOCKS5/HTTP CONNECT** в Rust CLI и клиентах Windows/macOS (`proxy`, `proxy_listen`,
+  `proxy_mode`) для per-app split-tunnel при `gateway = false`.
+- **Windows split-proxy routing:** reference-counted маршруты `/32` через Wintun на время
+  соединения; без них default route перехватывает сокеты, привязанные к адресу туннеля.
+- **Geo-пресеты v2rayN-стиля:** proxy all, bypass Russia, blocked RU, bypass CN, GFW blacklist;
+  `geosite.dat` / `geoip.dat` в Settings; Android — `geo/*` индексы и политика маршрутов.
+- **Журнал соединений** proxy/TUN на десктопе: SOCKS/HTTP цели, решения proxy/direct,
+  TCP/UDP/DNS через TUN.
+- **Мультипрофильный импорт/экспорт:** несколько `[qeli]` / `qeli://` в одном файле;
+  панель — batch copy/download `.conf`; CLI и panel INI export; фильтрация platform-only ключей
+  при импорте на Android.
+
+#### Windows и macOS
+
+- **Режим трафика** на главном экране: туннель XOR локальный proxy (порт/режим) для всех
+  профилей; при активном соединении — reconnect.
+- **Массовое удаление профилей** (чекбоксы + delete selected).
+- **REALITY seal** для профиля `reality` (:8443): AEAD-токен в ClientHello `session_id`
+  (Win/mac), иначе сервер отдаёт decoy → `Failed to parse hybrid ServerHello`.
+- **Метрики панели:** HTTPS-домен вместо `http://host:8080`; live telemetry (bytes/s, CPU/RAM,
+  public IP server); panel speedtest с TLS-bypass и URL-fallback.
+- **Resizable windows:** Settings, editor, QR/share, About, InputDialog.
+- **Fallback public DNS** (`1.1.1.1` / `8.8.8.8`), если сервер не пушит `dns_servers`.
+
+#### Сервер, nginx и lab deploy
+
+- **nginx stream SNI на `:443`:** `ssl_preread` → панель `127.0.0.1:8080`, остальной SNI →
+  `127.0.0.1:4430` (`scripts/deploy/nginx-panel-sni.sh`).
+- **`bind.public_port`:** порт в share-links при listen за nginx (listen `4430`, public `443`).
+- **Allowlist панели в nginx `geo`:** после stream qeli видит `127.0.0.1` — фильтр IP только
+  в nginx, не в `web.allowed_ips`.
+- **`install-qeli-server.sh`:** multiprofile по умолчанию (все режимы); legacy — `QELI_PROFILE`.
+- **Lab scripts:** `clean-reinstall-lab.sh`, `remote-upgrade-host2.sh`, `remote-smoke-api-host2.sh`,
+  `upgrade-public-port.sh`; секреты — `scripts/lab_secrets.example` → `.lab_secrets` (git-ignored).
+
+#### Agent pipeline и релиз форка
+
+- **Windows/Docker pipeline** (`scripts/agent/`): `release_flow.ps1` (deb → smoke → host2 → Win +
+  Android), `build_deb_docker.sh`, `docker_smoke_local.ps1`, `build_android_apk.ps1`.
+  Runbook: [`scripts/AGENT_DEB_BUILD_DEPLOY.md`](scripts/AGENT_DEB_BUILD_DEPLOY.md),
+  [`scripts/agent/README.md`](scripts/agent/README.md).
+- **In-place upgrade host2:** `chown root:root` на `/etc/qeli` до/после `dpkg -i` (unit от root).
+- **Android release APK:** подпись dev keystore (`qeli-dev-release.jks`, git-ignored);
+  `versionCode` 720; sideload / обновление поверх при том же ключе
+  (см. [`qeli-android/README.md`](qeli-android/README.md)).
+- **GitHub Release [`v0.7.16-fork.1`](https://github.com/raperrros-byte/qeli/releases/tag/v0.7.16-fork.1)**
+  (pre-release): `.deb`, `qeli-linux-amd64`, Android APK, Windows exe ×2, `install-keenetic.sh`,
+  WinDivert LICENSE/NOTICE, `SHA256SUMS`. macOS / OpenWrt / Keenetic clients — upstream
+  [`v0.7.16`](https://github.com/litvinovtd/qeli/releases/tag/v0.7.16).
 
 ### Мобильные клиенты
 
