@@ -29,6 +29,65 @@ object GeoAssetStore {
     @Volatile private var site: GeoSiteIndex? = null
     @Volatile private var ip: GeoIpIndex? = null
     @Volatile private var loadedPreset = ""
+    @Volatile private var loadedSiteTags: Set<String>? = null
+    @Volatile private var loadedIpTags: Set<String>? = null
+
+    /** Warm index cache off the connect path (after download / preset change). */
+    fun preload(ctx: Context, presetId: String) {
+        if (!hasFiles(ctx)) return
+        val id = ProxyRoutePreset.normalize(presetId)
+        if (id == ProxyRoutePreset.PROXY_ALL) return
+        getOrLoad(ctx, id)
+    }
+
+    fun getOrLoad(ctx: Context, presetId: String): Pair<GeoSiteIndex?, GeoIpIndex?> {
+        val id = ProxyRoutePreset.normalize(presetId)
+        val (siteTags, ipTags) = ProxyRoutePreset.tagsFor(id)
+        val siteTagSet = siteTags.toSet()
+        val ipTagSet = ipTags.toSet()
+        if (site != null && ip != null &&
+            loadedPreset == id &&
+            loadedSiteTags == siteTagSet &&
+            loadedIpTags == ipTagSet
+        ) {
+            return site to ip
+        }
+        if (!hasFiles(ctx)) return null to null
+        site = if (siteTags.isEmpty()) GeoSiteIndex() else
+            runCatching { GeoSiteIndex.load(geositePath(ctx), siteTags) }.getOrNull()
+        ip = if (ipTags.isEmpty()) GeoIpIndex() else
+            runCatching { GeoIpIndex.load(geoipPath(ctx), ipTags) }.getOrNull()
+        loadedPreset = id
+        loadedSiteTags = siteTagSet
+        loadedIpTags = ipTagSet
+        return site to ip
+    }
+
+    private fun getIpIndex(ctx: Context, presetId: String): GeoIpIndex? {
+        val id = ProxyRoutePreset.normalize(presetId)
+        val (_, ipTags) = ProxyRoutePreset.tagsFor(id)
+        val ipTagSet = ipTags.toSet()
+        if (ip != null && loadedPreset == id && loadedIpTags == ipTagSet) return ip
+        if (!hasFiles(ctx)) return null
+        if (ipTags.isEmpty()) return GeoIpIndex()
+        ip = runCatching { GeoIpIndex.load(geoipPath(ctx), ipTags) }.getOrNull()
+        loadedPreset = id
+        loadedIpTags = ipTagSet
+        return ip
+    }
+
+    private fun getSiteIndex(ctx: Context, presetId: String): GeoSiteIndex? {
+        val id = ProxyRoutePreset.normalize(presetId)
+        val (siteTags, _) = ProxyRoutePreset.tagsFor(id)
+        val siteTagSet = siteTags.toSet()
+        if (site != null && loadedPreset == id && loadedSiteTags == siteTagSet) return site
+        if (!hasFiles(ctx)) return null
+        if (siteTags.isEmpty()) return GeoSiteIndex()
+        site = runCatching { GeoSiteIndex.load(geositePath(ctx), siteTags) }.getOrNull()
+        loadedPreset = id
+        loadedSiteTags = siteTagSet
+        return site
+    }
 
     fun dir(ctx: Context): File = File(ctx.filesDir, "geo").also { it.mkdirs() }
     fun geositePath(ctx: Context) = File(dir(ctx), GEOSITE_FILE)
@@ -49,19 +108,8 @@ object GeoAssetStore {
         site = null
         ip = null
         loadedPreset = ""
-    }
-
-    fun getOrLoad(ctx: Context, presetId: String): Pair<GeoSiteIndex?, GeoIpIndex?> {
-        val id = ProxyRoutePreset.normalize(presetId)
-        if (site != null && ip != null && loadedPreset == id) return site to ip
-        if (!hasFiles(ctx)) return null to null
-        val (siteTags, ipTags) = ProxyRoutePreset.tagsFor(id)
-        site = if (siteTags.isEmpty()) GeoSiteIndex() else
-            runCatching { GeoSiteIndex.load(geositePath(ctx), siteTags) }.getOrNull()
-        ip = if (ipTags.isEmpty()) GeoIpIndex() else
-            runCatching { GeoIpIndex.load(geoipPath(ctx), ipTags) }.getOrNull()
-        loadedPreset = id
-        return site to ip
+        loadedSiteTags = null
+        loadedIpTags = null
     }
 
     /**
@@ -71,7 +119,7 @@ object GeoAssetStore {
     fun tunExcludeCidrs(ctx: Context, presetId: String, maxRoutes: Int = tunExcludeRouteBudget()): List<String> {
         val codes = ProxyRoutePreset.tunBypassIpCodes(presetId)
         if (codes.isEmpty()) return emptyList()
-        val (_, ipIdx) = getOrLoad(ctx, presetId)
+        val ipIdx = getIpIndex(ctx, presetId)
         val raw = ipIdx?.allCidrsFor(codes) ?: return emptyList()
         if (raw.isEmpty()) return emptyList()
         return CidrAggregator.prioritizeForCoverage(raw, maxRoutes)
@@ -81,7 +129,7 @@ object GeoAssetStore {
     fun tunIncludeCidrs(ctx: Context, presetId: String, maxRoutes: Int = tunIncludeRouteBudget()): List<String> {
         val codes = ProxyRoutePreset.tunIncludeIpCodes(presetId)
         if (codes.isEmpty()) return emptyList()
-        val (_, ipIdx) = getOrLoad(ctx, presetId)
+        val ipIdx = getIpIndex(ctx, presetId)
         val raw = ipIdx?.allCidrsFor(codes) ?: return emptyList()
         if (raw.isEmpty()) return emptyList()
         return CidrAggregator.prioritizeForCoverage(raw, maxRoutes)

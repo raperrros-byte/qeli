@@ -813,14 +813,77 @@ class VpnServiceImpl : VpnService() {
         trustedPauseInFlight = false
         liveTrustedSsid = ""
         userRequestedDisconnect = false
-        // Geo bypass CIDRs apply only to Android VpnService excludeRoute — they must NOT
-        // be serialized into the Rust transport-core INI (thousands of entries exceed
-        // MAX_CONFIG_BYTES / blow up strict parse → qeli_client_new -2).
-        val tunConfig = applyGeoRouting(config)
-        activeConfig = tunConfig
-        nativeFatalError = null
-        var initialCoreEvents: List<TransportCoreEvent> = emptyList()
-        transportCore = runCatching {
+        broadcastStatus(STATUS_CONNECTING)
+        if (!showNotification(s(R.string.notif_connecting))) {
+            stopVpn("Notification permission denied")
+            return
+        }
+        try {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Qeli::TunnelLock")
+            wakeLock?.acquire()
+        } catch (e: Exception) {
+            Log.e("VpnSvc", "WakeLock failed: ${e.message}", e)
+        }
+
+        supervisor = SupervisorJob()
+        coroutineScope = CoroutineScope(supervisor!! + Dispatchers.IO)
+
+        val runner = coroutineScope!!.launch(start = CoroutineStart.LAZY) {
+            try {
+                val tunConfig = withContext(Dispatchers.Default) {
+                    applyGeoRouting(config)
+                }
+                activeConfig = tunConfig
+                nativeFatalError = null
+
+                val coreSetup = withContext(Dispatchers.Default) {
+                    createTransportCore(config, killSwitchReadiness)
+                }
+                if (coreSetup == null) {
+                    activeConfig = null
+                    rejectForegroundConnect("Native transport core unavailable")
+                    return@launch
+                }
+                val (core, initialCoreEvents) = coreSetup
+                transportCore = core
+                core.let {
+                    debugLog(
+                        "Shared native transport active: ABI 0x" +
+                            TransportCore.abiVersion().toUInt().toString(16) +
+                            ", state=${it.state()}, lifecycle events drained"
+                    )
+                }
+                broadcastLog(
+                    "Service started: ${tunConfig.protocol.uppercase()}/${tunConfig.wireMode}" +
+                        if (tunConfig.isUdp && tunConfig.quicEnabled) "+QUIC" else ""
+                )
+                broadcastLog(
+                    "Connecting to ${logValue(tunConfig.serverAddress)}:${tunConfig.port} " +
+                        "as user '${logValue(tunConfig.username)}'"
+                )
+                launchTransportCoreEventPump(core, initialCoreEvents)
+                registerNetworkCallback()
+                registerScreenReceiver()
+                connectWithRetry(tunConfig)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // normal teardown — ignore
+            } catch (e: Exception) {
+                Log.e("VpnSvc", "Unhandled: ${e.message}", e)
+                broadcastLog("FATAL: ${e.javaClass.simpleName}: ${e.message}")
+                stopVpn(e.message ?: "VPN service failed")
+            }
+        }
+        transportJob = runner
+        runner.start()
+    }
+
+    /** Create and start the shared native transport core (blocking — run off main thread). */
+    private fun createTransportCore(
+        config: VpnConfig,
+        killSwitchReadiness: AndroidKillSwitchReadiness,
+    ): Pair<TransportCore, List<TransportCoreEvent>>? {
+        return runCatching {
             val stableDeviceId = deviceId()
             val core = try {
                 TransportCore.create(
@@ -840,16 +903,18 @@ class VpnServiceImpl : VpnService() {
             try {
                 core.start()
                 val lifecycle = core.drainEvents()
-                check(lifecycle.filter {
-                    it.kind == TransportCoreEventCodec.KIND_STATE_CHANGED
-                }.map { it.state } == listOf(
-                    TransportCore.STATE_CREATED,
-                    TransportCore.STATE_CONNECTING,
-                )) { "unexpected transport core lifecycle events" }
-                initialCoreEvents = lifecycle.filter {
+                check(
+                    lifecycle.filter {
+                        it.kind == TransportCoreEventCodec.KIND_STATE_CHANGED
+                    }.map { it.state } == listOf(
+                        TransportCore.STATE_CREATED,
+                        TransportCore.STATE_CONNECTING,
+                    )
+                ) { "unexpected transport core lifecycle events" }
+                val initialCoreEvents = lifecycle.filter {
                     it.kind != TransportCoreEventCodec.KIND_STATE_CHANGED
                 }
-                core
+                core to initialCoreEvents
             } catch (error: Throwable) {
                 try { core.close() } catch (_: Throwable) {}
                 throw error
@@ -858,63 +923,6 @@ class VpnServiceImpl : VpnService() {
             broadcastLog("ERROR: native transport core unavailable (${error.message})")
             null
         }
-        if (transportCore == null) {
-            activeConfig = null
-            rejectForegroundConnect("Native transport core unavailable")
-            return
-        }
-        transportCore?.let { core ->
-            debugLog(
-                "Shared native transport active: ABI 0x" +
-                    TransportCore.abiVersion().toUInt().toString(16) +
-                    ", state=${core.state()}, lifecycle events drained"
-            )
-        }
-        broadcastLog("Service started: ${tunConfig.protocol.uppercase()}/${tunConfig.wireMode}" +
-            if (tunConfig.isUdp && tunConfig.quicEnabled) "+QUIC" else "")
-        broadcastLog(
-            "Connecting to ${logValue(tunConfig.serverAddress)}:${tunConfig.port} " +
-                "as user '${logValue(tunConfig.username)}'"
-        )
-        try {
-            val pm = getSystemService(POWER_SERVICE) as PowerManager
-            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Qeli::TunnelLock")
-            // No timeout: the lock is bounded by the foreground-service lifecycle and is
-            // always released in stopVpn(). A 12h timeout used to let the CPU sleep after
-            // 12h on a long-lived session, silently stalling the data plane until traffic
-            // woke the device again.
-            wakeLock?.acquire()
-        } catch (e: Exception) {
-            Log.e("VpnSvc", "WakeLock failed: ${e.message}", e)
-        }
-
-        supervisor = SupervisorJob()
-        coroutineScope = CoroutineScope(supervisor!! + Dispatchers.IO)
-        transportCore?.let { core -> launchTransportCoreEventPump(core, initialCoreEvents) }
-        registerNetworkCallback()
-        registerScreenReceiver()
-        broadcastStatus(STATUS_CONNECTING)
-
-        if (!showNotification(s(R.string.notif_connecting))) {
-            stopVpn("Notification permission denied")
-            return
-        }
-
-        // Publish the Job before it can enter JNI. Otherwise an immediate native failure
-        // can call stopVpn before teardown has a runner to join.
-        val runner = coroutineScope!!.launch(start = CoroutineStart.LAZY) {
-            try {
-                connectWithRetry(config)
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                // normal teardown — ignore
-            } catch (e: Exception) {
-                Log.e("VpnSvc", "Unhandled: ${e.message}", e)
-                broadcastLog("FATAL: ${e.javaClass.simpleName}: ${e.message}")
-                stopVpn(e.message ?: "VPN service failed")
-            }
-        }
-        transportJob = runner
-        runner.start()
     }
 
     private fun launchTransportCoreEventPump(

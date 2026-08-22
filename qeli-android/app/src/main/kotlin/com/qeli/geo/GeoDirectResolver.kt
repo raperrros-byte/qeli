@@ -14,9 +14,9 @@ import java.util.concurrent.TimeoutException
  * Wildcard TLD rules (*.ru / *.su) still rely on geoip excludes at connection time.
  */
 object GeoDirectResolver {
-    private const val MAX_DOMAINS = 128
-    private const val RESOLVE_TIMEOUT_MS = 250L
-    private const val TOTAL_BUDGET_MS = 4_000L
+    private const val MAX_DOMAINS = 64
+    private const val RESOLVE_TIMEOUT_MS = 200L
+    private const val TOTAL_BUDGET_MS = 1_500L
 
     private val executor = Executors.newFixedThreadPool(4) { runnable ->
         Thread(runnable, "qeli-geo-dns").apply { isDaemon = true }

@@ -760,20 +760,29 @@ sni = www.microsoft.com
         val cfg = runCatching { VpnConfig.parse(p.text) }.getOrNull() ?: return
         val host = cfg.serverAddress.trim()
         if (host.isEmpty()) return
-        val base = if (host.contains('.') && host.any { it.isLetter() }) {
-            "https://$host"
-        } else {
-            "http://$host:8080"
-        }
+        val prefs = getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
+        val panelUrl = prefs.getString("panel_url", null)
+        val user = prefs.getString("panel_user", "admin") ?: "admin"
+        val pass = prefs.getString("panel_password", "") ?: ""
         binding.tvSpeedTestResult.visibility = View.VISIBLE
         binding.tvSpeedTestResult.text = getString(R.string.speed_test_running)
         binding.btnSpeedTest.isEnabled = false
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) {
-                runCatching { panelSpeedTestMbps(base, bytes = 1_048_576) }
+                runCatching {
+                    val mbps = PanelSpeedTest.mbps(
+                        preferredBaseUrl = panelUrl,
+                        user = user,
+                        password = pass,
+                        bytes = 1_048_576,
+                        vpnServerHost = host,
+                    )
+                    val base = PanelSpeedTest.buildCandidates(panelUrl, host).firstOrNull() ?: host
+                    mbps to base
+                }
             }
             binding.btnSpeedTest.isEnabled = true
-            result.onSuccess { mbps ->
+            result.onSuccess { (mbps, base) ->
                 binding.tvSpeedTestResult.text = String.format("%.2f Mbit/s via %s", mbps, base)
                 appendLog("Speed test: %.2f Mbit/s ($base)".format(mbps))
             }.onFailure { e ->
@@ -783,40 +792,16 @@ sni = www.microsoft.com
         }
     }
 
-    /** Authenticated download against panel `/api/speedtest` (uses stored panel creds if any). */
-    private fun panelSpeedTestMbps(base: String, bytes: Int): Double {
-        val prefs = getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
-        val user = prefs.getString("panel_user", "admin") ?: "admin"
-        val pass = prefs.getString("panel_password", "") ?: ""
-        val cookieManager = java.net.CookieManager()
-        java.net.CookieHandler.setDefault(cookieManager)
-        if (pass.isNotEmpty()) {
-            val login = java.net.URL("$base/api/login").openConnection() as java.net.HttpURLConnection
-            login.connectTimeout = 8_000
-            login.readTimeout = 8_000
-            login.requestMethod = "POST"
-            login.doOutput = true
-            login.setRequestProperty("Content-Type", "application/json")
-            login.outputStream.use { os ->
-                os.write("""{"username":"$user","password":"$pass"}""".toByteArray())
-            }
-            if (login.responseCode !in 200..299) {
-                throw IllegalStateException("panel login HTTP ${login.responseCode}")
-            }
-            login.inputStream.use { it.readBytes() }
+    private fun preloadGeoRouting(preset: String? = null) {
+        val id = com.qeli.geo.ProxyRoutePreset.normalize(
+            preset ?: getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
+                .getString(PREF_GEO_PRESET, com.qeli.geo.ProxyRoutePreset.PROXY_ALL),
+        )
+        if (id == com.qeli.geo.ProxyRoutePreset.PROXY_ALL) return
+        if (!com.qeli.geo.GeoAssetStore.hasFiles(this)) return
+        lifecycleScope.launch(Dispatchers.Default) {
+            com.qeli.geo.GeoAssetStore.preload(this@MainActivity, id)
         }
-        val url = java.net.URL("$base/api/speedtest?bytes=$bytes")
-        val conn = url.openConnection() as java.net.HttpURLConnection
-        conn.connectTimeout = 10_000
-        conn.readTimeout = 60_000
-        conn.requestMethod = "GET"
-        val t0 = System.nanoTime()
-        val n = conn.inputStream.use { it.readBytes().size }
-        val secs = (System.nanoTime() - t0) / 1e9
-        if (conn.responseCode !in 200..299) {
-            throw IllegalStateException("speedtest HTTP ${conn.responseCode}")
-        }
-        return (n * 8.0) / secs.coerceAtLeast(0.001) / 1_000_000.0
     }
 
     private fun setupGeoRouting() {
@@ -846,6 +831,7 @@ sni = www.microsoft.com
                 if (picked == prev) return
                 prefs.edit().putString(PREF_GEO_PRESET, picked).apply()
                 renderGeoRouting()
+                preloadGeoRouting(picked)
                 if (isConnected || isConnecting) {
                     Toast.makeText(this@MainActivity, getString(R.string.reconnecting_geo), Toast.LENGTH_SHORT).show()
                     connect()
@@ -865,6 +851,7 @@ sni = www.microsoft.com
                         }
                     }
                     renderGeoRouting()
+                    preloadGeoRouting()
                     Toast.makeText(this@MainActivity, R.string.geo_download_ok, Toast.LENGTH_SHORT).show()
                     if (isConnected || isConnecting) {
                         Toast.makeText(this@MainActivity, getString(R.string.reconnecting_geo), Toast.LENGTH_SHORT).show()
@@ -880,6 +867,7 @@ sni = www.microsoft.com
             }
         }
         renderGeoRouting()
+        preloadGeoRouting()
     }
 
     private fun renderGeoRouting() {
