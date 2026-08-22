@@ -21,6 +21,10 @@ public abstract class VpnTunnelBase
     public event Action<string>? LogLine;
     public event Action<VpnStatus, string?>? StatusChanged; // status, optional ip/error
     public event Action<string>? ConnectionDropped;          // established session lost (will retry)
+    /// <summary>Raised after the asynchronous run task has actually completed. A terminal
+    /// Error status is published from inside that task, so observers that derive controls
+    /// from <see cref="IsRunning"/> need this second edge after IsCompleted becomes true.</summary>
+    public event Action? RunCompleted;
     protected void Log(string m) => LogLine?.Invoke(m);
     private void Status(VpnStatus s, string? extra = null) => StatusChanged?.Invoke(s, extra);
 
@@ -31,10 +35,15 @@ public abstract class VpnTunnelBase
     // attempt's setup on the SHARED transport/TUN/route fields.
     private readonly object _lifecycleLock = new();
     private volatile bool _userRequestedDisconnect;
-    // persist-tun: client IP the currently-persisted TUN adapter+routes were built for,
-    // so a reconnect can reuse them when the server re-assigns the same IP. Null = no
-    // persisted TUN.
+    // persist-tun: client IP the currently-persisted TUN adapter+routes were built for.
+    // Kept separately for status/logging; reuse is gated by the complete applied-plan
+    // fingerprint below, not by the address alone.
     private string? _persistedClientIp;
+    // Canonical fingerprint of every NetworkPlan/config value that the desktop platform
+    // adapter applied to the host: address/prefix, effective MTU and DNS, routes (including
+    // route_file), carrier pin and platform routing policy. A new authenticated generation
+    // may keep the same client IP while changing any of these values.
+    private string? _persistedPlanFingerprint;
     // Physical network for which the persisted adapter's bypass routes and DNS
     // state were installed. Reusing the same client IP is not enough: a changed
     // gateway, resolver or service makes those platform settings stale.
@@ -61,6 +70,13 @@ public abstract class VpnTunnelBase
     // _lifecycleLock (Stop() holds it while joining that very task). Interlocked makes
     // "lift exactly once" hold without a lock. (Audit 2026-07-27, B2)
     private int _ksEngaged;
+    // A changed authenticated NetworkPlan cannot be applied to the desktop system TUN
+    // atomically at the OS route-table level: the old /1/include routes must be removed
+    // before the replacements can be installed. When the user did not request the regular
+    // kill-switch, temporarily reuse the same platform firewall transaction so that this
+    // unavoidable control-plane gap is fail-closed rather than a cleartext leak. Per-app
+    // adapters update their retained classifier in place and therefore never raise this.
+    private int _planReplacementGuardEngaged;
 
     // ABI 1.7+ native whole-transport generation. Kept as a signed slot solely so
     // Interlocked can publish/clear it while Stop() interrupts qeli_client_run.
@@ -94,7 +110,7 @@ public abstract class VpnTunnelBase
 
     public bool IsRunning => _runTask is { IsCompleted: false };
 
-    public void Start(VpnConfig config)
+    public bool Start(VpnConfig config)
     {
 
         // Serialize Start/Stop (and thus a concurrent profile switch) on one lock: Stop()
@@ -102,7 +118,24 @@ public abstract class VpnTunnelBase
         // fields, so the old task's teardown can't clobber the newly-established tunnel.
         lock (_lifecycleLock)
         {
-            Stop();
+            try
+            {
+                // This is an internal generation handoff, not a user-visible disconnect.
+                // Publishing Disconnected here races the GUI's new active-profile assignment
+                // and briefly makes a successful Start look stopped. Cleanup errors still
+                // publish Error and abort the new generation.
+                Stop(publishDisconnected: false);
+            }
+            catch (Exception e)
+            {
+                // Never start a new generation while the previous one may still own the
+                // shared TUN/socket/route fields. Stop() deliberately leaves its task and
+                // cancellation source published when it cannot prove quiescence, so a later
+                // Stop()/Start() can retry once that task has actually returned.
+                Log($"[SECURITY] previous tunnel did not stop cleanly: {e.Message}");
+                Status(VpnStatus.Error, FirstSentence(e.Message));
+                return false;
+            }
             // Validate AFTER Stop(), inside the lock. Returning before it left the PREVIOUS
             // tunnel running while the GUI had already switched to the new profile and shown
             // an error — routes and traffic still belonged to a session the user thought was
@@ -116,7 +149,7 @@ public abstract class VpnTunnelBase
             {
                 Log($"config rejected: {e.Message}");
                 Status(VpnStatus.Error, e.Message);
-                return;
+                return false;
             }
             _userRequestedDisconnect = false;
             // TestHandshake latches this and used to never clear it, so a GUI object that had
@@ -128,6 +161,8 @@ public abstract class VpnTunnelBase
             // "could not connect" message on the NEXT attempt. (Audit 2026-07-27, Z2)
             _stoppedForSecurityReason = false;
             _wasConnected = false;
+            _forcedReconnectInFlight = false;
+            Interlocked.Exchange(ref _forcedNetworkRebuild, 0);
             _carrierAddresses = Array.Empty<string>();
             _carrierGeneration = 0;
             _lastNetSig = PhysicalNetSignature(); // baseline: physical net at connect (TUN excluded)
@@ -177,11 +212,22 @@ public abstract class VpnTunnelBase
                     // anchor and the pfctl command that fixes it), so the first sentence is
                     // worth surfacing verbatim.
                     Status(VpnStatus.Error, $"kill-switch failed — {FirstSentence(e.Message)}");
-                    return;
+                    return false;
                 }
             }
 
-            _runTask = Task.Run(() => ConnectWithRetry(config, ct), ct);
+            var runTask = Task.Run(() => ConnectWithRetry(config, ct), ct);
+            _runTask = runTask;
+            _ = runTask.ContinueWith(
+                _ =>
+                {
+                    try { RunCompleted?.Invoke(); }
+                    catch (Exception e) { Log($"run-completion observer failed: {e.Message}"); }
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+            return true;
         }
     }
 
@@ -208,7 +254,9 @@ public abstract class VpnTunnelBase
     /// </summary>
     private volatile bool _stoppedForSecurityReason;
 
-    public void Stop()
+    public void Stop() => Stop(publishDisconnected: true);
+
+    private void Stop(bool publishDisconnected)
     {
         lock (_lifecycleLock)
         {
@@ -232,9 +280,20 @@ public abstract class VpnTunnelBase
             {
                 try
                 {
-                    if (!t.Wait(8000)) Log("warn: previous tunnel task did not stop within 8s — proceeding");
+                    if (!t.Wait(8000))
+                    {
+                        const string message =
+                            "previous tunnel task did not stop within 8s; refusing to reuse its network state";
+                        Log($"[SECURITY] {message}");
+                        Status(VpnStatus.Error, message);
+                        throw new TimeoutException(message);
+                    }
                 }
-                catch { /* the task's own fault is irrelevant to teardown */ }
+                catch (AggregateException) when (t.IsCompleted)
+                {
+                    // The task's own fault is irrelevant after it has relinquished all shared
+                    // state; its cleanup still ran through ConnectWithRetry's finally paths.
+                }
             }
             _runTask = null;
             _cts = null;
@@ -256,9 +315,22 @@ public abstract class VpnTunnelBase
                 Status(VpnStatus.Error, FirstSentence(e.Message));
                 throw;
             }
+            if (!PlanReplacementGuardLift())
+            {
+                const string message =
+                    "network-plan replacement guard could not be disengaged; egress remains fail-closed";
+                Status(VpnStatus.Error, message);
+                throw new InvalidOperationException(message);
+            }
             // Lift the kill-switch only on a clean stop (a crash leaves it = fail-safe).
-            KillSwitchLift();
-            Status(VpnStatus.Disconnected);
+            if (!KillSwitchLift())
+            {
+                const string message =
+                    "kill-switch could not be disengaged; egress remains fail-closed";
+                Status(VpnStatus.Error, message);
+                throw new InvalidOperationException(message);
+            }
+            if (publishDisconnected) Status(VpnStatus.Disconnected);
         }
     }
 
@@ -266,6 +338,10 @@ public abstract class VpnTunnelBase
     // True while ForceReconnect() deliberately closes the live sockets for a network change,
     // so the resulting data-plane socket error is logged as a clean reconnect, not a scary ERR.
     private volatile bool _forcedReconnectInFlight;
+    // Set with a forced reconnect when the platform network state itself must be rebuilt.
+    // The socket close wakes the run loop first; that loop owns `config` and performs the
+    // guarded teardown, so the OS callback never has to race the data-plane fields directly.
+    private int _forcedNetworkRebuild;
 
     /// <summary>Proactively cycle the connection NOW instead of waiting out the RX-liveness
     /// watchdog — called by the platform GUIs from OS suspend/resume and network-change
@@ -277,12 +353,23 @@ public abstract class VpnTunnelBase
     {
         NoteNetworkSettling();
         if (_userRequestedDisconnect || !IsRunning || !_wasConnected) return;
+        if (rebuildNetwork) Interlocked.Exchange(ref _forcedNetworkRebuild, 1);
         long now = Environment.TickCount64;
-        if (now - Interlocked.Read(ref _lastForceReconnectTick) < 3000) return; // debounce a burst
+        if (now - Interlocked.Read(ref _lastForceReconnectTick) < 3000)
+        {
+            // Ordinary duplicate lifecycle events stay debounced. A distinct physical-network
+            // change must not be swallowed after a very fast reconnect, however. While the
+            // previous forced cycle is still unwinding, the rebuild flag above is sufficient;
+            // once it has unwound and a new session is live, immediately cycle that stale path.
+            if (!rebuildNetwork || _forcedReconnectInFlight) return;
+        }
         Interlocked.Exchange(ref _lastForceReconnectTick, now);
         Log($"{reason} — reconnecting");
         _forcedReconnectInFlight = true;
-        CloseTransports(keepTun: !rebuildNetwork);
+        // Retain the adapter until ConnectWithRetry observes the interrupted generation.
+        // That path can first lower a per-app classifier or engage the system firewall;
+        // destroying it here opened exactly the cleartext route gap persist_tun prevents.
+        CloseTransports(keepTun: true);
     }
 
     /// <summary>First sentence of a message, for a one-line status detail. Falls back to a
@@ -347,6 +434,19 @@ public abstract class VpnTunnelBase
             long deadline = Environment.TickCount64 + maxWaitMs;
             while (PhysicalNetSignature().Length == 0 && Environment.TickCount64 < deadline)
                 await Task.Delay(500).ConfigureAwait(false);
+            // Only cycle if the physical path actually CHANGED across the suspend. A laptop that
+            // wakes on the same Wi-Fi has a working tunnel, and tearing it down costs a full
+            // handshake for nothing; a path that died silently is caught by the RX-liveness
+            // watchdog within seconds instead. Same rule the Android client applies on wake.
+            string now = PhysicalNetSignature();
+            if (now.Length > 0 && now == _lastNetSig)
+            {
+                Log($"{reason} — same network, keeping the tunnel");
+                return;
+            }
+            // The resume path does not pass through OnNetworkChanged, so make the newly
+            // observed topology the comparison baseline before its forced rebuild begins.
+            _lastNetSig = now;
             ForceReconnect(reason, rebuildNetwork: true);
         });
     }
@@ -416,10 +516,77 @@ public abstract class VpnTunnelBase
     /// last-known carrier set. An engaged firewall kill-switch must allow the new server
     /// addresses before the native transport tries them; throwing keeps the previous set.</summary>
     protected virtual void CarrierAddressesChanging(
-        VpnConfig config, IReadOnlyList<string> previous, IReadOnlyList<string> refreshed) { }
+        VpnConfig config, IReadOnlyList<string> previous, IReadOnlyList<string> refreshed)
+    { }
 
     /// <summary>Platform hook: lift the kill-switch on a clean stop.</summary>
     protected virtual void KillSwitchDisengage() { }
+
+    /// <summary>Whether this platform can use its firewall implementation as a temporary
+    /// fail-closed transaction around a system-TUN NetworkPlan replacement.</summary>
+    protected virtual bool SupportsPlanReplacementGuard => false;
+
+    /// <summary>True while either the user-requested kill switch or the temporary
+    /// persisted-plan replacement transaction owns the platform firewall.</summary>
+    protected bool EgressGuardEngaged =>
+        Volatile.Read(ref _ksEngaged) == 1
+        || Volatile.Read(ref _planReplacementGuardEngaged) == 1;
+
+    /// <summary>Give a retained per-app adapter the first chance to prepare/confirm an in-place
+    /// changed-plan update. Its classifier is already down at this point, so selected traffic
+    /// remains fail-closed while the platform SetupTun path publishes the authenticated policy.
+    /// Returning false delegates to the guarded system-TUN rebuild below.</summary>
+    protected virtual bool TryReconfigurePersistedTun(
+        VpnConfig config, Session session, IPAddress serverIp) => false;
+
+    /// <summary>Drop platform state that can pin the encrypted carrier to the old physical
+    /// network while retaining a fail-closed per-app adapter. Called only after the per-app
+    /// classifier has been lowered and before the next transport attempt.</summary>
+    protected virtual void PrepareRetainedTunForNetworkRebuild(VpnConfig config) { }
+
+    private void PlanReplacementGuardEngage(VpnConfig config)
+    {
+        // The configured kill-switch already covers the complete reconnect window.
+        if (Volatile.Read(ref _ksEngaged) == 1
+            || Volatile.Read(ref _planReplacementGuardEngaged) == 1) return;
+        if (!SupportsPlanReplacementGuard)
+            throw new InvalidOperationException(
+                "this platform cannot replace a live network plan without an egress leak guard");
+
+        try
+        {
+            KillSwitchEngage(config);
+            Interlocked.Exchange(ref _planReplacementGuardEngaged, 1);
+            Log("persist-tun: temporary fail-closed firewall guard engaged for network-plan replacement");
+        }
+        catch (Exception error)
+        {
+            throw new InvalidOperationException(
+                "refusing to rebuild the persisted TUN without a fail-closed firewall guard", error);
+        }
+    }
+
+    private bool PlanReplacementGuardLift()
+    {
+        if (Interlocked.CompareExchange(ref _planReplacementGuardEngaged, 0, 1) != 1) return true;
+        try
+        {
+            KillSwitchDisengage();
+            Log("persist-tun: replacement complete; temporary firewall guard disengaged");
+            return true;
+        }
+        catch (Exception error)
+        {
+            // Preserve both the platform recovery journal and our knowledge that the host is
+            // still gated, so Stop()/give-up can retry instead of silently claiming egress.
+            Interlocked.Exchange(ref _planReplacementGuardEngaged, 1);
+            Log($"[SECURITY] network-plan replacement guard remains engaged: {error.Message}");
+            return false;
+        }
+    }
+
+    private static bool NeedsSystemPlanReplacementGuard(
+        bool hasPersistedTun, bool usesAppFilter) => hasPersistedTun && !usesAppFilter;
 
     /// <summary>Lift the kill-switch exactly once, from whichever ORDERLY teardown path
     /// reaches it first — Stop(), or the reconnect loop giving up.
@@ -431,10 +598,14 @@ public abstract class VpnTunnelBase
     /// leave it engaged (fail-safe, swept on the next run); only a deliberate give-up lifts
     /// it. Interlocked rather than the lifecycle lock: the give-up tail runs ON the tunnel
     /// task, which Stop() joins while holding that lock. (Audit 2026-07-27, B2)</summary>
-    private void KillSwitchLift()
+    private bool KillSwitchLift()
     {
-        if (Interlocked.CompareExchange(ref _ksEngaged, 0, 1) != 1) return;
-        try { KillSwitchDisengage(); }
+        if (Interlocked.CompareExchange(ref _ksEngaged, 0, 1) != 1) return true;
+        try
+        {
+            KillSwitchDisengage();
+            return true;
+        }
         catch (Exception e)
         {
             // The platform restore is transactional: on failure the firewall remains
@@ -443,6 +614,7 @@ public abstract class VpnTunnelBase
             // permanently forgetting that the host is still gated.
             Interlocked.Exchange(ref _ksEngaged, 1);
             Log($"[SECURITY] kill-switch disengage failed; egress remains blocked: {e.Message}");
+            return false;
         }
     }
 
@@ -463,35 +635,64 @@ public abstract class VpnTunnelBase
         CleanupPlatform();
         _tun = null;
         _persistedClientIp = null;
+        _persistedPlanFingerprint = null;
         _persistedNetSig = null;
     }
 
-    /// <summary>persist-tun: if a TUN adapter + routes survived from the previous attempt
-    /// (PersistTun) and the server re-assigned the SAME client IP, reuse them as-is
-    /// instead of tearing down + recreating (the platform SetupTun calls this first and
-    /// returns early on true). If the IP changed, rebuild cleanly (the proven path).</summary>
-    protected bool ReusePersistedTun(VpnConfig config, Session session)
+    /// <summary>persist-tun: reuse a surviving TUN only when the complete effective network
+    /// state is unchanged. The same address alone is insufficient: an authenticated reconnect
+    /// may change the prefix, pushed routes, DNS or MTU while the physical carrier stays put.</summary>
+    protected bool ReusePersistedTun(VpnConfig config, Session session, IPAddress serverIp)
     {
         if (_tun == null) return false;                       // nothing persisted
         string currentNetSig = PhysicalNetSignature();
+        string currentPlanFingerprint = NetworkPlanFingerprint(config, session, serverIp);
         if (KeepTunDuringReconnect(config)
             && _persistedClientIp == session.ClientIp
+            && _persistedPlanFingerprint == currentPlanFingerprint
             && _persistedNetSig == currentNetSig)
         {
-            Log($"persist-tun: reusing TUN adapter + routes (client IP {session.ClientIp} unchanged)");
+            Log("persist-tun: reusing TUN adapter + network plan (fingerprint unchanged)");
             return true;
         }
-        // No persist, or the IP/physical network changed: tear the stale adapter
-        // down and rebuild its routes and DNS against the current carrier.
+        // Per-app capture is itself the leak guard. Reconfigure it in place instead of
+        // stopping the classifier and opening a fail-open window while a replacement capture
+        // handle is created. The caller publishes the new fingerprint after this succeeds.
+        if (TryReconfigurePersistedTun(config, session, serverIp))
+        {
+            Log("persist-tun: retained per-app adapter accepted the changed network plan in place");
+            return true;
+        }
+        // No persist, or the effective plan/physical network changed: tear the stale adapter
+        // down and rebuild its address, routes, DNS and MTU against the current carrier. The
+        // temporary firewall transaction is raised BEFORE the first destructive step and is
+        // released only after the new native generation reaches Running.
         if (_persistedClientIp != null && _persistedClientIp != session.ClientIp)
             Log($"persist-tun: client IP {_persistedClientIp} -> {session.ClientIp}; rebuilding TUN");
+        else if (_persistedPlanFingerprint != null
+                 && _persistedPlanFingerprint != currentPlanFingerprint)
+            Log("persist-tun: effective network plan changed; rebuilding TUN address, routes, DNS and MTU");
         else if (_persistedNetSig != null && _persistedNetSig != currentNetSig)
             Log("persist-tun: physical gateway/DNS changed; rebuilding TUN routes and resolver state");
+        // The guard is a replacement transaction, not an initial-connect kill switch. Raising
+        // it without an existing system TUN both blocks unrelated traffic unnecessarily and,
+        // on Windows per-app profiles, asks the Wintun-only firewall path to create an adapter
+        // that WinDivert deliberately does not use.
+        if (NeedsSystemPlanReplacementGuard(_persistedClientIp != null, config.UsesAppFilter))
+        {
+            PlanReplacementGuardEngage(config);
+        }
+        else if (_persistedClientIp != null && config.UsesAppFilter)
+        {
+            throw new InvalidOperationException(
+                "the retained per-app adapter cannot apply the authenticated network plan in place");
+        }
         try { BeforeTunDispose(); } catch (Exception e) { Log($"platform pre-dispose error: {e.Message}"); }
         try { _tun?.Dispose(); } catch { }
         CleanupPlatform();
         _tun = null;
         _persistedClientIp = null;
+        _persistedPlanFingerprint = null;
         _persistedNetSig = null;
         return false;
     }
@@ -521,12 +722,46 @@ public abstract class VpnTunnelBase
         return settling ? Math.Min(attempt + 1, SettlingAttemptCap) : attempt + 1;
     }
 
+    /// <summary>Put the platform data plane into a safe retry state after either a native
+    /// error or a clean native return that was not a user disconnect. Both outcomes occur
+    /// when ForceReconnect stops a generation, so handling only the exception path loses
+    /// the requested network rebuild and can leave a per-app classifier marked tunnel-up.</summary>
+    private void PreparePlatformForRetry(VpnConfig config)
+    {
+        OnTransportInterrupted(config);
+        bool physicalNetworkUnchanged = _persistedNetSig == PhysicalNetSignature();
+        bool networkRebuildRequested =
+            Interlocked.Exchange(ref _forcedNetworkRebuild, 0) == 1;
+        bool networkPlanMustBeRebuilt =
+            networkRebuildRequested || !physicalNetworkUnchanged;
+        bool persistRequested = KeepTunDuringReconnect(config);
+        if (networkPlanMustBeRebuilt && _persistedNetSig != null)
+            Log("persist-tun: carrier topology changed during transport failure; rebuilding network state");
+        bool retainedPerAppCanReconfigure =
+            persistRequested && config.UsesAppFilter && _persistedClientIp != null;
+        if (networkPlanMustBeRebuilt && retainedPerAppCanReconfigure)
+        {
+            // Force ReusePersistedTun through the in-place reconfiguration path even when a
+            // noisy OS callback produced the same compact signature. Release an old carrier
+            // pin before dialing on the new network, while the classifier is fail-closed.
+            _persistedNetSig = null;
+            PrepareRetainedTunForNetworkRebuild(config);
+        }
+        if (networkPlanMustBeRebuilt && _persistedClientIp != null
+            && persistRequested && !retainedPerAppCanReconfigure)
+            PlanReplacementGuardEngage(config);
+        CloseTransports(persistRequested && !_userRequestedDisconnect
+                        && _persistedClientIp != null
+                        && (!networkPlanMustBeRebuilt || retainedPerAppCanReconfigure));
+    }
+
     private void ConnectWithRetry(VpnConfig config, CancellationToken ct)
     {
         int attempt = 0;          // consecutive UNSTABLE attempts → backoff + max-retries
         bool firstAttempt = true; // very first connect: no reconnect gating / delay / status change
         long baseMs = config.ReconnectBaseDelaySecs * 1000;
         long maxMs = config.ReconnectMaxDelaySecs * 1000;
+        string? reconnectStateFailure = null;
         while (!ct.IsCancellationRequested)
         {
             DateTime startedAt = DateTime.UtcNow; // reset precisely before RunVpnConnection below
@@ -562,11 +797,31 @@ public abstract class VpnTunnelBase
                 RunVpnConnection(config, ct);
                 Log("Connection closed cleanly");
                 if (_userRequestedDisconnect) break;
+                bool cleanForced = _forcedReconnectInFlight;
+                _forcedReconnectInFlight = false;
+                bool cleanWasEstablished = _wasConnected;
                 _wasConnected = false;
+                if (!cleanForced && cleanWasEstablished)
+                    ConnectionDropped?.Invoke("Connection closed");
+                try
+                {
+                    PreparePlatformForRetry(config);
+                }
+                catch (Exception recoveryError)
+                {
+                    reconnectStateFailure =
+                        $"could not prepare a safe reconnect: {FirstSentence(recoveryError.Message)}";
+                    Log($"[SECURITY] {reconnectStateFailure}");
+                    break;
+                }
                 // Reset the backoff only after a STABLE session (ran a while). A connect-then-
                 // instant-drop keeps escalating, so it can't hot-loop AND still counts toward
-                // ReconnectMaxRetries.
-                attempt = (DateTime.UtcNow - startedAt >= TimeSpan.FromSeconds(30)) ? 0 : NextAttempt(attempt);
+                // ReconnectMaxRetries. A cycle WE asked for (resume from sleep, network change)
+                // is not a failure: counting it as one made a laptop that sleeps often climb the
+                // backoff until the tunnel spent longer serving a penalty than carrying traffic.
+                attempt = cleanForced
+                    ? 0
+                    : (DateTime.UtcNow - startedAt >= TimeSpan.FromSeconds(30)) ? 0 : NextAttempt(attempt);
             }
             catch (System.Security.SecurityException e) when (!ct.IsCancellationRequested)
             {
@@ -581,12 +836,12 @@ public abstract class VpnTunnelBase
                 // see, on a possible MITM, never reached the UI at all.
                 // (Audit 2026-07-27, Z2.)
                 _stoppedForSecurityReason = true;
-                CloseTransports();
                 break;
             }
             catch (Exception e) when (!ct.IsCancellationRequested)
             {
-                if (_forcedReconnectInFlight)
+                bool wasForced = _forcedReconnectInFlight;
+                if (wasForced)
                 {
                     // We closed the socket ourselves for a network change (ForceReconnect);
                     // the resulting socket error is expected — "…— reconnecting" was already
@@ -610,8 +865,10 @@ public abstract class VpnTunnelBase
                 // Reset backoff only after a STABLE established session; otherwise escalate so a
                 // flapping / never-stable server hits the delay + max-retries — EXCEPT while the
                 // network is still settling, where escalating is simply wrong.
-                attempt = (wasEstablished && DateTime.UtcNow - startedAt >= TimeSpan.FromSeconds(30))
-                    ? 0 : NextAttempt(attempt);
+                attempt = (wasForced && wasEstablished)
+                    ? 0
+                    : (wasEstablished && DateTime.UtcNow - startedAt >= TimeSpan.FromSeconds(30))
+                        ? 0 : NextAttempt(attempt);
                 // persist-tun: on a reconnect (not a user Stop) keep the TUN + routes up
                 // so the next attempt reuses them (no flicker / route gap; fail-closed).
                 // Only when one is actually UP, though (`_persistedClientIp` is set next to
@@ -619,12 +876,20 @@ public abstract class VpnTunnelBase
                 // alone also "persisted" failures that happened BEFORE or DURING SetupTun,
                 // which skipped CleanupPlatform() — the only disposer of a half-built adapter
                 // and of a prewarmed Wintun adapter the failed attempt never consumed.
-                OnTransportInterrupted(config);
-                bool physicalNetworkUnchanged = _persistedNetSig == PhysicalNetSignature();
-                if (!physicalNetworkUnchanged && _persistedNetSig != null)
-                    Log("persist-tun: carrier topology changed during transport failure; rebuilding network state");
-                CloseTransports(KeepTunDuringReconnect(config) && !_userRequestedDisconnect
-                                && _persistedClientIp != null && physicalNetworkUnchanged);
+                try
+                {
+                    PreparePlatformForRetry(config);
+                }
+                catch (Exception recoveryError)
+                {
+                    // Guard engagement and stale carrier cleanup are themselves fallible. Keep
+                    // the error inside the retry lifecycle so terminal cleanup and UI state are
+                    // still completed instead of faulting the run task without an Error edge.
+                    reconnectStateFailure =
+                        $"could not prepare a safe reconnect: {FirstSentence(recoveryError.Message)}";
+                    Log($"[SECURITY] {reconnectStateFailure}");
+                    break;
+                }
             }
             catch (Exception)
             {
@@ -637,19 +902,49 @@ public abstract class VpnTunnelBase
         // — leaving the host routed into a dead tunnel with a hijacked resolver, showing only
         // a generic "could not connect". On a user Stop, Stop() does the teardown itself (and
         // joins this task), so don't race it here.
-        if (!_userRequestedDisconnect) CloseTransports();
+        Exception? terminalCleanupFailure = null;
+        if (!_userRequestedDisconnect)
+        {
+            try { CloseTransports(); }
+            catch (Exception cleanupError)
+            {
+                terminalCleanupFailure = cleanupError;
+                Log($"[SECURITY] terminal platform cleanup failed: {cleanupError.Message}");
+            }
+        }
         if (_userRequestedDisconnect) Status(VpnStatus.Disconnected);
         else
         {
+            // Do not restore a firewall guard over partially cleaned routes/DNS. Stop() can
+            // retry both operations; claiming ordinary egress here could hide stale resolver
+            // ownership or an adapter that still owns host routes.
+            if (terminalCleanupFailure != null)
+            {
+                Status(VpnStatus.Error,
+                    EgressGuardEngaged
+                        ? "platform cleanup failed; egress remains fail-closed"
+                        : $"platform cleanup failed: {FirstSentence(terminalCleanupFailure.Message)}");
+                return;
+            }
             // …and the same is true of the kill-switch, which only Stop() used to lift: after
             // an orderly give-up the UI shows Error and offers "Connect", so a still-engaged
             // firewall left the host with no egress AND no in-app way to restore it. Lift it
             // BEFORE announcing Error, so egress is already back when the user sees the state.
             // (Audit 2026-07-27, B2)
-            KillSwitchLift();
+            bool egressRestored = PlanReplacementGuardLift();
+            egressRestored = KillSwitchLift() && egressRestored;
             // Keep a security stop visible: only announce the generic failure when the
             // loop ended for an ordinary reason. (Audit 2026-07-27, Z2.)
-            if (!_stoppedForSecurityReason)
+            if (!egressRestored)
+            {
+                Status(VpnStatus.Error,
+                    "kill-switch restore failed; egress remains fail-closed");
+            }
+            else if (reconnectStateFailure != null)
+            {
+                Status(VpnStatus.Error, reconnectStateFailure);
+            }
+            else if (!_stoppedForSecurityReason)
             {
                 Status(VpnStatus.Error, Loc.T("CouldNotConnect")); // gave up retrying
             }
@@ -779,91 +1074,110 @@ public abstract class VpnTunnelBase
                             break;
 
                         case NativeTransportCore.EventNetworkPlan:
-                        {
-                            var plan = JsonSerializer.Deserialize<NativePlan>(nativeEvent.Payload)
-                                ?? throw new InvalidDataException("native NetworkPlan is empty");
-                            if (plan.Generation == 0 || plan.Generation != nativeEvent.PlanGeneration)
-                                throw new InvalidDataException("native NetworkPlan generation mismatch");
-                            if (plan.FullTunnel != config.IsFullTunnel)
-                                throw new InvalidDataException(
-                                    "native NetworkPlan routing mode differs from the selected profile");
-                            Log($"Auth OK: user='{LogValue(config.Username)}', IP {plan.TunnelAddress}");
-                            foreach (string line in plan.ConnectionLog) Log(line);
-                            if (_handshakeOnly)
                             {
-                                _handshakeIp = plan.TunnelAddress;
-                                handshakeComplete = true;
-                                NativeTransportCore.Stop(handle);
+                                var plan = JsonSerializer.Deserialize<NativePlan>(nativeEvent.Payload)
+                                    ?? throw new InvalidDataException("native NetworkPlan is empty");
+                                if (plan.Generation == 0 || plan.Generation != nativeEvent.PlanGeneration)
+                                    throw new InvalidDataException("native NetworkPlan generation mismatch");
+                                if (plan.FullTunnel != config.IsFullTunnel)
+                                    throw new InvalidDataException(
+                                        "native NetworkPlan routing mode differs from the selected profile");
+                                Log($"Auth OK: user='{LogValue(config.Username)}', IP {plan.TunnelAddress}");
+                                foreach (string line in plan.ConnectionLog) Log(line);
+                                if (_handshakeOnly)
+                                {
+                                    _handshakeIp = plan.TunnelAddress;
+                                    handshakeComplete = true;
+                                    NativeTransportCore.Stop(handle);
+                                    break;
+                                }
+
+                                try
+                                {
+                                    IPAddress carrier = ResolveNativeCarrier(plan, config);
+                                    string routes = JsonSerializer.Serialize(plan.Routes);
+                                    var unsupportedDns = plan.DnsServers.FirstOrDefault(item => item.Port != 53);
+                                    if (unsupportedDns != null)
+                                        throw new InvalidDataException(
+                                            $"platform DNS adapter cannot apply {unsupportedDns.Address}:{unsupportedDns.Port}");
+                                    var dns = plan.DnsServers.Select(item => item.Address).ToList();
+                                    // route_file is deliberately platform-owned and is absent from
+                                    // the Rust NetworkPlan. Snapshot it once per authenticated
+                                    // generation so the fingerprint and the routes actually applied
+                                    // by Windows/macOS cannot observe two different file versions.
+                                    IReadOnlyList<string> routeFileRoutes =
+                                        config.UsesAppFilter || !config.IsFullTunnel
+                                            ? LoadRouteFile(config)
+                                            : Array.Empty<string>();
+                                    var session = new Session(plan.TunnelAddress, plan.PrefixLength,
+                                        dns.FirstOrDefault() ?? "", routes, plan.Mtu,
+                                        MaxStreams: plan.MaxStreams, Adaptive: plan.Adaptive,
+                                        PlannedDns: dns, PlanIncludesClientRoutes: true,
+                                        RouteFileRoutes: routeFileRoutes);
+                                    SetupTun(config, session, carrier);
+                                    EnforceDnsPolicy(config);
+                                    _persistedClientIp = plan.TunnelAddress;
+                                    _persistedPlanFingerprint =
+                                        NetworkPlanFingerprint(config, session, carrier);
+                                    _persistedNetSig = PhysicalNetSignature();
+                                    _lastNetSig = _persistedNetSig;
+                                    // The authenticated plan has now been rebuilt/reconfigured
+                                    // against the current carrier. Do not let an old OS event
+                                    // force a second teardown after this generation succeeds.
+                                    Interlocked.Exchange(ref _forcedNetworkRebuild, 0);
+                                    if (NativeTunFdOwnership)
+                                    {
+                                        if (_tun is not IFdTunDevice fdTun)
+                                            throw new InvalidOperationException(
+                                                "platform declared native TUN-fd ownership but exposed no descriptor");
+                                        NativeTransportCore.SetTunFd(handle, plan.Generation,
+                                            fdTun.FileDescriptor);
+                                    }
+                                    else if (NativeWintunOwnership)
+                                    {
+                                        if (_tun is not IWintunTunDevice wintun)
+                                            throw new InvalidOperationException(
+                                                "platform declared native Wintun ownership but exposed no adapter name");
+                                        NativeTransportCore.SetWintunAdapter(handle, plan.Generation,
+                                            wintun.AdapterName);
+                                    }
+                                    NativeTransportCore.NetworkPlanResult(handle, plan.Generation, true);
+                                    if (!NativeTunFdOwnership && !NativeWintunOwnership)
+                                    {
+                                        packetCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                                        (uplink, downlink) = StartNativePacketPumps(handle, plan.Generation,
+                                            _tun as IPacketTunDevice ?? throw new InvalidOperationException(
+                                                "platform declared packet TUN ownership but exposed no packet adapter"),
+                                            packetCts.Token);
+                                    }
+                                    Log($"Native NetworkPlan {plan.Generation} APPLIED: " +
+                                        $"mode={(plan.FullTunnel ? "full" : "split")} " +
+                                        $"address={plan.TunnelAddress}/{plan.PrefixLength} mtu={plan.Mtu} " +
+                                        $"dns={(dns.Count == 0 ? "system unchanged" : string.Join(", ", dns))} " +
+                                        $"plan_routes={plan.Routes.Count} pushed_routes={plan.PushedRoutes.Count} " +
+                                        $"padding={plan.DataPlane.PaddingEnabled}[{plan.DataPlane.PaddingMin}..{plan.DataPlane.PaddingMax}] " +
+                                        $"heartbeat={plan.DataPlane.HeartbeatEnabled}/{plan.DataPlane.HeartbeatIntervalMs}ms " +
+                                        $"shaping={plan.DataPlane.ShapingEnabled}");
+                                }
+                                catch (Exception error)
+                                {
+                                    Log($"ERROR: Native NetworkPlan {plan.Generation} REJECTED: {error.Message}");
+                                    try
+                                    {
+                                        NativeTransportCore.NetworkPlanResult(handle, plan.Generation, false,
+                                            error.Message);
+                                    }
+                                    catch { }
+                                    throw;
+                                }
                                 break;
                             }
 
-                            try
-                            {
-                                IPAddress carrier = ResolveNativeCarrier(plan, config);
-                                string routes = JsonSerializer.Serialize(plan.Routes);
-                                var unsupportedDns = plan.DnsServers.FirstOrDefault(item => item.Port != 53);
-                                if (unsupportedDns != null)
-                                    throw new InvalidDataException(
-                                        $"platform DNS adapter cannot apply {unsupportedDns.Address}:{unsupportedDns.Port}");
-                                var dns = plan.DnsServers.Select(item => item.Address).ToList();
-                                var session = new Session(plan.TunnelAddress, plan.PrefixLength,
-                                    dns.FirstOrDefault() ?? "", routes, plan.Mtu,
-                                    MaxStreams: plan.MaxStreams, Adaptive: plan.Adaptive,
-                                    PlannedDns: dns, PlanIncludesClientRoutes: true);
-                                SetupTun(config, session, carrier);
-                                EnforceDnsPolicy(config);
-                                _persistedClientIp = plan.TunnelAddress;
-                                _persistedNetSig = PhysicalNetSignature();
-                                if (NativeTunFdOwnership)
-                                {
-                                    if (_tun is not IFdTunDevice fdTun)
-                                        throw new InvalidOperationException(
-                                            "platform declared native TUN-fd ownership but exposed no descriptor");
-                                    NativeTransportCore.SetTunFd(handle, plan.Generation,
-                                        fdTun.FileDescriptor);
-                                }
-                                else if (NativeWintunOwnership)
-                                {
-                                    if (_tun is not IWintunTunDevice wintun)
-                                        throw new InvalidOperationException(
-                                            "platform declared native Wintun ownership but exposed no adapter name");
-                                    NativeTransportCore.SetWintunAdapter(handle, plan.Generation,
-                                        wintun.AdapterName);
-                                }
-                                NativeTransportCore.NetworkPlanResult(handle, plan.Generation, true);
-                                if (!NativeTunFdOwnership && !NativeWintunOwnership)
-                                {
-                                    packetCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                                    (uplink, downlink) = StartNativePacketPumps(handle, plan.Generation,
-                                        _tun as IPacketTunDevice ?? throw new InvalidOperationException(
-                                            "platform declared packet TUN ownership but exposed no packet adapter"),
-                                        packetCts.Token);
-                                }
-                                Log($"Native NetworkPlan {plan.Generation} APPLIED: " +
-                                    $"mode={(plan.FullTunnel ? "full" : "split")} " +
-                                    $"address={plan.TunnelAddress}/{plan.PrefixLength} mtu={plan.Mtu} " +
-                                    $"dns={(dns.Count == 0 ? "system unchanged" : string.Join(", ", dns))} " +
-                                    $"plan_routes={plan.Routes.Count} pushed_routes={plan.PushedRoutes.Count} " +
-                                    $"padding={plan.DataPlane.PaddingEnabled}[{plan.DataPlane.PaddingMin}..{plan.DataPlane.PaddingMax}] " +
-                                    $"heartbeat={plan.DataPlane.HeartbeatEnabled}/{plan.DataPlane.HeartbeatIntervalMs}ms " +
-                                    $"shaping={plan.DataPlane.ShapingEnabled}");
-                            }
-                            catch (Exception error)
-                            {
-                                Log($"ERROR: Native NetworkPlan {plan.Generation} REJECTED: {error.Message}");
-                                try
-                                {
-                                    NativeTransportCore.NetworkPlanResult(handle, plan.Generation, false,
-                                        error.Message);
-                                }
-                                catch { }
-                                throw;
-                            }
-                            break;
-                        }
-
                         case NativeTransportCore.EventStateChanged
                             when nativeEvent.State == NativeTransportCore.StateRunning && !_wasConnected:
+                            if (!PlanReplacementGuardLift())
+                                throw new InvalidOperationException(
+                                    "new tunnel is ready, but the temporary replacement firewall guard could not be restored");
                             _wasConnected = true;
                             ConnectedSince = DateTime.Now;
                             string clientIp = _persistedClientIp ?? "";
@@ -1206,7 +1520,11 @@ public abstract class VpnTunnelBase
         // Transport policy is executed by Rust; these values remain useful to platform
         // diagnostics without duplicating the bonding implementation.
         int MaxStreams = 1, bool Adaptive = false,
-        IReadOnlyList<string>? PlannedDns = null, bool PlanIncludesClientRoutes = false);
+        IReadOnlyList<string>? PlannedDns = null, bool PlanIncludesClientRoutes = false,
+        // One immutable snapshot is shared by fingerprinting and platform setup. Reading the
+        // file independently in each phase permits a concurrent edit to produce a fingerprint
+        // for one route set while installing another.
+        IReadOnlyList<string>? RouteFileRoutes = null);
 
     /// <summary>Resolve the effective TUN MTU: an explicit client config value (>0)
     /// wins, else the server-pushed value (>0), else the auto fallback (1400).</summary>
@@ -1232,6 +1550,115 @@ public abstract class VpnTunnelBase
         return new List<string>();
     }
 
+    /// <summary>The route_file snapshot attached to the authenticated generation. The fallback
+    /// keeps retained unit/legacy callers working without changing production's single-read
+    /// guarantee.</summary>
+    protected IReadOnlyList<string> EffectiveRouteFileRoutes(VpnConfig config, Session session) =>
+        session.RouteFileRoutes ?? LoadRouteFile(config);
+
+    /// <summary>Fingerprint the projection of NetworkPlan + platform-owned profile values that
+    /// actually changes host networking. Transport-only generation/data-plane facts are excluded:
+    /// changing padding or stream count must not recreate a perfectly valid TUN.</summary>
+    private static string NetworkPlanFingerprint(VpnConfig config, Session session, IPAddress serverIp)
+    {
+        var canonical = new StringBuilder(1024);
+
+        static void Add(StringBuilder target, string name, string? value)
+        {
+            value ??= "";
+            target.Append(name.Length).Append(':').Append(name)
+                .Append('=').Append(value.Length).Append(':').Append(value).Append(';');
+        }
+
+        static string NormalizeAddress(string value)
+        {
+            value = value.Trim();
+            return IPAddress.TryParse(value, out var parsed)
+                ? parsed.ToString()
+                : value.ToLowerInvariant();
+        }
+
+        static string NormalizeCidr(string value)
+        {
+            value = value.Trim();
+            int slash = value.LastIndexOf('/');
+            if (slash <= 0) return NormalizeAddress(value);
+            string address = NormalizeAddress(value[..slash]);
+            string prefix = int.TryParse(value[(slash + 1)..], out int parsed)
+                ? parsed.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                : value[(slash + 1)..].Trim();
+            return $"{address}/{prefix}";
+        }
+
+        static void AddOrdered(StringBuilder target, string name, IEnumerable<string> values,
+            Func<string, string>? normalize = null)
+        {
+            var items = values.Select(value => normalize?.Invoke(value) ?? value.Trim()).ToArray();
+            Add(target, $"{name}.count", items.Length.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            for (int index = 0; index < items.Length; index++)
+                Add(target, $"{name}[{index}]", items[index]);
+        }
+
+        static void AddSet(StringBuilder target, string name, IEnumerable<string> values,
+            Func<string, string>? normalize = null)
+        {
+            var items = values.Select(value => normalize?.Invoke(value) ?? value.Trim())
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(value => value, StringComparer.Ordinal)
+                .ToArray();
+            AddOrdered(target, name, items);
+        }
+
+        static IEnumerable<string> CanonicalRoutes(string routesJson)
+        {
+            try
+            {
+                var routes = JsonSerializer.Deserialize<List<NativeRoute>>(routesJson) ?? new();
+                // Windows/macOS install authenticated pushed routes as interface-scoped CIDRs.
+                // Their next-hop and metric are intentionally diagnostic-only on these
+                // platforms, so changing either must not tear down an otherwise identical TUN.
+                return routes.Select(route => NormalizeCidr(route.Cidr))
+                    .ToArray();
+            }
+            catch
+            {
+                // Production receives typed JSON serialized immediately above. Retaining an
+                // invalid payload verbatim makes the conservative choice (force rebuild) for
+                // legacy/test callers instead of accidentally equating two malformed plans.
+                return new[] { $"!invalid:{routesJson}" };
+            }
+        }
+
+        Add(canonical, "client_ip", NormalizeAddress(session.ClientIp));
+        Add(canonical, "prefix", session.Prefix.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        Add(canonical, "mtu", EffectiveMtu(config.Mtu, session.PushedMtu)
+            .ToString(System.Globalization.CultureInfo.InvariantCulture));
+        Add(canonical, "full_tunnel", config.IsFullTunnel.ToString());
+        Add(canonical, "plan_includes_client_routes", session.PlanIncludesClientRoutes.ToString());
+        Add(canonical, "allow_ipv6_leak", config.AllowIpv6Leak.ToString());
+        Add(canonical, "route_local", config.RouteLocalNetworks.ToString());
+        Add(canonical, "interface_metric", config.InterfaceMetric
+            .ToString(System.Globalization.CultureInfo.InvariantCulture));
+        Add(canonical, "forward", config.Forward.ToString());
+        Add(canonical, "local_address", config.LocalAddress?.Trim());
+        Add(canonical, "uses_app_filter", config.UsesAppFilter.ToString());
+        Add(canonical, "apps_mode", config.AppsMode.Trim().ToLowerInvariant());
+        Add(canonical, "carrier_address", serverIp.ToString());
+        Add(canonical, "carrier_port", config.Port.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        Add(canonical, "carrier_protocol", config.Protocol.Trim().ToLowerInvariant());
+
+        // Resolver order is significant (primary/secondary); route and app collections are sets.
+        AddOrdered(canonical, "dns", EffectiveDns(config, session), NormalizeAddress);
+        AddSet(canonical, "plan_routes", CanonicalRoutes(session.RoutesJson));
+        AddSet(canonical, "profile_include_routes", config.IncludeRoutes, NormalizeCidr);
+        AddSet(canonical, "profile_exclude_routes", config.ExcludeRoutes, NormalizeCidr);
+        AddSet(canonical, "route_file_routes", session.RouteFileRoutes ?? Array.Empty<string>(), NormalizeCidr);
+        AddSet(canonical, "apps", config.Apps, value => value.Trim());
+
+        byte[] digest = SHA256.HashData(Encoding.UTF8.GetBytes(canonical.ToString()));
+        return Convert.ToHexString(digest);
+    }
+
     /// <summary>Pure policy checks used by both desktop headless self-test runners.</summary>
     internal static void RunNetworkPolicySelfTests(Action<string, bool> check)
     {
@@ -1242,7 +1669,8 @@ public abstract class VpnTunnelBase
         var unresolved = EffectiveDns(empty, LegacySession());
         check("dns-policy: no profile/push DNS invents no public resolver", unresolved.Count == 0);
 
-        var explicitConfig = new VpnConfig {
+        var explicitConfig = new VpnConfig
+        {
             AddDefaultGateway = true,
             DnsMode = "tunnel",
             DnsServers = new List<string> { "9.9.9.9" },
@@ -1252,7 +1680,8 @@ public abstract class VpnTunnelBase
         check("dns-policy: authenticated server push is used when profile DNS is empty",
             EffectiveDns(empty, LegacySession("10.9.0.1")).SequenceEqual(new[] { "10.9.0.1" }));
 
-        var disabled = new VpnConfig {
+        var disabled = new VpnConfig
+        {
             AddDefaultGateway = true,
             DnsMode = "off",
             DnsServers = new List<string> { "9.9.9.9" },
@@ -1273,6 +1702,80 @@ public abstract class VpnTunnelBase
         check("carrier-dns: generation wrap retains the complete A set",
             RotateCarrierCandidates(carriers, 4)
                 .SequenceEqual(new[] { "192.0.2.11", "192.0.2.12", "192.0.2.10" }));
+
+        var persistConfig = new VpnConfig
+        {
+            AddDefaultGateway = false,
+            PersistTun = true,
+            DnsMode = "tunnel",
+            IncludeRoutes = new List<string> { "10.20.0.0/16" },
+        };
+        const string planRoutes =
+            "[{\"cidr\":\"10.20.0.0/16\",\"gateway\":\"10.9.0.1\",\"metric\":100}," +
+            "{\"cidr\":\"192.0.2.53/32\",\"gateway\":\"10.9.0.1\",\"metric\":50}]";
+        const string reorderedPlanRoutes =
+            "[{\"cidr\":\"192.0.2.53/32\",\"gateway\":\"10.9.0.1\",\"metric\":50}," +
+            "{\"cidr\":\"10.20.0.0/16\",\"gateway\":\"10.9.0.1\",\"metric\":100}]";
+        var persistedPlan = new Session("10.9.0.2", 24, "", planRoutes, PushedMtu: 1400,
+            PlannedDns: new[] { "192.0.2.53", "192.0.2.54" },
+            PlanIncludesClientRoutes: true,
+            RouteFileRoutes: new[] { "198.51.100.0/24" });
+        var carrier = IPAddress.Parse("203.0.113.7");
+        string persistedFingerprint = NetworkPlanFingerprint(persistConfig, persistedPlan, carrier);
+
+        check("persist-tun fingerprint: identical applied plan is reusable",
+            persistedFingerprint == NetworkPlanFingerprint(persistConfig, persistedPlan, carrier));
+        check("persist-tun fingerprint: route order is canonical",
+            persistedFingerprint == NetworkPlanFingerprint(
+                persistConfig, persistedPlan with { RoutesJson = reorderedPlanRoutes }, carrier));
+        check("persist-tun fingerprint: ignored pushed next-hop/metric do not rebuild desktop TUN",
+            persistedFingerprint == NetworkPlanFingerprint(
+                persistConfig,
+                persistedPlan with
+                {
+                    RoutesJson =
+                        "[{\"cidr\":\"10.20.0.0/16\",\"gateway\":\"10.9.0.254\",\"metric\":999}," +
+                        "{\"cidr\":\"192.0.2.53/32\",\"gateway\":\"\",\"metric\":0}]",
+                },
+                carrier));
+        check("persist-tun guard: initial setup does not raise a replacement firewall",
+            !NeedsSystemPlanReplacementGuard(hasPersistedTun: false, usesAppFilter: false));
+        check("persist-tun guard: retained per-app capture is its own fail-closed guard",
+            !NeedsSystemPlanReplacementGuard(hasPersistedTun: true, usesAppFilter: true));
+        check("persist-tun guard: changed retained system TUN is firewall-guarded",
+            NeedsSystemPlanReplacementGuard(hasPersistedTun: true, usesAppFilter: false));
+        check("persist-tun fingerprint: transport-only facts do not rebuild TUN",
+            persistedFingerprint == NetworkPlanFingerprint(
+                persistConfig, persistedPlan with { MaxStreams = 8, Adaptive = true }, carrier));
+        check("persist-tun fingerprint: prefix change rebuilds TUN",
+            persistedFingerprint != NetworkPlanFingerprint(
+                persistConfig, persistedPlan with { Prefix = 25 }, carrier));
+        check("persist-tun fingerprint: MTU change rebuilds TUN",
+            persistedFingerprint != NetworkPlanFingerprint(
+                persistConfig, persistedPlan with { PushedMtu = 1320 }, carrier));
+        check("persist-tun fingerprint: DNS change rebuilds TUN",
+            persistedFingerprint != NetworkPlanFingerprint(
+                persistConfig, persistedPlan with { PlannedDns = new[] { "192.0.2.55" } }, carrier));
+        check("persist-tun fingerprint: pushed route removal rebuilds TUN",
+            persistedFingerprint != NetworkPlanFingerprint(
+                persistConfig,
+                persistedPlan with
+                {
+                    RoutesJson =
+                        "[{\"cidr\":\"10.20.0.0/16\",\"gateway\":\"10.9.0.1\",\"metric\":100}]",
+                },
+                carrier));
+        check("persist-tun fingerprint: route_file change rebuilds TUN",
+            persistedFingerprint != NetworkPlanFingerprint(
+                persistConfig,
+                persistedPlan with { RouteFileRoutes = new[] { "198.51.101.0/24" } },
+                carrier));
+        check("persist-tun fingerprint: carrier change rebuilds pinned route",
+            persistedFingerprint != NetworkPlanFingerprint(
+                persistConfig, persistedPlan, IPAddress.Parse("203.0.113.8")));
+        persistConfig.ExcludeRoutes.Add("172.16.0.0/12");
+        check("persist-tun fingerprint: exclude-route change rebuilds TUN",
+            persistedFingerprint != NetworkPlanFingerprint(persistConfig, persistedPlan, carrier));
     }
 
     /// <summary>Rungs of the path-MTU ladder, in TUNNEL (inner) MTU units, highest first.

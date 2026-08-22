@@ -22,6 +22,7 @@ struct RoutingState: Codable, Equatable {
     var carrierPort: Int
     var carrierProtocol: String
     var allowIpv6Leak: Bool
+    var fullTunnel: Bool
     var routeLocalNetworks: Bool
     var includeRoutes: [String]
     var excludeRoutes: [String]
@@ -46,6 +47,7 @@ struct RoutingState: Codable, Equatable {
             && carrierPort == other.carrierPort
             && carrierProtocol == other.carrierProtocol
             && allowIpv6Leak == other.allowIpv6Leak
+            && fullTunnel == other.fullTunnel
             && routeLocalNetworks == other.routeLocalNetworks
             && includeRoutes == other.includeRoutes
             && excludeRoutes == other.excludeRoutes
@@ -67,18 +69,20 @@ struct RoutingState: Codable, Equatable {
         if excludeRoutes.compactMap(CIDR.init).contains(where: { $0.contains(address) }) {
             return .bypass
         }
+        let explicitlyTunneled = (includeRoutes + pushedRoutes).compactMap(CIDR.init)
+            .contains(where: { $0.contains(address) })
         if address.isIPv6 {
             if address.isIPv6LoopbackOrLinkLocal { return .bypass }
+            if explicitlyTunneled { return .drop }
+            if !fullTunnel { return .bypass }
             return allowIpv6Leak ? .bypass : .drop
         }
         if address.isIPv4LoopbackOrLinkLocal { return .bypass }
+        if explicitlyTunneled { return .tunnel }
         if address.isRFC1918 {
-            let explicit = routeLocalNetworks
-                || (includeRoutes + pushedRoutes).compactMap(CIDR.init)
-                    .contains(where: { $0.contains(address) })
-            return explicit ? .tunnel : .bypass
+            return routeLocalNetworks ? .tunnel : .bypass
         }
-        return .tunnel
+        return fullTunnel ? .tunnel : .bypass
     }
 }
 
@@ -97,9 +101,46 @@ enum RoutingStateStore {
         try JSONDecoder().decode(RoutingState.self, from: Data(contentsOf: try url()))
     }
 
-    static func save(_ state: RoutingState) throws {
+    /// Replace the complete policy under the same cross-process lock used by lease
+    /// heartbeats and tunnel-down transitions. Atomic file replacement protects readers
+    /// from partial JSON, but by itself it does not protect a read/modify/write operation:
+    /// a guardian could load the old policy, an update could install a new one, and the
+    /// guardian could then atomically replace it with its stale copy. `flock` serializes
+    /// every writer while providers continue to read the atomically replaced snapshot.
+    static func replace(_ state: RoutingState) throws {
+        try withExclusiveLock { try saveUnlocked(state) }
+    }
+
+    static func mutate(_ body: (inout RoutingState) -> Void) throws {
+        try withExclusiveLock {
+            var state = try load()
+            body(&state)
+            try saveUnlocked(state)
+        }
+    }
+
+    private static func saveUnlocked(_ state: RoutingState) throws {
         let data = try JSONEncoder().encode(state)
         try data.write(to: url(), options: .atomic)
+    }
+
+    private static func withExclusiveLock<T>(_ body: () throws -> T) throws -> T {
+        let lockURL = try url().deletingLastPathComponent()
+            .appendingPathComponent("\(qeliStateFile).lock")
+        let descriptor = Darwin.open(
+            lockURL.path,
+            O_CREAT | O_RDWR,
+            S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP
+        )
+        guard descriptor >= 0 else { throw posixError() }
+        defer { Darwin.close(descriptor) }
+        guard flock(descriptor, LOCK_EX) == 0 else { throw posixError() }
+        defer { _ = flock(descriptor, LOCK_UN) }
+        return try body()
+    }
+
+    private static func posixError() -> NSError {
+        NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
     }
 
     enum StateError: LocalizedError {

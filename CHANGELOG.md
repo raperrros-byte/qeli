@@ -1,46 +1,384 @@
 # Changelog
 
-Заметные изменения qeli, обратно-хронологически. Версии — единые на все компоненты
-(Rust-демон, клиенты Windows / macOS / Android). Бинарные артефакты публикуются во
+Заметные изменения qeli, обратно-хронологически. Версии — единые на сервер и все клиенты
+(Linux/OpenWrt, Android, iOS, Windows и macOS). Бинарные артефакты публикуются во
 вкладке **GitHub Releases** (в git не коммитятся — см. `.gitignore`).
 
-## [0.7.15] — не выпущен
+## [0.7.16] — 2026-08-19
 
-### Форк [raperrros-byte/qeli](https://github.com/raperrros-byte/qeli) — 2026-08-15
+### Форк [raperrros-byte/qeli](https://github.com/raperrros-byte/qeli) — 2026-08-22
 
 Maintained by: Daniil Nekrasov \<raperrros@yandex.ru\>
 
-- **Авто-подбор транспорта.** Клиент ранжирует профили
-  (reality-tls → fake-tls → obfs → plain → QUIC/UDP) по TCP-probe и preference-order,
-  выбирает рабочий режим; при обрыве — failover на следующий профиль.
-  CLI: `auto_transport` / `auto_transport_order`, `--auto-transport`,
-  `qeli probe-transports`, `qeli speedtest`.
-- **Режим × SNI матрица (Windows).** Окно ⚡: все выбранные профили × все выбранные
-  SNI, «Выбрать все», пауза между пробами (мс), Apply best. Рядом с **Подключить** —
-  чекбокс **Авто**: при коннекте сам прогоняет матрицу и применяет лучшую связку.
-- **Вкладка SNI (Android).** Каталог front-хостов (~285 из community Reality SNI lists +
-  CDN), тест TLS+HTTPS (LibreSpeed-стиль), Top-20 / Apply best; на главном экране —
-  авто-транспорт, SNI и panel speedtest. Исправлен OOM при отрисовке всего каталога
-  в `LinearLayout` и битый `activity_main.xml`.
-- **Панель API.** `GET /api/transport/modes`, `GET /api/transport/sni-presets`,
-  `GET /api/speedtest?bytes=…`; `/api/transport/health` дополнен блоком
-  `auto_transport`. Smoke: `scripts/smoke_transport_auto_api.py`.
-- **Каталог SNI.** `scripts/build_sni_catalog.py` →
-  `qeli-shared/…/sni_hosts.txt` и Android `assets/sni_hosts.txt`
-  (meower1 / Reza-shojaei / evkir + CDN seeds).
-- **Panel speedtest (Windows):** обход self-signed/mismatched TLS, fallback URL
-  (`http://IP:8080`, `https://host`, …), показ root-exception вместо
-  «SSL connection could not be established».
-- **Lab deploy host2:** `remote-upgrade-host2.sh` делает `chown root` **после**
-  `dpkg`, иначе postinst возвращает `qeli:qeli` и unit под root падает на
-  `users.conf` Permission denied.
+- Merge upstream `v0.7.16` с сохранением fork-фич: auto-transport, Mode×SNI matrix, SNI tab Android, geo routing, local proxy.
 
-- Подготовлено единое двуязычное описание GitHub Release `0.7.15`: сначала английская, затем
+Подробное двуязычное описание и примечания по обновлению:
+[`release/RELEASE_NOTES_0.7.16.md`](release/RELEASE_NOTES_0.7.16.md).
+
+- GitHub Release `v0.7.16` подготовлен как beta/prerelease: 16 платформенных payload-файлов и
+  `SHA256SUMS` публикуются только после повторной сверки всех GitHub asset digest с локальным
+  кандидатом; tag, `dev` и `main` указывают на один проверенный release-коммит.
+
+### Мобильные клиенты
+
+- Размер QR-диалога Android теперь задаётся до первой инициализации ZXing
+  (поздний resize оставлял рамку смещённой на реальных устройствах). Область декодирования
+  теперь совпадает со всем видимым квадратом камеры, без дополнительной затемнённой
+  70-процентной рамки; поворот устройства пересоздаёт scanner
+  с корректной геометрией. На iOS квадрат камеры позиционируется относительно геометрического
+  центра sheet независимо от расположенной под ним подсказки.
+- Android получил такой же автоматический опрос сохранённых профилей, как Windows и macOS:
+  настройка включена по умолчанию, интервал задаётся в диапазоне 10–3600 секунд (30 секунд по
+  умолчанию), проверки выполняются только у видимого приложения с отключённым VPN и защищены
+  от частых повторных sweep. Ручные проверки одного или всех профилей продолжают работать отдельно.
+- Android и iOS получили локальную политику доверенного Wi-Fi с точным списком SSID. Android
+  сохраняет foreground-контроллер без TUN и восстанавливает выбранный профиль после выхода из
+  сети; Disconnect, смена сети во время teardown и process restart не теряют пользовательский
+  intent. Lockdown/`kill_switch` всегда сильнее доверенного SSID и запрещает снимать TUN, а на
+  Android 9–11 события вторичных carrier-сетей больше не управляют этой политикой. iOS использует
+  упорядоченные On Demand Disconnect/Connect rules и показывает нейтральное ожидание сетевой
+  политики, поскольку NetworkExtension не раскрывает приложению, какое правило совпало.
+- Выключение Android-автоопроса теперь отменяет не только таймер, но и уже запущенные
+  автоматические проверки. Одиночный автоопрос не выходит напрямую в сеть во время Trusted Wi-Fi
+  pause; TCP probe закрывает сокет также при timeout/ошибке, а отмена UDP probe доходит через JNI
+  до конкретного Rust future и закрывает native socket. Гонка «отмена до регистрации» закрыта
+  ограниченным реестром ранних/завершённых `probe_id`, а shutdown локального runtime ограничен,
+  чтобы отмена не ждала оставшийся системный DNS-worker. До обязательной финальной пересборки
+  19-export ядра Android автоматически использует присутствующий в 17-export baseline старый
+  bounded UDP probe, поэтому UDP-профили не помечаются недоступными из-за отсутствующего JNI
+  символа; после пересборки включается cancellable-путь. Ручной опрос остаётся независимым.
+- Android Always-on проходит через тот же Trusted Wi-Fi gate, что запуск из приложения, tile и
+  widget. Если системный NetworkCallback зарегистрировать невозможно, сервис не остаётся в
+  вечном observer-less ожидании: он fail-safe поднимает VPN; принудительное восстановление
+  запускает reconnect-loop даже при временном отсутствии сети, поскольку ждать следующего
+  callback в этом состоянии уже некому. iOS сериализует полные
+  mutate/save/load транзакции NetworkExtension FIFO-гейтом, а синхронная ревизия UI-настройки
+  гарантирует, что быстро созданная старая Task не перезапишет более новый On Demand policy.
+- Активная проверка UDP-профиля на iOS теперь всегда использует нативный UDP first flight, в том
+  числе через tunnel gateway при уже поднятом VPN; UDP-only listener больше не проверяется ложным
+  TCP connect. Android и iOS ограничивают одновременно выполняемые ручные и автоматические
+  проверки четырьмя слотами, поэтому большой список профилей не создаёт burst из DNS-запросов
+  и сокетов; повторный запрос уже активного iOS-профиля не ставится в очередь второй раз.
+- Android и iOS читают импортируемые профили и backup вне UI thread с жёсткими пределами размера.
+  До замены или сохранения проверяются число профилей, active index, уникальность iOS UUID,
+  размеры имён/конфигов и полная валидность каждого INI. Android предварительно кодирует весь
+  prospective-набор до изменения живого списка, поэтому превышение общего лимита не оставляет
+  несохранённое состояние и не затирает старое хранилище при следующем запуске. Encrypted backup
+  допускает отдельный 12-МиБ envelope, необходимый для base64-представления валидного 8-МиБ JSON.
+
+### Сон, roaming и восстановление соединения
+
+- Намеренный reconnect после сна или смены физической сети больше не считается неудачной
+  попыткой и не увеличивает backoff `1→2→4→…→32` секунд. Исправление действует в общем Rust-ядре,
+  Linux CLI, Android, iOS, Windows и macOS.
+- Android больше не перезапускает исправный туннель при обычном screen-off: reconnect выполняется
+  только при фактическом изменении сигнатуры физической сети либо по RX-liveness watchdog.
+  Та же проверка физического пути применяется desktop-клиентами после resume.
+- Устаревший platform ACK от уже остановленной generation считается нормальным исходом гонки.
+  Ошибка обработки одного Android/iOS event больше не завершает единственный dispatcher и не
+  превращает все последующие подключения в постоянный `PLATFORM_REJECTED`.
+- Во время handover Android перечисляет доступные carrier-сети и предпочитает валидированную,
+  если `currentNetwork` ещё пуст, а `activeNetwork` уже указывает на собственный VPN. Базовая
+  сигнатура сети обновляется только после реального reconnect, поэтому событие не теряется.
+- Физический DNS Android переведён на ограниченный пул из двух запросов, ключованных по
+  `networkHandle:server`: зависший resolver старой сети не блокирует новую, а серия network flap
+  не создаёт неограниченное число потоков и заданий.
+- Терминальная ошибка фонового transport runner гарантированно вытесняет заполненную очередь
+  событий; поздний ACK не может оживить уже упавшую generation. Конфигурация ядра с однослотовой
+  очередью отклоняется заранее, потому что она не вмещает атомарную публикацию lifecycle и plan.
+
+### MTU, packet path и диагностика потерь
+
+- Downlink-пулы Android, iOS, Windows packet path и общего ядра рассчитывают размер слота из
+  согласованного MTU плюс запас на padding/normalization, а не резервируют 64 КиБ под каждый
+  пакет около 1,3 КиБ. Число слотов согласовано с принимающей очередью; превышающий резерв record
+  увеличивает свой буфер и не отбрасывается только из-за размера начального слота.
+- Общий `internal_drops` разложен в Linux CLI diagnostics на `pool_exhausted`, `queue_full`,
+  `oversize`, `unsupported` и `tun_write`. Отказы TUN writer с `EAGAIN`/`ENOBUFS`, ранее не
+  попадавшие ни в один счётчик, теперь учитываются отдельно.
+- Ошибка `dup()` очереди TUN и частичная запись IP-пакета больше не маскируются как успешная
+  передача: writer останавливается с диагностируемой ошибкой вместо отправки усечённого пакета.
+- UDP reachability резолвит до 16 различных IPv4 A-записей и проверяет их параллельно в одном
+  ограниченном временном окне; недоступный первый адрес DNS больше не делает рабочий профиль
+  красным. IPv4 path-MTU ladder опускается до поддерживаемого inner MTU 576, тогда как IPv6
+  сохраняет обязательный floor 1280 с учётом внешнего overhead.
+- Windows IPv4 fragmentation сохраняет IP options только на тех фрагментах, где установлен copy
+  bit, пересчитывает IHL/checksum для сокращённого заголовка и отклоняет malformed options,
+  невыравненный non-final fragment и переполнение 13-битного fragment offset.
+- Windows per-app NAT больше не пересчитывает TCP/UDP checksum первого входного фрагмента как
+  будто отсутствующий хвост payload имеет нулевую длину. Адреса и порты корректируются по RFC 1624,
+  IPv4 header checksum считается отдельно, нулевой UDP checksum остаётся отключённым; усечённый
+  первый transport header и частичный фрагментированный ICMP error отклоняются fail-closed.
+- Windows и macOS per-app теперь соблюдают `gateway = false`: выбранные приложения направляют в
+  туннель только явные/pushed routes и связанную туннельную подсеть, остальные публичные IPv4 и
+  нативный IPv6 идут напрямую. Явно включённый IPv6-префикс остаётся захваченным fail-closed до
+  появления IPv6 inner data plane; Android split-tunnel также явно разрешает остальной IPv6.
+
+### Клиентский lifecycle, DNS, маршруты и kill switch
+
+- Linux/OpenWrt DNS использует приватные per-interface ownership-маркеры до изменения
+  systemd-resolved. Неудачный `resolvectl revert` оставляет маркер для повторной очистки;
+  recovery не трогает живой интерфейс другого клиента и восстанавливает legacy `resolv.conf`
+  только после выхода последнего подтверждённого владельца.
+- Настройка gateway NAT и exit node теперь отказывается продолжать работу, если нельзя включить
+  `net.ipv4.ip_forward`; частично созданные sysctl/firewall-правила откатываются, а ошибки отката
+  возвращаются вызывающему коду. `exit_node = true` несовместим с `gateway = true`, потому что
+  самому exit node нужен физический default route.
+- Linux kill switch получил отдельные цепочки на экземпляр, строгую проверку наличия/ошибки
+  инспекции, откат частично установленного ruleset и удаление legacy-цепочки. Перед reconnect
+  разрешения серверных IP обновляются без временного снятия финального DROP; при teardown kill
+  switch снимается последним, после TUN/NAT/forwarding.
+- Журнал владения маршрутами больше не забывает запись после неудачного удаления: cleanup можно
+  повторить. Отсутствующий уже удалённый маршрут остаётся идемпотентным успехом, а ошибки очистки
+  TUN-маршрутов, интерфейса и bypass-маршрутов возвращаются раздельно.
+- Сервер и Linux-клиент не удаляют и не присоединяются к заранее существующему TUN без доказанного
+  владения. Совпадающие имена TUN между профилями, включая отключённые, обнаруживаются до
+  `TUNSETIFF`, чтобы разные generation не разделили multi-queue устройство.
+- Идентификатор устройства и identity/TOFU-ключи создаются под межпроцессной блокировкой:
+  конкурентный первый запуск публикует одно устойчивое значение. Ошибка сохранения device ID
+  видна в логе, а повреждённый или заблокированный known-hosts store не заменяется молча.
+- Результат `auth.password_command` теперь проверяется по exit status, а размер фактического
+  credential проверяется и для `password_file`/`password_command`, а не только для inline password.
+  Пароль обёрнут в zeroizing storage; `ClientConfig::drop` очищает password, command и obfs key во
+  всех клонах конфигурации после reconnect/bonding.
+
+### Windows и macOS
+
+- macOS GUI снова устанавливает и останавливает launchd-демон через системный диалог
+  администратора: root-helper очищает унаследованную от `security_authtrampoline` маску сигналов,
+  поэтому завершившиеся `launchctl`, `networksetup`, `route`, `ifconfig` и `pfctl` больше не
+  превращаются в ложные 20/30-секундные timeout. Полный сброс ограничен macOS root-helper,
+  запущенным GUI с `QELI_INVOKING_UID` и одним из `daemon-install`/`daemon-uninstall`/
+  `daemon-start`/`daemon-stop`; обычные GUI, launchd service и CLI сохраняют маску родителя.
+- Desktop `Start()` больше не публикует промежуточный `Disconnected` во время внутреннего
+  generation handoff. Windows и macOS сохраняют активный профиль только после успешного старта,
+  считают живой reconnect-loop работающим даже в статусе Error и не удаляют/не заменяют профиль
+  при незавершённом teardown. macOS также не проглатывает ошибку Disconnect, повторно принимает
+  SIGINT/SIGTERM после неудачной очистки и безопасно запускает `uishot` без synthetic
+  `SelectionChangedEventArgs`.
+- `persist_tun` на Windows и macOS больше не считает один неизменившийся client IP достаточным для
+  повторного использования старого TUN. Сохраняется канонический fingerprint реально применённого
+  сетевого состояния: IP/prefix, эффективные MTU и упорядоченный DNS, NetworkPlan routes,
+  include/exclude и snapshot `route_file`, carrier path и platform policy. Wintun/utun повторно
+  используются только при полном совпадении; любое изменение пересобирает адрес, маршруты, DNS и
+  MTU до положительного NetworkPlan ACK. Self-test покрывает изменение каждого поля, перестановку
+  эквивалентных маршрутов и исключение transport-only параметров из fingerprint.
+- Изменившийся системный NetworkPlan/физический carrier пересобирается под временным firewall
+  guard даже тогда, когда пользовательский kill switch выключен; guard снимается только после
+  `Running`, а ошибка восстановления остаётся fail-closed. WinDivert и macOS per-app вместо
+  разрушения retained TUN атомарно заменяют classifier/address/MTU/routes/DNS под состоянием
+  tunnel-down; macOS до нового dial снимает старый carrier pin, чтобы исчезнувший gateway не
+  блокировал повторную аутентификацию. Guard не включается на первом TUN/per-app старте.
+  Диагностические gateway/metric, которые platform adapter не применяет, больше не вызывают
+  ложную пересборку.
+- После терминальной desktop-ошибки Windows и macOS повторно рендерят состояние уже после фактического
+  завершения run task: кнопка меняется с неработающего `Disconnect` на `Connect`, снимается stale
+  active-profile lock и возобновляется reachability polling.
+- Новый desktop tunnel не стартует, пока предыдущая task не освободила общее состояние;
+  восьмисекундный таймаут остаётся ошибкой, а не разрешением повторно использовать TUN/socket.
+  Ошибки старта, DNS, route, firewall и teardown доходят до службы и UI вместо ложного статуса
+  `Disconnected`.
+- C#-обвязка проверяет непустой `NetworkPlan`, совпадение generation, поддерживаемость DNS endpoint
+  платформенным adapter и наличие заявленного native TUN/Wintun/packet descriptor. Некорректный
+  plan отклоняется до изменения сетевого состояния.
+- macOS kill switch перенесён в собственный PF anchor и больше не заменяет глобальный ruleset.
+  Он различает живого владельца и след от crash, сериализует PF-операции, откатывает частичное
+  включение и разрешает UDP/TCP 53 только к системным resolver, а не `to any`.
+- Windows native extraction при elevated-запуске использует каталог с ACL только для
+  Administrators и SYSTEM, не наследуя запись от пользовательского родителя. Службы Windows и
+  macOS отказываются запускать новую generation, если recovery прежнего kill switch не доказан.
+- Desktop-редактор сохраняет все поддерживаемые, но не показанные в форме INI-поля и маркеры
+  неизвестных/ошибочных ключей. Маркер снимается только с поля, реально исправленного формой;
+  устранённая duplicate-key неоднозначность не переносится. Переданный, но некорректный pinned key
+  теперь вызывает ошибку и не превращается молча в незакреплённый TOFU.
+- Desktop network debounce больше не поглощает реальную вторую смену carrier сразу после
+  принудительного reconnect; сохранённая сигнатура обновляется только согласованным состоянием.
+  macOS per-app сериализует полные policy replace и guardian heartbeat межпроцессным `flock`,
+  поэтому heartbeat не возвращает старую политику. Ошибка update оставляет уже установленное
+  расширение и guardian в tunnel-down fail-closed состоянии вместо отключения фильтра.
+
+### Сервер, панель и конфигурация
+
+- Все дочерние задачи profile generation закрываются для новых работ, abort/join выполняется до
+  удаления TUN, NAT и реестровой записи. Старый supervisor не может удалить уже зарегистрированную
+  replacement-generation с тем же именем; teardown-тест синхронизирован по фактическому Drop.
+- Control socket связывается и защищается до старта data plane. Ошибка bind/accept либо исчезновение
+  control task теперь фатальны для worker, а дочерние client-tunnel процессы получают timeout,
+  kill и обязательный reap вместо потери process handle или zombie.
+- Серверная identity создаётся атомарно и конкурентно безопасно без изменения прав произвольного
+  пользовательского parent-каталога. REALITY-профиль с `target_port = 0` отклоняется как заведомо
+  недостижимый decoy endpoint.
+- Usage accounting загружается fail-closed: повреждённый файл не превращается в пустые квоты и не
+  перезаписывается. Reload сохраняет последний корректный диагностический снимок, reset и flush
+  сериализованы, а неудачная запись откатывает изменение счётчика в памяти.
+- Аутентифицированный Logout панели повышает сохранённую session generation и отзывает все
+  выданные сессии. Ошибка долговременной записи возвращается оператору и не выдаётся за успешный
+  logout. Создание session key сериализовано между процессами, файл имеет режим `0600`,
+  повреждённый ключ не перезаписывается, а нечитаемая generation не откатывает проверку к
+  разрешающему значению `0`.
+- `allowed_networks` пользователей и групп проверяется одинаково для panel, inline, file-based и
+  restored config. Ошибочный CIDR отклоняет базу; runtime fallback для явно заданного, но полностью
+  невалидного списка остаётся deny-all. Метрика пользовательского route обязана быть целым `u32`.
+- Изменения пользователя строятся и валидируются на клоне до публикации: невалидный route/ACL или
+  конкурентное удаление не оставляет частично изменённые secrets и поля в памяти.
+- Preflight распознаёт `blackhole`, `unreachable`, `prohibit` и другие typed routes и не позволяет
+  отключённому профилю скрыть конфликт с физическим интерфейсом или маршрутом.
+- Backup/restore принимает active config только по нормальному пути внутри `/etc/qeli`, требует и
+  валидирует указанный `users_file`, отклоняет неизвестное содержимое `.conf`, небезопасные hook,
+  symlink и расхождение типов staged/live. Exact restore не заявляет успех, если в live-дереве
+  останутся отсутствующие в архиве вложенные файлы; вся проверка выполняется до публикации.
+- Quick Start проверяет коллизию по фактическим сохранённым bind port и transport существующего
+  профиля, а не по текущим значениям карточки. Повторный запуск того же режима разрешён; конфликт
+  с другим профилем требует сначала сменить его bind.
+- IPv4-only data plane отклоняет IPv6 DNS resolver в client config и server push с явным
+  сообщением и текущей версией. Установочный скрипт аналогично не принимает IPv6 literal в
+  `PUBLIC_HOST`, вместо генерации заведомо неработоспособного клиентского endpoint.
+- Rust round-trip fixture клиента теперь обязательно содержит `server` и `dns_servers`, а
+  автоматический тест сверяет fixture со всеми runtime-ключами, чтобы новый параметр нельзя было
+  добавить в parser и забыть в проверке сохранения.
+- `qeli check-config` теперь загружает внешний `users_file` тем же строгим `UsersDb`, что worker:
+  повреждённый INI, нечитаемые лимиты, ACL и неизвестные ключи больше не получают `OK` перед
+  отказом worker; отсутствующий файл допустим только при наличии inline users/groups, ровно как
+  при реальном запуске supervisor. Инсталлятор проверяет окончательный server.conf вместе с
+  users.conf после всех `add-client`/web-изменений и до рестарта существующего сервиса.
+- Команды `install-polkit` и `set-service-user` проверяют systemd unit и service user до вставки в
+  путь или правило, пишут drop-in/rule атомарно с явными правами и проверяют результат `chmod`,
+  `chown` и `systemctl daemon-reload`. При возврате с root на пользователя qeli владение
+  `/etc/qeli` исправляется до удаления рабочего root override.
+- Панель показывает hostname текущего сервера рядом с версией, а подписи UDP-метрик явно различают
+  размер очереди и заполнение сокетного буфера. Наличие административного доступа теперь
+  проверяется реальным `pkcheck`, без чтения системных polkit rules, которые обычно недоступны
+  непривилегированному пользователю; отсутствие helper или неоднозначный результат не выдаются за
+  подтверждённый запрет.
+- Удаление client-профиля в панели сначала обязано успешно остановить процесс и удалить основной
+  файл; ошибки удаления log/status возвращаются отдельным warning. Ошибка сериализации notification
+  config или создания каталога web TLS certificate больше не превращается в пустой/частичный файл
+  либо молча продолженный запуск.
+
+### Фрейминг, инкапсуляция и wire-совместимость
+
+- FFI отклоняет `(null, positive_length)` и принимает нулевой указатель только вместе с нулевой
+  длиной. EOF посередине TLS record считается `UnexpectedEof`, а не чистым завершением потока.
+- Rust, C# и Swift packet decoder требуют, чтобы переданный AEAD record целиком и точно совпадал
+  с объявленной длиной. Аутентифицированный корректный префикс с неаутентифицированным хвостом
+  отклоняется; in-place буфер при любой ошибке очищается.
+- UDP handshake проверяет каждый length-prefixed record, переполнение и полную доступность тела до
+  дорогого PQ/TLS key schedule. Усечённый `ChangeCipherSpec`, Certificate, Finished либо
+  NewSessionTicket больше не продвигает offset за границы datagram.
+- TCP/sans-IO handshake также требует корректный `ChangeCipherSpec` и `NewSessionTicket` вместо
+  проглатывания ошибки чтения. Ошибки генерации certificate, настройки TLS 1.3 и session ticketer
+  возвращаются из REALITY setup вместо panic; IPv6 decoy target форматируется через общий
+  host/port helper.
+- Новый QUIC-masking envelope всегда отправляет строгий qeli Initial `0xC3`; parser временно
+  принимает только точную legacy-форму `0xE3` для rolling upgrade. Проверяются QUIC v1, DCID ровно
+  4 байта, нулевые SCID и Token Length, четырёхбайтовый packet number, корректный varint Length и
+  полное потребление datagram. Short header принимает только ожидаемый qeli flags `0x43`.
+- Сервер включает QUIC-режим только после полного структурного разбора первого datagram, а не по
+  короткому magic-prefix. Переполненные/усечённые varint и лишний хвост отклоняются одинаково в
+  Rust, C# и Swift.
+- Межъязыковые fixtures packet decode, QUIC, UDP fragmentation, replay window, PRP nonce и HKDF
+  генерируются Rust-каноном и явно перечисляют реальные независимые consumers: Rust, retained C#
+  и Swift; Kotlin оставлен только для формата qeli-link. Документация больше не называет masking
+  полноценным QUIC: Initial AEAD, header protection, CRYPTO frame и padding до 1200 байт не
+  реализованы.
+
+### Сборка, release gate и гигиена
+
+- Символ `DELIBERATE_CYCLE` доступен на всех target, а не только Linux; это устранило ошибку E0425
+  при сборке Android core. После исправления Android `.so` были воспроизводимо пересобраны и
+  разложены, экспортируемые JNI/client ABI не изменились.
+- Rust build восстановлен после hardening-рефакторинга, код приведён к `rustfmt`, оставшиеся Clippy
+  warnings устранены. Тест teardown raw descriptor выполняется последовательно и ждёт фактического
+  освобождения ресурса, исключая ложное падение из-за повторного номера fd.
+- Keenetic scripts вычисляют пути от собственного checkout, а не из захардкоженного каталога
+  разработчика. Native recipe gate проверяет это и ненулевые exit code helpers.
+- Config/multiprofile/installer E2E также вычисляют checkout и текущую версию из manifest,
+  принимают lab/tool paths через окружение, валидируют все `qeli/config/*.conf` строгими
+  server/client-командами, завершаются ненулевым кодом при любом красном сценарии, запускают
+  supervisor в отдельной session и завершают всю его process group с TERM/KILL bound, не оставляя
+  `_worker`. PID считается принадлежащим тесту только при совпадении `/proc/<pid>/exe` и PGID,
+  поэтому stale/подложенный `/tmp`-файл не может послать групповой сигнал чужому процессу;
+  в `finally` восстанавливаются только ранее активные systemd units.
+  Management-route override Linux matrix больше не смешивается с захардкоженным prefix при
+  проверке/очистке, учитывает IPv4/IPv6 family и передаётся удалённой shell только после
+  parse+quoting. Android E2E разрешает путь `adb` на удалённом lab-хосте, а не на машине запуска.
+- Все активные Python-рецепты сборки, диагностики и A/B-проверок вычисляют checkout от `__file__`;
+  каталоги артефактов и внешние tool paths задаются переменными окружения. Тест сканирует весь
+  `scripts/*.py`, чтобы локальный `C:\Users\…` снова не попал в release automation.
+- Однохостовые `finish_deploy.py`, `setup_reality_tls.py`, `gen_share_link.py` и
+  `gen_reality_link.py`, которые перезаписывали live-конфиг и создавали пользователей с фиксированным
+  примером пароля, выведены из эксплуатации до любого SSH/import. Поддерживаемые пути —
+  `install-qeli-server.sh`, Quick Start панели и явная команда `qeli add-client --link`.
+- Серверный installer выбирает `.deb` по `dpkg --print-architecture`, проверяет поле
+  `Architecture` даже у явно переданного файла/URL и fail-closed отклоняет несовместимый пакет.
+  Временные `.deb` и `SHA256SUMS` основного download-пути зарегистрированы в общем cleanup-trap.
+- Удалены три временных round-trip snippet/fixture из `release/`, которые могли быть ошибочно
+  приняты за входы финальной сборки.
+- Исходники `0.7.16` синхронизированы для Rust, Android, iOS, Windows, macOS, macOS per-app,
+  OpenWrt/LuCI и Debian; Android/iOS build number — `719`, macOS per-app — `716`.
+- `sync_version.py` теперь проверяет marketing/build version подписанного macOS per-app extension,
+  а сообщения об ограничении IPv4/DNS используют `CARGO_PKG_VERSION` вместо захардкоженного номера
+  предыдущего релиза.
+- Обновлён dependency baseline: все Avalonia-пакеты macOS синхронизированы на `11.3.20` с
+  исправлением `NSTextInputClient`; Windows service hosting/controller — на `.NET 10.0.11`;
+  Android — на stable AppCompat `1.8.0` и Gradle wrapper `9.7.0`; wrapper-validation action — на
+  подписанный `v6.3.0`. Rust lockfile получил patch-релизы `rcgen 0.14.9`, `serde_json 1.0.151`,
+  `socket2 0.6.5`, `clap 4.6.6` и `thiserror 2.0.20`. Поскольку `Cargo.lock` входит в source digest,
+  native cores повторно собраны из clean commit `b1e220d` независимыми A/B-проходами на лабах
+  `.10`/`.11`; canonical/consumed copies, hashes, evidence и provenance согласованы с digest
+  `85d7163bd1f2632077070cd3706ceb49993cc13b21671353ab225161aef4e7e7`.
+- Android release sync теперь передаёт на лабу не только Gradle properties, но и pinned wrapper
+  JAR, `gradlew` и `gradlew.bat`; после однократного заполнения нового кэша Gradle `9.7.0`
+  финальный подписанный APK собран повторно с `clean` и полностью в offline-режиме.
+- Lab-helper `fmt_clippy.py push` теперь создаёт отсутствующие удалённые каталоги и синхронизирует
+  полный Git-tracked набор Rust build inputs, включая `Cargo.lock`, web templates/fonts, config,
+  conformance и `deny.toml`: Clippy/tests больше не зависят от неполного или старого дерева на лабе.
+- Транзитивная зависимость `h2` обновлена с `0.4.15` до `0.4.16`, устраняя
+  `RUSTSEC-2026-0258` (неограниченный поток пустых HTTP/2 DATA frames); финальный dependency graph
+  повторно проходит `cargo audit` без уязвимостей.
+- Предыдущий first-party native baseline был пересобран 2026-08-19 из clean source commit `0bbd9a0`
+  (source digest `32836c68a6335f7aeb0f42fbc1aa3f3dedc924516fce1dff6167ab78a1811dd7`) двумя
+  независимыми A/B-проходами: Windows x64, macOS universal2 и Android arm64-v8a/x86_64 побайтно
+  воспроизводимы. Canonical библиотеки, `SHA256SUMS`, reproducibility evidence и `PROVENANCE`
+  обновлены в commit `938b9e8`; desktop ABI содержит 6 Reality + 20 client exports, Android —
+  те же exports и 19 JNI symbols.
+- Регрессионный тест короткой записи учитывает новый строгий контроль полной длины кадра:
+  заведомо некорректный UDP datagram безопасно отклоняется как `PacketTooShort` либо более ранний
+  `FrameLengthMismatch`; прежнее устаревшее ожидание одного варианта больше не ломает release gate.
+- OpenWrt feed закреплён на исходном baseline-коммите `b1e220d`; SDK 23.05.5 сформировал canonical
+  `qeli-0.7.16.tar.xz` с SHA-256
+  `16d31f7cedadf9aac870d8c398845f242c0a4847ccc4239de7ec114b99084c32`, и повторный
+  `package/qeli/download` успешно проверил этот mirror hash.
+- Production e2e-скрипты больше не закреплены на путях, временных именах и ожидаемой версии
+  `0.7.15`: номер читается из `qeli/Cargo.toml`, поэтому evidence каждого будущего кандидата
+  попадает в собственный `release/dist/v<version>/evidence`, а Linux matrix проверяет именно
+  собираемую версию бинарника.
+- Финальный кандидат `release/dist/v0.7.16` полностью пересобран после Rust/native
+  baseline `b1e220d` и platform-изменений по `24e71f7` тем же набором, что 0.7.15: 16
+  payload-файлов для Debian/Linux, Android, Windows, macOS, OpenWrt и
+  Keenetic плюс `SHA256SUMS`. Прошли Rust/Debian gate (635 library + 8 CLI/config tests),
+  подписанная Android Release-сборка, Windows self-test/packetbench, universal macOS packaging,
+  четыре OpenWrt и две Keenetic architecture, GitHub CI и полный release preflight; соответствующие
+  OpenWrt/Keenetic aarch64 и mipsel бинарники побайтно совпали.
+- В `release/` сохранены датированные сырые результаты all-mode benchmark и отдельной серии из
+  пяти Reality-TLS прогонов для бинарника `0.7.16` от 2026-08-16. Они привязаны к собственному
+  hash/version marker и считаются историческим evidence: последующие Trusted Wi-Fi, polling,
+  desktop lifecycle и `persist_tun` изменения требуют новой сборки и повторного performance gate.
+- Production all-modes/Android roaming lifecycle e2e не запускался автоматически: он временно
+  меняет production profiles и перезапускает сервис, поэтому требует отдельно согласованного окна.
+
+## [0.7.15] — 2026-08-13
+
+- Rust release tests в GitHub CI и лабораторном gate теперь выполняются одним потоком test harness.
+  Параллельный запуск позволял соседнему тесту мгновенно переиспользовать уже закрытый Unix fd и
+  давал ложное падение проверки teardown по одному raw descriptor number; production-код и
+  релизные бинарники этой правкой не изменены.
+- Подготовлено и использовано единое двуязычное описание GitHub Release `0.7.15`: сначала английская, затем
   русская версия с обязательными действиями перед обновлением, ключевыми изменениями общего
   Rust transport core, per-app routing, lifecycle/DNS, панели и безопасности, результатами
   release gate и точной таблицей 16 локально собранных артефактов. Файл
-  `release/RELEASE_NOTES_0.7.15.md` готов для передачи в `gh release --notes-file`, но тег,
-  GitHub Release и ассеты по-прежнему намеренно не опубликованы.
+  `release/RELEASE_NOTES_0.7.15.md` передан в `gh release --notes-file`; все payload-файлы и
+  `SHA256SUMS` проверены локально и повторно сверены по GitHub SHA-256 перед публикацией.
 - DNS lifecycle и серверный TUN read path приведены к каноническому `rustfmt`, поэтому
   полный release gate снова проходит форматирование без изменения исполняемой логики.
 - Тестовая строка-маркер legacy DNS recovery теперь компилируется только вместе с тестами.
@@ -73,6 +411,10 @@ Maintained by: Daniil Nekrasov \<raperrros@yandex.ru\>
   systemd-resolved, а при другом владельце DNS требуют `dns = off`. Recovery старых снимков
   сохранён, поэтому обновление сначала чинит следы предыдущих версий.
 
+- macOS GUI теперь перехватывает `SIGINT`/`SIGTERM` (включая `Ctrl+C` при запуске через
+  `sudo`), отменяет немедленное завершение процесса и выполняет штатный `VpnTunnel.Stop()`.
+  Поэтому сохранённые маршруты и DNS физического сервиса, установленные через `networksetup`,
+  восстанавливаются до выхода; повторные сигналы не запускают teardown параллельно.
 - Сервер теперь сам устанавливает узкие `iptables INPUT`-разрешения UDP/TCP для DNS каждого
   профиля: точные TUN, client pool, адрес и порт resolver. При `INPUT DROP` неудача
   применения правила теперь останавливает профиль вместо выдачи клиенту недоступного DNS.
@@ -527,12 +869,12 @@ Maintained by: Daniil Nekrasov \<raperrros@yandex.ru\>
   /`routercheck` режимы, поэтому ошибка компиляции или client-only warning больше не может
   выглядеть как зелёный gate. Linux release sync включает `debian/` и `config/`, portable
   ELF и `.deb` загружаются одним version-derived helper вместо устаревшего абсолютного пути.
-- Локально подготовлен, но не опубликован кандидат `release/dist/v0.7.15`: подписанный Android
+- Сформирован и опубликован комплект `release/dist/v0.7.15`: подписанный Android
   APK, два Windows single-file варианта (повторно собраны после добавления desktop per-app
   routing), ad-hoc signed universal2 macOS ZIP, portable glibc-2.28+jemalloc Linux ELF и `.deb`,
   четыре OpenWrt и два Keenetic client-only бинарника, OpenWrt integration archive, полные
-  `WinDivert-LICENSE.txt`/`WinDivert-NOTICE.txt` и `SHA256SUMS` для 16 payload-ассетов. GitHub
-  Release, тег и публикация ассетов намеренно не выполнялись.
+  `WinDivert-LICENSE.txt`/`WinDivert-NOTICE.txt` и `SHA256SUMS` для 16 payload-ассетов. Тег
+  `v0.7.15` и GitHub Release опубликованы после полного release preflight и проверки digest каждого ассета.
 - Android теперь правильно считает применённые pushed routes из строкового массива активного
   `NetworkPlan`. Финальный platform-adapter применяет типизированный канонический список напрямую;
   совместимый legacy object-parser удалён, а UI получает число маршрутов только после успешного

@@ -57,6 +57,19 @@ fn default_proxy_mode() -> String {
     "mixed".into()
 }
 
+impl Drop for ClientConfig {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+
+        // ClientConfig is cloned into reconnect/bonding owners. Wiping only ClientCore's
+        // original copy left the same credentials in those heap allocations after teardown.
+        // Put the guarantee on the type itself so every current and future clone is covered.
+        self.auth.password.zeroize();
+        self.auth.password_command.zeroize();
+        self.obfuscation.obfs_key.zeroize();
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct ServerConnConfig {
     #[serde(default = "default_server_addr")]
@@ -1140,7 +1153,8 @@ impl ClientConfig {
                 match server.trim().parse::<std::net::IpAddr>() {
                     Ok(std::net::IpAddr::V4(_)) => {}
                     Ok(std::net::IpAddr::V6(_)) => anyhow::bail!(
-                        "'{source}' contains IPv6 resolver '{server}', but qeli 0.7.15 carries only IPv4 inner packets"
+                        "'{source}' contains IPv6 resolver '{server}', but qeli {} carries only IPv4 inner packets",
+                        env!("CARGO_PKG_VERSION")
                     ),
                     Err(_) => anyhow::bail!("'{source}' contains invalid resolver '{server}'"),
                 }
@@ -1158,6 +1172,13 @@ impl ClientConfig {
             &self.routing.mode,
             &["split-tunnel", "full-tunnel", "all"],
         )?;
+        if self.routing.exit_node && self.routing.add_default_gateway {
+            anyhow::bail!(
+                "'exit_node = true' cannot be combined with 'gateway = true': an exit node \
+                 must keep its own default route on the physical WAN so forwarded tunnel \
+                 traffic has an egress path"
+            );
+        }
         if self.proxy.enabled {
             check(
                 "proxy_mode",
@@ -2101,6 +2122,7 @@ shaping_stealth_mbps = 3
                 "shaping = true\nshaping_budget = 63\nshaping_max_size = 64",
                 "shaping",
             ),
+            ("exit_node = true\ngateway = true", "exit_node"),
         ] {
             let ini = format!("[qeli]\nserver = h:443\n{line}\n");
             let config = ClientConfig::from_ini(&IniDoc::parse(&ini).unwrap()).unwrap();
@@ -2111,7 +2133,7 @@ shaping_stealth_mbps = 3
 
     /// EXHAUSTIVE client round-trip: every key client.rs reads is set to a
     /// non-default value in the fixture (coverage proven by
-    /// scripts/gen_roundtrip_fixture.py's client arm), then parse ->
+    /// scripts/test_native_config_keys.py), then parse ->
     /// to_ini_string must re-emit each one. A value appears in the output only
     /// if it was BOTH parsed into the struct AND written back, so a missing
     /// token is a read-but-not-persisted key (the reality_sid / server
@@ -2176,6 +2198,7 @@ lan_subnet = 192.168.50.0/24
 post_up = echo up
 post_down = echo down
 dns = off
+dns_servers = 9.9.9.9, 149.112.112.112
 dev = mytun0
 dev_attach = true
 mtu = 1380
@@ -2193,6 +2216,7 @@ file = /tmp/client.log
         let c = ClientConfig::from_ini(&IniDoc::parse(fixture).unwrap()).unwrap();
         let out = c.to_ini_string();
         let qeli_tokens = [
+            "server = vpn.example.com:8443",
             "proto = udp",
             "user = carol",
             "pass = topsecret",
@@ -2247,6 +2271,7 @@ file = /tmp/client.log
             "post_up = echo up",
             "post_down = echo down",
             "dns = off",
+            "dns_servers = 9.9.9.9, 149.112.112.112",
             "dev = mytun0",
             "dev_attach = true",
             "mtu = 1380",

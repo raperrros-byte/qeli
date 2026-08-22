@@ -8,7 +8,7 @@ use crate::server::handler::{self, DEFAULT_HEARTBEAT_INTERVAL_MS};
 use crate::server::{lock_or_recover, ProfileRuntime, ServerState, ServerTunPacket, TunIngress};
 use crate::transport_core::buffer_pool::{BufferPool, PooledBuffer};
 use crate::transport_core::udp_buffer::{
-    AggregateUdpBudgetPlan, UdpBufferController, UdpBufferCounters, UdpBufferPolicy,
+    AggregateUdpBudgetPlan, InternalDrop, UdpBufferController, UdpBufferCounters, UdpBufferPolicy,
     AUTO_MAX_RECV_BYTES,
 };
 use std::collections::HashMap;
@@ -44,12 +44,10 @@ fn max_concurrent_udp_handshakes() -> usize {
     std::cmp::max(64, cores.saturating_mul(4))
 }
 
-#[allow(dead_code)] // session_id retained for symmetry with the TCP session model
 enum UdpSessionState {
     AwaitingAuth,
     Authenticated {
         session_id: u64,
-        username: String,
         /// Per-device pool/session key — used to release the IP on cleanup.
         device_key: String,
         client_ip: std::net::Ipv4Addr,
@@ -149,9 +147,9 @@ struct UdpClient {
     ///
     /// **What these actually count**, since it is not the same thing on both sides:
     ///
-    /// * `amp_received` adds `data.len()` — the raw datagram as it came off the socket, before
-    ///   obfs-open and QUIC-unwrap. That is the payload the network delivered; the IP and UDP
-    ///   headers around it are not included.
+    /// * `amp_received` adds `data.len()` after transparent obfs-open but before QUIC-unwrap.
+    ///   The 13-byte obfs envelope and the IP/UDP headers are therefore not included. Omitting
+    ///   received bytes makes the allowance stricter, not looser.
     /// * the seed for `amp_received` is the REASSEMBLED ClientHello, not the sum of the
     ///   datagrams that carried it, so a fragmented one is undercounted by the per-fragment
     ///   headers. **Undercounting received makes the budget stricter**, so this errs safe.
@@ -278,6 +276,7 @@ pub(crate) async fn run_udp_server(
     mut udp_buffer: UdpBufferController,
     worker_id: usize,
     tun_tx: TunIngress,
+    tasks: super::ProfileTasks,
 ) -> anyhow::Result<()> {
     let pcfg = &profile.config;
     log::info!(
@@ -407,7 +406,21 @@ pub(crate) async fn run_udp_server(
                     }
                 }
 
-                handle_udp_datagram(&server_state, &profile, &sessions, &mut frag_pending, &socket, addr, &recv_buf[..n], &tun_tx, quic_config, &handshake_permits, &auth_inflight).await;
+                handle_udp_datagram(
+                    &server_state,
+                    &profile,
+                    &sessions,
+                    &mut frag_pending,
+                    &socket,
+                    addr,
+                    &recv_buf[..n],
+                    &tun_tx,
+                    quic_config,
+                    &handshake_permits,
+                    &auth_inflight,
+                    &tasks,
+                )
+                .await;
             }
 
             _ = udp_buffer_tick.tick() => {
@@ -662,6 +675,7 @@ pub(crate) async fn run_udp_server(
                         }
                         drop(pool);
                         crate::server::handler::spawn_client_route_teardown(
+                            &profile.tasks,
                             iroutes,
                             profile.config.tun.name.clone(),
                         );
@@ -709,9 +723,9 @@ async fn send_handshake_response(
         };
         for (i, frag) in frags.into_iter().enumerate() {
             let pkt = if quic_enabled {
-                // Initial, matching the single-datagram path below and the client — a
-                // Handshake packet has no Token Length field. (Audit 2026-07-27, E4.)
-                wrap_quic_long(&frag, connection_id, i as u32, 0x00)
+                // Initial, matching the single-datagram path below and every new client.
+                // The receive side still accepts the historical Handshake-type spelling.
+                wrap_quic_long(&frag, connection_id, i as u32)
             } else {
                 frag
             };
@@ -719,7 +733,7 @@ async fn send_handshake_response(
         }
     } else {
         let pkt = if quic_enabled {
-            wrap_quic_long(raw, connection_id, 0, 0x00)
+            wrap_quic_long(raw, connection_id, 0)
         } else {
             raw.to_vec()
         };
@@ -795,6 +809,7 @@ async fn handle_udp_datagram(
     quic_config: &QuicMaskingConfig,
     handshake_permits: &Arc<Semaphore>,
     auth_inflight: &Arc<tokio::sync::Mutex<std::collections::HashSet<SocketAddr>>>,
+    tasks: &super::ProfileTasks,
 ) {
     // Decide whether this datagram is QUIC-masked. For an ESTABLISHED session we honour
     // the choice recorded at handshake time — a QUIC data packet is a short header over
@@ -880,8 +895,8 @@ async fn handle_udp_datagram(
             // fresh-port reconnect. This never creates or mutates crypto state.
             // Everything this source sends counts toward its budget, including the
             // datagrams that trigger a re-emit — otherwise the trigger would be free.
-            // `data` is the raw datagram off the socket (pre obfs-open, pre QUIC-unwrap);
-            // see the note on `amp_received` for what the two counters do and do not include.
+            // `data` is the datagram after transparent obfs-open but before QUIC-unwrap; see
+            // the note on `amp_received` for what the two counters do and do not include.
             client.amp_received = client.amp_received.saturating_add(data.len() as u64);
 
             let reemit_hello = matches!(client.state, UdpSessionState::AwaitingAuth)
@@ -1008,7 +1023,9 @@ async fn handle_udp_datagram(
                 client
                     .dropped
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                profile.udp_buffer_counters.note_internal_drop();
+                profile
+                    .udp_buffer_counters
+                    .note_internal_drop(InternalDrop::PoolExhausted);
                 log::debug!(
                     "UDP drop from {} on profile '{}': inbound TUN pool exhausted",
                     addr,
@@ -1020,7 +1037,9 @@ async fn handle_udp_datagram(
                 client
                     .dropped
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                profile.udp_buffer_counters.note_internal_drop();
+                profile
+                    .udp_buffer_counters
+                    .note_internal_drop(InternalDrop::Oversize);
                 log::debug!(
                     "UDP drop from {} on profile '{}': {}-byte record exceeds inbound pool slot",
                     addr,
@@ -1082,7 +1101,8 @@ async fn handle_udp_datagram(
                 let auth_inflight = auth_inflight.clone();
                 let auth_tun_tx = tun_tx.clone();
                 let raw = payload.to_vec();
-                tokio::spawn(async move {
+                let auth_tasks = tasks.clone();
+                tasks.spawn(async move {
                     handle_udp_auth(
                         &server_state,
                         &profile,
@@ -1093,6 +1113,7 @@ async fn handle_udp_datagram(
                         &raw,
                         &quic_config,
                         auth_tun_tx,
+                        auth_tasks,
                     )
                     .await;
                     auth_inflight.lock().await.remove(&addr);
@@ -1158,7 +1179,9 @@ async fn handle_udp_datagram(
                     // Never await a full per-client pacing queue in this shared receive loop:
                     // one capped peer must not head-of-line block every UDP session.
                     client_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    profile.udp_buffer_counters.note_internal_drop();
+                    profile
+                        .udp_buffer_counters
+                        .note_internal_drop(InternalDrop::QueueFull);
                     log::debug!(
                         "UDP upload pacing queue full for {} on profile '{}'; dropping packet",
                         addr,
@@ -1314,6 +1337,7 @@ async fn handle_udp_auth(
     raw_request: &[u8],
     _quic_config: &QuicMaskingConfig,
     tun_tx: TunIngress,
+    tasks: super::ProfileTasks,
 ) {
     let pcfg = &profile.config;
     // Auth plaintext: [client_key_proof:32]([0x00][device_id:16])?[username:password]
@@ -1711,7 +1735,7 @@ async fn handle_udp_auth(
     let upload_bytes = bytes_recv.clone();
     let upload_tun = tun_tx.clone();
     let upload_revoked = revoked.clone();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         while let Some(packet) = upload_rx.recv().await {
             // Dropping the per-worker UdpClient closes the only long-lived sender.
             // A kick/quota/supersede raises `revoked` even before that map entry is
@@ -1751,7 +1775,6 @@ async fn handle_udp_auth(
             client.revoked = Some(revoked.clone());
             client.state = UdpSessionState::Authenticated {
                 session_id,
-                username: username.clone(),
                 device_key: dkey.clone(),
                 client_ip,
             };
@@ -1967,7 +1990,7 @@ async fn handle_udp_auth(
     crate::server::notify::fire_connect(&writer_session.username, &profile.name, addr);
 
     let profile_name = profile.name.clone();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let mut quic_record = Vec::with_capacity(
             wire_pool.buffer_capacity() + crate::protocol::quic::QUIC_SHORT_HEADER_MIN,
         );

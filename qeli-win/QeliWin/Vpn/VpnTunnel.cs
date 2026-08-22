@@ -18,6 +18,8 @@ public sealed class VpnTunnel : VpnTunnelBase
     // the same Rust transport core without replacing or duplicating that core.
     protected override bool NativeWintunOwnership => !_useWinDivert;
 
+    protected override bool SupportsPlanReplacementGuard => true;
+
     protected override void PrepareTransport(VpnConfig config) =>
         _useWinDivert = config.UsesAppFilter;
 
@@ -63,16 +65,19 @@ public sealed class VpnTunnel : VpnTunnelBase
 
     protected override void SetupTun(VpnConfig config, Session session, IPAddress serverIp)
     {
-        // persist-tun: if the adapter + routes survived the previous attempt and the
-        // server re-assigned the same client IP, reuse them (no adapter flicker / route gap).
-        if (ReusePersistedTun(config, session))
+        // persist-tun: reuse only when the complete applied network-plan fingerprint matches;
+        // the same client IP can arrive with different routes, DNS, prefix or MTU.
+        if (ReusePersistedTun(config, session, serverIp))
         {
             if (_tun is WinDivertAdapter retained)
             {
                 retained.Reconfigure(
+                    IPAddress.Parse(session.ClientIp),
                     EffectiveDns(config, session),
+                    config.IsFullTunnel,
+                    session.Prefix,
                     config.RouteLocalNetworks,
-                    config.IncludeRoutes.Concat(LoadRouteFile(config)),
+                    config.IncludeRoutes.Concat(EffectiveRouteFileRoutes(config, session)),
                     config.ExcludeRoutes,
                     PushedRouteCidrs(session.RoutesJson),
                     serverIp,
@@ -93,8 +98,10 @@ public sealed class VpnTunnel : VpnTunnelBase
                 includeMode: config.AppsMode.Equals("include", StringComparison.OrdinalIgnoreCase),
                 dnsServers: EffectiveDns(config, session),
                 allowIpv6Leak: config.AllowIpv6Leak,
+                fullTunnel: config.IsFullTunnel,
+                clientPrefix: session.Prefix,
                 routeLocal: config.RouteLocalNetworks,
-                includeRoutes: config.IncludeRoutes.Concat(LoadRouteFile(config)),
+                includeRoutes: config.IncludeRoutes.Concat(EffectiveRouteFileRoutes(config, session)),
                 excludeRoutes: config.ExcludeRoutes,
                 pushedRoutes: PushedRouteCidrs(session.RoutesJson),
                 carrierIp: serverIp,
@@ -192,7 +199,8 @@ public sealed class VpnTunnel : VpnTunnelBase
             foreach (var r in config.IncludeRoutes) _net.AddRoute(r, session.ClientIp, tunIndex);
         }
         if (!config.IsFullTunnel)
-            foreach (var r in LoadRouteFile(config)) _net.AddRoute(r, session.ClientIp, tunIndex);  // OpenVPN route-file
+            foreach (var r in EffectiveRouteFileRoutes(config, session))
+                _net.AddRoute(r, session.ClientIp, tunIndex);  // OpenVPN route-file
 
         // Subnets the server advertised (`route = …` on the profile / per-user) are a
         // specific, explicit admin decision — always honoured, like OpenVPN's
@@ -245,8 +253,10 @@ public sealed class VpnTunnel : VpnTunnelBase
             var psi = new System.Diagnostics.ProcessStartInfo(SystemPaths.Netsh,
                 $"interface ipv4 set interface \"{alias}\" forwarding=enabled")
             {
-                UseShellExecute = false, RedirectStandardOutput = true,
-                RedirectStandardError = true, CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
                 WorkingDirectory = SystemPaths.SystemDirectory,
             };
             using var p = System.Diagnostics.Process.Start(psi);
@@ -308,6 +318,15 @@ public sealed class VpnTunnel : VpnTunnelBase
 
     protected override bool KeepTunDuringReconnect(VpnConfig config) =>
         config.UsesAppFilter || base.KeepTunDuringReconnect(config);
+
+    protected override bool TryReconfigurePersistedTun(
+        VpnConfig config, Session session, IPAddress serverIp)
+    {
+        // SetupTun performs the single policy refresh after the shared reuse decision.
+        // Merely confirm that this retained adapter can be changed in place; system Wintun
+        // must instead pass through the firewall-guarded rebuild branch.
+        return config.UsesAppFilter && _tun is WinDivertAdapter;
+    }
 
     protected override void OnTransportInterrupted(VpnConfig config)
     {
@@ -388,7 +407,7 @@ public sealed class VpnTunnel : VpnTunnelBase
     protected override void CarrierAddressesChanging(
         VpnConfig config, IReadOnlyList<string> previous, IReadOnlyList<string> refreshed)
     {
-        if (config.KillSwitch && config.IsFullTunnel && !config.UsesAppFilter)
+        if (EgressGuardEngaged && !config.UsesAppFilter)
             KillSwitch.UpdateServerAddresses(previous, refreshed, Log);
     }
 

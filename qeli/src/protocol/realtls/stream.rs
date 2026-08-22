@@ -6,7 +6,8 @@
 //! records and decrypts reads. It is the client-side mirror of tokio-rustls'
 //! server `TlsStream`, so the qeli tunnel can run inside a real TLS session.
 
-// M3.2 building block: wired into the reality-tls client in M3.3.
+// Used by both the native reality-tls client and the hand-rolled server terminator.
+// Feature-specific constructors still leave a few helpers unused in some builds.
 #![allow(dead_code)]
 
 use super::client::{EstablishedTls, MAX_RECORD};
@@ -164,7 +165,13 @@ impl<S: AsyncRead + Unpin> AsyncRead for RealTlsStream<S> {
                 Poll::Ready(Ok(())) => {
                     let filled = rb.filled();
                     if filled.is_empty() {
-                        return Poll::Ready(Ok(())); // EOF
+                        if me.in_buf.is_empty() {
+                            return Poll::Ready(Ok(())); // clean record boundary EOF
+                        }
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "TLS stream ended in the middle of a record",
+                        )));
                     }
                     me.in_buf.extend_from_slice(filled);
                     continue;
@@ -255,12 +262,33 @@ mod tests {
     use crate::protocol::realtls::server::{make_server_config, terminate};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[tokio::test]
+    async fn eof_in_partial_record_is_an_error() {
+        let (mut peer, inner) = tokio::io::duplex(32);
+        peer.write_all(&[0x17, 0x03]).await.unwrap();
+        peer.shutdown().await.unwrap();
+
+        let key = [0x11u8; 16];
+        let iv = [0x22u8; 12];
+        let mut stream = RealTlsStream::from_crypto(
+            inner,
+            RecordCrypto::new(&key, &iv),
+            RecordCrypto::new(&key, &iv),
+        );
+        let mut byte = [0u8; 1];
+        let error = stream
+            .read(&mut byte)
+            .await
+            .expect_err("truncated TLS framing must not be reported as clean EOF");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
     /// Wrap the realtls client's established session in `RealTlsStream` and talk to
     /// a real rustls server purely through the `AsyncRead + AsyncWrite` interface.
     #[tokio::test]
     async fn realtls_stream_interop_with_rustls() {
         let (mut client_io, server_io) = tokio::io::duplex(32 * 1024);
-        let config = make_server_config("www.microsoft.com");
+        let config = make_server_config("www.microsoft.com").expect("server config");
         let server = tokio::spawn(async move {
             let mut tls = terminate(Vec::new(), server_io, config)
                 .await
@@ -297,7 +325,7 @@ mod tests {
     #[tokio::test]
     async fn realtls_stream_bulk_roundtrip() {
         let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let config = make_server_config("www.microsoft.com");
+        let config = make_server_config("www.microsoft.com").expect("server config");
         let payload: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
         let expect = payload.clone();
         let server = tokio::spawn(async move {

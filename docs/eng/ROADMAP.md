@@ -315,7 +315,8 @@ details of the C# consolidation and Rust fixes — [REFACTOR-PLAN.md](REFACTOR-P
   RFC 8446 §4.6.1). The client doesn't resume — `RealTlsStream` skips post-handshake
   records, the seq stays in sync. 161 tests.
 - ⏸️ **QUIC per RFC (Axis 2A) — DEPRIORITIZED (2026-06-06).** Analysis of `quic.rs`:
-  the current QUIC is a structural masking shim (pn in cleartext, no Token Length/HP).
+  the current QUIC is a structural masking shim (pn in cleartext, no header protection or
+  QUIC Initial encryption; Token Length and Length are present and strictly validated).
   "Really by the RFC" = almost implementing QUIC, AND there is a **fundamental
   ceiling**: a QUIC Initial is decryptable by anyone (the Initial keys are derived
   from the DCID, RFC 9001 §5.2) — you cannot hide our payload inside a "real" Initial
@@ -409,6 +410,20 @@ details of the C# consolidation and Rust fixes — [REFACTOR-PLAN.md](REFACTOR-P
    profile overrides) — so as not to duplicate `obf.multipath.*` in every TCP profile.
 
 ## P1 — next
+
+### Surfacing the drop breakdown in the mobile ABI (after 2026-08-15)
+
+The "throughput collapses after sleep" investigation is closed in full: the wake policy,
+downlink slot sizing in all four pumps (Linux/Android, Wintun, the iOS/Windows packet
+bridge), no backoff escalation for a deliberate CLI reconnect, and `internal_drops` split
+into five reasons plus the TUN writer's own refusals.
+
+One item is deliberately left: the breakdown is visible in the CLI (`stats.udp_drops_*` in
+the diagnostics file) and in the server log, but **not** in the mobile ABI.
+`QeliClientStats` is size-versioned (`STATS_V2_SIZE`), so five new fields mean a V3 plus
+matching changes in JNI, Swift and both UIs. Breaking the ABI for diagnostics nobody reads
+on a phone today was not worth it: `udp_internal_drops` stayed the sum and did not change
+meaning.
 
 ### A control channel and live in-session PUSH (→ 0.8.0, BEFORE roaming)
 
@@ -667,8 +682,9 @@ protection, no CRYPTO frame. A real ClientHello with SNI does exist
 ([client/mod.rs:2561](../../qeli/src/client/mod.rs#L2561)) — it just rides in a hand-rolled
 fragmentation scheme ([udp_frag.rs](../../qeli/src/protocol/udp_frag.rs)).
 
-To a DPI that parses QUIC this is **a tell, not camouflage**: the packet claims QUIC v1 yet
-its protected fields are structurally invalid. Until this is done, treat the mode as
+To a DPI that parses QUIC this is **a tell, not camouflage**: the cleartext shell now has
+the required Token Length and Length fields, but the fields that real QUIC protects remain
+unprotected and the payload is not a CRYPTO frame. Until this is done, treat the mode as
 experimental.
 
 - Keep the scope tight: the **Initial packet** must be correct, not a whole QUIC stack (the

@@ -7,6 +7,7 @@ through the tunnel, reach its server gateway, and restore physical DNS after a g
 """
 
 import hashlib
+import ipaddress
 import io
 import os
 import re
@@ -14,6 +15,7 @@ import shlex
 import socket
 import sys
 import time
+import tomllib
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -23,20 +25,41 @@ import ssh_hostkey
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EVIDENCE = ROOT / "release/dist/v0.7.15/evidence"
+with (ROOT / "qeli" / "Cargo.toml").open("rb") as manifest:
+    VERSION = tomllib.load(manifest)["package"]["version"]
+VERSION_TOKEN = VERSION.replace(".", "")
+EVIDENCE = ROOT / "release" / "dist" / f"v{VERSION}" / "evidence"
 LINKS = ROOT / "release/prod-client-configs/allmodes"
-LAB_SERVER = "10.66.116.10"
+LAB_SERVER = os.environ.get("QELI_BUILD_LAB_IP", "10.66.116.10")
 LAB_CLIENT = os.environ.get("QELI_LAB_IP", "10.66.116.11")
 PROD_HOST = os.environ.get("QELI_PROD_HOST", "").strip()
 SOURCE_BINARY = "/opt/qeli-src/target/release/qeli"
-CLIENT_BINARY = "/root/qeli-0715-e2e"
-RESOLV_BACKUP = "/root/qeli-0715-e2e.resolv.conf"
-CLIENT_TUN = "qeli0715e2e"
-MGMT_ROUTE = "192.168.50.0/24 via 10.66.116.1 dev ens18 metric 50"
-LAB_CAPTURE = "/root/qeli-0715-linux-lab.pcap"
-PROD_CAPTURE = "/root/qeli-0715-linux-prod.pcap"
+CLIENT_BINARY = f"/root/qeli-{VERSION_TOKEN}-e2e"
+RESOLV_BACKUP = f"/root/qeli-{VERSION_TOKEN}-e2e.resolv.conf"
+CLIENT_TUN = f"qeli{VERSION_TOKEN}e2e"
+REMOTE_PREFIX = f"/root/qeli-{VERSION_TOKEN}"
+PID_FILE = f"{REMOTE_PREFIX}-e2e.pid"
+MGMT_ROUTE = os.environ.get(
+    "QELI_LAB_MANAGEMENT_ROUTE",
+    "192.168.50.0/24 via 10.66.116.1 dev ens18 metric 50",
+)
+MGMT_ROUTE_ARGS = shlex.split(MGMT_ROUTE)
+if not MGMT_ROUTE_ARGS:
+    raise SystemExit("QELI_LAB_MANAGEMENT_ROUTE must not be empty")
+try:
+    MGMT_ROUTE_NETWORK = ipaddress.ip_network(MGMT_ROUTE_ARGS[0], strict=False)
+    MGMT_ROUTE_PREFIX = str(MGMT_ROUTE_NETWORK)
+except ValueError as error:
+    raise SystemExit(
+        "QELI_LAB_MANAGEMENT_ROUTE must start with a valid IPv4/IPv6 prefix"
+    ) from error
+MGMT_ROUTE_COMMAND = shlex.join([MGMT_ROUTE_PREFIX, *MGMT_ROUTE_ARGS[1:]])
+MGMT_IP_ROUTE = "ip -6 route" if MGMT_ROUTE_NETWORK.version == 6 else "ip route"
+LAB_CAPTURE = f"/root/qeli-{VERSION_TOKEN}-linux-lab.pcap"
+PROD_CAPTURE = f"/root/qeli-{VERSION_TOKEN}-linux-prod.pcap"
 CAPTURE_FILTER = (
-    "port 53 or tcp port 443 or tcp portrange 8443-8447 or udp portrange 8448-8450"
+    "port 53 or tcp port 443 or tcp portrange 8443-8447 or tcp port 8451 "
+    "or udp portrange 8448-8450"
 )
 PROFILES = (
     ("reality-tls", "tcp", 443),
@@ -48,6 +71,7 @@ PROFILES = (
     ("udp-fake-tls", "udp", 8448),
     ("udp-quic", "udp", 8449),
     ("udp-obfs", "udp", 8450),
+    ("obfs-awg", "tcp", 8451),
 )
 
 
@@ -251,32 +275,32 @@ def main() -> int:
         # Never touch the pre-existing vpn0/PID owned by another lab workload.
         command(
             lab,
-            "pkill -TERM -f '^/root/qeli-0715-e2e client -c /root/qeli-0715-' "
+            f"pkill -TERM -f '^{CLIENT_BINARY} client -c {REMOTE_PREFIX}-' "
             "2>/dev/null || true; sleep 2; "
-            "pkill -KILL -f '^/root/qeli-0715-e2e client -c /root/qeli-0715-' "
+            f"pkill -KILL -f '^{CLIENT_BINARY} client -c {REMOTE_PREFIX}-' "
             "2>/dev/null || true; "
             f"test ! -f {RESOLV_BACKUP} || cp --preserve=all {RESOLV_BACKUP} /etc/resolv.conf; "
             f"ip link show {CLIENT_TUN} >/dev/null 2>&1 && ip link delete {CLIENT_TUN} "
-            "2>/dev/null || true; rm -f /root/qeli-0715-e2e.pid",
+            f"2>/dev/null || true; rm -f {PID_FILE}",
         )
         results.append("STALE E2E RECOVERY PASS [isolated process/TUN/resolver only]")
 
         existing_management_route = command(
-            lab, "ip route show 192.168.50.0/24"
+            lab, f"{MGMT_IP_ROUTE} show {shlex.quote(MGMT_ROUTE_PREFIX)}"
         ).strip()
         if existing_management_route:
-            if MGMT_ROUTE not in existing_management_route:
+            if MGMT_ROUTE_COMMAND not in existing_management_route:
                 raise RuntimeError(
                     "lab has an unexpected pre-existing management route: "
                     + existing_management_route
                 )
         else:
-            command(lab, f"ip route add {MGMT_ROUTE}")
+            command(lab, f"{MGMT_IP_ROUTE} add {MGMT_ROUTE_COMMAND}")
             management_route_added = True
         results.append("MANAGEMENT ROUTE PASS [workstation /24 pinned outside full tunnel]")
 
         # Refuse a partial matrix instead of mutating production configuration. The current
-        # server is expected to expose the same nine profiles used by its share-link command.
+        # server is expected to expose the same ten profiles used by its share-link command.
         tcp = command(prod, "ss -tlnH | awk '{print $4}'")
         udp = command(prod, "ss -ulnH | awk '{print $4}'")
         missing = []
@@ -296,7 +320,7 @@ def main() -> int:
         command(lab, f"chmod 700 {CLIENT_BINARY}")
         installed_sha = command(lab, f"sha256sum {CLIENT_BINARY} | awk '{{print $1}}'").strip()
         version = command(lab, f"{CLIENT_BINARY} --version 2>&1 | head -1").strip()
-        if installed_sha != source_sha or version != "qeli 0.7.15":
+        if installed_sha != source_sha or version != f"qeli {VERSION}":
             raise RuntimeError("lab Linux client binary does not match the gate-passed release")
         results.append(f"BINARY PASS sha256={source_sha} version={version}")
 
@@ -323,17 +347,17 @@ def main() -> int:
             if not profile_path.is_file():
                 raise RuntimeError(f"missing current production link: {profile_path}")
             config = ini_from_link(profile_path)
-            remote_config = f"/root/qeli-0715-{name}.conf"
-            remote_log = f"/root/qeli-0715-{name}.log"
+            remote_config = f"{REMOTE_PREFIX}-{name}.conf"
+            remote_log = f"{REMOTE_PREFIX}-{name}.log"
             with lab.open_sftp() as sftp:
                 sftp.putfo(io.BytesIO(config.encode()), remote_config)
             command(lab, f"chmod 600 {remote_config}")
             command(
                 lab,
                 f": > {remote_log}; RUST_LOG=debug nohup {CLIENT_BINARY} client -c {remote_config} "
-                f">{remote_log} 2>&1 </dev/null & echo $! >/root/qeli-0715-e2e.pid",
+                f">{remote_log} 2>&1 </dev/null & echo $! >{PID_FILE}",
             )
-            pid_text = command(lab, "cat /root/qeli-0715-e2e.pid").strip()
+            pid_text = command(lab, f"cat {PID_FILE}").strip()
             if not pid_text.isdigit():
                 raise RuntimeError(f"Linux client did not start for {name}")
             current_pid = int(pid_text)
@@ -415,7 +439,9 @@ def main() -> int:
             pass
         if management_route_added:
             try:
-                command(lab, "ip route del 192.168.50.0/24 2>/dev/null || true")
+                # Delete exactly the route this run added. Removing only the prefix could
+                # destroy a route another recovery process replaced while the matrix ran.
+                command(lab, f"{MGMT_IP_ROUTE} del {MGMT_ROUTE_COMMAND} 2>/dev/null || true")
             except Exception:
                 pass
         capture_errors = []

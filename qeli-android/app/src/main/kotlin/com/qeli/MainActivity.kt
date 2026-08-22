@@ -15,9 +15,11 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.text.InputType
 import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
+import android.view.ViewGroup
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -39,12 +41,18 @@ import com.qeli.model.VpnConfig
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.coroutines.resume
 
 class MainActivity : AppCompatActivity() {
 
@@ -73,6 +81,9 @@ class MainActivity : AppCompatActivity() {
     // CANCEL the attempt, otherwise a server that keeps closing the connection leaves
     // the client retrying forever with no way to stop it from the UI.
     private var isConnecting = false
+    // No TUN is installed, but the foreground controller is intentionally alive and will
+    // restore the selected profile after leaving a trusted Wi-Fi network.
+    private var isTrustedPaused = false
     // Native owns duplicated TUN descriptors. This state remains busy until the service
     // confirms that its runner has exited and Android routes/DNS are actually restored.
     private var isDisconnecting = false
@@ -89,6 +100,10 @@ class MainActivity : AppCompatActivity() {
     // coalesces into a single scroll per frame instead of one layout pass per line.
     private var pendingLogScroll = false
     private var ringSpin: android.animation.ObjectAnimator? = null
+    private var autoProbeJob: Job? = null
+    private val automaticProbeJobs = java.util.Collections.synchronizedSet(mutableSetOf<Job>())
+    private val reachabilityProbeSlots = kotlinx.coroutines.sync.Semaphore(4)
+    private var lastAutoProbeAtMs = 0L
 
     private val profiles = mutableListOf<Profile>()
     private var activeIndex = 0
@@ -128,6 +143,9 @@ class MainActivity : AppCompatActivity() {
         const val PREFS_STATE = "app_state"
         const val PREF_AUTO_CONNECT_LAUNCH = "auto_connect_launch"
         const val PREF_AUTO_CONNECT_BOOT = "auto_connect_boot"
+        const val PREF_TRUSTED_WIFI_ENABLED = "trusted_wifi_enabled"
+        const val PREF_TRUSTED_WIFI_SSIDS = "trusted_wifi_ssids"
+        const val PREF_CONNECTION_DESIRED = "connection_desired"
         // Global LAN-bypass toggle (read by QeliService at establish; OR'd with the
         // profile's own allow_lan). Lets Wi-Fi/LAN devices stay reachable on a full tunnel.
         const val PREF_ALLOW_LAN = "allow_lan"
@@ -148,6 +166,16 @@ class MainActivity : AppCompatActivity() {
         private const val SNI_UI_ROW_CAP = 40
         /** Geo routing preset id (proxy-all / bypass-ru / …). */
         const val PREF_GEO_PRESET = "geo_route_preset"
+        const val PREF_AUTO_PROBE = "auto_probe_profiles"
+        const val PREF_PROBE_INTERVAL_SECS = "probe_interval_secs"
+        private const val PREF_LAST_AUTO_PROBE_MS = "last_auto_probe_ms"
+        private const val MAX_IMPORTED_FILE_BYTES = 8 * 1024 * 1024
+        // QELI-ENC-1 base64-expands an otherwise valid 8 MiB plaintext archive.
+        private const val MAX_IMPORTED_BACKUP_BYTES = 12 * 1024 * 1024
+        private const val MAX_IMPORTED_CONFIG_BYTES = 1024 * 1024
+        private const val MAX_IMPORTED_PROFILES = 256
+        private const val MAX_IMPORTED_PROFILE_NAME_CHARS = 256
+        private val REACHABILITY_PROBE_IDS = AtomicLong(0L)
         // Flat-INI template — the same `[qeli]` schema the Rust client reads.
         private const val TEMPLATE = """# My server
 [qeli]
@@ -181,6 +209,17 @@ sni = www.microsoft.com
     ) { granted ->
         if (granted) { if (pendingConnect) { pendingConnect = false; proceedWithVpnPermission() } }
         else { appendLog("Notification permission denied - required for VPN"); setDisconnectedState() }
+    }
+
+    private val trustedWifiPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { grants ->
+        if (grants.values.any { granted -> !granted }) {
+            Toast.makeText(this, R.string.trusted_wifi_permission_denied, Toast.LENGTH_LONG).show()
+        }
+        // A denial can turn an SSID that was previously known into UNKNOWN. Re-evaluate even
+        // then so the service resumes instead of leaving VPN suppressed on unverifiable trust.
+        reevaluateTrustedWifi()
     }
 
     // Backup/restore ALL profiles via the Storage Access Framework (a plain JSON file the
@@ -242,9 +281,11 @@ sni = www.microsoft.com
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         setDisconnectedState()
-        logTimeFormat = getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
+        val statePrefs = getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
+        logTimeFormat = statePrefs
             .getString(PREF_LOG_TIME_FORMAT, DEFAULT_LOG_TIME_FORMAT)
             ?.trim()?.lowercase() ?: DEFAULT_LOG_TIME_FORMAT
+        lastAutoProbeAtMs = statePrefs.getLong(PREF_LAST_AUTO_PROBE_MS, 0L)
         // After a theme switch / rotation the Activity is recreated but the VPN
         // foreground service keeps running — restore the real tunnel state so the
         // UI doesn't falsely show "Disconnected".
@@ -274,8 +315,8 @@ sni = www.microsoft.com
 
         binding.btnImport.setOnClickListener { showImportChooser() }
         binding.btnNewProfile.setOnClickListener { showEditor(-1) }
-        binding.btnCheckAll.setOnClickListener { pingAll() }
-        binding.btnPing.setOnClickListener { pingActive() }
+        binding.btnCheckAll.setOnClickListener { pingAll(manual = true) }
+        binding.btnPing.setOnClickListener { pingActive(manual = true) }
         binding.ringConnect.setOnClickListener { onConnectTap(it) }
 
         // Log tab toolbar
@@ -304,12 +345,10 @@ sni = www.microsoft.com
         binding.tvVersion.text = getString(R.string.version_label, appVersion())
         binding.tvVersion.setOnClickListener { showUpdatesDialog() }
 
-        val prefs = getSharedPreferences("app_state", Context.MODE_PRIVATE)
+        val prefs = statePrefs
         if (!prefs.getBoolean("battery_opt_requested", false)) {
             requestBatteryOptimizationExclusion(); prefs.edit().putBoolean("battery_opt_requested", true).apply()
         }
-        pingActive()
-
         // Launched by the Quick Settings tile? Connect the active profile now that the receiver
         // and UI are wired (so the connect flow's status/log updates land).
         maybeAutoConnect(intent)
@@ -317,10 +356,22 @@ sni = www.microsoft.com
         // Auto-connect on launch (opt-in): only on a fresh cold start (not rotation/theme),
         // not already busy, and not already handling a tile / deep-link request.
         if (savedInstanceState == null && prefs.getBoolean(PREF_AUTO_CONNECT_LAUNCH, false)
-            && !isConnected && !isConnecting
+            && !isConnected && !isConnecting && !isTrustedPaused
             && intent?.getBooleanExtra(EXTRA_AUTO_CONNECT, false) != true && intent?.data == null) {
             connect()
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        configureAutoProbeTimer(runImmediately = true)
+    }
+
+    override fun onStop() {
+        autoProbeJob?.cancel()
+        autoProbeJob = null
+        cancelAutomaticProbeJobs()
+        super.onStop()
     }
 
     override fun onDestroy() {
@@ -339,8 +390,8 @@ sni = www.microsoft.com
         binding.viewSniSpeed.visibility = if (pos == 2) View.VISIBLE else View.GONE
         binding.viewLog.visibility = if (pos == 3) View.VISIBLE else View.GONE
         when (pos) {
-            1 -> { renderProfileList(); pingAll() }
-            0 -> { renderActiveProfile(); pingActive() }
+            1 -> { renderProfileList(); pingAll(manual = false) }
+            0 -> { renderActiveProfile(); pingActive(manual = false) }
             2 -> ensureSniSpeedReady()
         }
     }
@@ -433,6 +484,7 @@ sni = www.microsoft.com
             VpnServiceImpl.STATUS_CONNECTED -> { clientIp = VpnServiceImpl.liveIp; setConnectedState() }
             VpnServiceImpl.STATUS_CONNECTING -> setConnectingState()
             VpnServiceImpl.STATUS_DISCONNECTING -> setDisconnectingState()
+            VpnServiceImpl.STATUS_WAITING_TRUSTED -> setTrustedWaitingState()
             else -> { /* disconnected / error → already in the default state */ }
         }
     }
@@ -879,6 +931,79 @@ sni = www.microsoft.com
             text = getString(R.string.profile_failover)
             isChecked = prefs.getBoolean(PREF_FAILOVER, false)
         }
+        val cbTrustedWifi = android.widget.CheckBox(this).apply {
+            text = getString(R.string.trusted_wifi)
+            isChecked = prefs.getBoolean(PREF_TRUSTED_WIFI_ENABLED, false)
+        }
+        val trustedWifiInput = com.google.android.material.textfield.TextInputEditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            minLines = 2
+            maxLines = 5
+            setText(prefs.getString(PREF_TRUSTED_WIFI_SSIDS, ""))
+            isEnabled = cbTrustedWifi.isChecked
+        }
+        val trustedWifiField = com.google.android.material.textfield.TextInputLayout(
+            this,
+            null,
+            com.google.android.material.R.attr.textInputOutlinedStyle,
+        ).apply {
+            hint = getString(R.string.trusted_wifi_ssids)
+            helperText = getString(R.string.trusted_wifi_desc)
+            isEnabled = cbTrustedWifi.isChecked
+            addView(
+                trustedWifiInput,
+                android.widget.LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+        }
+        cbTrustedWifi.setOnCheckedChangeListener { _, enabled ->
+            trustedWifiField.isEnabled = enabled
+            trustedWifiInput.isEnabled = enabled
+        }
+        val cbAutoProbe = android.widget.CheckBox(this).apply {
+            text = getString(R.string.auto_probe_profiles)
+            isChecked = prefs.getBoolean(PREF_AUTO_PROBE, true)
+        }
+        val probeIntervalInput = com.google.android.material.textfield.TextInputEditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(
+                ProfileAutoProbePolicy.clampIntervalSeconds(
+                    prefs.getInt(
+                        PREF_PROBE_INTERVAL_SECS,
+                        ProfileAutoProbePolicy.DEFAULT_INTERVAL_SECS,
+                    ),
+                ).toString(),
+            )
+            setSelectAllOnFocus(true)
+        }
+        val probeIntervalField = com.google.android.material.textfield.TextInputLayout(
+            this,
+            null,
+            com.google.android.material.R.attr.textInputOutlinedStyle,
+        ).apply {
+            hint = getString(R.string.probe_interval)
+            suffixText = getString(R.string.seconds_short)
+            isEnabled = cbAutoProbe.isChecked
+            probeIntervalInput.isEnabled = cbAutoProbe.isChecked
+            addView(
+                probeIntervalInput,
+                android.widget.LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+        }
+        val tvAutoProbe = android.widget.TextView(this).apply {
+            text = getString(R.string.auto_probe_profiles_desc)
+            textSize = 12f
+            setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
+        }
+        cbAutoProbe.setOnCheckedChangeListener { _, enabled ->
+            probeIntervalField.isEnabled = enabled
+            probeIntervalInput.isEnabled = enabled
+        }
         // Interface language. Applied via AppCompatDelegate, which recreates this Activity —
         // so it is handled on Save and nothing else in the dialog needs to know about it.
         val langs = QeliApp.LANGUAGES
@@ -944,6 +1069,20 @@ sni = www.microsoft.com
             orientation = android.widget.LinearLayout.VERTICAL
             setPadding(dp(20), dp(12), dp(20), 0)
             addView(cbLaunch); addView(cbBoot); addView(cbLan); addView(cbFailover)
+            addView(cbTrustedWifi)
+            addView(trustedWifiField, android.widget.LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { marginStart = dp(26); topMargin = dp(4); bottomMargin = dp(8) })
+            addView(cbAutoProbe)
+            addView(probeIntervalField, android.widget.LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { marginStart = dp(26); topMargin = dp(4) })
+            addView(tvAutoProbe, android.widget.LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { marginStart = dp(26); topMargin = dp(4); bottomMargin = dp(8) })
             addView(tvLang); addView(rgLang)
             addView(tvLogFmt); addView(rgLogFmt)
             addView(tvLogLevel); addView(rgLogLevel)
@@ -965,14 +1104,31 @@ sni = www.microsoft.com
                 val pickedLogLevel = logLevels.getOrElse(
                     logLevelButtons.indexOfFirst { it.id == rgLogLevel.checkedRadioButtonId },
                 ) { DEFAULT_LOG_LEVEL }
+                val probeInterval = ProfileAutoProbePolicy.clampIntervalSeconds(
+                    probeIntervalInput.text?.toString()?.toIntOrNull()
+                        ?: ProfileAutoProbePolicy.DEFAULT_INTERVAL_SECS,
+                )
+                val trustedSsids = TrustedWifiPolicy.serialize(
+                    TrustedWifiPolicy.parse(trustedWifiInput.text?.toString()),
+                )
                 prefs.edit()
                     .putBoolean(PREF_AUTO_CONNECT_LAUNCH, cbLaunch.isChecked)
                     .putBoolean(PREF_AUTO_CONNECT_BOOT, cbBoot.isChecked)
                     .putBoolean(PREF_ALLOW_LAN, cbLan.isChecked)
                     .putBoolean(PREF_FAILOVER, cbFailover.isChecked)
+                    .putBoolean(PREF_TRUSTED_WIFI_ENABLED, cbTrustedWifi.isChecked)
+                    .putString(PREF_TRUSTED_WIFI_SSIDS, trustedSsids)
+                    .putBoolean(PREF_AUTO_PROBE, cbAutoProbe.isChecked)
+                    .putInt(PREF_PROBE_INTERVAL_SECS, probeInterval)
                     .putString(PREF_LOG_TIME_FORMAT, pickedLogFmt)
                     .putString(PREF_LOG_LEVEL, pickedLogLevel)
                     .apply()
+                if (cbTrustedWifi.isChecked && trustedSsids.isNotEmpty()) {
+                    requestTrustedWifiPermissions()
+                } else {
+                    reevaluateTrustedWifi()
+                }
+                configureAutoProbeTimer(runImmediately = cbAutoProbe.isChecked)
                 logTimeFormat = pickedLogFmt  // applies to the next line, no restart
                 val pickedLang = langs.getOrElse(
                     langButtons.indexOfFirst { it.id == rgLang.checkedRadioButtonId },
@@ -993,6 +1149,30 @@ sni = www.microsoft.com
             .show()
     }
 
+    private fun requestTrustedWifiPermissions() {
+        val required = buildList {
+            add(Manifest.permission.ACCESS_COARSE_LOCATION)
+            add(Manifest.permission.ACCESS_FINE_LOCATION)
+            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.NEARBY_WIFI_DEVICES)
+        }.filter { permission ->
+            ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED
+        }
+        if (required.isEmpty()) reevaluateTrustedWifi()
+        else trustedWifiPermissionLauncher.launch(required.toTypedArray())
+    }
+
+    /** Apply a settings edit to the already-running controller without creating a new service. */
+    private fun reevaluateTrustedWifi() {
+        if (VpnServiceImpl.liveStatus != VpnServiceImpl.STATUS_CONNECTED &&
+            VpnServiceImpl.liveStatus != VpnServiceImpl.STATUS_CONNECTING &&
+            VpnServiceImpl.liveStatus != VpnServiceImpl.STATUS_WAITING_TRUSTED) return
+        runCatching {
+            startService(Intent(this, VpnServiceImpl::class.java).apply {
+                action = VpnServiceImpl.ACTION_REEVALUATE_TRUSTED
+            })
+        }
+    }
+
     /** Export ALL profiles (the encrypted store's JSON blob) to a user-picked file. */
     private fun writeBackup(uri: android.net.Uri) {
         val blob = secureStore.getString(KEY_PROFILES, null)
@@ -1003,6 +1183,14 @@ sni = www.microsoft.com
             try {
                 val out = if (pass.isEmpty()) blob.toByteArray()
                           else com.qeli.crypto.BackupCrypto.encrypt(blob, pass)
+                val outputLimit = if (pass.isEmpty()) {
+                    MAX_IMPORTED_FILE_BYTES
+                } else {
+                    MAX_IMPORTED_BACKUP_BYTES
+                }
+                require(out.size <= outputLimit) {
+                    "backup exceeds the supported export limit"
+                }
                 contentResolver.openOutputStream(uri)?.use { it.write(out) }
                 val suffix = getString(if (pass.isEmpty()) R.string.backup_unencrypted else R.string.backup_encrypted)
                 Toast.makeText(this, getString(R.string.backed_up, profiles.size, suffix), Toast.LENGTH_SHORT).show()
@@ -1015,34 +1203,118 @@ sni = www.microsoft.com
     /** Restore ALL profiles from a backup file (replaces the current set, after confirmation).
      *  Transparently handles both the legacy plaintext JSON and a passphrase-encrypted export. */
     private fun readRestore(uri: android.net.Uri) {
-        try {
-            val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                ?: throw Exception("empty file")
-            if (com.qeli.crypto.BackupCrypto.isEncrypted(bytes)) {
-                promptPassphrase(getString(R.string.restore_passphrase_title), allowEmpty = false) { pass ->
-                    if (pass.isEmpty()) {
-                        Toast.makeText(this, getString(R.string.passphrase_required), Toast.LENGTH_SHORT).show()
-                        return@promptPassphrase
+        lifecycleScope.launch {
+            try {
+                val bytes = readUriBytesBounded(uri, MAX_IMPORTED_BACKUP_BYTES)
+                if (com.qeli.crypto.BackupCrypto.isEncrypted(bytes)) {
+                    promptPassphrase(getString(R.string.restore_passphrase_title), allowEmpty = false) { pass ->
+                        if (pass.isEmpty()) {
+                            bytes.fill(0)
+                            Toast.makeText(
+                                this@MainActivity,
+                                getString(R.string.passphrase_required),
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                            return@promptPassphrase
+                        }
+                        // PBKDF2 is deliberately expensive. Keep even a normal 210k-round
+                        // backup off the main thread; BackupCrypto also caps attacker-chosen
+                        // iteration counts before entering the KDF.
+                        lifecycleScope.launch {
+                            val decrypted = try {
+                                withContext(Dispatchers.Default) {
+                                    com.qeli.crypto.BackupCrypto.decrypt(bytes, pass)
+                                }
+                            } catch (e: Exception) {
+                                Toast.makeText(
+                                    this@MainActivity,
+                                    getString(R.string.wrong_passphrase),
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                                return@launch
+                            } finally {
+                                bytes.fill(0)
+                            }
+                            try {
+                                confirmAndRestore(decrypted)
+                            } catch (e: Exception) {
+                                Toast.makeText(
+                                    this@MainActivity,
+                                    getString(R.string.restore_failed, e.message ?: ""),
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                            }
+                        }
                     }
-                    try {
-                        confirmAndRestore(com.qeli.crypto.BackupCrypto.decrypt(bytes, pass))
-                    } catch (e: Exception) {
-                        Toast.makeText(this, getString(R.string.wrong_passphrase), Toast.LENGTH_LONG).show()
-                    }
+                } else {
+                    try { confirmAndRestore(String(bytes, Charsets.UTF_8)) }
+                    finally { bytes.fill(0) }
                 }
-            } else {
-                confirmAndRestore(String(bytes, Charsets.UTF_8))
+            } catch (e: Exception) {
+                Toast.makeText(
+                    this@MainActivity,
+                    getString(R.string.restore_failed, e.message ?: ""),
+                    Toast.LENGTH_LONG,
+                ).show()
             }
-        } catch (e: Exception) {
-            Toast.makeText(this, getString(R.string.restore_failed, e.message ?: ""), Toast.LENGTH_LONG).show()
         }
     }
 
+    /** Read an untrusted document off the UI thread and reject it before memory use becomes
+     * unbounded. The caller selects the plaintext-config or base64-expanded backup ceiling. */
+    private suspend fun readUriBytesBounded(uri: Uri, maxBytes: Int): ByteArray =
+        withContext(Dispatchers.IO) {
+            contentResolver.openInputStream(uri)?.use { input ->
+                val output = java.io.ByteArrayOutputStream()
+                val buffer = ByteArray(16 * 1024)
+                try {
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        if (output.size() + count > maxBytes) {
+                            throw IllegalArgumentException(
+                                "file exceeds ${maxBytes / (1024 * 1024)} MiB import limit"
+                            )
+                        }
+                        output.write(buffer, 0, count)
+                    }
+                } finally {
+                    buffer.fill(0)
+                }
+                output.toByteArray().also { require(it.isNotEmpty()) { "empty file" } }
+            } ?: throw IllegalArgumentException("empty file")
+        }
+
     /** Validate a decrypted/plaintext backup JSON, confirm, then replace the profile set. */
     private fun confirmAndRestore(text: String) {
+        require(text.toByteArray(Charsets.UTF_8).size <= MAX_IMPORTED_FILE_BYTES) {
+            "decrypted archive exceeds the supported size limit"
+        }
         val root = JSONObject(text)                       // validate JSON
-        require(root.has("profiles")) { "not a Qeli backup" }
-        val n = root.optJSONArray("profiles")?.length() ?: 0
+        val entries = root.optJSONArray("profiles")
+            ?: throw IllegalArgumentException("not a Qeli backup: profiles must be an array")
+        val n = entries.length()
+        require(n in 1..MAX_IMPORTED_PROFILES) {
+            "backup must contain 1..$MAX_IMPORTED_PROFILES profiles"
+        }
+        for (index in 0 until n) {
+            val entry = entries.optJSONObject(index)
+                ?: throw IllegalArgumentException("profile ${index + 1} must be an object")
+            val name = entry.optString("name", "profile")
+            val stored = storedProfileText(entry)
+            validateProfileForStorage(name, stored, "profile ${index + 1}")
+            try {
+                VpnConfig.parse(stored).validate()
+            } catch (error: Exception) {
+                throw IllegalArgumentException(
+                    "profile ${index + 1} ('$name') is invalid: " +
+                        (error.message ?: "invalid config"),
+                    error,
+                )
+            }
+        }
+        val restoredActive = root.optInt("active", 0)
+        require(restoredActive in 0 until n) { "backup active profile index is out of range" }
         MaterialAlertDialogBuilder(this)
             .setTitle(R.string.restore_profiles)
             .setMessage(getString(R.string.restore_confirm, n))
@@ -1074,27 +1346,55 @@ sni = www.microsoft.com
     }
 
     private fun loadProfiles() {
-        profiles.clear()
         val raw = secureStore.getString(KEY_PROFILES, null)
+        var loadRejected = false
         if (raw != null) {
             try {
+                require(raw.toByteArray(Charsets.UTF_8).size <= MAX_IMPORTED_FILE_BYTES) {
+                    "stored profile set exceeds the safety limit"
+                }
                 val root = JSONObject(raw)
-                activeIndex = root.optInt("active", 0)
                 val arr = root.optJSONArray("profiles") ?: JSONArray()
+                require(arr.length() <= MAX_IMPORTED_PROFILES) {
+                    "stored profile set exceeds $MAX_IMPORTED_PROFILES entries"
+                }
+                val loaded = ArrayList<Profile>(arr.length())
                 for (i in 0 until arr.length()) {
                     val p = arr.getJSONObject(i)
-                    // New format stores `cfg` (INI). Legacy stored `json` (JSON) or
-                    // an old multi-profile {address,port,...}. Normalize all to INI.
-                    val stored = p.optString("cfg", "").ifBlank {
-                        p.optString("json", "").ifBlank { synthesizeIni(p) }
-                    }
-                    profiles.add(Profile(p.optString("name", "profile"), stored))
+                    val name = p.optString("name", "profile")
+                    val stored = storedProfileText(p)
+                    validateProfileForStorage(name, stored, "profile ${i + 1}")
+                    VpnConfig.parse(stored).validate()
+                    loaded.add(Profile(name, stored))
                 }
-            } catch (e: Exception) { Log.e("VpnMain", "profiles load: ${e.message}") }
+                // Commit only after every entry parsed and validated. A corrupt tail must not
+                // replace a previously usable in-memory set with a partial prefix.
+                profiles.clear()
+                profiles.addAll(loaded)
+                activeIndex = root.optInt("active", 0)
+            } catch (e: Exception) {
+                loadRejected = true
+                Log.e("VpnMain", "profiles load: ${e.message}")
+            }
         }
-        if (profiles.isEmpty()) { profiles.add(Profile(getString(R.string.default_profile_name), TEMPLATE)); persist() }
+        if (profiles.isEmpty()) {
+            profiles.add(Profile(getString(R.string.default_profile_name), TEMPLATE))
+            // Never overwrite a rejected encrypted store merely by opening the app. The
+            // normal creation/import paths below prevent new over-limit stores; retaining an
+            // older/corrupt value here still leaves it recoverable from app data or a fixed
+            // build instead of silently replacing all credentials with the template.
+            if (!loadRejected) persist()
+        }
         if (activeIndex !in profiles.indices) activeIndex = 0
     }
+
+    /** New backups store `cfg` (INI); very old field-based entries are normalized through the
+     * current model. A retired `json` payload remains explicit input to `parse`, which rejects
+     * it with the documented migration error instead of silently guessing. */
+    private fun storedProfileText(profile: JSONObject): String =
+        profile.optString("cfg", "").ifBlank {
+            profile.optString("json", "").ifBlank { synthesizeIni(profile) }
+        }.also { require(it.isNotBlank()) { "profile config is empty" } }
 
     /**
      * Legacy old-multi-profile entry (`{address,port,username}`) -> current flat-INI.
@@ -1124,11 +1424,37 @@ sni = www.microsoft.com
     }
 
     private fun persist() {
-        val arr = JSONArray()
-        for (p in profiles) arr.put(JSONObject().put("name", p.name).put("cfg", p.text))
+        val encoded = encodeProfileSet(profiles, activeIndex)
         secureStore.edit()
-            .putString(KEY_PROFILES, JSONObject().put("active", activeIndex).put("profiles", arr).toString())
+            .putString(KEY_PROFILES, encoded)
             .apply()
+    }
+
+    /** Validate and encode a complete prospective state before mutating the live list. */
+    private fun encodeProfileSet(items: List<Profile>, selectedIndex: Int): String {
+        require(items.isNotEmpty()) { "profile set must not be empty" }
+        require(items.size <= MAX_IMPORTED_PROFILES) {
+            "profile limit ($MAX_IMPORTED_PROFILES) reached"
+        }
+        require(selectedIndex in items.indices) { "active profile index is out of range" }
+        val arr = JSONArray()
+        for ((index, p) in items.withIndex()) {
+            validateProfileForStorage(p.name, p.text, "profile ${index + 1}")
+            arr.put(JSONObject().put("name", p.name).put("cfg", p.text))
+        }
+        val encoded = JSONObject().put("active", selectedIndex).put("profiles", arr).toString()
+        require(encoded.toByteArray(Charsets.UTF_8).size <= MAX_IMPORTED_FILE_BYTES) {
+            "stored profile set exceeds the safety limit"
+        }
+        return encoded
+    }
+
+    private fun validateProfileForStorage(name: String, text: String, label: String = "profile") {
+        require(name.isNotBlank()) { "$label name is empty" }
+        require(name.length <= MAX_IMPORTED_PROFILE_NAME_CHARS) { "$label name is too long" }
+        require(text.toByteArray(Charsets.UTF_8).size <= MAX_IMPORTED_CONFIG_BYTES) {
+            "$label config exceeds the safety limit"
+        }
     }
 
     /** Parsed address/port for display + ping; null on parse failure. */
@@ -1161,8 +1487,17 @@ sni = www.microsoft.com
             val iniText = if (cfgText.trimStart().startsWith("{")) cfg.toIni() else cfgText
             var name = dlgBinding.editName.text.toString().trim()
             if (name.isBlank()) name = cfg.serverAddress.ifBlank { getString(R.string.profile_fallback_name) }
-            if (index < 0) { profiles.add(Profile(name, iniText)); activeIndex = activeAfterAdd() }
-            else { profiles[index].name = name; profiles[index].text = iniText }
+            val candidate = profiles.map { it.copy() }.toMutableList()
+            if (index < 0) candidate.add(Profile(name, iniText))
+            else candidate[index] = Profile(name, iniText)
+            val candidateActive = if (index < 0) activeAfterAdd(candidate.size) else activeIndex
+            try {
+                encodeProfileSet(candidate, candidateActive)
+            } catch (e: Exception) {
+                Toast.makeText(this, e.message ?: getString(R.string.invalid_config, ""), Toast.LENGTH_LONG).show()
+                return@setOnClickListener
+            }
+            profiles.clear(); profiles.addAll(candidate); activeIndex = candidateActive
             persist(); renderProfileList(); renderActiveProfile(); pingActive()
             dialog.dismiss()
         }
@@ -1250,12 +1585,19 @@ sni = www.microsoft.com
     }
 
     private fun importConfigFromUri(uri: Uri) {
-        try {
-            val text = contentResolver.openInputStream(uri)?.use { it.readBytes().decodeToString() }
-                ?.trim() ?: throw IllegalStateException("Empty file")
-            importProfilesBundle(text)
-        } catch (e: Exception) {
-            Toast.makeText(this, getString(R.string.invalid_config, e.message ?: ""), Toast.LENGTH_LONG).show()
+        lifecycleScope.launch {
+            try {
+                val bytes = readUriBytesBounded(uri, MAX_IMPORTED_CONFIG_BYTES)
+                val text = try { bytes.decodeToString().trim() } finally { bytes.fill(0) }
+                require(text.isNotEmpty()) { "Empty file" }
+                importProfilesBundle(text)
+            } catch (e: Exception) {
+                Toast.makeText(
+                    this@MainActivity,
+                    getString(R.string.invalid_config, e.message ?: ""),
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
         }
     }
 
@@ -1507,7 +1849,7 @@ sni = www.microsoft.com
             // Switching the active profile is refused while a tunnel is up — it would tear
             // down a live connection on a single tap. Dim the other rows so it reads as
             // unavailable before the tap, but keep them clickable so the tap can explain why.
-            val locked = (isConnected || isConnecting || isDisconnecting) && i != activeIndex
+            val locked = (isConnected || isConnecting || isDisconnecting || isTrustedPaused) && i != activeIndex
             row.root.alpha = if (locked) 0.45f else 1f
             row.root.setOnClickListener {
                 if (locked) {
@@ -1616,7 +1958,16 @@ sni = www.microsoft.com
             .setPositiveButton(R.string.save) { _, _ ->
                 val mode = when (rgMode.checkedRadioButtonId) { rbInc.id -> "include"; rbExc.id -> "exclude"; else -> "all" }
                 val sel = checks.filterValues { it.isChecked }.keys.toList()
-                profiles[i].text = writeAppsIntoIni(profile.text, mode, sel)
+                val candidate = profiles.map { it.copy() }.toMutableList()
+                candidate[i].text = writeAppsIntoIni(profile.text, mode, sel)
+                try {
+                    VpnConfig.parse(candidate[i].text).validate()
+                    encodeProfileSet(candidate, activeIndex)
+                } catch (e: Exception) {
+                    Toast.makeText(this, e.message ?: "Invalid per-app profile", Toast.LENGTH_LONG).show()
+                    return@setPositiveButton
+                }
+                profiles.clear(); profiles.addAll(candidate)
                 persist()
                 val n = if (mode == "all") 0 else sel.size
                 Toast.makeText(this, if (mode == "all") getString(R.string.per_app_all_toast) else getString(R.string.per_app_selected_toast, n), Toast.LENGTH_SHORT).show()
@@ -1697,7 +2048,18 @@ sni = www.microsoft.com
     /** Duplicate a profile (inserted right after it, name + " (copy)"). */
     private fun duplicateProfile(i: Int) {
         val p = profiles.getOrNull(i) ?: return
-        profiles.add(i + 1, Profile(getString(R.string.duplicate_suffix, p.name), p.text))
+        val name = getString(R.string.duplicate_suffix, p.name)
+        try {
+            val candidate = profiles.map { it.copy() }.toMutableList()
+            candidate.add(i + 1, Profile(name, p.text))
+            // Insertion before the active row must retain the same active profile.
+            val candidateActive = if (activeIndex > i) activeIndex + 1 else activeIndex
+            encodeProfileSet(candidate, candidateActive)
+            profiles.clear(); profiles.addAll(candidate); activeIndex = candidateActive
+        } catch (e: Exception) {
+            Toast.makeText(this, e.message ?: "Profile cannot be duplicated", Toast.LENGTH_LONG).show()
+            return
+        }
         reach.clear()               // indices shifted → re-probe
         persist(); renderProfileList()
     }
@@ -1708,8 +2070,9 @@ sni = www.microsoft.com
      * unchanged current one while a tunnel is up. Creating or importing a profile must not
      * become a back-door profile switch on a live connection.
      */
-    private fun activeAfterAdd(): Int =
-        if (isConnected || isConnecting || isDisconnecting) activeIndex else profiles.size - 1
+    private fun activeAfterAdd(candidateSize: Int): Int =
+        if (isConnected || isConnecting || isDisconnecting || isTrustedPaused) activeIndex
+        else candidateSize - 1
 
     private fun moveProfile(i: Int, delta: Int) {
         val j = i + delta
@@ -1788,34 +2151,99 @@ sni = www.microsoft.com
 
     // ── reachability (TCP connect) ───────────────────────────────────────--
 
-    private fun pingActive() {
+    private fun configureAutoProbeTimer(runImmediately: Boolean) {
+        autoProbeJob?.cancel()
+        autoProbeJob = null
+        cancelAutomaticProbeJobs()
+        val prefs = getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
+        if (!prefs.getBoolean(PREF_AUTO_PROBE, true)) return
+
+        autoProbeJob = lifecycleScope.launch {
+            if (runImmediately) pingAll(manual = false)
+            while (isActive) {
+                val interval = ProfileAutoProbePolicy.clampIntervalSeconds(
+                    prefs.getInt(
+                        PREF_PROBE_INTERVAL_SECS,
+                        ProfileAutoProbePolicy.DEFAULT_INTERVAL_SECS,
+                    ),
+                )
+                delay(interval * 1_000L)
+                pingAll(manual = false)
+            }
+        }
+    }
+
+    private fun cancelAutomaticProbeJobs() {
+        val jobs = synchronized(automaticProbeJobs) {
+            automaticProbeJobs.toList().also { automaticProbeJobs.clear() }
+        }
+        jobs.forEach(Job::cancel)
+    }
+
+    private fun launchReachabilityProbe(
+        manual: Boolean,
+        block: suspend kotlinx.coroutines.CoroutineScope.() -> Unit,
+    ) {
+        val job = lifecycleScope.launch(block = block)
+        if (!manual) {
+            automaticProbeJobs.add(job)
+            job.invokeOnCompletion { automaticProbeJobs.remove(job) }
+        }
+    }
+
+    private suspend fun <T> withReachabilityProbeSlot(block: suspend () -> T): T {
+        reachabilityProbeSlots.acquire()
+        return try { block() } finally { reachabilityProbeSlots.release() }
+    }
+
+    private fun pingActive(manual: Boolean = false) {
         if (isDisconnecting) return
+        if (!manual) {
+            val enabled = getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
+                .getBoolean(PREF_AUTO_PROBE, true)
+            if (!enabled || isConnected || isConnecting || isTrustedPaused) return
+        }
         val p = current() ?: return
         val idx = activeIndex
         val epoch = reachEpoch
         reach[idx] = -2L; renderActiveProfile()
         val cfg = try { VpnConfig.parse(p.text) } catch (_: Exception) { null }
         if (cfg == null) { reach[idx] = -1L; renderActiveProfile(); return }
-        lifecycleScope.launch {
+        launchReachabilityProbe(manual) {
             // While connected, probe the in-tunnel gateway for a clean tunnel RTT
             // (probing the public IP loops back through the server and ~doubles it).
-            val ms = if (isConnected && clientIp.isNotEmpty()) {
-                val gw = gatewayOf(clientIp)
-                if (cfg.isUdp) udpPing(cfg, gw) else tcpPing(gw, cfg.port)
-            } else {
-                probe(p)
+            val ms = withReachabilityProbeSlot {
+                if (isConnected && clientIp.isNotEmpty()) {
+                    val gw = gatewayOf(clientIp)
+                    if (cfg.isUdp) udpPing(cfg, gw) else tcpPing(gw, cfg.port)
+                } else {
+                    probe(p)
+                }
             }
-            if (epoch == reachEpoch && !isDisconnecting) {
+            if (epoch == reachEpoch && !isDisconnecting
+                && profiles.getOrNull(idx) === p) {
                 reach[idx] = ms
                 if (activeIndex == idx) renderActiveProfile()
             }
         }
     }
 
-    private fun pingAll() {
+    private fun pingAll(manual: Boolean = false) {
         if (isDisconnecting) return
+        val sweepPrefs = getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
+        val sweepAt = System.currentTimeMillis()
+        if (!manual) {
+            if (!ProfileAutoProbePolicy.canStartSweep(
+                    enabled = sweepPrefs.getBoolean(PREF_AUTO_PROBE, true),
+                    tunnelBusy = isConnected || isConnecting || isDisconnecting || isTrustedPaused,
+                    nowMs = sweepAt,
+                    lastSweepMs = lastAutoProbeAtMs,
+                )) return
+        }
+        lastAutoProbeAtMs = sweepAt
+        sweepPrefs.edit().putLong(PREF_LAST_AUTO_PROBE_MS, sweepAt).apply()
         val epoch = reachEpoch
-        profiles.forEachIndexed { i, p ->
+        profiles.toList().forEachIndexed { i, p ->
             val ep = endpointOf(p)
             when {
                 ep == null -> reach[i] = -1L
@@ -1825,11 +2253,13 @@ sni = www.microsoft.com
                 isConnected && i == activeIndex -> reach[i] = 0L
                 else -> {
                     reach[i] = -2L
-                    lifecycleScope.launch {
-                        val ms = probe(p)
-                        if (epoch == reachEpoch && !isDisconnecting) {
+                    launchReachabilityProbe(manual) {
+                        val ms = withReachabilityProbeSlot { probe(p) }
+                        if (epoch == reachEpoch && !isDisconnecting
+                            && profiles.getOrNull(i) === p) {
                             reach[i] = ms
                             if (binding.viewProfiles.visibility == View.VISIBLE) renderProfileList()
+                            if (activeIndex == i) renderActiveProfile()
                         }
                     }
                 }
@@ -1839,12 +2269,20 @@ sni = www.microsoft.com
     }
 
     private suspend fun tcpPing(host: String, port: Int): Long = withContext(Dispatchers.IO) {
-        try {
-            val s = Socket(); val t0 = System.currentTimeMillis()
-            s.connect(InetSocketAddress(host, port), 3000)
-            val ms = System.currentTimeMillis() - t0; try { s.close() } catch (_: Exception) {}
-            ms
-        } catch (_: Exception) { -1L }
+        suspendCancellableCoroutine { continuation ->
+            val socket = Socket()
+            continuation.invokeOnCancellation { runCatching { socket.close() } }
+            val result = try {
+                val startedAt = System.currentTimeMillis()
+                socket.connect(InetSocketAddress(host, port), 3000)
+                System.currentTimeMillis() - startedAt
+            } catch (_: Exception) {
+                -1L
+            } finally {
+                runCatching { socket.close() }
+            }
+            if (continuation.isActive) continuation.resume(result)
+        }
     }
 
     /** Protocol-aware reachability: TCP connect for TCP profiles, a real first-packet
@@ -1866,8 +2304,18 @@ sni = www.microsoft.com
      *  fragmentation, QUIC and obfs helpers as the live transport; Kotlin supplies only a
      *  credential-free profile and displays the measured time to any server reply. */
     private suspend fun udpPing(cfg: VpnConfig, host: String): Long = withContext(Dispatchers.IO) {
-        runCatching { TransportCore.udpReachability(cfg.toTransportProbeIni(), host) }
-            .getOrDefault(-1L)
+        suspendCancellableCoroutine { continuation ->
+            val probeId = REACHABILITY_PROBE_IDS.updateAndGet { current ->
+                if (current == Long.MAX_VALUE) 1L else current + 1L
+            }
+            continuation.invokeOnCancellation {
+                TransportCore.cancelUdpReachability(probeId)
+            }
+            val result = runCatching {
+                TransportCore.udpReachability(cfg.toTransportProbeIni(), host, probeId)
+            }.getOrDefault(-1L)
+            if (continuation.isActive) continuation.resume(result)
+        }
     }
 
     // ── connect / disconnect ─────────────────────────────────────────────--
@@ -1876,7 +2324,7 @@ sni = www.microsoft.com
     // (so the button can interrupt an endlessly-retrying connection); else connect.
     fun onConnectTap(v: View) {
         if (isDisconnecting) return
-        if (isConnected || isConnecting) disconnect() else connect()
+        if (isConnected || isConnecting || isTrustedPaused) disconnect() else connect()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -1906,11 +2354,11 @@ sni = www.microsoft.com
     private fun maybeAutoConnect(intent: Intent?) {
         if (intent?.getBooleanExtra(EXTRA_AUTO_CONNECT, false) != true) return
         intent.removeExtra(EXTRA_AUTO_CONNECT)
-        if (!isConnected && !isConnecting && !isDisconnecting) connect()
+        if (!isConnected && !isConnecting && !isDisconnecting && !isTrustedPaused) connect()
     }
 
     private fun connect() {
-        if (isDisconnecting) return
+        if (isDisconnecting || isTrustedPaused) return
         val prefs = getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
         if (prefs.getBoolean(PREF_AUTO_TRANSPORT, false) && profiles.size > 1) {
             pickBestTransportThenConnect()
@@ -2031,7 +2479,7 @@ sni = www.microsoft.com
     // ── UI state ──────────────────────────────────────────────────────────--
 
     private fun setConnectingState() {
-        isConnected = false; isConnecting = true; isDisconnecting = false
+        isConnected = false; isConnecting = true; isDisconnecting = false; isTrustedPaused = false
         binding.btnPing.isEnabled = true
         binding.btnCheckAll.isEnabled = true
         binding.statusIndicator.backgroundTintList = csl(R.color.status_connecting)
@@ -2046,7 +2494,7 @@ sni = www.microsoft.com
 
     private fun setDisconnectingState() {
         if (!isDisconnecting) reachEpoch++
-        isConnected = false; isConnecting = false; isDisconnecting = true
+        isConnected = false; isConnecting = false; isDisconnecting = true; isTrustedPaused = false
         clientIp = ""
         binding.btnPing.isEnabled = false
         binding.btnCheckAll.isEnabled = false
@@ -2062,7 +2510,7 @@ sni = www.microsoft.com
     }
 
     private fun setDisconnectedState() {
-        isConnected = false; isConnecting = false; isDisconnecting = false; clientIp = ""
+        isConnected = false; isConnecting = false; isDisconnecting = false; isTrustedPaused = false; clientIp = ""
         binding.btnPing.isEnabled = true
         binding.btnCheckAll.isEnabled = true
         binding.statusIndicator.backgroundTintList = csl(R.color.status_disconnected)
@@ -2076,7 +2524,7 @@ sni = www.microsoft.com
     }
 
     private fun setConnectedState() {
-        isConnected = true; isConnecting = false; isDisconnecting = false
+        isConnected = true; isConnecting = false; isDisconnecting = false; isTrustedPaused = false
         binding.btnPing.isEnabled = true
         binding.btnCheckAll.isEnabled = true
         binding.statusIndicator.backgroundTintList = csl(R.color.status_connected)
@@ -2092,8 +2540,27 @@ sni = www.microsoft.com
         maybeCheckForUpdates()
     }
 
+    private fun setTrustedWaitingState() {
+        isConnected = false; isConnecting = false; isDisconnecting = false; isTrustedPaused = true
+        clientIp = ""
+        binding.btnPing.isEnabled = true
+        binding.btnCheckAll.isEnabled = true
+        binding.statusIndicator.backgroundTintList = csl(R.color.status_connecting)
+        binding.tvStatus.text = getString(R.string.trusted_wifi_waiting)
+        binding.tvRingHint.text = getString(R.string.tap_to_cancel_resume)
+        binding.tvIp.visibility = View.GONE
+        binding.tvConnectionStep.visibility = View.VISIBLE
+        binding.tvConnectionStep.text = getString(
+            R.string.trusted_wifi_waiting_detail,
+            VpnServiceImpl.liveTrustedSsid.ifBlank { getString(R.string.trusted_wifi_unknown) },
+        )
+        binding.tvSpeed.visibility = View.GONE
+        binding.statsCard.visibility = View.GONE
+        stopRingSpin()
+    }
+
     private fun setErrorState(error: String?) {
-        isConnected = false; isConnecting = false; isDisconnecting = false; clientIp = ""
+        isConnected = false; isConnecting = false; isDisconnecting = false; isTrustedPaused = false; clientIp = ""
         binding.btnPing.isEnabled = true
         binding.btnCheckAll.isEnabled = true
         binding.statusIndicator.backgroundTintList = csl(R.color.status_error)
@@ -2107,18 +2574,22 @@ sni = www.microsoft.com
     }
 
     private fun updateUi(status: String?, error: String?) {
-        val wasLocked = isConnected || isConnecting || isDisconnecting
+        val wasLocked = isConnected || isConnecting || isDisconnecting || isTrustedPaused
         when (status) {
             VpnServiceImpl.STATUS_CONNECTING -> setConnectingState()
             VpnServiceImpl.STATUS_CONNECTED -> setConnectedState()
             VpnServiceImpl.STATUS_DISCONNECTING -> setDisconnectingState()
+            VpnServiceImpl.STATUS_WAITING_TRUSTED -> setTrustedWaitingState()
             VpnServiceImpl.STATUS_DISCONNECTED -> setDisconnectedState()
             VpnServiceImpl.STATUS_ERROR -> setErrorState(error)
         }
         // Profile switching is locked while the tunnel is up, and the rows render that as
         // dimming — so the list has to be redrawn whenever we cross that boundary, or the
         // lock stays visible after a disconnect (and invisible after a connect).
-        if (wasLocked != (isConnected || isConnecting || isDisconnecting)) renderProfileList()
+        if (wasLocked != (isConnected || isConnecting || isDisconnecting || isTrustedPaused)) renderProfileList()
+        if (wasLocked && !isConnected && !isConnecting && !isDisconnecting && !isTrustedPaused) {
+            pingAll(manual = false)
+        }
         // The protection card is worded in the present tense only while connected.
         renderConnectionInfo()
     }

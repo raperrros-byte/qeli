@@ -21,8 +21,8 @@
 | `third-party/windows-x64/wintun.dll` | x86_64 | 418 КБ | WireGuard Wintun userspace TUN (СТОРОННЯЯ, не наша) | `qeli-win/QeliWin/wintun/wintun.dll` → EmbeddedResource |
 | `third-party/windows-x64/windivert/WinDivert.dll` + `WinDivert64.sys` | x86_64 | — | WinDivert 2.2.2 (СТОРОННЯЯ, LGPL-3.0 OR GPL-2.0) — per-app packet capture | `qeli-win/QeliWin/windivert/` → EmbeddedResource |
 
-> **Текущий статус:** все четыре first-party binaries пересобраны 2026-08-10 с ABI 1.10
-> двумя независимыми проходами на лабах `.10`/`.11`. A/B-пары побайтно совпали;
+> **Текущий статус:** все четыре first-party binaries пересобраны 2026-08-19 из clean commit
+> `b1e220d` с ABI 1.10 двумя независимыми проходами на лабах `.10`/`.11`. A/B-пары побайтно совпали;
 > `SHA256SUMS`, canonical/consumed copies, обе evidence-записи и `PROVENANCE` согласованы.
 
 Все `qeli`-либы (so/dll/dylib) — это ОДИН Rust-крейт `qeli`
@@ -30,13 +30,16 @@
 `src/protocol/realtls/ffi.rs`, `src/transport_core/ffi.rs` и Android JNI adapter,
 кросс-скомпилированный под разные таргеты. Экспорты:
 `qeli_realtls_{new,recv,seal,open,free,buf_free}` (6 символов C ABI) и 20
-`qeli_client_*`; Android дополнительно содержит 17 `Java_com_qeli_TransportCore_*`.
+`qeli_client_*`; текущий исходный Android ABI требует 19
+`Java_com_qeli_TransportCore_*` (canonical `.so` получает их при обязательной пересборке ниже).
 Старые Kotlin-specific RealTls/ML-KEM/KeyExchange JNI
 wrappers удалены после перехода всего Android transport на whole-client core.
 
-**Версия лежащих сейчас бинарников:** собраны 2026-08-10 из дерева разработки 0.7.15 с
-ABI 1.10 transport-core,
-поддержка обоих cipher-suite (TLS_AES_128_GCM_SHA256 + TLS_AES_256_GCM_SHA384) и
+**Версия лежащих сейчас бинарников:** baseline собран 2026-08-19 из дерева разработки 0.7.16 с
+ABI 1.10 transport-core, включая два cancellable UDP-probe JNI exports и dependency baseline из
+`Cargo.lock` коммита `b1e220d`. `provenance.py --check` проходит; публикация полного релиза всё равно
+требует пересборки остальных payload-файлов и прохождения platform/signing/E2E gates. Поверхность baseline включает
+поддержку обоих cipher-suite (TLS_AES_128_GCM_SHA256 + TLS_AES_256_GCM_SHA384) и
 post-quantum hybrid X25519MLKEM768. Единый browser-grade отпечаток со всеми клиентами.
 
 Все три платформенных варианта собираются с `--no-default-features --features transport-core-ffi`
@@ -67,7 +70,9 @@ generation-scoped TUN fd. ABI 1.6 добавляет whole-client export `qeli_c
 run/stats bindings и capability `NATIVE_DATA_PLANE`; Kotlin остаётся platform/UI adapter и не
 является packet reader на активном пути. 17-й JNI export — handle-free UDP first-flight
 diagnostic: credential-free профиль использует тот же Rust PQ ClientHello/fragment/QUIC/obfs
-builder, что рабочий transport, и останавливается на первом ответе сервера.
+builder, что рабочий transport, и останавливается на первом ответе сервера. 18-й и 19-й
+exports добавляют cancellable-вариант этой проверки и точечную отмену по `probe_id`, чтобы
+закрытие Android-экрана действительно закрывало native UDP socket, а не только coroutine.
 
 ## Как собрать (всё на лаб-сервере .10/.11, на Windows Rust-тулчейна нет)
 
@@ -91,7 +96,7 @@ python scripts/build_android_so_11.py    # arm64-v8a + x86_64 libqeli.so
    и разными чистыми `CARGO_TARGET_DIR` (`a`/`b`); после сохранения конечного файла тяжёлый
    target-кэш прохода удаляется, чтобы A/B укладывался в свободное место лабы;
 5. требуют byte-identical SHA256 для A/B и полный export gate (6 Reality + 20 client;
-   Android дополнительно 17 JNI). Для macOS до ad-hoc подписи нормализуются случайный
+   Android дополнительно 19 JNI). Для macOS до ad-hoc подписи нормализуются случайный
    `LC_UUID` и недопустимый нестабильный Zig 0.13 GOT-index, install name закреплён как
    `@rpath/libqeli.dylib`;
 6. только после этого атомарно заменяют canonical/consumed копии и создают

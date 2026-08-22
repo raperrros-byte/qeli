@@ -1,6 +1,6 @@
 # qeli configuration
 
-> **These docs describe 0.7.14** — the latest released version. `qeli --version` tells you
+> **These docs describe 0.7.15** — the latest released version. `qeli --version` tells you
 > what you actually have.
 
 ## Format: flat-INI (the only one; TOML/JSON have been dropped)
@@ -74,8 +74,9 @@ links with `proto` and `mode` spelled out separately.
 > no longer emits them, but still **parses** them so links it issued earlier import as
 > intended.
 
-**About `quic`.** The server **mirrors the client's choice per-connection** — it sniffs QUIC
-from the first packet's signature, so `udp-quic` works even when the server profile's
+**About `quic`.** The server **mirrors the client's choice per-connection** — it validates
+the complete qeli QUIC envelope on the first datagram (including its declared Length), so
+`udp-quic` works even when the server profile's
 `obf.quic.enabled` is off; that flag only controls whether the server stamps `quic=1` into
 the links it generates.
 
@@ -1267,6 +1268,10 @@ but not applied on this platform, **✓\*** with a caveat (footnote).
 zero-copy path and macOS keeps its ordinary global utun routes/DNS. `include` or `exclude`
 changes only platform packet/flow ownership: the selected TCP, UDP and DNS traffic still enters
 the same ABI 1.10 Rust transport and uses the same server push, crypto and reconnect logic.
+Destination routing remains a separate axis: with `gateway = false`, a selected application uses
+the tunnel only for `include`, pushed routes and the assigned tunnel subnet; other public IPv4 and
+native IPv6 remain direct. An explicitly included IPv6 prefix is retained fail-closed until the
+inner data plane supports IPv6. With `gateway = true`, selected public IPv4 remains full-tunnel.
 Windows captures/classifies with the bundled WinDivert driver. macOS uses a signed system
 extension containing both `NETransparentProxyProvider` and `NEDNSProxyProvider`; an ad-hoc or
 cross-built macOS archive therefore rejects an app-filtered profile until a Developer-ID build

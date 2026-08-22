@@ -357,7 +357,9 @@ fn free_dev(exclude: &str) -> String {
         if let Ok(s) = std::fs::read_to_string(ClientManager::profile_path(&n)) {
             if let Ok(d) = IniDoc::parse(&s) {
                 if let Ok(c) = ClientConfig::from_ini(&d) {
-                    used.insert(c.tun.name);
+                    // ClientConfig zeroizes secrets in Drop, so none of its fields may be
+                    // moved out even when this particular field is not sensitive.
+                    used.insert(c.tun.name.clone());
                 }
             }
         }
@@ -383,7 +385,7 @@ fn ensure_unique_dev(name: &str, ini: &str) -> String {
         .ok()
         .and_then(|s| IniDoc::parse(&s).ok())
         .and_then(|d| ClientConfig::from_ini(&d).ok())
-        .map(|c| c.tun.name)
+        .map(|c| c.tun.name.clone())
         .unwrap_or_else(|| free_dev(name));
     let mut out = String::with_capacity(ini.len() + 20);
     let mut injected = false;
@@ -563,11 +565,43 @@ pub async fn delete_profile(
     if !ClientManager::valid_name(&name) {
         return Json(super::err_json("invalid name"));
     }
-    let _ = state.client_manager.disconnect(&name).await;
-    let _ = std::fs::remove_file(ClientManager::profile_path(&name));
-    let _ = std::fs::remove_file(ClientManager::log_path(&name));
-    let _ = std::fs::remove_file(ClientManager::status_path(&name));
-    Json(super::ok_json())
+    if let Err(error) = state.client_manager.disconnect(&name).await {
+        return Json(super::err_json(format!(
+            "could not stop profile '{name}': {error}"
+        )));
+    }
+    let profile_path = ClientManager::profile_path(&name);
+    match std::fs::remove_file(&profile_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Json(super::err_json("profile not found"));
+        }
+        Err(error) => {
+            return Json(super::err_json(format!(
+                "could not delete {profile_path}: {error}"
+            )));
+        }
+    }
+
+    let mut cleanup_warnings = Vec::new();
+    for path in [
+        ClientManager::log_path(&name),
+        ClientManager::status_path(&name),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => cleanup_warnings.push(format!("{path}: {error}")),
+        }
+    }
+    Json(json!({
+        "ok": true,
+        "warning": if cleanup_warnings.is_empty() {
+            None
+        } else {
+            Some(format!("profile deleted, but auxiliary cleanup failed: {}", cleanup_warnings.join("; ")))
+        }
+    }))
 }
 
 pub async fn connect(

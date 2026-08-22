@@ -28,7 +28,7 @@ use crate::tun::strip_ethernet_header;
 use crate::tun::DeviceType;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -329,6 +329,8 @@ impl SessionMap {
 pub struct ProfileRuntime {
     pub name: String,
     pub config: ProfileConfig,
+    /// Generation-scoped owner used by nested session tasks as well as top-level services.
+    pub(crate) tasks: ProfileTasks,
     pub pool: Arc<Mutex<pool::IpPool>>,
     pub sessions: Arc<RwLock<SessionMap>>,
     pub rate_limiter: Arc<Mutex<RateLimiter>>,
@@ -755,38 +757,59 @@ pub fn profile_identity_path(pcfg: &ProfileConfig) -> String {
         .unwrap_or_else(|| format!("{}/{}.key", IDENTITY_DIR, pcfg.name))
 }
 
+fn prepare_identity_parent(path: &std::path::Path) -> anyhow::Result<()> {
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    let existed = parent.exists();
+    std::fs::create_dir_all(parent)?;
+    // Enforce privacy on qeli's own directory and on a directory we just created. Never chmod
+    // an arbitrary existing parent supplied via `identity_key` (for example `/etc`).
+    #[cfg(unix)]
+    if !existed || parent == std::path::Path::new(IDENTITY_DIR) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 /// Load a profile's identity key, or generate+persist a fresh one on first use.
 /// Each profile (interface) has its own identity so clients pin a key specific
 /// to the interface they connect to.
 pub fn load_or_generate_profile_key(pcfg: &ProfileConfig) -> anyhow::Result<StaticKeypair> {
     let path = profile_identity_path(pcfg);
+    let path_ref = std::path::Path::new(&path);
 
-    // Serialise the check-then-generate under a lock on the identity directory. Without
+    // Serialise the check-then-generate under a sidecar lock for this identity path. Without
     // it this was a TOCTOU: the worker starting a profile, the panel's identity endpoint
     // and the share endpoint can all run `exists()==false` concurrently and each generate
     // a DIFFERENT key, the last write winning. For an IDENTITY key that is catastrophic —
     // every already-pinned client would then fail to verify a server it never changed. The
     // lock makes "load if present, else generate once" atomic across processes. (identity race)
-    if let Some(parent) = std::path::Path::new(&path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _lock = crate::util::FileLock::acquire(&path).ok();
+    prepare_identity_parent(path_ref)?;
+    let _lock = crate::util::FileLock::acquire(path_ref)?;
 
-    if std::path::Path::new(&path).exists() {
-        let bytes = std::fs::read(&path)?;
-        if bytes.len() != 32 {
-            return Err(anyhow::anyhow!(
-                "invalid identity key length in {}: {}",
-                path,
-                bytes.len()
-            ));
+    match std::fs::read(path_ref) {
+        Ok(bytes) => {
+            if bytes.len() != 32 {
+                return Err(anyhow::anyhow!(
+                    "invalid identity key length in {}: {}",
+                    path,
+                    bytes.len()
+                ));
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            log::info!("Profile '{}': loaded identity key from {}", pcfg.name, path);
+            Ok(StaticKeypair::from_private_bytes(key))
         }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&bytes);
-        log::info!("Profile '{}': loaded identity key from {}", pcfg.name, path);
-        Ok(StaticKeypair::from_private_bytes(key))
-    } else {
-        generate_profile_key(pcfg)
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            generate_profile_key_unlocked(pcfg, path_ref)
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -794,25 +817,27 @@ pub fn load_or_generate_profile_key(pcfg: &ProfileConfig) -> anyhow::Result<Stat
 /// the identity directory (0700) if needed. Overwrites any existing key.
 pub fn generate_profile_key(pcfg: &ProfileConfig) -> anyhow::Result<StaticKeypair> {
     let path = profile_identity_path(pcfg);
+    let path_ref = std::path::Path::new(&path);
+    prepare_identity_parent(path_ref)?;
+    let _lock = crate::util::FileLock::acquire(path_ref)?;
+    generate_profile_key_unlocked(pcfg, path_ref)
+}
+
+fn generate_profile_key_unlocked(
+    pcfg: &ProfileConfig,
+    path: &std::path::Path,
+) -> anyhow::Result<StaticKeypair> {
     let kp = StaticKeypair::generate();
-    if let Some(parent) = std::path::Path::new(&path).parent() {
-        std::fs::create_dir_all(parent)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-        }
-    }
-    crate::util::write_atomic_private(&path, &kp.private_bytes()[..])?;
+    crate::util::write_atomic_private(path, &kp.private_bytes()[..])?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     log::info!(
         "Profile '{}': generated new identity key at {}",
         pcfg.name,
-        path
+        path.display()
     );
     Ok(kp)
 }
@@ -940,9 +965,8 @@ pub fn validate_profiles(config: &ServerConfig) -> anyhow::Result<()> {
         });
     }
     // tun.name -> profile that claimed it first. Two profiles on one device name is not a
-    // cosmetic clash: `run_profile` starts with `TunInterface::delete(&tun.name)`, so the
-    // second profile DELETES the first one's live interface and both then write into whatever
-    // survives. (Audit 2026-08-01, §4.)
+    // cosmetic clash: TUNSETIFF can attach another queue to an existing multi-queue device,
+    // splitting traffic between unrelated profile generations. (Audit 2026-08-01, §4.)
     let mut tun_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for p in &config.profiles {
         // Disabled profiles are not bound/served, so their config is not validated
@@ -962,9 +986,9 @@ pub fn validate_profiles(config: &ServerConfig) -> anyhow::Result<()> {
         // (IFNAMSIZ - 1). A longer name therefore CREATED a truncated device and every
         // follow-up `ip ... dev <full name>` then failed against a device that does not exist —
         // late, one command at a time, with the interface already half configured. And two
-        // profiles sharing a name is worse than a clash: `run_profile` opens with
-        // `TunInterface::delete(&tun.name)`, so starting the second profile destroys the first
-        // one's live interface. Neither was checked anywhere. (Audit 2026-08-01, §4.)
+        // profiles sharing a name is worse than a clash: TUNSETIFF may attach the second
+        // profile to the first one's multi-queue device and split packets between them.
+        // Neither was checked anywhere. (Audit 2026-08-01, §4.)
         let tun_name = p.tun.name.trim();
         if tun_name.is_empty() {
             anyhow::bail!("profile '{}': tun.name is empty", p.name);
@@ -1002,7 +1026,7 @@ pub fn validate_profiles(config: &ServerConfig) -> anyhow::Result<()> {
         if let Some(other) = tun_names.insert(tun_name.to_string(), p.name.clone()) {
             anyhow::bail!(
                 "profiles '{}' and '{}' both use tun.name '{}' — starting the second one \
-                 deletes the first one's live interface",
+                 could attach it to the first one's multi-queue device",
                 other,
                 p.name,
                 tun_name
@@ -1564,6 +1588,20 @@ pub fn validate_profiles(config: &ServerConfig) -> anyhow::Result<()> {
                 p.name
             );
         }
+        if rp.enabled && rp.target.trim().is_empty() {
+            anyhow::bail!(
+                "profile '{}': reality_proxy.enabled requires a non-empty \
+                 obf.tls.reality_proxy.target for probe/decoy traffic",
+                p.name
+            );
+        }
+        if rp.enabled && rp.target_port == 0 {
+            anyhow::bail!(
+                "profile '{}': obf.tls.reality_proxy.target_port = 0 cannot reach a \
+                 probe/decoy backend — set its real TCP port",
+                p.name
+            );
+        }
         // A NON-EMPTY but unusable list is just as dangerous, and used to be silent: the
         // lenient hex parser dropped every non-hex character, so `short_ids = zzzz` became
         // all-zeros and matched any client whose short_id was equally malformed. The
@@ -1869,9 +1907,10 @@ pub fn validate_profiles(config: &ServerConfig) -> anyhow::Result<()> {
                 Ok(std::net::IpAddr::V6(_))
             ) {
                 anyhow::bail!(
-                    "profile '{}': dns.push_servers entry '{}' is IPv6, but qeli 0.7.15 clients carry only IPv4 inner packets",
+                    "profile '{}': dns.push_servers entry '{}' is IPv6, but qeli {} clients carry only IPv4 inner packets",
                     p.name,
-                    ps
+                    ps,
+                    env!("CARGO_PKG_VERSION")
                 );
             }
             if ps.trim().parse::<std::net::IpAddr>().is_err() {
@@ -2087,6 +2126,7 @@ pub fn load_users_db(config: &ServerConfig) -> anyhow::Result<UsersDb> {
             shadowed
         );
     }
+    db.validate_access_controls()?;
     Ok(db)
 }
 
@@ -2212,21 +2252,23 @@ pub async fn run_worker(cfg_path: &str) -> anyhow::Result<()> {
         worker_tx: None,
         client_manager: Arc::new(client_manager::ClientManager::new()),
         metrics: Arc::new(metrics::MetricsState::new()),
-        usage: Arc::new(usage::UsageStore::load(usage::USAGE_PATH)),
+        usage: Arc::new(usage::UsageStore::load(usage::USAGE_PATH)?),
         live_web,
         udp_buffer_budget,
     });
 
     // Control socket (shared across profiles) — the supervisor's panel reaches
     // live client data (list/kick/bandwidth) through this.
-    {
-        let ctrl_state = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = control::run_control_server(ctrl_state).await {
-                log::error!("Control server error: {}", e);
-            }
-        });
-    }
+    let control_listener = control::bind_control_server()?;
+    let (control_fatal_tx, mut control_fatal_rx) = mpsc::unbounded_channel::<String>();
+    let ctrl_state = state.clone();
+    let control_task = tokio::spawn(async move {
+        let reason = match control::run_control_server(ctrl_state, control_listener).await {
+            Ok(()) => "control server stopped unexpectedly".to_string(),
+            Err(error) => format!("control server failed: {error}"),
+        };
+        let _ = control_fatal_tx.send(reason);
+    });
 
     // (The web panel runs in the supervisor process, not here.)
 
@@ -2251,6 +2293,7 @@ pub async fn run_worker(cfg_path: &str) -> anyhow::Result<()> {
 
     // Start one independent supervisor per profile. The JoinSet only watches for a
     // supervisor panic/return; ordinary profile failures are restarted in place.
+    let (profile_shutdown_tx, profile_shutdown_rx) = tokio::sync::watch::channel(false);
     let mut profile_set = tokio::task::JoinSet::new();
     for pcfg in &state.config.profiles {
         if !pcfg.enabled {
@@ -2263,17 +2306,29 @@ pub async fn run_worker(cfg_path: &str) -> anyhow::Result<()> {
         let state = state.clone();
         let pcfg = pcfg.clone();
         let post_down_done = post_down_done.clone();
+        let mut profile_shutdown = profile_shutdown_rx.clone();
         profile_set.spawn(async move {
             let pname = pcfg.name.clone();
             let mut retry_secs = 1u64;
             loop {
+                if *profile_shutdown.borrow() {
+                    break;
+                }
                 post_down_done.lock().await.remove(&pname);
                 let started = tokio::time::Instant::now();
-                match run_profile(state.clone(), pcfg.clone()).await {
-                    Ok(()) => log::warn!("Profile '{}' stopped unexpectedly", pname),
-                    Err(e) => log::error!("Profile '{}' error: {}", pname, e),
+                let result =
+                    run_profile(state.clone(), pcfg.clone(), profile_shutdown.clone()).await;
+                let stopping = *profile_shutdown.borrow();
+                if !stopping {
+                    match result {
+                        Ok(()) => log::warn!("Profile '{}' stopped unexpectedly", pname),
+                        Err(e) => log::error!("Profile '{}' error: {}", pname, e),
+                    }
                 }
                 run_post_down(&state, &pname, &post_down_done).await;
+                if stopping {
+                    break;
+                }
 
                 // Reset the backoff after a stable generation; persistent setup
                 // failures back off so they cannot spin and flood the journal.
@@ -2285,7 +2340,10 @@ pub async fn run_worker(cfg_path: &str) -> anyhow::Result<()> {
                     pname,
                     retry_secs
                 );
-                tokio::time::sleep(Duration::from_secs(retry_secs)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(retry_secs)) => {}
+                    _ = wait_for_profile_shutdown(&mut profile_shutdown) => break,
+                }
                 retry_secs = retry_secs.saturating_mul(2).min(30);
             }
         });
@@ -2304,14 +2362,24 @@ pub async fn run_worker(cfg_path: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to install SIGTERM handler: {}", e))?;
 
     let mut via_signal = false;
+    let mut fatal_reason: Option<String> = None;
     loop {
         tokio::select! {
             joined = profile_set.join_next() => {
-                match joined {
-                    Some(Ok(())) => log::error!("A profile supervisor ended unexpectedly"),
-                    Some(Err(e)) => log::warn!("A profile supervisor failed: {}", e),
-                    None => log::error!("No profile supervisors remain"),
-                }
+                let reason = match joined {
+                    Some(Ok(())) => "a profile supervisor ended unexpectedly".to_string(),
+                    Some(Err(e)) => format!("a profile supervisor failed: {e}"),
+                    None => "no profile supervisors remain".to_string(),
+                };
+                log::error!("{reason}");
+                fatal_reason = Some(reason);
+                break;
+            },
+            control = control_fatal_rx.recv() => {
+                let reason = control
+                    .unwrap_or_else(|| "control server task disappeared".to_string());
+                log::error!("{reason}");
+                fatal_reason = Some(reason);
                 break;
             },
             _ = tokio::signal::ctrl_c() => {
@@ -2331,11 +2399,13 @@ pub async fn run_worker(cfg_path: &str) -> anyhow::Result<()> {
         }
     }
 
-    // Stop every supervisor before the final NAT/post_down sweep. Leaving them
-    // alive here lets a generation that is in its retry sleep wake up and install
-    // a fresh TUN/NAT rule while shutdown is removing the old one.
-    profile_set.abort_all();
+    // Ask every generation to leave through its normal async cleanup path. Aborting the
+    // supervisors dropped `ProfileTeardown` synchronously and could remove TUN/NAT while
+    // generation-owned tasks were still detached and using those resources.
+    let _ = profile_shutdown_tx.send(true);
     while profile_set.join_next().await.is_some() {}
+    control_task.abort();
+    let _ = control_task.await;
 
     // Tear down the host NAT rules we installed (the next start also cleans stale
     // rules, so a SIGKILL that skips this is recovered then) and run post_down.
@@ -2367,8 +2437,13 @@ pub async fn run_worker(cfg_path: &str) -> anyhow::Result<()> {
         // Persist the last usage deltas before the hard exit: process::exit skips
         // UsageStore's Drop flush, so without this up to one sweep interval of traffic
         // per user is lost from the counters.
-        state.usage.flush();
+        if let Err(error) = state.usage.flush() {
+            log::error!("usage: shutdown flush failed: {error}");
+        }
         std::process::exit(0);
+    }
+    if let Some(reason) = fatal_reason {
+        anyhow::bail!(reason);
     }
     Ok(())
 }
@@ -2450,7 +2525,9 @@ async fn usage_sweep(state: Arc<ServerState>) {
         }
 
         state.usage.prune(&live);
-        state.usage.flush();
+        if let Err(error) = state.usage.flush() {
+            log::error!("usage: periodic flush failed: {error}");
+        }
 
         for (pname, ip, session_id) in to_kick {
             let profiles = state.profiles.read().await;
@@ -2483,6 +2560,7 @@ async fn usage_sweep(state: Arc<ServerState>) {
                         // which both halves observe.
                         s.kick_all();
                         crate::server::handler::spawn_client_route_teardown(
+                            &profile.tasks,
                             iroutes,
                             profile.config.tun.name.clone(),
                         );
@@ -3099,6 +3177,106 @@ struct QueueThreads {
     tids: Arc<std::sync::Mutex<Vec<libc::pthread_t>>>,
 }
 
+/// Every asynchronous task owned by one profile generation.
+///
+/// Dropping a Tokio `JoinHandle` detaches its task. Profiles restart in-process, so all
+/// nested service/session tasks must instead be closed as one generation: shutdown rejects
+/// new children, aborts the existing ones and joins them before system resources are removed.
+#[derive(Clone)]
+pub(crate) struct ProfileTasks {
+    profile: Arc<str>,
+    inner: Arc<std::sync::Mutex<ProfileTasksInner>>,
+}
+
+struct ProfileTasksInner {
+    stopping: bool,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl ProfileTasks {
+    fn new(profile: &str) -> Self {
+        Self {
+            profile: Arc::from(profile),
+            inner: Arc::new(std::sync::Mutex::new(ProfileTasksInner {
+                stopping: false,
+                handles: Vec::new(),
+            })),
+        }
+    }
+
+    pub(crate) fn spawn<F>(&self, future: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.stopping {
+            return false;
+        }
+        // Completed tasks no longer own resources. Reap their handles so a busy DNS profile
+        // does not retain one allocation for every query until the next restart.
+        let mut index = 0;
+        while index < inner.handles.len() {
+            if inner.handles[index].is_finished() {
+                inner.handles.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        inner.handles.push(tokio::spawn(future));
+        true
+    }
+
+    fn abort_all(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.stopping = true;
+        for handle in &inner.handles {
+            handle.abort();
+        }
+    }
+
+    async fn shutdown(&self) {
+        let handles = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            inner.stopping = true;
+            for handle in &inner.handles {
+                handle.abort();
+            }
+            std::mem::take(&mut inner.handles)
+        };
+        for handle in handles {
+            if let Err(error) = handle.await {
+                if !error.is_cancelled() {
+                    log::error!(
+                        "Profile '{}': child task failed during teardown: {}",
+                        self.profile,
+                        error
+                    );
+                }
+            }
+        }
+    }
+}
+
+async fn wait_for_profile_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            return;
+        }
+    }
+}
+
 /// Undoes everything `run_profile` created on the host, however it leaves.
 ///
 /// A profile start is a sequence of side effects on the SYSTEM — a TUN device, iptables rules,
@@ -3122,10 +3300,37 @@ struct ProfileTeardown {
     /// Set once the per-queue reader/writer threads are running, so they can be stopped before
     /// the device is removed — it only disappears when the last descriptor closes.
     readers: Option<QueueThreads>,
+    /// Async descendants of this exact generation. The normal path awaits them before Drop;
+    /// this synchronous abort is the panic/cancellation fallback.
+    tasks: ProfileTasks,
+    /// Registry identity installed by this generation. Cleanup must not remove a replacement
+    /// generation that registered under the same profile name.
+    registered_profile: Option<Arc<ProfileRuntime>>,
+}
+
+impl ProfileTeardown {
+    async fn unregister(&mut self) {
+        let Some(expected) = self.registered_profile.clone() else {
+            return;
+        };
+        let mut profiles = self.state.profiles.write().await;
+        if profiles
+            .get(&self.profile)
+            .is_some_and(|current| Arc::ptr_eq(current, &expected))
+        {
+            profiles.remove(&self.profile);
+        }
+        // Clear only after the awaited removal completed. If this future is cancelled while
+        // waiting for the lock, Drop still owns the identity and can run its guarded fallback.
+        self.registered_profile = None;
+    }
 }
 
 impl Drop for ProfileTeardown {
     fn drop(&mut self) {
+        // Normal exits already awaited `shutdown`; this is essential for a cancelled or
+        // panicking generation, whose wrapper cannot run async cleanup.
+        self.tasks.abort_all();
         // iptables first: the rules reference the interface by name, so removing them before
         // the device keeps the window where a rule points at a vanished device closed.
         nat::cleanup(&self.profile);
@@ -3215,13 +3420,24 @@ impl Drop for ProfileTeardown {
                 );
             }
         }
-        // The registry entry outlives the task otherwise, so `list-clients`, the panel and the
-        // metrics sampler would all keep reporting a profile that is not running.
-        let state = self.state.clone();
-        let name = self.profile.clone();
-        tokio::spawn(async move {
-            state.profiles.write().await.remove(&name);
-        });
+        // The normal path removes this entry synchronously before Drop. On panic/cancellation
+        // fall back to an async removal, but only if the map still contains THIS generation.
+        // An unconditional remove-by-name can erase a replacement generation after restart.
+        if let Some(expected) = self.registered_profile.take() {
+            let state = self.state.clone();
+            let name = self.profile.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let mut profiles = state.profiles.write().await;
+                    if profiles
+                        .get(&name)
+                        .is_some_and(|current| Arc::ptr_eq(current, &expected))
+                    {
+                        profiles.remove(&name);
+                    }
+                });
+            }
+        }
         log::info!("Profile '{}': torn down (TUN, NAT, registry)", self.profile);
     }
 }
@@ -3274,7 +3490,11 @@ async fn run_post_down(
     .await;
 }
 
-async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Result<()> {
+async fn run_profile(
+    state: Arc<ServerState>,
+    pcfg: ProfileConfig,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let name = pcfg.name.clone();
     log::info!(
         "Starting profile '{}' ({}://{}:{})",
@@ -3284,21 +3504,55 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
         pcfg.bind.port
     );
 
-    // Armed BEFORE the first side effect on the host, so there is no window in which
-    // something has been created and nothing would undo it. Populated as each resource
-    // appears; its Drop runs on every exit path, including `?`.
+    let tasks = ProfileTasks::new(&name);
+    // Armed BEFORE the first side effect on the host. The wrapper deliberately owns this
+    // guard while the generation body runs, so it can await every async child BEFORE Drop
+    // removes the TUN/NAT resources those children use.
     let mut teardown = ProfileTeardown {
         profile: name.clone(),
         ifname: None,
         state: state.clone(),
         readers: None,
+        tasks: tasks.clone(),
+        registered_profile: None,
     };
+
+    let result =
+        run_profile_generation(state, pcfg, &mut teardown, tasks.clone(), &mut shutdown).await;
+    tasks.shutdown().await;
+    teardown.unregister().await;
+    drop(teardown);
+    result
+}
+
+async fn run_profile_generation(
+    state: Arc<ServerState>,
+    pcfg: ProfileConfig,
+    teardown: &mut ProfileTeardown,
+    tasks: ProfileTasks,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let name = pcfg.name.clone();
+    let mut service_set = tokio::task::JoinSet::new();
 
     // Setup TUN interface(s). With tun.queues>1 we open several IFF_MULTI_QUEUE fds
     // attached to ONE device; the kernel RSS-spreads packets across them so the data
     // plane reads/writes the interface — and runs the per-queue encrypt — on multiple
     // cores instead of funnelling everything through one reader/writer/forwarder.
-    TunInterface::delete(&pcfg.tun.name).ok();
+    // Never delete a pre-existing device here: there is no ownership marker proving it is
+    // ours, and qeli-created devices are non-persistent and disappear with their last fd.
+    // It can therefore be another qeli process, another application, or an operator-owned
+    // persistent TUN. Worse, create_multiqueue may ATTACH to an existing multi-queue device
+    // instead of returning EEXIST and silently share its traffic. Refuse before TUNSETIFF.
+    let tun_sysfs = format!("/sys/class/net/{}", pcfg.tun.name);
+    if std::path::Path::new(&tun_sysfs).exists() {
+        anyhow::bail!(
+            "profile '{}': interface '{}' already exists — refusing to delete or attach to a \
+             device whose ownership cannot be proved; stop its owner or choose another tun.name",
+            name,
+            pcfg.tun.name
+        );
+    }
     let dev_type = match pcfg.tun.device_type.to_lowercase().as_str() {
         "tap" => DeviceType::Tap,
         _ => DeviceType::Tun,
@@ -3455,8 +3709,8 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
     // Per-queue reader/writer fds (dup'd so the blocking reader and writer threads each
     // own a closable fd for their queue). Dropping `queues` after this keeps the device
     // alive via these dups (closed when the threads exit).
-    let mut reader_fds: Vec<i32> = Vec::with_capacity(queues.len());
-    let mut writer_fds: Vec<i32> = Vec::with_capacity(queues.len());
+    let mut reader_fds: Vec<OwnedFd> = Vec::with_capacity(queues.len());
+    let mut writer_fds: Vec<OwnedFd> = Vec::with_capacity(queues.len());
     for q in &queues {
         // Leave the fds BLOCKING: the reader thread sleeps inside read() until a
         // packet arrives (no 1ms busy-poll → 0% idle CPU even with many queues); the
@@ -3467,19 +3721,18 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
         // inherited TUN queue fd reads the plaintext traffic of EVERY client on the profile.
         // Same defect and same fix as the client side. (Audit 2026-08-04.)
         let rfd = unsafe { libc::fcntl(q.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        let wfd = unsafe { libc::fcntl(q.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        if rfd < 0 || wfd < 0 {
-            for fd in reader_fds.iter().chain(writer_fds.iter()) {
-                unsafe { libc::close(*fd) };
-            }
-            if rfd >= 0 {
-                unsafe { libc::close(rfd) };
-            }
-            if wfd >= 0 {
-                unsafe { libc::close(wfd) };
-            }
+        if rfd < 0 {
             return Err(anyhow::anyhow!("failed to dup TUN queue fd"));
         }
+        // SAFETY: fcntl returned a fresh descriptor owned by this function.
+        let rfd = unsafe { OwnedFd::from_raw_fd(rfd) };
+        let wfd = unsafe { libc::fcntl(q.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if wfd < 0 {
+            // `rfd` and every descriptor already in the vectors close through RAII.
+            return Err(anyhow::anyhow!("failed to dup TUN queue fd"));
+        }
+        // SAFETY: fcntl returned a fresh descriptor owned by this function.
+        let wfd = unsafe { OwnedFd::from_raw_fd(wfd) };
         reader_fds.push(rfd);
         writer_fds.push(wfd);
     }
@@ -3517,7 +3770,9 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
     );
 
     // Build the REALITY real-TLS rustls config once (cert generation is not free).
-    let reality_tls_config = if pcfg.obfuscation.tls.reality_proxy.real_tls {
+    let reality_tls_config = if pcfg.obfuscation.tls.reality_proxy.enabled
+        && pcfg.obfuscation.tls.reality_proxy.real_tls
+    {
         log::info!(
             "Profile '{}': REALITY real-TLS termination enabled (SNI {})",
             name,
@@ -3531,9 +3786,14 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                 name
             );
         }
-        Some(crate::protocol::realtls::server::make_server_config(
-            &pcfg.obfuscation.tls.reality_proxy.target,
-        ))
+        Some(
+            crate::protocol::realtls::server::make_server_config(
+                &pcfg.obfuscation.tls.reality_proxy.target,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!("profile '{}': REALITY TLS setup failed: {error}", name)
+            })?,
+        )
     } else {
         None
     };
@@ -3541,7 +3801,8 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
     // Probe the borrowed target's ServerHello once so the hand-rolled terminator
     // can mirror its shape (cipher, PQ group, extension order) — making the
     // ServerHello's JA3S match whatever `target` is set to, not just microsoft.
-    let reality_borrow = if pcfg.obfuscation.tls.reality_proxy.real_tls
+    let reality_borrow = if pcfg.obfuscation.tls.reality_proxy.enabled
+        && pcfg.obfuscation.tls.reality_proxy.real_tls
         && pcfg.obfuscation.tls.reality_proxy.handrolled
     {
         let host = pcfg.obfuscation.tls.reality_proxy.target.clone();
@@ -3597,7 +3858,7 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
             let state = state.clone();
             let host = host.clone();
             let pname = name.clone();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 const REFRESH: Duration = Duration::from_secs(12 * 3600);
                 loop {
                     tokio::time::sleep(REFRESH).await;
@@ -3639,6 +3900,7 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
     let profile = Arc::new(ProfileRuntime {
         name: name.clone(),
         config: pcfg.clone(),
+        tasks: tasks.clone(),
         pool: Arc::new(Mutex::new(pool)),
         sessions: Arc::new(RwLock::new(SessionMap {
             by_ip: HashMap::new(),
@@ -3666,6 +3928,7 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
         .write()
         .await
         .insert(name.clone(), profile.clone());
+    teardown.registered_profile = Some(profile.clone());
 
     let is_tap = dev_type == DeviceType::Tap;
     let gateway_mac: [u8; 6] = if is_tap {
@@ -3798,7 +4061,11 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                         let spare = read_buffer.spare_capacity_mut();
                         let read_len = tun_buf_size.min(spare.len());
                         let n = unsafe {
-                            libc::read(reader_fd, spare.as_mut_ptr() as *mut libc::c_void, read_len)
+                            libc::read(
+                                reader_fd.as_raw_fd(),
+                                spare.as_mut_ptr() as *mut libc::c_void,
+                                read_len,
+                            )
                         };
                         if n > 0 {
                             // SAFETY: `read` initialised exactly `n` bytes of the spare tail,
@@ -3857,11 +4124,7 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                             break;
                         }
                     }
-                    // Closed HERE, by the thread that owns it — which is what finally lets a
-                    // non-persistent TUN device go away once every queue has exited.
-                    unsafe {
-                        libc::close(reader_fd);
-                    }
+                    // OwnedFd closes on every thread exit path, including panic.
                     log::info!("TUN reader q{} for profile '{}' stopped", qi, name_r);
                 });
             match handle {
@@ -3889,7 +4152,7 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                 .address
                 .parse::<std::net::Ipv4Addr>()
                 .ok();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 // The forwarder serializes packets, so one task-owned buffer serves all
                 // server→client padding without a Vec allocation per record.
                 let mut padding = Vec::with_capacity(crate::protocol::packet::MAX_RECORD_SIZE);
@@ -4151,13 +4414,22 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                         loop {
                             let n = unsafe {
                                 libc::write(
-                                    writer_fd,
+                                    writer_fd.as_raw_fd(),
                                     buf.as_ptr() as *const libc::c_void,
                                     buf.len(),
                                 )
                             };
-                            if n >= 0 {
+                            if n == buf.len() as isize {
                                 break;
+                            }
+                            if n >= 0 {
+                                let message = format!(
+                                    "TUN writer q{qi} performed a partial packet write ({n}/{})",
+                                    buf.len()
+                                );
+                                log::warn!("{message} — stopping the writer");
+                                let _ = fatal_w.try_send(message);
+                                break 'writer;
                             }
                             let err = std::io::Error::last_os_error();
                             match err.raw_os_error() {
@@ -4196,11 +4468,7 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                             }
                         }
                     }
-                    // Closed HERE, by the thread that owns it. Together with the reader's own
-                    // close this is what finally lets a non-persistent TUN device go away.
-                    unsafe {
-                        libc::close(writer_fd);
-                    }
+                    // OwnedFd closes on every thread exit path, including panic.
                     log::info!("TUN writer q{} for profile '{}' stopped", qi, name_w);
                 });
             match handle {
@@ -4306,27 +4574,22 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
             let cfg_tcp = pcfg.dns.clone();
             let cache_tcp = dns_cache.clone();
             let pref_tcp = dns_pref.clone();
-            let name_tcp = name.clone();
-            tokio::spawn(async move {
-                if let Err(e) = dns::run_dns_proxy_tcp(cfg_tcp, dns_tcp, cache_tcp, pref_tcp).await
-                {
-                    log::error!("Profile '{name_tcp}': DNS proxy (tcp) stopped: {e}");
-                }
+            let dns_tasks = tasks.clone();
+            let label = format!("profile '{name}' DNS proxy (TCP)");
+            service_set.spawn(async move {
+                dns::run_dns_proxy_tcp(cfg_tcp, dns_tcp, cache_tcp, pref_tcp, dns_tasks)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{label} failed: {error}"))
             });
         }
-        tokio::spawn(async move {
-            if let Err(e) =
-                dns::run_dns_proxy(dns_state, dns_cfg, dns_socket, dns_cache, dns_pref).await
-            {
-                // LOUD, and it says what it costs. This used to be one ERROR line while the
-                // tunnel came up and kept handing every client the address of a resolver that
-                // does not exist — names simply stopped resolving, with nothing pointing at
-                // the cause. The commonest trigger is a host service already holding
-                // `0.0.0.0:53`, which covers the TUN address too. (Audit 2026-07-31.)
-                log::error!(
-                    "Profile '{name_dns}': the DNS proxy on {dns_listen} STOPPED: {e}. Clients                      of this profile are being pushed this address as their resolver and will                      get NO name resolution. If the port is already taken (`ss -lunp | grep                      ':53 '`), free it or set a different dns.port — the tunnel now bridges 53                      to it automatically."
-                );
-            }
+        let dns_tasks = tasks.clone();
+        let label = format!("profile '{name_dns}' DNS proxy (UDP) on {dns_listen}");
+        service_set.spawn(async move {
+            dns::run_dns_proxy(
+                dns_state, dns_cfg, dns_socket, dns_cache, dns_pref, dns_tasks,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("{label} failed: {error}"))
         });
     }
 
@@ -4382,11 +4645,12 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
             name,
             dhcp_listen
         );
-        let name_dhcp = name.clone();
-        tokio::spawn(async move {
-            if let Err(e) = dhcp_server.run(&dhcp_listen, dhcp_socket).await {
-                log::error!("DHCP server error on profile '{}': {}", name_dhcp, e);
-            }
+        let label = format!("profile '{name}' DHCP server on {dhcp_listen}");
+        service_set.spawn(async move {
+            dhcp_server
+                .run(&dhcp_listen, dhcp_socket)
+                .await
+                .map_err(|error| anyhow::anyhow!("{label} failed: {error}"))
         });
     }
 
@@ -4460,6 +4724,7 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
         let tun_write_pool = tun_write_pool.clone();
         let pcfg = pcfg.clone();
         let name = name.clone();
+        let profile_tasks = tasks.clone();
         listener_set.spawn(async move {
             match transport {
                 TransportProtocol::Tcp => {
@@ -4552,7 +4817,7 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                             jmax: pcfg.obfuscation.awg.jmax,
                         };
                         let name_conn = profile_clone.name.clone();
-                        tokio::spawn(async move {
+                        profile_tasks.spawn(async move {
                             // Socket options on the raw TcpStream before any obfs wrapping.
                             let _ = stream.set_nodelay(nodelay);
                             let _ = set_tcp_keepalive(&stream, keepalive);
@@ -4647,7 +4912,7 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                         bind_addr,
                         workers
                     );
-                    let mut handles = Vec::with_capacity(workers);
+                    let mut worker_set = tokio::task::JoinSet::new();
                     for wid in 0..workers {
                         let (socket, udp_buffer) = udp_handler::bind_reuseport(
                             &bind_addr,
@@ -4661,33 +4926,31 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
                             sender: in_txs[wid % in_txs.len()].clone(),
                             pool: tun_write_pool.clone(),
                         };
-                        let pname = name.clone();
-                        handles.push(tokio::spawn(async move {
-                            if let Err(e) = udp_handler::run_udp_server(
+                        let worker_tasks = profile_tasks.clone();
+                        worker_set.spawn(async move {
+                            udp_handler::run_udp_server(
                                 udp_state,
                                 udp_profile,
                                 socket,
                                 udp_buffer,
                                 wid,
                                 tun_tx_udp,
+                                worker_tasks,
                             )
                             .await
-                            {
-                                log::error!(
-                                    "UDP worker {} on profile '{}' exited: {}",
-                                    wid,
-                                    pname,
-                                    e
-                                );
-                            }
-                        }));
+                        });
                     }
-                    for h in handles {
-                        let _ = h.await;
-                    }
+                    let why = match worker_set.join_next().await {
+                        Some(Ok(Err(error))) => format!("UDP worker failed: {error}"),
+                        Some(Ok(Ok(()))) => "UDP worker stopped unexpectedly".to_string(),
+                        Some(Err(error)) => format!("UDP worker task panicked: {error}"),
+                        None => "no UDP workers were started".to_string(),
+                    };
+                    worker_set.abort_all();
+                    while worker_set.join_next().await.is_some() {}
+                    Err(anyhow::anyhow!(why))
                 }
             }
-            Ok::<(), anyhow::Error>(())
         });
     }
     // Await the listeners CONCURRENTLY.
@@ -4713,9 +4976,16 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
     // profile back (TUN, NAT, registry) and the spawn site logs it per profile while the other
     // profiles keep serving. (Audit 2026-08-01, §5.)
     let why = tokio::select! {
-        fatal = tun_fatal_rx.recv() => fatal
-            .unwrap_or_else(|| "all TUN queue health senders disappeared".to_string()),
-        joined = listener_set.join_next() => match joined {
+        _ = wait_for_profile_shutdown(shutdown) => None,
+        service = service_set.join_next(), if !service_set.is_empty() => Some(match service {
+            Some(Ok(Err(error))) => format!("a critical profile service exited: {error}"),
+            Some(Ok(Ok(()))) => "a critical profile service stopped unexpectedly".to_string(),
+            Some(Err(error)) => format!("a critical profile service task panicked: {error}"),
+            None => "all critical profile services disappeared".to_string(),
+        }),
+        fatal = tun_fatal_rx.recv() => Some(fatal
+            .unwrap_or_else(|| "all TUN queue health senders disappeared".to_string())),
+        joined = listener_set.join_next() => Some(match joined {
             Some(Ok(Err(e))) => format!("a listener exited: {e}"),
             Some(Ok(Ok(()))) => "a listener stopped unexpectedly".to_string(),
             Some(Err(e)) => format!("a listener task panicked: {e}"),
@@ -4723,12 +4993,18 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
             // nothing at all — reported rather than returned as success, which is what used to
             // happen when every bind failed.
             None => "no listeners were started at all".to_string(),
-        },
+        }),
     };
     // Stop the survivors explicitly rather than relying on the JoinSet's drop: their accept
     // loops would otherwise keep taking connections for a profile that is being torn down,
     // and a client could complete a handshake against a pool that is about to disappear.
     listener_set.abort_all();
+    while listener_set.join_next().await.is_some() {}
+    service_set.abort_all();
+    while service_set.join_next().await.is_some() {}
+    let Some(why) = why else {
+        return Ok(());
+    };
     anyhow::bail!(
         "profile '{}': {} — the profile still publishes endpoints it can no longer serve",
         name,
@@ -4740,6 +5016,85 @@ async fn run_profile(state: Arc<ServerState>, pcfg: ProfileConfig) -> anyhow::Re
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_generation_is_serialized_and_preserves_custom_parent_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("qeli-identity-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let key_path = dir.join("custom.key");
+        let profile = ProfileConfig {
+            name: "identity-test".to_string(),
+            identity_key: Some(key_path.to_string_lossy().into_owned()),
+            ..ProfileConfig::default()
+        };
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let profile = profile.clone();
+                std::thread::spawn(move || load_or_generate_profile_key(&profile).unwrap())
+            })
+            .collect();
+        let keys: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().private_bytes())
+            .collect();
+        assert!(keys.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(
+            std::fs::read(&key_path).unwrap().as_slice(),
+            keys[0].as_ref()
+        );
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "an existing custom parent must not be chmodded"
+        );
+        assert_eq!(
+            std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn profile_tasks_abort_join_and_close_admission() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let tasks = ProfileTasks::new("test");
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        assert!(tasks.spawn(async move {
+            let _signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        assert!(
+            started_rx.await.is_ok(),
+            "child task must start before shutdown"
+        );
+
+        tasks.shutdown().await;
+
+        assert!(
+            dropped_rx.await.is_ok(),
+            "aborted child future must be dropped"
+        );
+        assert!(
+            !tasks.spawn(async {}),
+            "a closed generation must reject late child tasks"
+        );
+    }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -5061,9 +5416,9 @@ pool.cidr = 10.1.0.0/24
     /// A device name the kernel would truncate, or one two profiles share.
     ///
     /// TUNSETIFF copies at most 15 bytes, so a longer name created a device under a DIFFERENT
-    /// name than every following `ip ... dev <name>` used. And `run_profile` opens with
-    /// `TunInterface::delete(&tun.name)`, so two profiles sharing a name means starting the
-    /// second one destroys the first one's live interface. (Audit 2026-08-01, §4.)
+    /// name than every following `ip ... dev <name>` used. It can also attach another queue
+    /// to an existing multi-queue device, so two profiles sharing a name can split traffic
+    /// between unrelated generations. (Audit 2026-08-01, §4.)
     #[test]
     fn tun_names_that_truncate_or_collide_are_rejected() {
         fn cfg(text: &str) -> ServerConfig {
@@ -5460,6 +5815,26 @@ pool.cidr = 10.1.0.0/24
         let mut cfg = cfg_with("fake-tls", "tcp");
         cfg.profiles[0].obfuscation.tls.reality_proxy.enabled = true;
         cfg.profiles[0].obfuscation.tls.reality_proxy.short_ids = vec!["0123456789abcdef".into()];
+        assert!(validate_profiles(&cfg).is_ok());
+    }
+
+    #[test]
+    fn reality_requires_a_reachable_decoy_endpoint_shape() {
+        let mut cfg = cfg_with("fake-tls", "tcp");
+        let reality = &mut cfg.profiles[0].obfuscation.tls.reality_proxy;
+        reality.enabled = true;
+        reality.short_ids = vec!["0123456789abcdef".into()];
+
+        reality.target.clear();
+        let err = validate_profiles(&cfg).unwrap_err();
+        assert!(err.to_string().contains("reality_proxy.target"));
+
+        cfg.profiles[0].obfuscation.tls.reality_proxy.target = "www.cloudflare.com".into();
+        cfg.profiles[0].obfuscation.tls.reality_proxy.target_port = 0;
+        let err = validate_profiles(&cfg).unwrap_err();
+        assert!(err.to_string().contains("target_port = 0"));
+
+        cfg.profiles[0].obfuscation.tls.reality_proxy.target_port = 443;
         assert!(validate_profiles(&cfg).is_ok());
     }
 
