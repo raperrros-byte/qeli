@@ -22,19 +22,22 @@ public sealed class AppSettings
     public bool StartMinimized { get; set; }            // start hidden in the tray
     public bool ServiceEnabled { get; set; }            // desired: run as a Windows service
     public string? ServiceProfile { get; set; }         // profile the Windows service runs
-    // Global traffic for ALL profiles. One of: "full" | "apps" | "apps-proxy".
-    // full = system gateway, all apps; apps = WinDivert include only; apps-proxy = include + SOCKS/HTTP.
+    // Global traffic for ALL profiles. One of: "full" | "apps" | "proxy" | "intercept".
+    // full = system gateway; apps = WinDivert VPN include; proxy = local SOCKS only;
+    // intercept = force selected apps into local proxy (WinDivert DNAT + Wintun).
     public string TrafficPreset { get; set; } = "full";
     public bool PreferFullTunnel { get; set; } = true;
     public bool EnableLocalProxy { get; set; } = false;
-    // Legacy: "tunnel" | "proxy" | "both" | "split". Migrated into TrafficPreset.
+    // Legacy: "tunnel" | "proxy" | "both" | "split" | "apps" | "apps-proxy". Migrated into TrafficPreset.
     public string TrafficMode { get; set; } = "tunnel";
     public int ProxyPort { get; set; } = 1080;
     public string ProxyMode { get; set; } = "mixed"; // socks5 | http | mixed
-    /// <summary>Kept for migration; runtime apps filter is always include|all from TrafficPreset.</summary>
+    /// <summary>Runtime apps filter: all | include | proxy-redirect (from TrafficPreset).</summary>
     public string AppsMode { get; set; } = "all";
-    /// <summary>Full .exe paths for apps / apps-proxy presets.</summary>
+    /// <summary>Full .exe paths for apps / intercept presets.</summary>
     public List<string> Apps { get; set; } = new();
+    /// <summary>Optional path to ProxyBridge_CLI.exe for intercept mode (proxy-cursor style).</summary>
+    public string ProxyBridgePath { get; set; } = "";
     /// <summary>Global DNS mode: tunnel | system | off.</summary>
     public string DnsMode { get; set; } = "tunnel";
     /// <summary>Global DNS servers when DnsMode is tunnel (empty = server push / defaults).</summary>
@@ -128,39 +131,38 @@ public sealed class AppSettings
     public void MigrateTrafficMode()
     {
         string preset = (TrafficPreset ?? "").Trim().ToLowerInvariant();
-        if (preset is not ("full" or "apps" or "apps-proxy"))
+        if (preset == "apps-proxy")
+            // Broken combo: WinDivert TUN + proxy. Prefer intercept when apps exist.
+            preset = Apps.Count > 0 ? "intercept" : "proxy";
+        if (preset is not ("full" or "apps" or "proxy" or "intercept"))
         {
-            // Derive from older XOR / both / split fields.
-            if (TrafficMode.Equals("apps-proxy", StringComparison.OrdinalIgnoreCase)
-                || (EnableLocalProxy && AppsMode.Equals("include", StringComparison.OrdinalIgnoreCase)))
-                preset = "apps-proxy";
+            if (TrafficMode.Equals("intercept", StringComparison.OrdinalIgnoreCase)
+                || (EnableLocalProxy && Apps.Count > 0
+                    && (AppsMode.Equals("proxy-redirect", StringComparison.OrdinalIgnoreCase)
+                        || (TrafficPreset ?? "").Equals("intercept", StringComparison.OrdinalIgnoreCase))))
+                preset = "intercept";
             else if (TrafficMode.Equals("apps", StringComparison.OrdinalIgnoreCase)
                      || (!PreferFullTunnel && !EnableLocalProxy
                          && AppsMode.Equals("include", StringComparison.OrdinalIgnoreCase)
                          && Apps.Count > 0))
                 preset = "apps";
-            else if (!EnableLocalProxy
-                     && TrafficMode.Equals("proxy", StringComparison.OrdinalIgnoreCase))
-                // Legacy proxy-only → apps-proxy (needs app list; user picks if empty).
-                preset = "apps-proxy";
-            else if (!EnableLocalProxy
-                     && TrafficMode.Equals("both", StringComparison.OrdinalIgnoreCase))
-                preset = "apps-proxy";
+            else if (EnableLocalProxy
+                     || TrafficMode.Equals("proxy", StringComparison.OrdinalIgnoreCase)
+                     || TrafficMode.Equals("both", StringComparison.OrdinalIgnoreCase))
+                preset = Apps.Count > 0
+                         && AppsMode.Equals("include", StringComparison.OrdinalIgnoreCase)
+                    ? "intercept"
+                    : "proxy";
             else if (!PreferFullTunnel && !EnableLocalProxy
                      && TrafficMode.Equals("split", StringComparison.OrdinalIgnoreCase)
                      && Apps.Count > 0)
                 preset = "apps";
-            else if (EnableLocalProxy && Apps.Count == 0
-                     && !AppsMode.Equals("include", StringComparison.OrdinalIgnoreCase))
-                // Broken combo from earlier UI: proxy without app list → restore full tunnel.
-                preset = "full";
             else
                 preset = "full";
         }
 
-        // apps / apps-proxy without a list cannot work — fall back to full until user picks.
-        if (preset is ("apps" or "apps-proxy") && Apps.Count == 0)
-            preset = "full";
+        if (preset is ("apps" or "intercept") && Apps.Count == 0)
+            preset = preset == "intercept" ? "proxy" : "full";
 
         ApplyTrafficPreset(preset);
     }
@@ -169,7 +171,7 @@ public sealed class AppSettings
     public void ApplyTrafficPreset(string preset)
     {
         preset = (preset ?? "full").Trim().ToLowerInvariant();
-        if (preset is not ("full" or "apps" or "apps-proxy")) preset = "full";
+        if (preset is not ("full" or "apps" or "proxy" or "intercept")) preset = "full";
         TrafficPreset = preset;
         switch (preset)
         {
@@ -178,10 +180,15 @@ public sealed class AppSettings
                 EnableLocalProxy = false;
                 AppsMode = "include";
                 break;
-            case "apps-proxy":
+            case "proxy":
                 PreferFullTunnel = false;
                 EnableLocalProxy = true;
-                AppsMode = "include";
+                AppsMode = "all";
+                break;
+            case "intercept":
+                PreferFullTunnel = false;
+                EnableLocalProxy = true;
+                AppsMode = "all";
                 break;
             default:
                 PreferFullTunnel = true;

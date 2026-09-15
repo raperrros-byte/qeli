@@ -327,8 +327,11 @@
                     <RadioButton x:Name="PresetAppsRadio" GroupName="TrafficPreset"
                                  Content="{local:Loc TrafficPresetApps}"
                                  Margin="0,0,0,4" Checked="OnTrafficModeChanged"/>
-                    <RadioButton x:Name="PresetAppsProxyRadio" GroupName="TrafficPreset"
-                                 Content="{local:Loc TrafficPresetAppsProxy}"
+                    <RadioButton x:Name="PresetProxyRadio" GroupName="TrafficPreset"
+                                 Content="{local:Loc TrafficPresetProxy}"
+                                 Margin="0,0,0,4" Checked="OnTrafficModeChanged"/>
+                    <RadioButton x:Name="PresetInterceptRadio" GroupName="TrafficPreset"
+                                 Content="{local:Loc TrafficPresetIntercept}"
                                  Margin="0,0,0,8" Checked="OnTrafficModeChanged"/>
 
                     <Grid x:Name="AppsPickPanel" Margin="0,0,0,8" Visibility="Collapsed">

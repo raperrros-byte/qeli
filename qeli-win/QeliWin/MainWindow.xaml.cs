@@ -710,7 +710,8 @@ public partial class MainWindow : Window
             TrafficModeLabel.Text = Loc.T("TrafficMode");
             PresetFullRadio.Content = Loc.T("TrafficPresetFull");
             PresetAppsRadio.Content = Loc.T("TrafficPresetApps");
-            PresetAppsProxyRadio.Content = Loc.T("TrafficPresetAppsProxy");
+            PresetProxyRadio.Content = Loc.T("TrafficPresetProxy");
+            PresetInterceptRadio.Content = Loc.T("TrafficPresetIntercept");
             if (GlobalAppsPickBtn != null)
                 GlobalAppsPickBtn.Content = Loc.T("AppsPick");
 
@@ -759,7 +760,8 @@ public partial class MainWindow : Window
     };
 
     private string CurrentPresetFromUi() =>
-        PresetAppsProxyRadio.IsChecked == true ? "apps-proxy"
+        PresetInterceptRadio.IsChecked == true ? "intercept"
+        : PresetProxyRadio.IsChecked == true ? "proxy"
         : PresetAppsRadio.IsChecked == true ? "apps"
         : "full";
 
@@ -768,21 +770,24 @@ public partial class MainWindow : Window
         preset = (preset ?? "full").Trim().ToLowerInvariant();
         PresetFullRadio.IsChecked = preset == "full";
         PresetAppsRadio.IsChecked = preset == "apps";
-        PresetAppsProxyRadio.IsChecked = preset == "apps-proxy";
+        PresetProxyRadio.IsChecked = preset == "proxy";
+        PresetInterceptRadio.IsChecked = preset == "intercept";
         if (PresetFullRadio.IsChecked != true
             && PresetAppsRadio.IsChecked != true
-            && PresetAppsProxyRadio.IsChecked != true)
+            && PresetProxyRadio.IsChecked != true
+            && PresetInterceptRadio.IsChecked != true)
             PresetFullRadio.IsChecked = true;
     }
 
     private void UpdatePresetPanels()
     {
         string preset = CurrentPresetFromUi();
-        bool needsApps = preset is "apps" or "apps-proxy";
+        bool needsApps = preset is "apps" or "intercept";
+        bool needsProxy = preset is "proxy" or "intercept";
         if (AppsPickPanel != null)
             AppsPickPanel.Visibility = needsApps ? Visibility.Visible : Visibility.Collapsed;
         if (ProxyOptsPanel != null)
-            ProxyOptsPanel.Visibility = preset == "apps-proxy" ? Visibility.Visible : Visibility.Collapsed;
+            ProxyOptsPanel.Visibility = needsProxy ? Visibility.Visible : Visibility.Collapsed;
         if (GlobalAppsCountText != null)
             GlobalAppsCountText.Text = needsApps ? Loc.F("AppsPicked", _globalApps.Count) : "";
     }
@@ -816,7 +821,7 @@ public partial class MainWindow : Window
         if (_suppressTrafficUi) return;
         UpdatePresetPanels();
         string preset = CurrentPresetFromUi();
-        if (preset is ("apps" or "apps-proxy") && _globalApps.Count == 0)
+        if (preset is ("apps" or "intercept") && _globalApps.Count == 0)
         {
             Toast.Show(ToastKind.Info, Loc.T("NeedApps"), "");
             return;
@@ -827,7 +832,7 @@ public partial class MainWindow : Window
 
     private void OnGlobalPickApps(object sender, RoutedEventArgs e)
     {
-        if (CurrentPresetFromUi() == "full")
+        if (CurrentPresetFromUi() is "full" or "proxy")
         {
             _suppressTrafficUi = true;
             try { PresetAppsRadio.IsChecked = true; }
@@ -867,7 +872,7 @@ public partial class MainWindow : Window
     private void OnGlobalProxyOptsChanged(object sender, EventArgs e)
     {
         if (_suppressTrafficUi) return;
-        if (CurrentPresetFromUi() != "apps-proxy") return;
+        if (CurrentPresetFromUi() is not ("proxy" or "intercept")) return;
         if (!PersistTrafficSettingsFromUi()) return;
         _ = ApplyTrafficModeAndMaybeReconnectAsync(userInitiated: true);
     }
@@ -886,7 +891,7 @@ public partial class MainWindow : Window
     {
         var s = AppSettings.Current;
         string preset = CurrentPresetFromUi();
-        if (preset is ("apps" or "apps-proxy") && _globalApps.Count == 0)
+        if (preset is ("apps" or "intercept") && _globalApps.Count == 0)
         {
             Toast.Show(ToastKind.Info, Loc.T("NeedApps"), "");
             return false;

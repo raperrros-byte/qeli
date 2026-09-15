@@ -51,14 +51,15 @@ VPN требует прав администратора (создание Wintu
 
 | Файл | Размер | Что нужно на машине |
 |---|---|---|
-| `QeliWin-standalone.exe` | ~77 МБ | **ничего** — рантайм вшит (проще всего) |
-| `QeliWin-net-required.exe` | ~11 МБ | **.NET 10 Desktop Runtime** |
+| `QeliWin-standalone.exe` | ~73 МБ | **ничего** — рантайм вшит (проще всего) |
+| `QeliWin-net-required.exe` | ~8 МБ | **.NET 10 Desktop Runtime** |
+| `ProxyBridge/` (рядом с exe) | ~0.5 МБ | только для **режима 4** (перехват приложений в локальный SOCKS) |
 
 1. Только для `net-required`: `winget install Microsoft.DotNet.DesktopRuntime.10`.
    Для `standalone` этот шаг пропускается.
-2. Скопируйте выбранный файл куда угодно — он самодостаточный (`wintun.dll` вшита и
-   распаковывается при старте в `%LOCALAPPDATA%\QeliWin\native`).
-3. Запустите его (по запросу UAC согласитесь на повышение прав).
+2. Скопируйте выбранный exe **и**, если нужен режим 4, папку `ProxyBridge/` рядом с ним
+   (`ProxyBridge_CLI.exe`, `ProxyBridgeCore.dll`, `WinDivert.dll`, `WinDivert64.sys`).
+3. Запустите exe **от имени администратора** (UAC).
 4. Нажмите **Импорт** → вставьте `qeli://`-ссылку или **INI-конфиг** (`[qeli]`-секция) →
    **Подключить**.
 
@@ -66,7 +67,31 @@ VPN требует прав администратора (создание Wintu
 
 Профили сохраняются в `%APPDATA%\QeliWin\profiles.json`.
 
-### Раздельный туннель по приложениям
+### Режимы трафика (главное окно, на все профили)
+
+| # | Режим | Поведение |
+|---|--------|-----------|
+| 1 | Full tunnel | Системный gateway, весь трафик через VPN (Wintun) |
+| 2 | Selected apps | Только выбранные `.exe` через VPN (WinDivert include), остальное direct |
+| 3 | Local SOCKS/HTTP | Локальный прокси `127.0.0.1:port`; приложения сами указывают SOCKS/HTTP. Egress через Wintun (bind + pin host route) |
+| 4 | Force apps → proxy | Выбранные `.exe` принудительно идут в локальный SOCKS **без** настройки в приложении |
+
+Режим 4 реализован как у [proxy-cursor](https://github.com/latencyong-design/proxy-cursor):
+Qeli поднимает [ProxyBridge](https://github.com/InterceptSuite/ProxyBridge) CLI с правилом
+`process.exe:*:*:TCP:PROXY` на `socks5://127.0.0.1:<port>`. В логе при успехе:
+`App proxy intercept ACTIVE via ProxyBridge…`.
+
+Поиск `ProxyBridge_CLI.exe`: папка `ProxyBridge/` рядом с exe →
+`%ProgramFiles%\ProxyBridge\` → переменная `QELI_PROXYBRIDGE` →
+поле `ProxyBridgePath` в `%APPDATA%\QeliWin\settings.json`.
+
+Ограничения режима 4: нужен admin; пока только TCP (UDP/QUIC через SOCKS без UDP ASSOCIATE
+не форсятся); самодельный WinDivert-DNAT на loopback убран как ненадёжный.
+
+INI-флаг: `proxy_intercept = true` + список `apps = ...` при `apps_mode = all`
+(не используйте устаревший `apps_mode = proxy-redirect` — Validate его отклонит).
+
+### Раздельный туннель по приложениям (профиль / режим 2)
 
 В редакторе профиля `apps_mode = include` направляет в VPN только выбранные `.exe`,
 а `exclude` — все процессы, кроме выбранных. Полные пути хранятся в `apps`; picker
@@ -198,9 +223,14 @@ dotnet publish QeliWin\QeliWin.csproj -c Release -r win-x64 --self-contained tru
   -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
   -p:EnableCompressionInSingleFile=true -o dist\standalone
 Copy-Item dist\standalone\QeliWin.exe dist\QeliWin-standalone.exe
+
+# Режим 4: рядом с exe нужна папка ProxyBridge/ (MIT, InterceptSuite).
+# Из установщика ProxyBridge-Setup-*.exe (7-Zip) скопируйте:
+#   ProxyBridge_CLI.exe, ProxyBridgeCore.dll, WinDivert.dll, WinDivert64.sys
+# в dist\ProxyBridge\ и в dist\standalone\ProxyBridge\, dist\net-required\ProxyBridge\.
 ```
 
-Wintun DLL вшита в exe как ресурс (`EmbeddedResource`), но `Wintun-LICENSE.txt` и notices WinDivert должны распространяться рядом с обоими вариантами приложения.
+Wintun DLL вшита в exe как ресурс (`EmbeddedResource`), но `Wintun-LICENSE.txt` и notices WinDivert должны распространяться рядом с обоими вариантами приложения. Для режима 4 дополнительно распространяйте `ProxyBridge/` (NOTICE-Qeli.txt внутри папки).
 
 ## Headless-режимы (для отладки/CI)
 

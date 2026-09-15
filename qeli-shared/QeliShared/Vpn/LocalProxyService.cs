@@ -6,8 +6,38 @@ using Qeli.Shared.Geo;
 namespace Qeli.Shared.Vpn;
 
 /// <summary>
+/// Original TCP destinations for WinDivert DNAT into the local proxy (app intercept mode).
+/// Keyed by the intercepted client's apparent source endpoint after rewrite to 127.0.0.1:proxy.
+/// </summary>
+public static class TransparentDestRegistry
+{
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<
+        (string ip, ushort port), (IPAddress dest, ushort destPort)> Map = new();
+
+    public static void Remember(IPAddress clientIp, ushort clientPort, IPAddress dest, ushort destPort) =>
+        Map[(clientIp.ToString(), clientPort)] = (dest, destPort);
+
+    public static bool TryGet(IPAddress clientIp, ushort clientPort, out IPAddress dest, out ushort destPort)
+    {
+        if (Map.TryGetValue((clientIp.ToString(), clientPort), out var v))
+        {
+            dest = v.dest;
+            destPort = v.destPort;
+            return true;
+        }
+        dest = IPAddress.None;
+        destPort = 0;
+        return false;
+    }
+
+    public static void Forget(IPAddress clientIp, ushort clientPort) =>
+        Map.TryRemove((clientIp.ToString(), clientPort), out _);
+}
+
+/// <summary>
 /// Local SOCKS5 / HTTP CONNECT proxy: apps connect here, outbound TCP is bound to the
 /// tunnel client IP so traffic exits via the VPN in split-tunnel mode.
+/// Also accepts transparent TCP from WinDivert app-intercept (no SOCKS handshake).
 /// Log lines follow v2rayN style: <c>from tcp:peer accepted tcp:host:port [socks -> proxy|direct]</c>.
 /// </summary>
 public sealed class LocalProxyService : IDisposable
@@ -30,8 +60,7 @@ public sealed class LocalProxyService : IDisposable
     /// TUN for the lease lifetime (refcounted). Null = bind only (Linux/macOS / full-tunnel).
     /// </param>
     /// <param name="bindOutboundToTunnelIp">
-    /// When false (WinDivert per-app), dials use the normal NIC; WinDivert tunnels the
-    /// client process. Binding to the virtual client IP fails because there is no TUN iface.
+    /// When false, dials use the normal NIC (legacy WinDivert combo — prefer Wintun bind+pin).
     /// </param>
     public void Start(
         string tunnelClientIp,
@@ -56,7 +85,7 @@ public sealed class LocalProxyService : IDisposable
         _acceptTask = Task.Run(() => AcceptLoop(ct), ct);
         Log(bindOutboundToTunnelIp
             ? $"Local proxy on {listen} ({mode}) — outbound via tunnel IP {tunnelClientIp}"
-            : $"Local proxy on {listen} ({mode}) — outbound via per-app process capture");
+            : $"Local proxy on {listen} ({mode}) — outbound via process capture");
     }
 
     public void Stop()
@@ -92,10 +121,25 @@ public sealed class LocalProxyService : IDisposable
         using (client)
         {
             string peer = "tcp:127.0.0.1:0";
+            IPEndPoint? remote = null;
             try
             {
                 if (client.Client.RemoteEndPoint is IPEndPoint ep)
+                {
+                    remote = ep;
                     peer = $"tcp:{ep.Address}:{ep.Port}";
+                }
+
+                // WinDivert intercept: client speaks raw TCP to the original server; we already
+                // know the destination from the DNAT flow table.
+                if (remote != null
+                    && TransparentDestRegistry.TryGet(remote.Address, (ushort)remote.Port,
+                        out var dest, out var destPort))
+                {
+                    await TransparentRelay(client, peer, dest, destPort, ct);
+                    return;
+                }
+
                 var stream = client.GetStream();
                 var lead = new byte[1];
                 if (await stream.ReadAsync(lead, ct) != 1) return;
@@ -111,7 +155,24 @@ public sealed class LocalProxyService : IDisposable
             {
                 Log($"{peer} session: {e.Message}");
             }
+            finally
+            {
+                if (remote != null)
+                    TransparentDestRegistry.Forget(remote.Address, (ushort)remote.Port);
+            }
         }
+    }
+
+    private async Task TransparentRelay(
+        TcpClient client, string peer, IPAddress dest, ushort destPort, CancellationToken ct)
+    {
+        string host = dest.ToString();
+        var decision = Decide(host, destPort, out var targetIp);
+        Log($"{peer} accepted tcp:{host}:{destPort} [intercept -> {decision.Tag}]");
+        if (decision.Tag == "block") return;
+        using var upstream = await Dial(host, destPort, targetIp ?? dest, decision.ViaTunnel, ct);
+        if (upstream == null) return;
+        await Relay(client.GetStream(), upstream.Stream, ct);
     }
 
     private async Task Socks5Relay(NetworkStream client, string peer, CancellationToken ct)
@@ -290,7 +351,6 @@ public sealed class LocalProxyService : IDisposable
 
             // Split-tunnel Wintun: without a dest/32 via TUN, Connect from the tunnel IP
             // fails (WSAEACCES) because the default route stays on the physical NIC.
-            // WinDivert skips bind+pin; ProcessAppMap tunnels this process instead.
             if (viaTunnel && _bindOutboundToTunnelIp && _pinHostViaTunnel != null)
                 routeLease = _pinHostViaTunnel(targetIp);
 

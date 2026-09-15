@@ -2194,13 +2194,14 @@ public abstract class VpnTunnelBase
         {
             StopLocalProxy();
             _localProxy = new LocalProxyService();
-            // WinDivert has no TUN NIC: skip bind+route pin; tunnel own process instead.
+            // Proxy dials need Wintun bind+pin. WinDivert TUN (apps mode) never enables proxy.
             bool windivert = config.UsesAppFilter;
             Func<IPAddress, IDisposable?>? pin =
                 windivert || config.IsFullTunnel ? null : PinProxyHostViaTunnel;
             _localProxy.Start(
                 clientIp, config.ProxyListen, config.ProxyMode, Log, pin,
                 bindOutboundToTunnelIp: !windivert);
+            AfterLocalProxyStarted(config);
         }
         catch (Exception e)
         {
@@ -2214,8 +2215,15 @@ public abstract class VpnTunnelBase
     /// </summary>
     protected virtual IDisposable? PinProxyHostViaTunnel(IPAddress destination) => null;
 
+    /// <summary>Windows app-intercept starts WinDivert DNAT after the SOCKS listener is up.</summary>
+    protected virtual void AfterLocalProxyStarted(VpnConfig config) { }
+
+    /// <summary>Tear down platform helpers that depend on the local proxy listener.</summary>
+    protected virtual void BeforeLocalProxyStopped() { }
+
     private void StopLocalProxy()
     {
+        BeforeLocalProxyStopped();
         try { _localProxy?.Dispose(); } catch { }
         _localProxy = null;
     }

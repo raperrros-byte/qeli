@@ -154,6 +154,11 @@ public sealed class VpnConfig : INotifyPropertyChanged
         Apps.Count > 0
         && (AppsMode.Equals("include", StringComparison.OrdinalIgnoreCase)
             || AppsMode.Equals("exclude", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>Windows: force selected apps into the local proxy via WinDivert DNAT
+    /// (Wintun still owns the tunnel). Not a WinDivert TUN path.</summary>
+    [JsonIgnore]
+    public bool UsesProxyRedirect => ProxyIntercept && Apps.Count > 0;
     // Empty by default so a profile that never specified DNS round-trips without inventing a
     // resolver and server-pushed DNS remains authoritative. Resolution order is explicit list,
     // then authenticated server push, then no change to the host resolver.
@@ -262,7 +267,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
         "route_file", "route_local", "server", "shaping", "shaping_budget", "shaping_gap_max",
         "shaping_gap_mean", "shaping_gap_min", "shaping_max_size", "shaping_min_size",
         "shaping_stealth", "shaping_stealth_mbps", "sni", "timeout", "user",
-        "proxy", "proxy_listen", "proxy_mode",
+        "proxy", "proxy_listen", "proxy_mode", "proxy_intercept",
     }.Union(CarriedIniKeys).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>`[qeli]` keys no qeli client understands — i.e. misspellings. The setting they
@@ -327,6 +332,9 @@ public sealed class VpnConfig : INotifyPropertyChanged
     public bool ProxyEnabled { get; init; }
     public string ProxyListen { get; init; } = "127.0.0.1:1080";
     public string ProxyMode { get; init; } = "mixed";  // socks5 | http | mixed
+    /// <summary>Windows: force listed <see cref="Apps"/> into the local proxy via WinDivert
+    /// DNAT. Kept separate from <see cref="AppsMode"/> (all/include/exclude only).</summary>
+    public bool ProxyIntercept { get; init; }
 
     /// <summary>Stable unique profile id (GUID hex). Profiles are referenced by this
     /// in app settings (service / auto-connect) instead of by DisplayName — two
@@ -395,6 +403,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
         ShapingStealth = shStealth, ShapingStealthRateMbps = shStealthRateMbps,
         Name = Name, Id = Id,
         ProxyEnabled = ProxyEnabled, ProxyListen = ProxyListen, ProxyMode = ProxyMode,
+        ProxyIntercept = ProxyIntercept,
     };
 
     /// <summary>Clone applying the fields the profile editor's FORM edits, preserving every
@@ -407,7 +416,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
     /// cleared; every other key keeps its marker because nothing in the form touched it.
     private static readonly string[] EditorControlledBooleanKeys =
     {
-        "quic", "gateway", "route_local", "padding", "heartbeat", "proxy",
+        "quic", "gateway", "route_local", "padding", "heartbeat", "proxy", "proxy_intercept",
     };
 
     /// <summary>Numeric keys the editor form supplies a real value for, so a marker on them is
@@ -439,7 +448,8 @@ public sealed class VpnConfig : INotifyPropertyChanged
         int? reconnectMaxRetries = null, bool? persistTun = null,
         bool? mtuProbe = null, bool? killSwitch = null, string? dnsMode = null,
         string? ipv6Policy = null, string? roamingPolicy = null,
-        bool? allowIpv4Leak = null, bool? allowIpv6Leak = null) => new()
+        bool? allowIpv4Leak = null, bool? allowIpv6Leak = null,
+        bool? proxyIntercept = null) => new()
     {
         // ── form-edited fields (from params) ──
         ServerAddress = serverAddress, Port = port, Protocol = protocol, WireMode = wireMode,
@@ -459,6 +469,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
         ProxyEnabled = proxyEnabled,
         ProxyListen = string.IsNullOrWhiteSpace(proxyListen) ? "127.0.0.1:1080" : proxyListen.Trim(),
         ProxyMode = string.IsNullOrWhiteSpace(proxyMode) ? "mixed" : proxyMode.Trim(),
+        ProxyIntercept = proxyIntercept ?? ProxyIntercept,
         AppsMode = appsMode ?? AppsMode,
         Apps = apps ?? Apps,
         ConnectionTimeoutSecs = connectionTimeoutSecs ?? ConnectionTimeoutSecs,
@@ -547,14 +558,14 @@ public sealed class VpnConfig : INotifyPropertyChanged
     };
 
     /// <summary>Apply main-window traffic preset to a profile.
-    /// Presets: full (gateway), apps (WinDivert include), apps-proxy (include + SOCKS/HTTP).</summary>
+    /// Presets: full | apps | proxy | intercept (force apps into local proxy).</summary>
     public VpnConfig WithGlobalTrafficMode(
         string trafficPreset, bool proxyEnabled, string proxyListen, string proxyMode,
         string appsMode, IReadOnlyList<string> apps,
         string dnsMode, IReadOnlyList<string> dnsServers)
     {
         string preset = (trafficPreset ?? "full").Trim().ToLowerInvariant();
-        if (preset is not ("full" or "apps" or "apps-proxy")) preset = "full";
+        if (preset is not ("full" or "apps" or "proxy" or "intercept")) preset = "full";
 
         var appList = (apps ?? Array.Empty<string>())
             .Select(a => a.Trim()).Where(a => a.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase)
@@ -562,6 +573,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
 
         bool fullTunnel;
         bool proxy;
+        bool intercept = false;
         string mode;
         switch (preset)
         {
@@ -569,13 +581,20 @@ public sealed class VpnConfig : INotifyPropertyChanged
                 fullTunnel = false;
                 proxy = false;
                 mode = appList.Count > 0 ? "include" : "all";
-                if (mode == "all") fullTunnel = true; // no apps yet → safe full tunnel
+                if (mode == "all") fullTunnel = true;
                 break;
-            case "apps-proxy":
+            case "proxy":
                 fullTunnel = false;
                 proxy = true;
-                mode = appList.Count > 0 ? "include" : "all";
-                // Proxy without WinDivert still works on Wintun split (bind+pin).
+                mode = "all";
+                appList = new List<string>();
+                break;
+            case "intercept":
+                fullTunnel = false;
+                proxy = true;
+                // apps_mode stays all|include|exclude only — intercept is proxy_intercept=.
+                mode = "all";
+                intercept = appList.Count > 0;
                 break;
             default:
                 fullTunnel = true;
@@ -584,7 +603,6 @@ public sealed class VpnConfig : INotifyPropertyChanged
                 appList = new List<string>();
                 break;
         }
-        // Explicit proxyEnabled only gates listen when preset already wants proxy.
         if (!proxy) proxyEnabled = false;
         else proxyEnabled = true;
 
@@ -611,7 +629,8 @@ public sealed class VpnConfig : INotifyPropertyChanged
             proxyMode: string.IsNullOrWhiteSpace(proxyMode) ? "mixed" : proxyMode.Trim(),
             appsMode: mode,
             apps: appList,
-            dnsMode: dns);
+            dnsMode: dns,
+            proxyIntercept: intercept);
     }
 
     /// <summary>Legacy overload kept for callers that still pass preferFullTunnel.</summary>
@@ -621,8 +640,13 @@ public sealed class VpnConfig : INotifyPropertyChanged
         string dnsMode, IReadOnlyList<string> dnsServers)
     {
         string preset = preferFullTunnel && !proxyEnabled ? "full"
-            : proxyEnabled ? "apps-proxy"
+            : proxyEnabled && appsMode.Equals("proxy-redirect", StringComparison.OrdinalIgnoreCase)
+                ? "intercept"
+            : proxyEnabled ? "proxy"
             : "apps";
+        if (proxyEnabled && apps.Count == 0
+            && !appsMode.Equals("proxy-redirect", StringComparison.OrdinalIgnoreCase))
+            preset = "proxy";
         return WithGlobalTrafficMode(preset, proxyEnabled, proxyListen, proxyMode,
             appsMode, apps, dnsMode, dnsServers);
     }
@@ -674,6 +698,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
             q.Add($"apps_mode={Uri.EscapeDataString(AppsMode)}");
         if (Apps.Count > 0)
             q.Add($"apps={Uri.EscapeDataString(string.Join(",", Apps))}");
+        if (ProxyIntercept) q.Add("proxy_intercept=1");
         // Per-application routing identifiers remain platform-owned for file profiles;
         // emitting apps_* here keeps the share-link contract aligned with INI round-trip.
         sb.Append('?').Append(string.Join("&", q));
@@ -693,6 +718,14 @@ public sealed class VpnConfig : INotifyPropertyChanged
     /// </summary>
     private static string IniSafe(string? v) =>
         v is null ? "" : new string(v.Where(c => !char.IsControl(c)).ToArray());
+
+    /// <summary>Map the short-lived Windows-only <c>proxy-redirect</c> apps_mode to
+    /// canonical <c>all</c>; intercept is expressed as <see cref="ProxyIntercept"/>.</summary>
+    private static string NormalizeAppsMode(string raw)
+    {
+        string mode = (raw ?? "all").Trim().ToLowerInvariant();
+        return mode == "proxy-redirect" ? "all" : mode;
+    }
 
     public string ToIni()
     {
@@ -800,6 +833,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
         if (ProxyEnabled) sb.AppendLine("proxy = true");
         if (ProxyListen != "127.0.0.1:1080") sb.AppendLine($"proxy_listen = {IniSafe(ProxyListen)}");
         if (ProxyMode != "mixed") sb.AppendLine($"proxy_mode = {IniSafe(ProxyMode)}");
+        if (ProxyIntercept) sb.AppendLine("proxy_intercept = true");
         // Re-emit the keys this port accepts but does not model, verbatim and in a stable
         // order. Without this, opening a CLI or mobile profile here and saving it deleted its
         // hooks (`post_up`/`post_down`), socket policy, routing policy and the whole
@@ -833,7 +867,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
     {
         "allow_lan", "apps", "apps_mode", "dev_node", "metric", "name", "persist_tun", "route_file",
         "reconnect", "reconnect_base_delay", "reconnect_max_delay", "reconnect_retries",
-        "proxy", "proxy_listen", "proxy_mode",
+        "proxy", "proxy_listen", "proxy_mode", "proxy_intercept",
     };
 
     /// <summary>Canonical profile passed to the Rust transport owner. The ordinary exported
@@ -1270,8 +1304,8 @@ public sealed class VpnConfig : INotifyPropertyChanged
             IncludeRoutes = SplitCidrs(Get("include")),
             ExcludeRoutes = SplitCidrs(Get("exclude")),
             // Keep unknown values verbatim; Validate() rejects them. Coercing a typo to `all`
-            // would silently widen the tunnel.
-            AppsMode = Get("apps_mode", "all").Trim().ToLowerInvariant(),
+            // would silently widen the tunnel. Legacy `proxy-redirect` → all + proxy_intercept.
+            AppsMode = NormalizeAppsMode(Get("apps_mode", "all")),
             Apps = Get("apps").Split(',').Select(s => s.Trim()).Where(s => s.Length > 0)
                 .Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
             PersistTun = BoolAt("persist_tun", false),
@@ -1329,9 +1363,13 @@ public sealed class VpnConfig : INotifyPropertyChanged
             ShapingMaxSize = RangedNum("shaping_max_size", 1024, 1, int.MaxValue),
             ShapingStealth = BoolAt("shaping_stealth", false),
             ShapingStealthRateMbps = RangedNum("shaping_stealth_mbps", 2, 1, int.MaxValue),
-            ProxyEnabled = BoolAt("proxy", false),
+            ProxyEnabled = BoolAt("proxy", false)
+                || BoolAt("proxy_intercept", false)
+                || Get("apps_mode", "all").Trim().Equals("proxy-redirect", StringComparison.OrdinalIgnoreCase),
             ProxyListen = Get("proxy_listen").Length > 0 ? Get("proxy_listen") : "127.0.0.1:1080",
             ProxyMode = Get("proxy_mode").Length > 0 ? Get("proxy_mode") : "mixed",
+            ProxyIntercept = BoolAt("proxy_intercept", false)
+                || Get("apps_mode", "all").Trim().Equals("proxy-redirect", StringComparison.OrdinalIgnoreCase),
             UnparsedBooleanKeys = badBools,
             DuplicateKeys = dupKeys,
             UnparsedNumericKeys = badNums,
@@ -1674,6 +1712,12 @@ public sealed class VpnConfig : INotifyPropertyChanged
                     $"invalid proxy_listen '{ProxyListen}' — expected host:port");
             }
         }
+        if (ProxyIntercept && Apps.Count == 0)
+            throw new ArgumentException(
+                "'proxy_intercept = true' requires a non-empty 'apps' list");
+        if (ProxyIntercept && !ProxyEnabled)
+            throw new ArgumentException(
+                "'proxy_intercept = true' requires 'proxy = true'");
         foreach (var (field, routes) in new[]
                  {
                      ("include", (IEnumerable<string>)IncludeRoutes),
@@ -1814,6 +1858,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
         string dnsMode = "tunnel";
         string appsMode = "all";
         List<string> apps = new();
+        bool proxyIntercept = false;
         // F2 AmneziaWG junk params (off unless awg=1).
         bool awg = false;
         uint awgJc = 0;
@@ -1873,6 +1918,10 @@ public sealed class VpnConfig : INotifyPropertyChanged
                             .Distinct(StringComparer.OrdinalIgnoreCase)
                             .ToList();
                         break;
+                    case "proxy_intercept":
+                        proxyIntercept = v == "1"
+                            || v.Equals("true", StringComparison.OrdinalIgnoreCase);
+                        break;
                     case "awg": awg = v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase); break;
                     case "jc": if (uint.TryParse(v, out var jcp)) awgJc = Math.Min(jcp, 128u); break;
                     case "jmin": if (ushort.TryParse(v, out var jminp)) awgJmin = Math.Min(jminp, (ushort)1400); break;
@@ -1884,6 +1933,11 @@ public sealed class VpnConfig : INotifyPropertyChanged
         // Alias convenience: some users fold transport+QUIC into the wire mode
         // (`mode=udp-quic` / `udp-obfs`). Split it back into proto + wire mode + quic.
         (proto, mode, quic) = NormalizeMode(proto, mode, quic);
+        if (appsMode.Equals("proxy-redirect", StringComparison.OrdinalIgnoreCase))
+        {
+            proxyIntercept = true;
+            appsMode = "all";
+        }
 
         var cfg = new VpnConfig
         {
@@ -1908,6 +1962,8 @@ public sealed class VpnConfig : INotifyPropertyChanged
             Mtu = LinkMtu(mtu),
             AppsMode = appsMode,
             Apps = apps,
+            ProxyIntercept = proxyIntercept,
+            ProxyEnabled = proxyIntercept,
             DnsMode = dnsMode,
         };
         // Kotlin's fromQeliUri and Swift's fromQeliURI both end with validate(); C# defined

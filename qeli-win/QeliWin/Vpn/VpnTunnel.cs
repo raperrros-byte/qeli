@@ -12,6 +12,8 @@ public sealed class VpnTunnel : VpnTunnelBase
 {
     private NetworkConfigurator? _net;
     private bool _useWinDivert;
+    private AppProxyRedirector? _proxyRedirector;
+    private IPAddress? _proxyRedirectCarrierIp;
     private readonly Dictionary<ulong, RoamingObservation> _roamingObservations = new();
     private readonly Dictionary<ulong, RoamingCandidate> _roamingCandidates = new();
 
@@ -297,6 +299,43 @@ public sealed class VpnTunnel : VpnTunnelBase
         return _net.PinHostViaTunnel(destination, TunIfIndex);
     }
 
+    protected override void AfterLocalProxyStarted(VpnConfig config)
+    {
+        BeforeLocalProxyStopped();
+        if (!config.UsesProxyRedirect) return;
+        ushort listenPort = ParseListenPort(config.ProxyListen);
+        try
+        {
+            _proxyRedirector = new AppProxyRedirector(
+                config.Apps, listenPort,
+                _proxyRedirectCarrierIp ?? IPAddress.None, (ushort)config.Port, Log);
+            _proxyRedirector.Start();
+        }
+        catch (Exception e)
+        {
+            Log($"App proxy intercept failed: {e.Message}");
+            try { _proxyRedirector?.Dispose(); } catch { }
+            _proxyRedirector = null;
+        }
+    }
+
+    protected override void BeforeLocalProxyStopped()
+    {
+        try { _proxyRedirector?.Dispose(); } catch { }
+        _proxyRedirector = null;
+    }
+
+    private static ushort ParseListenPort(string listen)
+    {
+        if (string.IsNullOrWhiteSpace(listen)) return 1080;
+        int colon = listen.LastIndexOf(':');
+        if (colon >= 0
+            && ushort.TryParse(listen[(colon + 1)..], out ushort port)
+            && port > 0)
+            return port;
+        return 1080;
+    }
+
     // Wintun adapter creation (~10 s) started in the background at connect kickoff so it
     // overlaps the handshake (PrewarmTun) and SetupTun just consumes it. _prewarmId pins the
     // identity so we only reuse a warmed adapter for the SAME profile.
@@ -326,6 +365,7 @@ public sealed class VpnTunnel : VpnTunnelBase
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        _proxyRedirectCarrierIp = serverIp;
         var assigned = session.NetworkAddresses;
         // persist-tun: reuse only when the complete applied network-plan fingerprint matches;
         // the same client IP can arrive with different routes, DNS, prefix or MTU.
@@ -357,7 +397,7 @@ public sealed class VpnTunnel : VpnTunnelBase
                     EffectiveMtu(config.Mtu, session.PushedMtu),
                     physicalLocalRoutes:
                         RouteLocalPolicy.DiscoverConnectedRfc1918Prefixes(log: Log),
-                    tunnelSelfProcess: config.ProxyEnabled);
+                    tunnelSelfProcess: false);
                 retained.SetTunnelUp(true);
             }
             return;
@@ -391,7 +431,7 @@ public sealed class VpnTunnel : VpnTunnelBase
                 log: Log,
                 physicalLocalRoutes:
                     RouteLocalPolicy.DiscoverConnectedRfc1918Prefixes(log: Log),
-                tunnelSelfProcess: config.ProxyEnabled);
+                tunnelSelfProcess: false);
             adapter.Open();
             cancellationToken.ThrowIfCancellationRequested();
             adapter.SetTunnelUp(true);
@@ -849,6 +889,7 @@ public sealed class VpnTunnel : VpnTunnelBase
 
     protected override void BeforeTunDispose()
     {
+        BeforeLocalProxyStopped();
         RestoreIpForwarding();
         // DNS belongs to the Wintun interface, so reset it before its last handle closes.
         // Retain the configurator on failure; CleanupPlatform below then retries and makes
@@ -860,6 +901,7 @@ public sealed class VpnTunnel : VpnTunnelBase
 
     protected override void CleanupPlatform()
     {
+        BeforeLocalProxyStopped();
         Exception? roamingCleanupError = null;
         try { ResetNativeRoamingPath(); }
         catch (Exception error) { roamingCleanupError = error; }
