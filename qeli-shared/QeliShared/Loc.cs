@@ -248,8 +248,12 @@ public static class Loc
         ["DnsSystem"] = ("Keep system DNS", "Оставить системный DNS"),
         ["DnsOff"] = ("Do not configure DNS", "Не настраивать DNS"),
         ["DnsPushHint"] = (
-            "Leave the server list empty to use DNS received securely from the VPN server.",
-            "Оставьте список серверов пустым, чтобы использовать DNS, безопасно полученный от VPN-сервера."),
+            "Empty list + Tunnel = use DNS from the VPN server (or public resolvers via the tunnel). " +
+            "For a corporate WireGuard/other VPN on the same PC: set mode to Keep system DNS or Do not configure DNS, " +
+            "otherwise qeli overrides the corporate resolver.",
+            "Пустой список + «Туннель» = DNS с VPN-сервера (или публичные резолверы через туннель). " +
+            "Если рядом корпоративный WireGuard/другой VPN: выберите «Оставить системный DNS» или «Не настраивать DNS», " +
+            "иначе qeli перебьёт корпоративный резолвер."),
         ["MtuProbe"] = ("Discover path MTU automatically when MTU is 0", "Автоматически определять MTU маршрута при значении 0"),
         ["KillSwitch"] = ("Block traffic if the tunnel is interrupted (kill switch)", "Блокировать трафик при разрыве туннеля (kill switch)"),
         ["ConnectionBehavior"] = ("Connection behavior", "Поведение подключения"),

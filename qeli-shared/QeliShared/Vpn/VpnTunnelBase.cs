@@ -1959,6 +1959,17 @@ public abstract class VpnTunnelBase
     protected static List<string> EffectiveDns(Session session) =>
         session.PlannedDns.Where(address => !string.IsNullOrWhiteSpace(address)).ToList();
 
+    /// <summary>
+    /// Respect profile <c>dns</c> mode for corporate-VPN coexistence: <c>off</c>/<c>system</c>
+    /// leave the host resolver alone (empty list). <c>tunnel</c> uses the NetworkPlan list.
+    /// </summary>
+    protected static List<string> EffectiveDns(VpnConfig config, Session session)
+    {
+        if (!config.DnsMode.Equals("tunnel", StringComparison.OrdinalIgnoreCase))
+            return new List<string>();
+        return EffectiveDns(session);
+    }
+
     /// <summary>The immutable route_file snapshot attached to the authenticated generation.</summary>
     protected static IReadOnlyList<string> EffectiveRouteFileRoutes(Session session) =>
         session.RouteFileRoutes;
@@ -2043,7 +2054,7 @@ public abstract class VpnTunnelBase
         Add(canonical, "carrier_protocol", config.Protocol.Trim().ToLowerInvariant());
 
         // Resolver order is significant (primary/secondary); route and app collections are sets.
-        AddOrdered(canonical, "dns", EffectiveDns(session), NormalizeAddress);
+        AddOrdered(canonical, "dns", EffectiveDns(config, session), NormalizeAddress);
         AddSet(canonical, "plan_routes", CanonicalRoutes(session.PlannedRoutes));
         AddSet(canonical, "profile_include_routes", config.IncludeRoutes, NormalizeCidr);
         AddSet(canonical, "profile_exclude_routes", config.ExcludeRoutes, NormalizeCidr);

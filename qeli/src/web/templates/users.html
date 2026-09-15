@@ -520,37 +520,59 @@
           </div>
         </div>
 
-        <div x-show="share.format === 'ini'" class="space-y-2 p-3 rounded-lg" style="background:var(--bg-2);border:1px solid var(--line)">
-          <p class="text-xs font-medium text-slate-300">Linux client options</p>
-          <p class="text-[11px] text-slate-500">These keys are not carried in qeli:// links — set them here for a ready-to-use file.</p>
-          <label class="flex items-start gap-2.5 text-xs cursor-pointer">
-            <input type="checkbox" class="mt-0.5" x-model="share.gateway">
-            <span>
-              <span class="text-slate-200 block">Full-tunnel (gateway = true)</span>
-              <span class="text-slate-500">Route all IPv4 traffic through the VPN. Requires NAT on the server profile (routing.nat.enabled).</span>
-            </span>
-          </label>
-          <label class="flex items-start gap-2.5 text-xs cursor-pointer">
-            <input type="checkbox" class="mt-0.5" x-model="share.dnsTunnel">
-            <span>
-              <span class="text-slate-200 block">DNS through tunnel (dns = tunnel)</span>
-              <span class="text-slate-500">Use tunnel DNS via systemd-resolved. Uncheck for dns = off (Docker / external DNS manager).</span>
-            </span>
-          </label>
-          <label class="flex items-start gap-2.5 text-xs cursor-pointer">
-            <input type="checkbox" class="mt-0.5" x-model="share.routeLocal">
-            <span>
-              <span class="text-slate-200 block">Private LAN routes (route_local = true)</span>
-              <span class="text-slate-500">Also route RFC1918 (10/8, 172.16/12, 192.168/16) through the tunnel — may break local LAN access.</span>
-            </span>
-          </label>
-          <label class="flex items-start gap-2.5 text-xs cursor-pointer" :class="!share.gateway ? 'opacity-50' : ''">
-            <input type="checkbox" class="mt-0.5" x-model="share.killSwitch" :disabled="!share.gateway">
-            <span>
-              <span class="text-slate-200 block">Kill switch (kill_switch = true)</span>
-              <span class="text-slate-500">Block non-tunnel egress while connected (full-tunnel only, Linux iptables).</span>
-            </span>
-          </label>
+        <div class="space-y-2 p-3 rounded-lg" style="background:var(--bg-2);border:1px solid var(--line)">
+          <p class="text-xs font-medium text-slate-300">Client options</p>
+          <p class="text-[11px] text-slate-500">Written into each selected profile's qeli:// link (`dns=…`) and into INI (`dns = …`). Use system/off when a corporate WireGuard (or other VPN) must keep its own resolver.</p>
+
+          <div>
+            <label class="block text-xs font-medium text-slate-400 mb-1">DNS mode (default for selected profiles)</label>
+            <select class="inp text-xs" x-model="share.dnsMode" @change="applyDnsDefaultToProfiles()">
+              <option value="tunnel">tunnel — VPN / server DNS</option>
+              <option value="system">system — keep host / corporate DNS</option>
+              <option value="off">off — do not configure DNS</option>
+            </select>
+          </div>
+
+          <div x-show="share.profilesSelected.length > 1" class="space-y-1.5 pt-1">
+            <p class="text-[11px] font-medium text-slate-400">Per-profile DNS</p>
+            <template x-for="pname in share.profilesSelected" :key="pname">
+              <div class="flex items-center gap-2 text-xs">
+                <span class="font-mono text-slate-300 w-28 truncate" x-text="pname"></span>
+                <select class="inp text-xs flex-1"
+                        :value="share.dnsByProfile[pname] || share.dnsMode"
+                        @change="share.dnsByProfile[pname] = $event.target.value">
+                  <option value="tunnel">tunnel</option>
+                  <option value="system">system</option>
+                  <option value="off">off</option>
+                </select>
+              </div>
+            </template>
+          </div>
+
+          <div x-show="share.format === 'ini'" class="space-y-2 pt-2 border-t" style="border-color:var(--line)">
+            <p class="text-[11px] text-slate-500">Linux CLI file-only keys (not carried in qeli:// links)</p>
+            <label class="flex items-start gap-2.5 text-xs cursor-pointer">
+              <input type="checkbox" class="mt-0.5" x-model="share.gateway">
+              <span>
+                <span class="text-slate-200 block">Full-tunnel (gateway = true)</span>
+                <span class="text-slate-500">Route all IPv4 traffic through the VPN. Requires NAT on the server profile (routing.nat.enabled).</span>
+              </span>
+            </label>
+            <label class="flex items-start gap-2.5 text-xs cursor-pointer">
+              <input type="checkbox" class="mt-0.5" x-model="share.routeLocal">
+              <span>
+                <span class="text-slate-200 block">Private LAN routes (route_local = true)</span>
+                <span class="text-slate-500">Also route RFC1918 (10/8, 172.16/12, 192.168/16) through the tunnel — may break local LAN access.</span>
+              </span>
+            </label>
+            <label class="flex items-start gap-2.5 text-xs cursor-pointer" :class="!share.gateway ? 'opacity-50' : ''">
+              <input type="checkbox" class="mt-0.5" x-model="share.killSwitch" :disabled="!share.gateway">
+              <span>
+                <span class="text-slate-200 block">Kill switch (kill_switch = true)</span>
+                <span class="text-slate-500">Block non-tunnel egress while connected (full-tunnel only, Linux iptables).</span>
+              </span>
+            </label>
+          </div>
         </div>
 
         <!-- Legacy user with no recoverable password — enter current password or reset. -->
@@ -889,7 +911,8 @@ function usersPage() {
         host, label: '',
         format: 'link',
         gateway: true,
-        dnsTunnel: true,
+        dnsMode: 'tunnel',
+        dnsByProfile: Object.fromEntries(allowed.map(p => [p.name, 'tunnel'])),
         routeLocal: false,
         killSwitch: false,
         manualPassword: '',
@@ -899,14 +922,25 @@ function usersPage() {
       this.modal = 'share';
     },
 
+    applyDnsDefaultToProfiles() {
+      const mode = this.share.dnsMode || 'tunnel';
+      const next = { ...(this.share.dnsByProfile || {}) };
+      for (const name of this.share.profilesSelected) next[name] = mode;
+      this.share.dnsByProfile = next;
+    },
+
     toggleShareProfile(name) {
       const i = this.share.profilesSelected.indexOf(name);
       if (i >= 0) this.share.profilesSelected.splice(i, 1);
-      else this.share.profilesSelected.push(name);
+      else {
+        this.share.profilesSelected.push(name);
+        if (!this.share.dnsByProfile[name]) this.share.dnsByProfile[name] = this.share.dnsMode || 'tunnel';
+      }
     },
 
     selectAllShareProfiles() {
       this.share.profilesSelected = this.share.availableProfiles.map(p => p.name);
+      this.applyDnsDefaultToProfiles();
     },
 
     resetShare() {
@@ -937,12 +971,14 @@ function usersPage() {
             host: this.share.host.trim(),
             user: this.share.user,
             format: exportFormat,
+            dns: (this.share.dnsByProfile && this.share.dnsByProfile[profile])
+              || this.share.dnsMode
+              || 'tunnel',
           };
           if (exportFormat === 'ini') {
             if (this.share.gateway) payload.gateway = 'true';
             if (this.share.routeLocal) payload.route_local = 'true';
             if (this.share.killSwitch && this.share.gateway) payload.kill_switch = 'true';
-            payload.dns = this.share.dnsTunnel ? 'tunnel' : 'off';
           }
           const manualPassword = this.share.manualPassword.trim();
           if (!allowReset && manualPassword) payload.password = manualPassword;

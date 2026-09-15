@@ -8,10 +8,12 @@
 //! ```
 //!
 //! Everything in [`ClientLink`] is the connection descriptor needed before the
-//! authenticated server push: credentials, endpoint, pinned key and the wire/framing
-//! settings that must already match. NetworkPlan supplies tunnel addresses, routes, DNS
-//! and the automatic inner MTU after auth; an explicit client MTU may appear here as an
-//! override. Device-local policy such as per-app routing deliberately stays in flat INI.
+//! authenticated server push: credentials, endpoint, pinned key, the wire/framing
+//! settings that must already match, and the client-side DNS *mode* (`tunnel` /
+//! `system` / `off`) for corporate-VPN coexistence. NetworkPlan supplies tunnel
+//! addresses, routes, resolver *addresses* and the automatic inner MTU after auth;
+//! an explicit client MTU may appear here as an override. Device-local policy such
+//! as per-app routing deliberately stays in flat INI.
 //!
 //! Pure `std` (manual percent-encoding, no `url` crate), so it builds and is
 //! tested on every platform.
@@ -64,6 +66,10 @@ pub struct ClientLink {
     /// the default and is omitted from compact links; non-default policy must
     /// survive sharing between clients.
     pub roaming: String,
+    /// Client DNS mode (`dns=`): `tunnel` (default - install tunnel/pushed
+    /// resolvers), `system` (leave the host / corporate resolver alone), or
+    /// `off` (do not configure DNS). Independent of server-pushed addresses.
+    pub dns_mode: String,
     /// Human label shown in the client UI (URI fragment).
     pub label: Option<String>,
 }
@@ -220,6 +226,7 @@ impl ClientLink {
             // URI; set a non-zero value only to force a client-side override.
             mtu: 0,
             roaming: "auto".into(),
+            dns_mode: "tunnel".into(),
             label,
             // AmneziaWG-style junk masking. Junk is emitted only where the handshake
             // actually sends it: on TCP the obfs wire mode (protocol::obfs), and on UDP
@@ -232,6 +239,11 @@ impl ClientLink {
             jmin: obf.awg.jmin,
             jmax: obf.awg.jmax,
         }
+    }
+
+    pub fn with_dns_mode(mut self, mode: &str) -> Self {
+        self.dns_mode = normalize_dns_mode(mode).into();
+        self
     }
 
     /// Render to a `qeli://` URI suitable for a QR code.
@@ -295,6 +307,9 @@ impl ClientLink {
         if !self.roaming.is_empty() && self.roaming != "auto" {
             query.push(("roaming".into(), self.roaming.clone()));
         }
+        // Always emit dns= so exported links are explicit about resolver ownership.
+        let dns = normalize_dns_mode(&self.dns_mode);
+        query.push(("dns".into(), dns.to_string()));
         if !query.is_empty() {
             uri.push('?');
             let parts: Vec<String> = query
@@ -389,6 +404,7 @@ impl ClientLink {
             jmax: 0,
             mtu: 0,
             roaming: "auto".into(),
+            dns_mode: "tunnel".into(),
             label: fragment,
         };
 
@@ -416,6 +432,7 @@ impl ClientLink {
                             return Err(LinkError("roaming must be off, auto or required"));
                         }
                     },
+                    "dns" => link.dns_mode = normalize_dns_mode(&v).into(),
                     _ => {} // forward-compatible: ignore unknown params
                 }
             }
@@ -436,6 +453,16 @@ impl ClientLink {
         }
         Ok(link)
     }
+
+/// Normalize a client DNS mode from a link/INI value. Unknown values become `tunnel`.
+pub fn normalize_dns_mode(mode: &str) -> &'static str {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "off" => "off",
+        "system" => "system",
+        _ => "tunnel",
+    }
+}
+
 }
 
 #[cfg(test)]
@@ -687,6 +714,7 @@ mod tests {
             jmax: 0,
             mtu: 0,
             roaming: "auto".into(),
+            dns_mode: "tunnel".into(),
             label: Some("My VPN".into()),
         }
     }
@@ -729,6 +757,7 @@ mod tests {
             jmax: 0,
             mtu: 1280,
             roaming: "required".into(),
+            dns_mode: "tunnel".into(),
             label: None,
         };
         let back = ClientLink::from_uri(&link.to_uri()).unwrap();

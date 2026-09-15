@@ -19,7 +19,7 @@ use std::sync::Arc;
 ///
 /// `POST /api/share` body:
 /// `{"profile":"tcp","host":"vpn.example.com","user":"alice","label":"My VPN","allow_reset":"true",
-///   "format":"link|ini|both","gateway":"true","route_local":"false","kill_switch":"false","dns":"tunnel|off"}`
+///   "format":"link|ini|both","gateway":"true","route_local":"false","kill_switch":"false","dns":"tunnel|system|off"}`
 pub async fn share_link(
     State(state): State<Arc<ServerState>>,
     _guard: auth::AuthGuard,
@@ -222,7 +222,8 @@ pub async fn share_link(
         pass,
         server_key,
         params.get("label").cloned().filter(|s| !s.is_empty()),
-    );
+    )
+    .with_dns_mode(params.get("dns").map(String::as_str).unwrap_or("tunnel"));
 
     let uri = link.to_uri();
     let export_format = params.get("format").map(String::as_str).unwrap_or("link");

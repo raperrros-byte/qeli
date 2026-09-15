@@ -342,7 +342,7 @@ public sealed class VpnTunnel : VpnTunnelBase
                     retainedIpv6 == null ? null : IPAddress.Parse(retainedIpv6.Address),
                     config.Apps,
                     config.AppsMode.Equals("include", StringComparison.OrdinalIgnoreCase),
-                    EffectiveDns(session),
+                    EffectiveDns(config, session),
                     session.AllowIpv4Leak,
                     session.AllowIpv6Leak,
                     config.IsFullTunnel,
@@ -374,7 +374,7 @@ public sealed class VpnTunnel : VpnTunnelBase
                 ipv6 == null ? null : IPAddress.Parse(ipv6.Address),
                 config.Apps,
                 includeMode: config.AppsMode.Equals("include", StringComparison.OrdinalIgnoreCase),
-                dnsServers: EffectiveDns(session),
+                dnsServers: EffectiveDns(config, session),
                 allowIpv4Leak: session.AllowIpv4Leak,
                 allowIpv6Leak: session.AllowIpv6Leak,
                 fullTunnel: config.IsFullTunnel,
@@ -394,6 +394,11 @@ public sealed class VpnTunnel : VpnTunnelBase
             cancellationToken.ThrowIfCancellationRequested();
             adapter.SetTunnelUp(true);
             _tun = adapter;
+            var perAppDns = EffectiveDns(config, session);
+            if (perAppDns.Count == 0)
+                Log($"DNS left unchanged (dns = {config.DnsMode}; WinDivert will not rewrite port 53)");
+            else
+                WarnIfDnsConflictsWithOtherVpn(config, perAppDns);
             Log($"Per-app split tunnel ACTIVE: mode={config.AppsMode}, apps={config.Apps.Count}; "
                 + "WinDivert packet path is attached to the common Rust transport core");
             return;
@@ -586,7 +591,9 @@ public sealed class VpnTunnel : VpnTunnelBase
                 assigned.Any(address => address.Family == "ipv4"),
                 assigned.Any(address => address.Family == "ipv6"));
 
-        _net.SetDns(alias, EffectiveDns(session));
+        var dns = EffectiveDns(config, session);
+        _net.SetDns(alias, dns);
+        WarnIfDnsConflictsWithOtherVpn(config, dns, alias);
 
         // LAST step of bring-up: ask the OS whether the carrier still leaves via the
         // physical interface. Everything above only proved the commands were issued; this
@@ -597,6 +604,29 @@ public sealed class VpnTunnel : VpnTunnelBase
             foreach (var path in carrierPaths)
                 _net.VerifyCarrierPath(
                     path.address, tunIndex, path.ifIndex, path.gateway);
+    }
+
+    /// <summary>When qeli installs tunnel DNS while another VPN NIC is up, Windows often
+    /// prefers qeli's resolvers (low InterfaceMetric on full-tunnel) and corporate WireGuard
+    /// DNS stops working. Surface that in the log; the fix is dns = off / system.</summary>
+    private void WarnIfDnsConflictsWithOtherVpn(
+        VpnConfig config, IReadOnlyList<string> dns, string? excludeTunAlias = null)
+    {
+        if (dns.Count == 0) return;
+        if (!config.DnsMode.Equals("tunnel", StringComparison.OrdinalIgnoreCase)) return;
+        try
+        {
+            var others = NetworkConfigurator.OtherVpnAdapterNames(excludeTunAlias);
+            if (others.Count == 0) return;
+            Log("NOTE: tunnel DNS is active while other VPN adapter(s) are up: "
+                + string.Join(", ", others)
+                + ". Windows may prefer qeli's resolvers over corporate DNS. "
+                + "Set dns = off or dns = system in this profile to leave the host resolver alone.");
+        }
+        catch (Exception e)
+        {
+            Log($"NOTE: could not probe other VPN adapters for DNS coexistence: {e.Message}");
+        }
     }
 
     private string? _forwardingAlias;

@@ -896,6 +896,7 @@ impl ClientConfig {
             jmax: self.obfuscation.awg.jmax,
             mtu: self.tun.mtu,
             roaming: self.roaming.to_string(),
+            dns_mode: self.dns.mode.clone(),
             label,
         }
     }
@@ -955,6 +956,7 @@ impl ClientConfig {
             link.mtu
         };
         cfg.roaming = link.roaming.parse().unwrap_or_default();
+        cfg.dns.mode = crate::config::share::normalize_dns_mode(&link.dns_mode).into();
         cfg
     }
 

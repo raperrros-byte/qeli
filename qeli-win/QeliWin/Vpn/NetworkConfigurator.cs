@@ -132,6 +132,45 @@ public sealed class NetworkConfigurator : IDisposable
         return null;
     }
 
+    /// <summary>Up VPN-like adapters (WireGuard, OpenVPN TAP, Tailscale, other Wintun,
+    /// Cisco AnyConnect, ...) excluding qeli's own tunnel alias when known. Used only to
+    /// warn about DNS coexistence - never changes routing.</summary>
+    public static IReadOnlyList<string> OtherVpnAdapterNames(string? excludeTunAlias)
+    {
+        var names = new List<string>();
+        foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (ni.OperationalStatus != OperationalStatus.Up) continue;
+            if (!string.IsNullOrEmpty(excludeTunAlias)
+                && string.Equals(ni.Name, excludeTunAlias, StringComparison.OrdinalIgnoreCase))
+                continue;
+            string desc = ni.Description ?? "";
+            string name = ni.Name ?? "";
+            if (!LooksLikeVpnAdapter(name, desc)) continue;
+            names.Add(string.IsNullOrWhiteSpace(desc) ? name : $"{name} ({desc})");
+        }
+        return names;
+    }
+
+    private static bool LooksLikeVpnAdapter(string name, string description)
+    {
+        string hay = $"{name} {description}";
+        ReadOnlySpan<string> needles =
+        [
+            "WireGuard", "Wintun", "TAP-Windows", "TAP-Win32", "OpenVPN",
+            "Tailscale", "Cisco AnyConnect", "PANGP", "GlobalProtect",
+            "Fortinet", "fortissl", "Check Point", "SonicWall",
+            "SoftEther", "ZeroTier", "Nebula", "Hamachi",
+        ];
+        foreach (var needle in needles)
+        {
+            if (hay.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        if (name.StartsWith("Qeli", StringComparison.OrdinalIgnoreCase)) return false;
+        return false;
+    }
+
     private sealed record RoutePath(
         uint InterfaceIndex, IPAddress? Gateway, IPAddress? Source, uint Metric);
 
@@ -1135,7 +1174,13 @@ public sealed class NetworkConfigurator : IDisposable
 
     public void SetDns(string alias, IReadOnlyList<string> servers)
     {
-        if (servers.Count == 0) return;
+        if (servers.Count == 0)
+        {
+            // dns = off / system: do not install resolvers on the tunnel NIC so another
+            // VPN (e.g. corporate WireGuard) or the physical NIC keeps owning DNS.
+            _log($"DNS left unchanged on \"{alias}\" (dns mode is not tunnel)");
+            return;
+        }
         if (_dnsAlias != null && !string.Equals(_dnsAlias, alias, StringComparison.Ordinal))
             throw new InvalidOperationException(
                 $"DNS is already configured on adapter \"{_dnsAlias}\"; refusing to lose its cleanup state");

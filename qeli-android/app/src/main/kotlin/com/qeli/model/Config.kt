@@ -493,6 +493,7 @@ data class VpnConfig(
         if (quicEnabled) q.add("quic=1")
         if (mtu > 0) q.add("mtu=$mtu")   // 0 = auto, omit
         if (roaming != "auto") q.add("roaming=$roaming")
+        q.add("dns=$dnsMode")
         // `front` affects the wire: omitting it does not mean "default" to the importer,
         // it means the import silently re-defaults to websocket — a different framing, so
         // the tunnel never handshakes. Carried by every implementation. (C-12)
@@ -1337,6 +1338,7 @@ data class VpnConfig(
             // Parsed here so a link emitted by toQeliUri survives a round trip. `mtu` was
             // already being EMITTED but had no case below, so importing dropped it. (C-12)
             var linkMtu = 0; var linkMtuProbe = true; var bindStatic = true
+            var dnsMode = "tunnel"
             query?.split("&")?.forEach { pair ->
                 if (pair.isEmpty()) return@forEach
                 val eq = pair.indexOf('=')
@@ -1363,6 +1365,7 @@ data class VpnConfig(
                     // `qeli://…?mtu=99999` reached VpnService.Builder.setMtu and turned into
                     // an endless establish-fail → reconnect loop. (Audit 2026-07-27, C6)
                     "mtu" -> linkMtu = linkMtuOrAuto(v.toIntOrNull() ?: 0)
+                    "dns" -> if (v.lowercase() in setOf("off", "tunnel", "system")) dnsMode = v.lowercase()
                     // Legacy tolerance only — this app stopped EMITTING these in 0.7.13
                     // (see toQeliUri). Kept so links it issued earlier still import the way
                     // they were shared; no other implementation carries them.
@@ -1403,7 +1406,8 @@ data class VpnConfig(
                 roaming = roaming,
                 mtu = linkMtu,
                 mtuProbe = linkMtuProbe,
-                bindStaticToSession = bindStatic
+                bindStaticToSession = bindStatic,
+                dnsMode = dnsMode,
             ).also {
                 // A link is untrusted input: validate at the boundary so a forged newline
                 // in user/pass/sni can never reach the profile store (and from there the

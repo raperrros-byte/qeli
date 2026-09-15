@@ -442,6 +442,16 @@
       'client.conf (INI)': 'client.conf (INI)',
       'Linux CLI / Docker': 'Linux CLI / Docker',
       'Linux client options': 'Параметры Linux-клиента',
+      'Client options': 'Параметры клиента',
+      'Written into each selected profile\'s qeli:// link (`dns=…`) and into INI (`dns = …`). Use system/off when a corporate WireGuard (or other VPN) must keep its own resolver.':
+        'Записывается в qeli:// каждой выбранной профильной ссылки (`dns=…`) и в INI (`dns = …`). Для корпоративного WireGuard выберите system/off.',
+      'DNS mode (default for selected profiles)': 'Режим DNS (по умолчанию для выбранных профилей)',
+      'tunnel — VPN / server DNS': 'tunnel — DNS VPN / сервера',
+      'system — keep host / corporate DNS': 'system — оставить хостовый / корп. DNS',
+      'off — do not configure DNS': 'off — не настраивать DNS',
+      'Per-profile DNS': 'DNS по профилям',
+      'Linux CLI file-only keys (not carried in qeli:// links)':
+        'Ключи только для Linux CLI (не входят в qeli://)',
       'These keys are not carried in qeli:// links — set them here for a ready-to-use file.':
         'Эти ключи не передаются в qeli:// — задайте их здесь для готового файла.',
       'Full-tunnel (gateway = true)': 'Full-tunnel (gateway = true)',

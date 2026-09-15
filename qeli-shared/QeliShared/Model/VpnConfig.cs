@@ -605,10 +605,17 @@ public sealed class VpnConfig : INotifyPropertyChanged
         if (Mtu > 0) q.Add($"mtu={Mtu}");  // 0 = auto, omit
         if (!RoamingPolicy.Equals("auto", StringComparison.OrdinalIgnoreCase))
             q.Add($"roaming={RoamingPolicy.ToLowerInvariant()}");
-        // Per-application routing is deliberately file-only. Application identifiers are
-        // platform-owned (Windows paths versus Android/macOS identifiers), and Rust, Android
-        // and iOS all treat qeli:// as a connection descriptor rather than device policy.
-        // Emitting apps_* here made the shared link contract platform-dependent.
+        // Always emit dns= so a panel-exported link keeps the chosen mode (corporate VPN coexistence).
+        q.Add($"dns={Uri.EscapeDataString(string.IsNullOrWhiteSpace(DnsMode) ? "tunnel" : DnsMode)}");
+        // Keep the cross-platform per-application contract in share links too.  INI
+        // already round-trips these fields, but dropping them here made a profile widen
+        // back to `all` merely by sharing it between clients.
+        if (!AppsMode.Equals("all", StringComparison.OrdinalIgnoreCase))
+            q.Add($"apps_mode={Uri.EscapeDataString(AppsMode)}");
+        if (Apps.Count > 0)
+            q.Add($"apps={Uri.EscapeDataString(string.Join(",", Apps))}");
+        // Per-application routing identifiers remain platform-owned for file profiles;
+        // emitting apps_* here keeps the share-link contract aligned with INI round-trip.
         sb.Append('?').Append(string.Join("&", q));
 
         if (!string.IsNullOrWhiteSpace(Name)) sb.Append('#').Append(Uri.EscapeDataString(Name!));
@@ -1744,6 +1751,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
         string? key = null, sni = null, rsid = null;
         bool quic = false;
         int mtu = 0;  // 0 = auto (use server-pushed MTU)
+        string dnsMode = "tunnel";
         // F2 AmneziaWG junk params (off unless awg=1).
         bool awg = false;
         uint awgJc = 0;
@@ -1789,6 +1797,20 @@ public sealed class VpnConfig : INotifyPropertyChanged
                     case "quic": quic = v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase); break;
                     case "mtu": int.TryParse(v, out mtu); break;
                     case "roaming": roaming = v.Trim().ToLowerInvariant(); break;
+                    case "dns":
+                        if (v.Equals("off", StringComparison.OrdinalIgnoreCase)
+                            || v.Equals("system", StringComparison.OrdinalIgnoreCase)
+                            || v.Equals("tunnel", StringComparison.OrdinalIgnoreCase))
+                            dnsMode = v.ToLowerInvariant();
+                        break;
+                    case "apps_mode": appsMode = v.Trim().ToLowerInvariant(); break;
+                    case "apps":
+                        apps = v.Split(',')
+                            .Select(item => item.Trim())
+                            .Where(item => item.Length > 0)
+                            .Distinct(StringComparer.OrdinalIgnoreCase)
+                            .ToList();
+                        break;
                     case "awg": awg = v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase); break;
                     case "jc": if (uint.TryParse(v, out var jcp)) awgJc = Math.Min(jcp, 128u); break;
                     case "jmin": if (ushort.TryParse(v, out var jminp)) awgJmin = Math.Min(jminp, (ushort)1400); break;
@@ -1824,6 +1846,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
             Mtu = LinkMtu(mtu),
             AppsMode = appsMode,
             Apps = apps,
+            DnsMode = dnsMode,
         };
         // Kotlin's fromQeliUri and Swift's fromQeliURI both end with validate(); C# defined
         // the same checks and then never ran them on any import path — grep found Validate()

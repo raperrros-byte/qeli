@@ -65,6 +65,15 @@ echo "$ini" | grep -q 'mode = reality-tls' || fail "ini mode"
 echo "$share_ini" | jq -e '.reset == false' >/dev/null || fail "unexpected reset"
 pass "POST /api/share format=ini"
 
+echo "-- 5b. share link carries dns= --"
+share_dns=$(curl -sk -b "$CJ" -X POST "$BASE/api/share" \
+  -H 'Content-Type: application/json' \
+  -d "{\"profile\":\"$PROFILE\",\"host\":\"$PUBLIC_HOST\",\"user\":\"$VPN_USER\",\"format\":\"link\",\"dns\":\"system\"}")
+ok "$share_dns" || fail "share link dns"
+uri_dns=$(echo "$share_dns" | jq -r '.uri')
+echo "$uri_dns" | grep -q 'dns=system' || fail "uri missing dns=system"
+pass "POST /api/share format=link dns=system"
+
 echo "-- 6. share link + qr --"
 share_link=$(curl -sk -b "$CJ" -X POST "$BASE/api/share" \
   -H 'Content-Type: application/json' \
