@@ -1752,6 +1752,8 @@ public sealed class VpnConfig : INotifyPropertyChanged
         bool quic = false;
         int mtu = 0;  // 0 = auto (use server-pushed MTU)
         string dnsMode = "tunnel";
+        string appsMode = "all";
+        List<string> apps = new();
         // F2 AmneziaWG junk params (off unless awg=1).
         bool awg = false;
         uint awgJc = 0;

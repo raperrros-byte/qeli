@@ -453,6 +453,7 @@ impl ClientLink {
         }
         Ok(link)
     }
+}
 
 /// Normalize a client DNS mode from a link/INI value. Unknown values become `tunnel`.
 pub fn normalize_dns_mode(mode: &str) -> &'static str {
@@ -461,8 +462,6 @@ pub fn normalize_dns_mode(mode: &str) -> &'static str {
         "system" => "system",
         _ => "tunnel",
     }
-}
-
 }
 
 #[cfg(test)]

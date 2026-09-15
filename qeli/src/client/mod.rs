@@ -7450,10 +7450,13 @@ fn setup_tunnel(
             && !config.routing.add_default_gateway
             && config.routing.mode != "full-tunnel"
             && config.routing.mode != "all"
+            && !plan.tunnel_gateway.is_empty()
         {
-            if let Err(e) =
-                route::setup_proxy_policy_routes(client_ip, &if_name, server_ip)
-            {
+            if let Err(e) = route::setup_proxy_policy_routes(
+                client_ip,
+                &if_name,
+                plan.tunnel_gateway.as_str(),
+            ) {
                 log::warn!(
                     "proxy policy routing failed ({e}) - proxied connections may not reach \
                      the internet in split-tunnel mode"

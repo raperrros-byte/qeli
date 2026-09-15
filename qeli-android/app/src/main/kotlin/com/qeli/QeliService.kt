@@ -3264,6 +3264,8 @@ class VpnServiceImpl : VpnService() {
                 if (captureIpv4) when {
                     allowLan && Build.VERSION.SDK_INT >= 33 -> {
                         addRoute("0.0.0.0", 0)
+                        var installed = 0
+                        var failed = 0
                         for (cidr in LAN_BYPASS_IPV4_EXCLUDES) {
                             try {
                                 val slash = cidr.indexOf('/')
@@ -3273,13 +3275,14 @@ class VpnServiceImpl : VpnService() {
                                 excludeRoute(android.net.IpPrefix(
                                     android.system.Os.inet_pton(
                                         android.system.OsConstants.AF_INET,
-                                    cidr.substring(0, slash)),
-                                    cidr.substring(slash + 1).toInt()))
+                                        addr,
+                                    ) ?: throw IllegalArgumentException("not an IP literal"),
+                                    prefix,
+                                ))
+                                installed++
                             } catch (e: Exception) {
-                                throw IllegalStateException(
-                                    "Android could not apply IPv4 LAN bypass for $cidr",
-                                    e,
-                                )
+                                failed++
+                                if (failed <= 3) broadcastLog("bad exclude route $cidr: ${e.message}")
                             }
                         }
                         broadcastLog(buildString {

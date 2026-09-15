@@ -11,6 +11,7 @@ VPN_USER="${VPN_USER:-linux}"
 PROFILE="${PROFILE:-reality-tls}"
 PUBLIC_HOST="${PUBLIC_HOST:-clientarea.devopsworld.ru}"
 
+apk update -q
 apk add -q openssh-client sshpass
 
 echo "== qeli API smoke @ ${HOST} (${PUBLIC_HOST}) =="

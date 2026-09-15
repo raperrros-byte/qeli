@@ -162,7 +162,7 @@ pub async fn share_link(
                     let mut found = false;
                     if let Some(entry) = db.users.iter_mut().find(|entry| entry.username == user) {
                         entry.password_hash = hash.clone();
-                        entry.password_enc = enc2.clone();
+                        entry.password_enc = Some(enc2.clone());
                         found = true;
                     } else if let Some(inline) = config
                         .auth
@@ -172,7 +172,7 @@ pub async fn share_link(
                     {
                         let mut entry = inline.clone();
                         entry.password_hash = hash.clone();
-                        entry.password_enc = enc2.clone();
+                        entry.password_enc = Some(enc2.clone());
                         db.users.push(entry);
                         found = true;
                     }

@@ -912,11 +912,40 @@ public sealed class NetworkConfigurator : IDisposable
     private const int SockaddrInetSize = 28;
     private const int OffIfIndex = 8;
     private const int OffDstFamily = 12;
+    private const int OffDstAddr = 16;
+    private const int OffDstV6Addr = 20;
     private const int OffDstPrefixLen = 40;
     private const int OffNextHopFamily = 44;
     private const int OffMetric = 84;
     private const short AfInet = 2;
     private const short AfInet6 = 23;
+
+    /// <summary>Simple create/delete helper used by proxy host-pin leases.</summary>
+    private static bool TryRouteApi(bool create, string addr, int prefix, uint ifIndex)
+    {
+        if (!IPAddress.TryParse(addr, out var ip)) return false;
+        bool v6 = ip.AddressFamily == AddressFamily.InterNetworkV6;
+        int maxPrefix = v6 ? 128 : 32;
+        if (prefix < 0 || prefix > maxPrefix) return false;
+        IntPtr row = Marshal.AllocHGlobal(Row2Size);
+        try
+        {
+            InitializeIpForwardEntry(row);
+            Marshal.WriteInt32(row, OffIfIndex, (int)ifIndex);
+            short family = v6 ? AfInet6 : AfInet;
+            Marshal.WriteInt16(row, OffDstFamily, family);
+            byte[] bytes = ip.GetAddressBytes();
+            Marshal.Copy(bytes, 0, row + (v6 ? OffDstV6Addr : OffDstAddr), bytes.Length);
+            Marshal.WriteByte(row, OffDstPrefixLen, (byte)prefix);
+            Marshal.WriteInt16(row, OffNextHopFamily, family);
+            Marshal.WriteInt32(row, OffMetric, 1);
+            int rc = create ? CreateIpForwardEntry2(row) : DeleteIpForwardEntry2(row);
+            // 0 = NO_ERROR; 5010 = ERROR_OBJECT_ALREADY_EXISTS; 1168 = ERROR_NOT_FOUND.
+            return rc == 0 || (create && rc == 5010) || (!create && rc == 1168);
+        }
+        catch { return false; }
+        finally { Marshal.FreeHGlobal(row); }
+    }
 
     private enum RouteApiResult { Created, AlreadyExists, Failed }
 
