@@ -321,7 +321,7 @@
                 </Grid>
             </Border>
 
-            <!-- global traffic mode: tunnel XOR local proxy — applies to ALL profiles -->
+            <!-- global traffic: full-tunnel / per-app can combine with local proxy -->
             <Border Grid.Row="1" Style="{StaticResource StatTile}" Padding="14,12" Margin="0,14,0,0">
                 <StackPanel>
                     <TextBlock x:Name="TrafficModeLabel" Text="{local:Loc TrafficMode}"
@@ -331,11 +331,16 @@
                                      Content="{local:Loc TrafficModeTunnel}"
                                      VerticalAlignment="Center" Margin="0,0,18,0"
                                      Checked="OnTrafficModeChanged"/>
-                        <RadioButton x:Name="ModeProxyRadio" GroupName="TrafficMode"
-                                     Content="{local:Loc TrafficModeProxy}"
+                        <RadioButton x:Name="ModeSplitRadio" GroupName="TrafficMode"
+                                     Content="{local:Loc TrafficModeSplit}"
                                      VerticalAlignment="Center"
                                      Checked="OnTrafficModeChanged"/>
                     </StackPanel>
+                    <CheckBox x:Name="GlobalProxyCheck" Content="{local:Loc TrafficModeProxy}"
+                              Margin="0,10,0,0" VerticalAlignment="Center"
+                              Checked="OnTrafficModeChanged" Unchecked="OnTrafficModeChanged"/>
+                    <TextBlock Text="{local:Loc TrafficModeProxyHint}" TextWrapping="Wrap"
+                               Foreground="{DynamicResource FgDim}" FontSize="11" Margin="0,4,0,0"/>
                     <Grid x:Name="ProxyOptsPanel" Margin="0,10,0,0" Visibility="Collapsed">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto"/>

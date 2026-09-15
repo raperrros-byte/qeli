@@ -19,25 +19,32 @@ public sealed class LocalProxyService : IDisposable
     private ProxyMode _mode = ProxyMode.Mixed;
     private Action<string>? _log;
     private Func<IPAddress, IDisposable?>? _pinHostViaTunnel;
+    private bool _bindOutboundToTunnelIp = true;
     private bool _warnedMissingGeo;
 
     private enum ProxyMode { Socks5, Http, Mixed }
 
     /// <param name="pinHostViaTunnel">
-    /// Optional: for split-tunnel on Windows, bind-to-TUN alone is not enough — the OS
+    /// Optional: for split-tunnel on Windows Wintun, bind-to-TUN alone is not enough — the OS
     /// still picks the physical default route. Caller installs a temporary dest/32 via the
     /// TUN for the lease lifetime (refcounted). Null = bind only (Linux/macOS / full-tunnel).
+    /// </param>
+    /// <param name="bindOutboundToTunnelIp">
+    /// When false (WinDivert per-app), dials use the normal NIC; WinDivert tunnels the
+    /// client process. Binding to the virtual client IP fails because there is no TUN iface.
     /// </param>
     public void Start(
         string tunnelClientIp,
         string listen,
         string mode,
         Action<string>? log = null,
-        Func<IPAddress, IDisposable?>? pinHostViaTunnel = null)
+        Func<IPAddress, IDisposable?>? pinHostViaTunnel = null,
+        bool bindOutboundToTunnelIp = true)
     {
         Stop();
         _log = log;
         _pinHostViaTunnel = pinHostViaTunnel;
+        _bindOutboundToTunnelIp = bindOutboundToTunnelIp;
         _warnedMissingGeo = false;
         _tunnelIp = IPAddress.Parse(tunnelClientIp);
         _mode = ParseMode(mode);
@@ -47,7 +54,9 @@ public sealed class LocalProxyService : IDisposable
         _cts = new CancellationTokenSource();
         var ct = _cts.Token;
         _acceptTask = Task.Run(() => AcceptLoop(ct), ct);
-        Log($"Local proxy on {listen} ({mode}) — outbound via tunnel IP {tunnelClientIp}");
+        Log(bindOutboundToTunnelIp
+            ? $"Local proxy on {listen} ({mode}) — outbound via tunnel IP {tunnelClientIp}"
+            : $"Local proxy on {listen} ({mode}) — outbound via per-app process capture");
     }
 
     public void Stop()
@@ -279,13 +288,14 @@ public sealed class LocalProxyService : IDisposable
                     .FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork)
                 ?? throw new InvalidOperationException($"no IPv4 address for {host}");
 
-            // Split-tunnel Windows: without a dest/32 via TUN, Connect from the tunnel IP
+            // Split-tunnel Wintun: without a dest/32 via TUN, Connect from the tunnel IP
             // fails (WSAEACCES) because the default route stays on the physical NIC.
-            if (viaTunnel && _pinHostViaTunnel != null)
+            // WinDivert skips bind+pin; ProcessAppMap tunnels this process instead.
+            if (viaTunnel && _bindOutboundToTunnelIp && _pinHostViaTunnel != null)
                 routeLease = _pinHostViaTunnel(targetIp);
 
             var client = new TcpClient(AddressFamily.InterNetwork);
-            if (viaTunnel)
+            if (viaTunnel && _bindOutboundToTunnelIp)
                 client.Client.Bind(new IPEndPoint(_tunnelIp, 0));
             await client.ConnectAsync(new IPEndPoint(targetIp, port), ct);
             return new UpstreamConn(client, routeLease);

@@ -232,6 +232,30 @@ internal static class WinDivertSelfTest
             check("exclude: unknown owner is deferred without a policy leak",
                 d == PacketDisposition.Unknown);
         }
+        {
+            uint self = (uint)Environment.ProcessId;
+            var endpointToPid = new Dictionary<(byte proto, string local, ushort localPort,
+                string remote, ushort remotePort), uint>
+            {
+                [(6, "127.0.0.1", 40000, "1.1.1.1", 443)] = self,
+            };
+            var snapshot = new ProcessAppMap.OwnershipSnapshot(
+                endpointToPid, new Dictionary<uint, string>());
+            using var bypassSelf = new ProcessAppMap(
+                Array.Empty<string>(), includeMode: true,
+                snapshotBuilder: () => snapshot, tunnelSelfProcess: false);
+            using var tunnelSelf = new ProcessAppMap(
+                Array.Empty<string>(), includeMode: true,
+                snapshotBuilder: () => snapshot, tunnelSelfProcess: true);
+            check("self PID: default Bypass keeps VPN carrier path free of recursion",
+                bypassSelf.WaitForPendingRefresh(2000)
+                && bypassSelf.Classify(6, IPAddress.Parse("127.0.0.1"), 40000,
+                    IPAddress.Parse("1.1.1.1"), 443) == PacketDisposition.Bypass);
+            check("self PID: tunnelSelfProcess tunnels LocalProxy dials",
+                tunnelSelf.WaitForPendingRefresh(2000)
+                && tunnelSelf.Classify(6, IPAddress.Parse("127.0.0.1"), 40000,
+                    IPAddress.Parse("1.1.1.1"), 443) == PacketDisposition.Tunnel);
+        }
         using (var refreshStarted = new ManualResetEventSlim(initialState: false))
         using (var releaseRefresh = new ManualResetEventSlim(initialState: false))
         {

@@ -2187,17 +2187,20 @@ public abstract class VpnTunnelBase
     private void StartLocalProxyIfEnabled(VpnConfig config, string clientIp)
     {
         if (!config.ProxyEnabled) return;
-        if (config.IsFullTunnel)
+        if (config.IsFullTunnel && !config.UsesAppFilter)
             Log("NOTE: proxy = true with gateway = true — prefer gateway = false so only "
                 + "apps using the local proxy go through the tunnel");
         try
         {
             StopLocalProxy();
             _localProxy = new LocalProxyService();
-            Func<IPAddress, IDisposable?>? pin = config.IsFullTunnel
-                ? null
-                : PinProxyHostViaTunnel;
-            _localProxy.Start(clientIp, config.ProxyListen, config.ProxyMode, Log, pin);
+            // WinDivert has no TUN NIC: skip bind+route pin; tunnel own process instead.
+            bool windivert = config.UsesAppFilter;
+            Func<IPAddress, IDisposable?>? pin =
+                windivert || config.IsFullTunnel ? null : PinProxyHostViaTunnel;
+            _localProxy.Start(
+                clientIp, config.ProxyListen, config.ProxyMode, Log, pin,
+                bindOutboundToTunnelIp: !windivert);
         }
         catch (Exception e)
         {

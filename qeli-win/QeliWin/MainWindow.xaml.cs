@@ -665,7 +665,7 @@ public partial class MainWindow : Window
         if (MemLabel != null) MemLabel.Text = Loc.T("StatServerMem");
     }
 
-    // в”Ђв”Ђ global traffic mode (tunnel XOR local proxy в†’ all profiles) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    // -- global traffic: full-tunnel / split can combine with local proxy -----------------
     private void InitTrafficModeUi()
     {
         _suppressTrafficUi = true;
@@ -677,10 +677,11 @@ public partial class MainWindow : Window
             GlobalProxyModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("ProxyModeHttp"), Tag = "http" });
 
             var s = AppSettings.Current;
-            bool proxy = s.TrafficMode.Equals("proxy", StringComparison.OrdinalIgnoreCase);
-            ModeTunnelRadio.IsChecked = !proxy;
-            ModeProxyRadio.IsChecked = proxy;
-            ProxyOptsPanel.Visibility = proxy ? Visibility.Visible : Visibility.Collapsed;
+            s.MigrateTrafficMode();
+            ModeTunnelRadio.IsChecked = s.PreferFullTunnel;
+            ModeSplitRadio.IsChecked = !s.PreferFullTunnel;
+            GlobalProxyCheck.IsChecked = s.EnableLocalProxy;
+            ProxyOptsPanel.Visibility = s.EnableLocalProxy ? Visibility.Visible : Visibility.Collapsed;
             GlobalProxyPortBox.Text = ClampProxyPort(s.ProxyPort).ToString();
             SelectProxyModeTag(string.IsNullOrWhiteSpace(s.ProxyMode) ? "mixed" : s.ProxyMode);
         }
@@ -695,7 +696,8 @@ public partial class MainWindow : Window
         {
             TrafficModeLabel.Text = Loc.T("TrafficMode");
             ModeTunnelRadio.Content = Loc.T("TrafficModeTunnel");
-            ModeProxyRadio.Content = Loc.T("TrafficModeProxy");
+            ModeSplitRadio.Content = Loc.T("TrafficModeSplit");
+            GlobalProxyCheck.Content = Loc.T("TrafficModeProxy");
             string? tag = (GlobalProxyModeBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "mixed";
             GlobalProxyModeBox.Items.Clear();
             GlobalProxyModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("ProxyModeMixed"), Tag = "mixed" });
@@ -725,15 +727,17 @@ public partial class MainWindow : Window
     private VpnConfig ApplyCurrentGlobal(VpnConfig c)
     {
         var s = AppSettings.Current;
-        bool proxy = s.TrafficMode.Equals("proxy", StringComparison.OrdinalIgnoreCase);
-        return c.WithGlobalTrafficMode(proxy, $"127.0.0.1:{ClampProxyPort(s.ProxyPort)}",
+        return c.WithGlobalTrafficMode(
+            s.PreferFullTunnel,
+            s.EnableLocalProxy,
+            $"127.0.0.1:{ClampProxyPort(s.ProxyPort)}",
             string.IsNullOrWhiteSpace(s.ProxyMode) ? "mixed" : s.ProxyMode.Trim());
     }
 
     private void OnTrafficModeChanged(object sender, RoutedEventArgs e)
     {
         if (_suppressTrafficUi) return;
-        bool proxy = ModeProxyRadio.IsChecked == true;
+        bool proxy = GlobalProxyCheck.IsChecked == true;
         ProxyOptsPanel.Visibility = proxy ? Visibility.Visible : Visibility.Collapsed;
         PersistTrafficSettingsFromUi();
         _ = ApplyTrafficModeAndMaybeReconnectAsync(userInitiated: true);
@@ -742,7 +746,7 @@ public partial class MainWindow : Window
     private void OnGlobalProxyOptsChanged(object sender, EventArgs e)
     {
         if (_suppressTrafficUi) return;
-        if (ModeProxyRadio.IsChecked != true) return;
+        if (GlobalProxyCheck.IsChecked != true) return;
         if (!PersistTrafficSettingsFromUi()) return;
         _ = ApplyTrafficModeAndMaybeReconnectAsync(userInitiated: true);
     }
@@ -761,8 +765,9 @@ public partial class MainWindow : Window
     private bool PersistTrafficSettingsFromUi()
     {
         var s = AppSettings.Current;
-        s.TrafficMode = ModeProxyRadio.IsChecked == true ? "proxy" : "tunnel";
-        if (s.TrafficMode == "proxy")
+        s.PreferFullTunnel = ModeTunnelRadio.IsChecked == true;
+        s.EnableLocalProxy = GlobalProxyCheck.IsChecked == true;
+        if (s.EnableLocalProxy)
         {
             if (!int.TryParse(GlobalProxyPortBox.Text.Trim(), out int port) || port is < 1 or > 65535)
             {
@@ -773,6 +778,7 @@ public partial class MainWindow : Window
             s.ProxyPort = port;
             s.ProxyMode = (GlobalProxyModeBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "mixed";
         }
+        s.MigrateTrafficMode();
         s.Save();
         return true;
     }

@@ -22,9 +22,12 @@ public sealed class AppSettings
     public bool StartMinimized { get; set; }            // start hidden in the tray
     public bool ServiceEnabled { get; set; }            // desired: run as a Windows service
     public string? ServiceProfile { get; set; }         // profile the Windows service runs
-    // Global traffic mode for ALL profiles (main window): "tunnel" = full-tunnel, no local
-    // proxy; "proxy" = split-tunnel + local SOCKS/HTTP. Changing it rewrites every profile.
-    public string TrafficMode { get; set; } = "tunnel"; // "tunnel" | "proxy"
+    // Global traffic defaults for ALL profiles (main window). PreferFullTunnel sets
+    // gateway/routing; EnableLocalProxy can be on together with per-app filters.
+    public bool PreferFullTunnel { get; set; } = true;
+    public bool EnableLocalProxy { get; set; } = false;
+    // Legacy: "tunnel" | "proxy". Migrated into PreferFullTunnel + EnableLocalProxy on load.
+    public string TrafficMode { get; set; } = "tunnel";
     public int ProxyPort { get; set; } = 1080;
     public string ProxyMode { get; set; } = "mixed"; // socks5 | http | mixed
     // Local SOCKS/HTTP proxy routing (v2rayN-like). See Qeli.Shared.Geo.ProxyRoutePreset.
@@ -104,9 +107,41 @@ public sealed class AppSettings
         _current = this;
     }
 
-    private static AppSettings Read(string path) =>
-        JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(path), Options)
-        ?? throw new JsonException("settings root is null");
+    private static AppSettings Read(string path)
+    {
+        var settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(path), Options)
+            ?? throw new JsonException("settings root is null");
+        settings.MigrateTrafficMode();
+        return settings;
+    }
+
+    /// <summary>Map legacy TrafficMode XOR into PreferFullTunnel + EnableLocalProxy.
+    /// New settings persist both flags; only upgrade when EnableLocalProxy is still off
+    /// so a saved PreferFullTunnel=true + proxy ("both") is not rewritten to split.</summary>
+    public void MigrateTrafficMode()
+    {
+        if (!EnableLocalProxy
+            && TrafficMode.Equals("proxy", StringComparison.OrdinalIgnoreCase))
+        {
+            PreferFullTunnel = false;
+            EnableLocalProxy = true;
+        }
+        else if (!EnableLocalProxy
+                 && TrafficMode.Equals("both", StringComparison.OrdinalIgnoreCase))
+        {
+            PreferFullTunnel = false;
+            EnableLocalProxy = true;
+        }
+        else if (!EnableLocalProxy
+                 && TrafficMode.Equals("split", StringComparison.OrdinalIgnoreCase))
+        {
+            PreferFullTunnel = false;
+        }
+        // Keep TrafficMode in sync for older tools that still read it.
+        TrafficMode = EnableLocalProxy
+            ? (PreferFullTunnel ? "both" : "proxy")
+            : (PreferFullTunnel ? "tunnel" : "split");
+    }
 
     private static AppSettings ReadBackupOrDefault()
     {

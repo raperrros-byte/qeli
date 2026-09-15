@@ -20,6 +20,7 @@ namespace QeliWin.Vpn;
 public sealed class WinDivertAdapter : IPacketTunDevice
 {
     private ProcessAppMap _apps;
+    private bool _tunnelSelfProcess;
     private readonly WinDivertFlowTable _flows;
     private readonly PendingFragmentBuffer<WinDivertFlowTable.Ipv6FragKey, CapturedFragment>
         _pendingIpv6 = new();
@@ -104,7 +105,8 @@ public sealed class WinDivertAdapter : IPacketTunDevice
         string carrierProtocol,
         int tunnelMtu,
         Action<string>? log = null,
-        IEnumerable<string>? physicalLocalRoutes = null)
+        IEnumerable<string>? physicalLocalRoutes = null,
+        bool tunnelSelfProcess = false)
     {
         if (clientIpv4 != null && clientIpv4.AddressFamily != AddressFamily.InterNetwork)
             throw new ArgumentException("clientIpv4 must be an IPv4 address", nameof(clientIpv4));
@@ -114,7 +116,8 @@ public sealed class WinDivertAdapter : IPacketTunDevice
             throw new ArgumentException("at least one tunnel address family is required");
         _clientIpv4 = clientIpv4;
         _clientIpv6 = clientIpv6;
-        _apps = new ProcessAppMap(apps, includeMode);
+        _tunnelSelfProcess = tunnelSelfProcess;
+        _apps = new ProcessAppMap(apps, includeMode, tunnelSelfProcess);
         // Bind the flow table to the adapter, not to this first ProcessAppMap instance:
         // persist_tun may atomically replace the app selection while retaining the capture.
         _flows = new WinDivertFlowTable(tcpFlowExists: CurrentAppHasTcpEndpoint);
@@ -163,7 +166,8 @@ public sealed class WinDivertAdapter : IPacketTunDevice
         int carrierPort,
         string carrierProtocol,
         int tunnelMtu,
-        IEnumerable<string>? physicalLocalRoutes = null)
+        IEnumerable<string>? physicalLocalRoutes = null,
+        bool tunnelSelfProcess = false)
     {
         SetTunnelUp(false);
         if ((clientIpv4 != null && clientIpv4.AddressFamily != AddressFamily.InterNetwork)
@@ -180,7 +184,7 @@ public sealed class WinDivertAdapter : IPacketTunDevice
         var replacementCarriers = MakeCarriers(
             new[] { carrierIp }, carrierPort, carrierProtocol);
         int replacementMtu = ValidateMtu(tunnelMtu, clientIpv6 != null);
-        var replacementApps = new ProcessAppMap(apps, includeMode);
+        var replacementApps = new ProcessAppMap(apps, includeMode, tunnelSelfProcess);
         if (replacementApps.SelectedCount == 0)
         {
             replacementApps.Dispose();
@@ -193,6 +197,7 @@ public sealed class WinDivertAdapter : IPacketTunDevice
         {
             previousApps = _apps;
             _apps = replacementApps;
+            _tunnelSelfProcess = tunnelSelfProcess;
             _clientIpv4 = clientIpv4;
             _clientIpv6 = clientIpv6;
             _dnsServers = replacementDns;

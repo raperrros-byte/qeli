@@ -43,6 +43,9 @@ internal sealed class ProcessAppMap : IDisposable
     private const uint AmbiguousPid = uint.MaxValue;
     private readonly HashSet<string> _selected;
     private readonly bool _includeMode; // true = only selected tunnel; false = selected bypass
+    // When true, own PID outbound is Tunnel so LocalProxy dials exit via WinDivert.
+    // Carrier packets still Bypass earlier via IsCarrier on the adapter.
+    private readonly bool _tunnelSelfProcess;
     private DateTime _lastRefresh = DateTime.MinValue;
     private static readonly TimeSpan RefreshInterval = TimeSpan.FromSeconds(2);
     private bool _refreshQueued;
@@ -50,17 +53,19 @@ internal sealed class ProcessAppMap : IDisposable
     private readonly int _selfPid = Environment.ProcessId;
     private volatile bool _disposed;
 
-    public ProcessAppMap(IEnumerable<string> apps, bool includeMode)
-        : this(apps, includeMode, snapshotBuilder: null)
+    public ProcessAppMap(IEnumerable<string> apps, bool includeMode, bool tunnelSelfProcess = false)
+        : this(apps, includeMode, snapshotBuilder: null, tunnelSelfProcess)
     {
     }
 
     internal ProcessAppMap(
         IEnumerable<string> apps,
         bool includeMode,
-        Func<OwnershipSnapshot>? snapshotBuilder)
+        Func<OwnershipSnapshot>? snapshotBuilder,
+        bool tunnelSelfProcess = false)
     {
         _includeMode = includeMode;
+        _tunnelSelfProcess = tunnelSelfProcess;
         _selected = new HashSet<string>(
             apps.Where(LooksLikeWindowsExecutable).Select(NormalizePath).Where(p => p.Length > 0),
             StringComparer.OrdinalIgnoreCase);
@@ -166,7 +171,8 @@ internal sealed class ProcessAppMap : IDisposable
         if (pid == AmbiguousPid)
             return PacketDisposition.Unknown;
 
-        if (pid == (uint)_selfPid) return PacketDisposition.Bypass;
+        if (pid == (uint)_selfPid)
+            return _tunnelSelfProcess ? PacketDisposition.Tunnel : PacketDisposition.Bypass;
 
         // Path unknown in this complete snapshot: defer until a later refresh. Never call
         // Process.MainModule / OpenProcess from the packet capture path.

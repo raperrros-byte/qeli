@@ -356,7 +356,8 @@ public sealed class VpnTunnel : VpnTunnelBase
                     config.Protocol,
                     EffectiveMtu(config.Mtu, session.PushedMtu),
                     physicalLocalRoutes:
-                        RouteLocalPolicy.DiscoverConnectedRfc1918Prefixes(log: Log));
+                        RouteLocalPolicy.DiscoverConnectedRfc1918Prefixes(log: Log),
+                    tunnelSelfProcess: config.ProxyEnabled);
                 retained.SetTunnelUp(true);
             }
             return;
@@ -389,7 +390,8 @@ public sealed class VpnTunnel : VpnTunnelBase
                 tunnelMtu: EffectiveMtu(config.Mtu, session.PushedMtu),
                 log: Log,
                 physicalLocalRoutes:
-                    RouteLocalPolicy.DiscoverConnectedRfc1918Prefixes(log: Log));
+                    RouteLocalPolicy.DiscoverConnectedRfc1918Prefixes(log: Log),
+                tunnelSelfProcess: config.ProxyEnabled);
             adapter.Open();
             cancellationToken.ThrowIfCancellationRequested();
             adapter.SetTunnelUp(true);
