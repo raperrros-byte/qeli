@@ -3262,11 +3262,20 @@ class VpnServiceImpl : VpnService() {
                         config.excludeRoutes.filter { ':' in it }
                 else emptyList()
                 if (captureIpv4) when {
-                    allowLan && Build.VERSION.SDK_INT >= 33 -> {
+                    Build.VERSION.SDK_INT >= 33 -> {
                         addRoute("0.0.0.0", 0)
+                        // LAN bypass + profile/geo IPv4 excludes. After the 0.8.1 merge this
+                        // branch only carved LAN when allowLan was on, and the later
+                        // excludeRoutes loop filtered IPv4 out on full tunnel — so bypass-ru
+                        // / bypass-cn silently became proxy-all.
+                        val ipv4Excludes = com.qeli.geo.GeoTunRoutes.fullTunnelIpv4Excludes(
+                            allowLan = allowLan,
+                            lanBypass = LAN_BYPASS_IPV4_EXCLUDES,
+                            excludeRoutes = config.excludeRoutes,
+                        )
                         var installed = 0
                         var failed = 0
-                        for (cidr in LAN_BYPASS_IPV4_EXCLUDES) {
+                        for (cidr in ipv4Excludes) {
                             try {
                                 val slash = cidr.indexOf('/')
                                 val addr = if (slash < 0) cidr else cidr.substring(0, slash)
@@ -3285,11 +3294,16 @@ class VpnServiceImpl : VpnService() {
                                 if (failed <= 3) broadcastLog("bad exclude route $cidr: ${e.message}")
                             }
                         }
-                        broadcastLog(buildString {
-                            append("full tunnel: 0.0.0.0/0 with $installed exclude(s)")
-                            if (allowLan) append(" (LAN bypass)")
-                            if (failed > 0) append(", $failed skipped")
-                        })
+                        if (ipv4Excludes.isNotEmpty()) {
+                            broadcastLog(buildString {
+                                append("full tunnel: 0.0.0.0/0 with $installed exclude(s)")
+                                if (allowLan) append(" (LAN bypass)")
+                                if (config.excludeRoutes.any {
+                                        !com.qeli.geo.GeoTunRoutes.isIpv6Cidr(it)
+                                    }) append(" (geo/user)")
+                                if (failed > 0) append(", $failed skipped")
+                            })
+                        }
                     }
                     // Pre-13: one complement covering BOTH the LAN ranges (when the
                     // bypass is on) and the user's excludes. Computing
@@ -3406,34 +3420,31 @@ class VpnServiceImpl : VpnService() {
             // are applied in the routing block above (API 33+).
             if (config.excludeRoutes.isNotEmpty()) {
                 if (Build.VERSION.SDK_INT >= 33) {
-                    val pending = if (useFullTunnel) {
-                        config.excludeRoutes.filter { ':' in it }
-                    } else {
-                        config.excludeRoutes
-                    }
+                    val pending = com.qeli.geo.GeoTunRoutes.pendingExcludeRoutes(
+                        useFullTunnel = useFullTunnel,
+                        excludeRoutes = config.excludeRoutes,
+                    )
                     if (pending.isNotEmpty()) {
                         var installed = 0
                         var failed = 0
                         for (cidr in pending) {
-                        try {
-                            val slash = cidr.indexOf('/')
-                            val addr = if (slash < 0) cidr else cidr.substring(0, slash)
-                            val prefix = if (slash < 0) RouteComplements.hostPrefix(addr)
-                                else cidr.substring(slash + 1).toIntOrNull()
-                                    ?: throw IllegalArgumentException("prefix is not a number")
-                            val family = if (':' in addr) android.system.OsConstants.AF_INET6
-                                else android.system.OsConstants.AF_INET
-                            val address = android.system.Os.inet_pton(family, addr)
-                                ?: throw IllegalArgumentException("not an IP literal")
-                            excludeRoute(android.net.IpPrefix(address, prefix))
-                            broadcastLog("exclude $cidr from tunnel")
-                        } catch (e: Exception) {
-                            throw IllegalStateException(
-                                "Android could not exclude route $cidr from the tunnel",
-                                e,
-                            )
+                            try {
+                                val slash = cidr.indexOf('/')
+                                val addr = if (slash < 0) cidr else cidr.substring(0, slash)
+                                val prefix = if (slash < 0) RouteComplements.hostPrefix(addr)
+                                    else cidr.substring(slash + 1).toIntOrNull()
+                                        ?: throw IllegalArgumentException("prefix is not a number")
+                                val family = if (':' in addr) android.system.OsConstants.AF_INET6
+                                    else android.system.OsConstants.AF_INET
+                                val address = android.system.Os.inet_pton(family, addr)
+                                    ?: throw IllegalArgumentException("not an IP literal")
+                                excludeRoute(android.net.IpPrefix(address, prefix))
+                                installed++
+                            } catch (e: Exception) {
+                                failed++
+                                if (failed <= 3) broadcastLog("bad exclude route $cidr: ${e.message}")
+                            }
                         }
-                    }
                         broadcastLog(
                             "exclude routes: $installed installed" +
                                 if (failed > 0) ", $failed skipped" else "",
