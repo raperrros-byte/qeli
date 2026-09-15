@@ -23,13 +23,21 @@ public sealed class AppSettings
     public bool ServiceEnabled { get; set; }            // desired: run as a Windows service
     public string? ServiceProfile { get; set; }         // profile the Windows service runs
     // Global traffic defaults for ALL profiles (main window). PreferFullTunnel sets
-    // gateway/routing; EnableLocalProxy can be on together with per-app filters.
+    // gateway/routing when AppsMode is "all"; EnableLocalProxy can combine with per-app.
     public bool PreferFullTunnel { get; set; } = true;
     public bool EnableLocalProxy { get; set; } = false;
-    // Legacy: "tunnel" | "proxy". Migrated into PreferFullTunnel + EnableLocalProxy on load.
+    // Legacy: "tunnel" | "proxy" | "both" | "split". Migrated into PreferFullTunnel + EnableLocalProxy.
     public string TrafficMode { get; set; } = "tunnel";
     public int ProxyPort { get; set; } = 1080;
     public string ProxyMode { get; set; } = "mixed"; // socks5 | http | mixed
+    /// <summary>Global per-app filter: all | include | exclude (applied to every profile).</summary>
+    public string AppsMode { get; set; } = "all";
+    /// <summary>Full .exe paths selected for include/exclude on the main window.</summary>
+    public List<string> Apps { get; set; } = new();
+    /// <summary>Global DNS mode: tunnel | system | off.</summary>
+    public string DnsMode { get; set; } = "tunnel";
+    /// <summary>Global DNS servers when DnsMode is tunnel (empty = server push / defaults).</summary>
+    public List<string> DnsServers { get; set; } = new();
     // Local SOCKS/HTTP proxy routing (v2rayN-like). See Qeli.Shared.Geo.ProxyRoutePreset.
     public string ProxyRoutePreset { get; set; } = "proxy-all";
     // Server panel metrics (CPU/RAM charts). Empty URL = http://{connected-server}:8080

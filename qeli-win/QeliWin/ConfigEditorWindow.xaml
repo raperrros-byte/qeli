@@ -229,6 +229,9 @@
                         </StackPanel>
                         <CheckBox x:Name="MtuProbeBox" Content="{l:Loc MtuProbe}" Margin="0,0,0,16"/>
 
+                        <TextBlock Text="{l:Loc GlobalRoutingManaged}" TextWrapping="Wrap"
+                                   Foreground="{DynamicResource FgDim}" FontSize="11.5" Margin="0,0,0,12"/>
+
                         <Grid Margin="0,0,0,8">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="190"/>
@@ -237,13 +240,14 @@
                             </Grid.ColumnDefinitions>
                             <StackPanel Grid.Column="0">
                                 <TextBlock Text="{l:Loc FieldDnsMode}" Style="{StaticResource Label}"/>
-                                <ComboBox x:Name="DnsModeBox" SelectionChanged="OnDnsModeChanged">
+                                <ComboBox x:Name="DnsModeBox" SelectionChanged="OnDnsModeChanged" IsEnabled="False"
+                                          Opacity="0.45">
                                     <ComboBoxItem Content="{l:Loc DnsTunnel}" Tag="tunnel"/>
                                     <ComboBoxItem Content="{l:Loc DnsSystem}" Tag="system"/>
                                     <ComboBoxItem Content="{l:Loc DnsOff}" Tag="off"/>
                                 </ComboBox>
                             </StackPanel>
-                            <StackPanel x:Name="DnsServersPanel" Grid.Column="2">
+                            <StackPanel x:Name="DnsServersPanel" Grid.Column="2" IsEnabled="False" Opacity="0.45">
                                 <TextBlock Text="{l:Loc FieldDns}" Style="{StaticResource Label}"/>
                                 <ComboBox x:Name="DnsBox" IsEditable="True" TextSearch.TextPath="Content">
                                     <ComboBoxItem Content="1.1.1.1, 8.8.8.8"/>
@@ -265,8 +269,9 @@
                         </StackPanel>
 
                         <CheckBox x:Name="ProxyBox" Content="{l:Loc FieldProxy}" Margin="0,0,0,10"
-                                  Checked="OnProxyToggled" Unchecked="OnProxyToggled"/>
-                        <Grid x:Name="ProxyPanel" Margin="0,0,0,18">
+                                  Checked="OnProxyToggled" Unchecked="OnProxyToggled"
+                                  IsEnabled="False" Opacity="0.45"/>
+                        <Grid x:Name="ProxyPanel" Margin="0,0,0,18" IsEnabled="False" Opacity="0.45">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="130"/>
                                 <ColumnDefinition Width="14"/>
@@ -287,7 +292,9 @@
                         </Grid>
 
                         <TextBlock Text="{l:Loc SectionApplications}" Style="{StaticResource SectionHeader}" Margin="0,28,0,14"/>
-                        <Grid>
+                        <TextBlock Text="{l:Loc GlobalRoutingManaged}" TextWrapping="Wrap"
+                                   Foreground="{DynamicResource FgDim}" FontSize="11.5" Margin="0,0,0,10"/>
+                        <Grid IsEnabled="False" Opacity="0.45">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="Auto"/>

@@ -270,19 +270,16 @@
             </Border>
         </DockPanel>
 
-        <!-- ════ RIGHT: hero + stats + log (fills) ════ -->
+        <!-- ════ RIGHT: hero + scrollable tiles + log ════ -->
         <Grid Grid.Column="2">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="*"/>
+                <RowDefinition Height="*" MinHeight="140"/>
+                <RowDefinition Height="*" MinHeight="100"/>
             </Grid.RowDefinitions>
 
-            <!-- hero: status + selected server + connect. Height = brand band + gap + search. -->
-            <Border Grid.Row="0" Style="{StaticResource StatTile}" Height="102" Padding="18,0">
+            <!-- hero: status + selected server + connect -->
+            <Border Grid.Row="0" Style="{StaticResource StatTile}" MinHeight="88" Padding="18,12">
                 <Grid>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="Auto"/>
@@ -304,7 +301,8 @@
 
                     <StackPanel Grid.Column="1" VerticalAlignment="Center">
                         <TextBlock x:Name="StatusText" Text="Disconnected" FontFamily="{DynamicResource DisplayFont}"
-                                   FontSize="21" FontWeight="Bold" Foreground="{DynamicResource Fg}"/>
+                                   FontSize="21" FontWeight="Bold" Foreground="{DynamicResource Fg}"
+                                   TextWrapping="Wrap"/>
                         <TextBlock x:Name="DetailText" Text="" Foreground="{DynamicResource FgDim}"
                                    FontSize="12.5" Margin="0,3,0,0" TextTrimming="CharacterEllipsis"/>
                     </StackPanel>
@@ -321,147 +319,171 @@
                 </Grid>
             </Border>
 
-            <!-- global traffic: full-tunnel / per-app can combine with local proxy -->
-            <Border Grid.Row="1" Style="{StaticResource StatTile}" Padding="14,12" Margin="0,14,0,0">
+            <!-- scrollable settings + metrics: flex with window height -->
+            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
+                          Margin="0,14,0,0" Padding="0,0,4,0" CanContentScroll="False">
                 <StackPanel>
-                    <TextBlock x:Name="TrafficModeLabel" Text="{local:Loc TrafficMode}"
-                               Style="{StaticResource TileLabel}" Margin="0,0,0,8"/>
-                    <StackPanel Orientation="Horizontal">
-                        <RadioButton x:Name="ModeTunnelRadio" GroupName="TrafficMode"
-                                     Content="{local:Loc TrafficModeTunnel}"
-                                     VerticalAlignment="Center" Margin="0,0,18,0"
-                                     Checked="OnTrafficModeChanged"/>
-                        <RadioButton x:Name="ModeSplitRadio" GroupName="TrafficMode"
-                                     Content="{local:Loc TrafficModeSplit}"
-                                     VerticalAlignment="Center"
-                                     Checked="OnTrafficModeChanged"/>
-                    </StackPanel>
-                    <CheckBox x:Name="GlobalProxyCheck" Content="{local:Loc TrafficModeProxy}"
-                              Margin="0,10,0,0" VerticalAlignment="Center"
-                              Checked="OnTrafficModeChanged" Unchecked="OnTrafficModeChanged"/>
-                    <TextBlock Text="{local:Loc TrafficModeProxyHint}" TextWrapping="Wrap"
-                               Foreground="{DynamicResource FgDim}" FontSize="11" Margin="0,4,0,0"/>
-                    <Grid x:Name="ProxyOptsPanel" Margin="0,10,0,0" Visibility="Collapsed">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="80"/>
-                            <ColumnDefinition Width="16"/>
-                            <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="*"/>
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="{local:Loc FieldProxyPort}"
-                                   VerticalAlignment="Center" Margin="0,0,8,0"
-                                   Foreground="{DynamicResource FgDim}" FontSize="12"/>
-                        <TextBox x:Name="GlobalProxyPortBox" Grid.Column="1"
-                                 VerticalContentAlignment="Center" Padding="6,4"
-                                 LostFocus="OnGlobalProxyOptsChanged" KeyDown="OnGlobalProxyPortKeyDown"/>
-                        <TextBlock Grid.Column="3" Text="{local:Loc FieldProxyMode}"
-                                   VerticalAlignment="Center" Margin="0,0,8,0"
-                                   Foreground="{DynamicResource FgDim}" FontSize="12"/>
-                        <ComboBox x:Name="GlobalProxyModeBox" Grid.Column="4"
-                                  SelectionChanged="OnGlobalProxyOptsChanged"/>
-                    </Grid>
+                    <!-- global traffic: apps + DNS + proxy (all profiles) -->
+                    <Border Style="{StaticResource StatTile}" Padding="14,12">
+                        <StackPanel>
+                            <TextBlock x:Name="TrafficModeLabel" Text="{local:Loc TrafficMode}"
+                                       Style="{StaticResource TileLabel}" Margin="0,0,0,4"/>
+                            <TextBlock Text="{local:Loc TrafficModeAppsHint}" TextWrapping="Wrap"
+                                       Foreground="{DynamicResource FgDim}" FontSize="11" Margin="0,0,0,10"/>
+
+                            <TextBlock Text="{local:Loc FieldApps}" Style="{StaticResource TileLabel}" Margin="0,0,0,6"/>
+                            <Grid Margin="0,0,0,8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" MinWidth="140"/>
+                                    <ColumnDefinition Width="8"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <ComboBox x:Name="GlobalAppsModeBox" Grid.Column="0"
+                                          SelectionChanged="OnGlobalAppsModeChanged"/>
+                                <Button x:Name="GlobalAppsPickBtn" Grid.Column="2"
+                                        Content="{local:Loc AppsPick}" Click="OnGlobalPickApps"
+                                        Padding="12,6" MinWidth="140"/>
+                            </Grid>
+                            <TextBlock x:Name="GlobalAppsCountText" Style="{StaticResource TileSub}" Margin="0,0,0,10"/>
+
+                            <TextBlock x:Name="GatewayWhenAllLabel" Text="{local:Loc TrafficGatewayWhenAll}"
+                                       Style="{StaticResource TileLabel}" Margin="0,0,0,6"/>
+                            <StackPanel x:Name="GatewayRadiosPanel" Orientation="Horizontal" Margin="0,0,0,10">
+                                <RadioButton x:Name="ModeTunnelRadio" GroupName="TrafficMode"
+                                             Content="{local:Loc TrafficModeTunnel}"
+                                             VerticalAlignment="Center" Margin="0,0,18,0"
+                                             Checked="OnTrafficModeChanged"/>
+                                <RadioButton x:Name="ModeSplitRadio" GroupName="TrafficMode"
+                                             Content="{local:Loc TrafficModeSplit}"
+                                             VerticalAlignment="Center"
+                                             Checked="OnTrafficModeChanged"/>
+                            </StackPanel>
+
+                            <TextBlock Text="{local:Loc FieldDnsMode}" Style="{StaticResource TileLabel}" Margin="0,0,0,6"/>
+                            <Grid Margin="0,0,0,10">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="160" MinWidth="120"/>
+                                    <ColumnDefinition Width="8"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <ComboBox x:Name="GlobalDnsModeBox" Grid.Column="0"
+                                          SelectionChanged="OnGlobalDnsChanged"/>
+                                <TextBox x:Name="GlobalDnsServersBox" Grid.Column="2"
+                                         VerticalContentAlignment="Center" Padding="6,4"
+                                         ToolTip="{local:Loc FieldDns}"
+                                         LostFocus="OnGlobalDnsChanged" KeyDown="OnGlobalDnsServersKeyDown"/>
+                            </Grid>
+
+                            <CheckBox x:Name="GlobalProxyCheck" Content="{local:Loc TrafficModeProxy}"
+                                      VerticalAlignment="Center"
+                                      Checked="OnTrafficModeChanged" Unchecked="OnTrafficModeChanged"/>
+                            <TextBlock Text="{local:Loc TrafficModeProxyHint}" TextWrapping="Wrap"
+                                       Foreground="{DynamicResource FgDim}" FontSize="11" Margin="0,4,0,0"/>
+                            <Grid x:Name="ProxyOptsPanel" Margin="0,10,0,0" Visibility="Collapsed">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="80"/>
+                                    <ColumnDefinition Width="16"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="{local:Loc FieldProxyPort}"
+                                           VerticalAlignment="Center" Margin="0,0,8,0"
+                                           Foreground="{DynamicResource FgDim}" FontSize="12"/>
+                                <TextBox x:Name="GlobalProxyPortBox" Grid.Column="1"
+                                         VerticalContentAlignment="Center" Padding="6,4"
+                                         LostFocus="OnGlobalProxyOptsChanged" KeyDown="OnGlobalProxyPortKeyDown"/>
+                                <TextBlock Grid.Column="3" Text="{local:Loc FieldProxyMode}"
+                                           VerticalAlignment="Center" Margin="0,0,8,0"
+                                           Foreground="{DynamicResource FgDim}" FontSize="12"/>
+                                <ComboBox x:Name="GlobalProxyModeBox" Grid.Column="4"
+                                          SelectionChanged="OnGlobalProxyOptsChanged"/>
+                            </Grid>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- auto transport + SNI -->
+                    <Border Style="{StaticResource StatTile}" Padding="14,12" Margin="0,14,0,0">
+                        <StackPanel>
+                            <CheckBox x:Name="AutoTransportCheck" Content="{local:Loc AutoTransport}"
+                                      Checked="OnAutoTransportChanged" Unchecked="OnAutoTransportChanged"/>
+                            <TextBlock Text="{local:Loc AutoTransportHint}" Foreground="{DynamicResource FgDim}"
+                                       FontSize="11" TextWrapping="Wrap" Margin="0,4,0,10"/>
+                            <TextBlock Text="{local:Loc FieldSni}" Style="{StaticResource TileLabel}" Margin="0,0,0,6"/>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="160" MinWidth="100"/>
+                                    <ColumnDefinition Width="8"/>
+                                    <ColumnDefinition Width="*" MinWidth="80"/>
+                                    <ColumnDefinition Width="8"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="8"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <ComboBox x:Name="SniPresetBox" Grid.Column="0" IsEditable="False"
+                                          SelectionChanged="OnSniPresetChanged"/>
+                                <TextBox x:Name="SniEditBox" Grid.Column="2"
+                                         VerticalContentAlignment="Center" Padding="6,4"/>
+                                <Button Grid.Column="4" Content="{local:Loc ApplySni}" Padding="12,6"
+                                        Click="OnApplySni"/>
+                                <Button Grid.Column="6" Content="{local:Loc SpeedTest}" Padding="12,6"
+                                        Click="OnSpeedTest"/>
+                            </Grid>
+                            <TextBlock x:Name="SpeedTestResult" Foreground="{DynamicResource FgDim}"
+                                       FontSize="11" FontFamily="Consolas" Margin="0,6,0,0" TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- stat strip -->
+                    <Border Style="{StaticResource StatTile}" Padding="0" Margin="0,14,0,0">
+                        <UniformGrid Columns="4" Rows="1">
+                            <StackPanel Margin="14,11">
+                                <TextBlock x:Name="DownLabel" Style="{StaticResource TileLabel}"/>
+                                <TextBlock x:Name="DownVal" Text="—" Style="{StaticResource TileValue}"/>
+                                <TextBlock x:Name="TotalDownVal" Text="—" Style="{StaticResource TileSub}"/>
+                            </StackPanel>
+                            <StackPanel Margin="14,11">
+                                <TextBlock x:Name="UpLabel" Style="{StaticResource TileLabel}"/>
+                                <TextBlock x:Name="UpVal" Text="—" Style="{StaticResource TileValue}"/>
+                                <TextBlock x:Name="TotalUpVal" Text="—" Style="{StaticResource TileSub}"/>
+                            </StackPanel>
+                            <StackPanel Margin="14,11">
+                                <TextBlock x:Name="SessionLabel" Style="{StaticResource TileLabel}"/>
+                                <TextBlock x:Name="SessionVal" Text="—" Style="{StaticResource TileValue}"/>
+                                <TextBlock x:Name="SessionSubVal" Text="" Style="{StaticResource TileSub}"/>
+                            </StackPanel>
+                            <StackPanel Margin="14,11">
+                                <TextBlock x:Name="IpLabel" Style="{StaticResource TileLabel}"/>
+                                <TextBlock x:Name="IpVal" Text="—" Style="{StaticResource TileValue}" FontSize="15"/>
+                                <TextBlock x:Name="IpSubVal" Text="" Style="{StaticResource TileSub}"/>
+                            </StackPanel>
+                        </UniformGrid>
+                    </Border>
+
+                    <!-- server CPU / RAM -->
+                    <Border Style="{StaticResource StatTile}" Padding="12,10" Margin="0,14,0,0">
+                        <UniformGrid Columns="2" Rows="1">
+                            <StackPanel Margin="0,0,8,0">
+                                <TextBlock x:Name="CpuLabel" Style="{StaticResource TileLabel}"/>
+                                <TextBlock x:Name="CpuVal" Text="—" Style="{StaticResource TileValue}" FontSize="16"/>
+                                <TextBlock x:Name="CpuSubVal" Text="" Style="{StaticResource TileSub}"/>
+                                <Canvas x:Name="CpuChart" Height="36" Margin="0,6,0,0" ClipToBounds="True"/>
+                            </StackPanel>
+                            <StackPanel Margin="8,0,0,0">
+                                <TextBlock x:Name="MemLabel" Style="{StaticResource TileLabel}"/>
+                                <TextBlock x:Name="MemVal" Text="—" Style="{StaticResource TileValue}" FontSize="16"/>
+                                <TextBlock x:Name="MemSubVal" Text="" Style="{StaticResource TileSub}"/>
+                                <Canvas x:Name="MemChart" Height="36" Margin="0,6,0,0" ClipToBounds="True"/>
+                            </StackPanel>
+                        </UniformGrid>
+                    </Border>
                 </StackPanel>
-            </Border>
+            </ScrollViewer>
 
-            <!-- auto transport + SNI on the main screen -->
-            <Border Grid.Row="2" Style="{StaticResource StatTile}" Padding="14,12" Margin="0,14,0,0">
-                <StackPanel>
-                    <CheckBox x:Name="AutoTransportCheck" Content="{local:Loc AutoTransport}"
-                              Checked="OnAutoTransportChanged" Unchecked="OnAutoTransportChanged"/>
-                    <TextBlock Text="{local:Loc AutoTransportHint}" Foreground="{DynamicResource FgDim}"
-                               FontSize="11" TextWrapping="Wrap" Margin="0,4,0,10"/>
-                    <TextBlock Text="{local:Loc FieldSni}" Style="{StaticResource TileLabel}" Margin="0,0,0,6"/>
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="160"/>
-                            <ColumnDefinition Width="8"/>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="8"/>
-                            <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="8"/>
-                            <ColumnDefinition Width="Auto"/>
-                        </Grid.ColumnDefinitions>
-                        <ComboBox x:Name="SniPresetBox" Grid.Column="0" IsEditable="False"
-                                  SelectionChanged="OnSniPresetChanged"/>
-                        <TextBox x:Name="SniEditBox" Grid.Column="2"
-                                 VerticalContentAlignment="Center" Padding="6,4"/>
-                        <Button Grid.Column="4" Content="{local:Loc ApplySni}" Padding="12,6"
-                                Click="OnApplySni"/>
-                        <Button Grid.Column="6" Content="{local:Loc SpeedTest}" Padding="12,6"
-                                Click="OnSpeedTest"/>
-                    </Grid>
-                    <TextBlock x:Name="SpeedTestResult" Foreground="{DynamicResource FgDim}"
-                               FontSize="11" FontFamily="Consolas" Margin="0,6,0,0"/>
-                </StackPanel>
-            </Border>
-
-            <!-- stat strip: one card, four metrics with a value + context sub-line -->
-            <Border Grid.Row="3" Style="{StaticResource StatTile}" Padding="0" Margin="0,14,0,0">
-                <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="1"/>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="1"/>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="1"/>
-                        <ColumnDefinition Width="*"/>
-                    </Grid.ColumnDefinitions>
-                    <StackPanel Grid.Column="0" Margin="14,11">
-                        <TextBlock x:Name="DownLabel" Style="{StaticResource TileLabel}"/>
-                        <TextBlock x:Name="DownVal" Text="—" Style="{StaticResource TileValue}"/>
-                        <TextBlock x:Name="TotalDownVal" Text="—" Style="{StaticResource TileSub}"/>
-                    </StackPanel>
-                    <Border Grid.Column="1" Background="{DynamicResource PanelBorder}" Margin="0,11"/>
-                    <StackPanel Grid.Column="2" Margin="14,11">
-                        <TextBlock x:Name="UpLabel" Style="{StaticResource TileLabel}"/>
-                        <TextBlock x:Name="UpVal" Text="—" Style="{StaticResource TileValue}"/>
-                        <TextBlock x:Name="TotalUpVal" Text="—" Style="{StaticResource TileSub}"/>
-                    </StackPanel>
-                    <Border Grid.Column="3" Background="{DynamicResource PanelBorder}" Margin="0,11"/>
-                    <StackPanel Grid.Column="4" Margin="14,11">
-                        <TextBlock x:Name="SessionLabel" Style="{StaticResource TileLabel}"/>
-                        <TextBlock x:Name="SessionVal" Text="—" Style="{StaticResource TileValue}"/>
-                        <TextBlock x:Name="SessionSubVal" Text="" Style="{StaticResource TileSub}"/>
-                    </StackPanel>
-                    <Border Grid.Column="5" Background="{DynamicResource PanelBorder}" Margin="0,11"/>
-                    <StackPanel Grid.Column="6" Margin="14,11">
-                        <TextBlock x:Name="IpLabel" Style="{StaticResource TileLabel}"/>
-                        <TextBlock x:Name="IpVal" Text="—" Style="{StaticResource TileValue}" FontSize="15"/>
-                        <TextBlock x:Name="IpSubVal" Text="" Style="{StaticResource TileSub}"/>
-                    </StackPanel>
-                </Grid>
-            </Border>
-
-            <!-- server CPU / RAM + sparklines -->
-            <Border Grid.Row="4" Style="{StaticResource StatTile}" Padding="12,10" Margin="0,10,0,0">
-                <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="16"/>
-                        <ColumnDefinition Width="*"/>
-                    </Grid.ColumnDefinitions>
-                    <StackPanel Grid.Column="0">
-                        <TextBlock x:Name="CpuLabel" Style="{StaticResource TileLabel}"/>
-                        <TextBlock x:Name="CpuVal" Text="—" Style="{StaticResource TileValue}" FontSize="16"/>
-                        <TextBlock x:Name="CpuSubVal" Text="" Style="{StaticResource TileSub}"/>
-                        <Canvas x:Name="CpuChart" Height="36" Margin="0,6,0,0" ClipToBounds="True"/>
-                    </StackPanel>
-                    <StackPanel Grid.Column="2">
-                        <TextBlock x:Name="MemLabel" Style="{StaticResource TileLabel}"/>
-                        <TextBlock x:Name="MemVal" Text="—" Style="{StaticResource TileValue}" FontSize="16"/>
-                        <TextBlock x:Name="MemSubVal" Text="" Style="{StaticResource TileSub}"/>
-                        <Canvas x:Name="MemChart" Height="36" Margin="0,6,0,0" ClipToBounds="True"/>
-                    </StackPanel>
-                </Grid>
-            </Border>
-
-            <!-- log — fills the remaining height; the most useful block grows with the window -->
-            <Border Grid.Row="5" Background="{DynamicResource Panel}" BorderBrush="{DynamicResource PanelBorder}"
+            <!-- log — shares remaining height with the tile scroller -->
+            <Border Grid.Row="2" Background="{DynamicResource Panel}" BorderBrush="{DynamicResource PanelBorder}"
                     BorderThickness="1" CornerRadius="12" Margin="0,14,0,0">
                 <DockPanel>
-                    <!-- header: title (left), copy/clear + version + about (right) -->
                     <Grid DockPanel.Dock="Top" Height="36">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*"/>

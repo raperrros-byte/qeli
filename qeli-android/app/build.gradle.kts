@@ -24,7 +24,7 @@ android {
         applicationId = "com.qeli"
         minSdk = 28
         targetSdk = 37
-        versionCode = 722
+        versionCode = 723
         versionName = "0.8.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

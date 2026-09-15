@@ -546,12 +546,29 @@ public sealed class VpnConfig : INotifyPropertyChanged
         // gone, so carrying the marker would reject a profile that is now fine.
     };
 
-    /// <summary>Apply main-window traffic defaults. Proxy and full-tunnel are independent so
-    /// a profile can keep per-app WinDivert filtering while SOCKS/HTTP also exits via VPN.</summary>
+    /// <summary>Apply main-window traffic defaults to a profile: proxy, full-tunnel preference,
+    /// global apps filter, and DNS. Proxy can run together with WinDivert include/exclude.</summary>
     public VpnConfig WithGlobalTrafficMode(
-        bool preferFullTunnel, bool proxyEnabled, string proxyListen, string proxyMode)
+        bool preferFullTunnel, bool proxyEnabled, string proxyListen, string proxyMode,
+        string appsMode, IReadOnlyList<string> apps,
+        string dnsMode, IReadOnlyList<string> dnsServers)
     {
-        bool fullTunnel = preferFullTunnel && !UsesAppFilter;
+        string mode = (appsMode ?? "all").Trim().ToLowerInvariant();
+        if (mode is not ("include" or "exclude")) mode = "all";
+        var appList = (apps ?? Array.Empty<string>())
+            .Select(a => a.Trim()).Where(a => a.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (mode is ("include" or "exclude") && appList.Count == 0)
+            mode = "all"; // invalid empty filter → widen rather than fail connect
+        bool usesApps = mode is "include" or "exclude";
+        bool fullTunnel = preferFullTunnel && !usesApps;
+
+        string dns = (dnsMode ?? "tunnel").Trim().ToLowerInvariant();
+        if (dns is not ("tunnel" or "system" or "off")) dns = "tunnel";
+        var dnsList = (dnsServers ?? Array.Empty<string>())
+            .Select(s => s.Trim()).Where(s => s.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
         return WithEditorFields(
             name: Name, serverAddress: ServerAddress, port: Port, protocol: Protocol,
             wireMode: WireMode, obfsKey: ObfsKey, obfsFronting: ObfsFronting,
@@ -560,13 +577,16 @@ public sealed class VpnConfig : INotifyPropertyChanged
             routingMode: fullTunnel ? "full-tunnel" : "split-tunnel",
             addDefaultGateway: fullTunnel,
             routeLocalNetworks: RouteLocalNetworks,
-            mtu: Mtu, dnsServers: DnsServers,
+            mtu: Mtu, dnsServers: dnsList,
             paddingEnabled: PaddingEnabled, paddingMin: PaddingMin, paddingMax: PaddingMax,
             heartbeatEnabled: HeartbeatEnabled, heartbeatIntervalMs: HeartbeatIntervalMs,
             heartbeatJitterMs: HeartbeatJitterMs,
             proxyEnabled: proxyEnabled,
             proxyListen: string.IsNullOrWhiteSpace(proxyListen) ? "127.0.0.1:1080" : proxyListen.Trim(),
-            proxyMode: string.IsNullOrWhiteSpace(proxyMode) ? "mixed" : proxyMode.Trim());
+            proxyMode: string.IsNullOrWhiteSpace(proxyMode) ? "mixed" : proxyMode.Trim(),
+            appsMode: mode,
+            apps: appList,
+            dnsMode: dns);
     }
     /// <summary>Bracket-wrap a bare IPv6 literal for a URI authority (RFC 3986:
     /// <c>qeli://user@[2001:db8::1]:443</c>); IPv4 / hostnames pass through unchanged.</summary>
