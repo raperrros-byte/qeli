@@ -220,6 +220,29 @@ class ConfigImportRangesTest {
         assertNotNull(runCatching { cfg.validate() }.exceptionOrNull())
     }
 
+    @Test
+    fun `inverted shaping ranges and insufficient budget are refused`() {
+        val invalid = listOf(
+            arrayOf("shaping_gap_min = 500", "shaping_gap_max = 100"),
+            arrayOf("shaping_min_size = 900", "shaping_max_size = 300"),
+            arrayOf("shaping = true", "shaping_budget = 200", "shaping_max_size = 300"),
+        )
+        for (lines in invalid) {
+            val error = runCatching { VpnConfig.fromIni(ini(*lines)).validate() }.exceptionOrNull()
+            assertNotNull("${lines.contentToString()} must be refused", error)
+        }
+
+        val valid = VpnConfig.fromIni(ini(
+            "shaping = true",
+            "shaping_gap_min = 40",
+            "shaping_gap_max = 6000",
+            "shaping_budget = 1024",
+            "shaping_min_size = 64",
+            "shaping_max_size = 1024",
+        ))
+        valid.validate()
+    }
+
     /**
      * A wire mode that needs a STREAM must not validate on a datagram transport.
      *
@@ -372,8 +395,8 @@ class ConfigImportRangesTest {
         assertEquals(9000, VpnConfig.fromIni(ini("mtu = 9000")).mtu)
         // The real ceiling, derived in Rust from the record format. Pinned so this port cannot
         // silently keep an older, lower bound than the server accepts. (Audit 2026-08-01, §1.)
-        assertEquals(16638, VpnConfig.MTU_MAX)
-        assertEquals(16638, VpnConfig.fromIni(ini("mtu = 16638")).mtu)
+        assertEquals(16602, VpnConfig.MTU_MAX)
+        assertEquals(16602, VpnConfig.fromIni(ini("mtu = 16602")).mtu)
         // 9001 used to be refused; it is inside the range now. Kept as a case so the old
         // ceiling cannot creep back in unnoticed.
         assertEquals(9001, VpnConfig.fromIni(ini("mtu = 9001")).mtu)
@@ -472,7 +495,8 @@ class ConfigImportRangesTest {
             ini(
                 "timeout = 47", "padding_min = 7", "heartbeat_jitter = 2345",
                 "shaping = true", "local = 192.0.2.7", "lport = 34567",
-                "route_file = C:/routes.txt", "kill_switch = true",
+                "route_file = C:/cidrs.txt", "route_file = C:/openvpn.txt",
+                "kill_switch = true",
                 "allow_unpinned_tofu = true",
             )
         )
@@ -483,9 +507,11 @@ class ConfigImportRangesTest {
         assertEquals(2345L, back.heartbeatJitterMs)
         assertTrue(back.shapingEnabled)
         assertTrue(back.allowUnpinnedTofu)
-        for (key in listOf("local", "lport", "route_file")) {
+        for (key in listOf("local", "lport")) {
             assertEquals(config.carriedKeys[key], back.carriedKeys[key])
         }
+        assertEquals(listOf("C:/cidrs.txt", "C:/openvpn.txt"), back.routeFiles)
+        assertFalse(back.duplicateKeys.contains("qeli.route_file"))
         assertTrue(output.contains("gateway = true"))
         assertTrue(output.contains("padding = true"))
         assertTrue(output.contains("shaping = true"))
@@ -499,7 +525,7 @@ class ConfigImportRangesTest {
      * Nothing reads a typo, so the setting it was meant to change silently keeps its default:
      * `gatway = true` left the tunnel split with nothing said. The Rust client has always
      * refused these. The trap is over-correcting: `keepalive`, `post_up`, `exit_node` and
-     * friends are real Rust-client file-only keys (docs/ru/CONFIG.md, "Что пушем НЕ
+     * friends are real Rust-client file-only keys (docs/ru/manuals/CONFIG.md, "Что пушем НЕ
      * передаётся"), and refusing a CLI profile that carries them would be a worse regression
      * than the typo it catches. (Audit 2026-08-01, §14.)
      */

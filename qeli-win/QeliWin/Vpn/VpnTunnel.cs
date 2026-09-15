@@ -1,5 +1,5 @@
 using System.Net;
-using System.Text.Json.Nodes;
+using System.Text.Json;
 using Qeli.Shared.Model;
 using Qeli.Shared.Vpn;
 
@@ -12,13 +12,271 @@ public sealed class VpnTunnel : VpnTunnelBase
 {
     private NetworkConfigurator? _net;
     private bool _useWinDivert;
+    private readonly Dictionary<ulong, RoamingObservation> _roamingObservations = new();
+    private readonly Dictionary<ulong, RoamingCandidate> _roamingCandidates = new();
+
+    private sealed record RoamingObservation(
+        ulong Generation,
+        string PathIdentity,
+        VpnConfig Config,
+        string[] CarrierAddresses);
+
+    private sealed class RoamingCandidate
+    {
+        public required ulong Generation { get; init; }
+        public required ulong CandidateId { get; init; }
+        public required ulong UpdateId { get; init; }
+        public required string PathIdentity { get; init; }
+        public required VpnConfig Config { get; init; }
+        public required string[] OldCarriers { get; init; }
+        public required string[] NewCarriers { get; init; }
+        public required string[] UnionCarriers { get; init; }
+        public required string[] PolicyCarriers { get; set; }
+        public NetworkConfigurator.RoamingRouteLease? Routes { get; init; }
+        public bool Bound { get; set; }
+    }
 
     // Normal profiles keep the zero-copy Rust-owned Wintun path. Per-app profiles use
-    // WinDivert as an IPacketTunDevice, so the shared ABI 1.10 packet pumps connect it to
+    // WinDivert as an IPacketTunDevice, so the shared ABI 1.11 packet pumps connect it to
     // the same Rust transport core without replacing or duplicating that core.
     protected override bool NativeWintunOwnership => !_useWinDivert;
 
+    // A retained system Wintun can only be replaced safely while the shared base owns the
+    // temporary fail-closed firewall transaction. Per-app WinDivert plans are reconfigured
+    // in place, but keeping this capability enabled is required for the normal system-TUN
+    // path when an authenticated NetworkPlan changes under persist_tun.
     protected override bool SupportsPlanReplacementGuard => true;
+
+    protected override ulong NativeIpv6Capabilities(VpnConfig config) =>
+        NativeIpv6SystemPlanCapabilities | NativeIpv6KillSwitchCapability;
+
+    // A fixed source address/port is an explicit user routing contract. Candidate sockets
+    // are deliberately left on reconnect fallback until the Rust candidate factory can
+    // preserve that exact bind. Every ordinary TCP and UDP transport shares this path.
+    protected override ulong NativeRoamingCapabilities(VpnConfig config) =>
+        AllowsNativePathRoaming(config)
+            ? NativeRoamingPathCapabilities | NativePathRefreshCapability
+            : 0;
+
+    internal static bool AllowsNativePathRoaming(VpnConfig config) =>
+        !config.RoamingPolicy.Equals("off", StringComparison.OrdinalIgnoreCase)
+        && string.IsNullOrWhiteSpace(config.LocalAddress) && config.LocalPort == 0;
+
+    internal static void RunRoamingCapabilitySelfTest(Action<string, bool> check)
+    {
+        var ordinaryProfiles = new[]
+        {
+            new VpnConfig { Protocol = "tcp", WireMode = "fake-tls" },
+            new VpnConfig { Protocol = "udp", WireMode = "fake-tls" },
+            new VpnConfig { Protocol = "udp", WireMode = "fake-tls", QuicEnabled = true },
+            new VpnConfig { Protocol = "udp", WireMode = "obfs" },
+        };
+        check("Native path roaming covers TCP and every UDP camouflage mode",
+            ordinaryProfiles.All(AllowsNativePathRoaming));
+        check("Fixed local address or port stays on reconnect fallback",
+            !AllowsNativePathRoaming(new VpnConfig { LocalAddress = "192.0.2.10" })
+            && !AllowsNativePathRoaming(new VpnConfig { LocalPort = 41000 }));
+        check("roaming = off disables the native path executor",
+            !AllowsNativePathRoaming(new VpnConfig { RoamingPolicy = "off" }));
+    }
+
+    protected override NativePathUpdate? CaptureNativeRoamingPath(VpnConfig config,
+        IReadOnlyList<string> carrierAddresses, ulong generation, ulong updateId, string reason)
+    {
+        IPAddress[] carriers = carrierAddresses
+            .Select(IPAddress.Parse)
+            .Distinct()
+            .ToArray();
+        NativePathUpdate update = NetworkConfigurator.CaptureRoamingPath(
+            carriers, generation, updateId, reason);
+        if (_roamingObservations.Count >= 16)
+            _roamingObservations.Remove(_roamingObservations.Keys.Min());
+        _roamingObservations[updateId] = new RoamingObservation(
+            generation, PathIdentity(update), config,
+            carriers.Select(item => item.ToString()).ToArray());
+        return update;
+    }
+
+    protected override void ApplyNativeRoamingCommand(NativePathCommand command)
+    {
+        switch (command.Action)
+        {
+            case "prepare_path": PrepareRoamingCandidate(command); break;
+            case "bind_socket": BindRoamingCandidate(command); break;
+            case "commit_path": CommitRoamingCandidate(command); break;
+            case "abort_path": AbortRoamingCandidate(command); break;
+            default: throw new InvalidOperationException(
+                $"unsupported Windows roaming action {command.Action}");
+        }
+    }
+
+    protected override void ResetNativeRoamingPath()
+    {
+        var failures = new List<string>();
+        foreach (RoamingCandidate candidate in _roamingCandidates.Values.ToArray())
+        {
+            try
+            {
+                AbortCandidate(candidate);
+                _roamingCandidates.Remove(candidate.CandidateId);
+            }
+            catch (Exception error) { failures.Add(error.Message); }
+        }
+        _roamingObservations.Clear();
+        if (failures.Count != 0)
+            throw new InvalidOperationException(
+                "Windows roaming cleanup failed: " + string.Join("; ", failures));
+    }
+
+    private void PrepareRoamingCandidate(NativePathCommand command)
+    {
+        if (_roamingCandidates.Count != 0 || _roamingCandidates.ContainsKey(command.CandidateId))
+            throw new InvalidOperationException("another Windows roaming candidate is already active");
+        if (!_roamingObservations.TryGetValue(command.Path.UpdateId, out var observation)
+            || observation.Generation != command.Generation
+            || observation.PathIdentity != PathIdentity(command.Path))
+            throw new InvalidOperationException("Windows roaming PREPARE does not match an observation");
+
+        string[] next = command.Path.ResolvedAddresses
+            .Select(item => IPAddress.Parse(item.Address).ToString())
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        string[] union = observation.CarrierAddresses.Concat(next)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        NetworkConfigurator.RoamingRouteLease? routes = null;
+        if (_useWinDivert)
+        {
+            if (_tun is not WinDivertAdapter)
+                throw new InvalidOperationException("WinDivert roaming adapter is not active");
+        }
+        else
+        {
+            routes = (_net ?? throw new InvalidOperationException(
+                "Windows network configurator is not active")).PrepareRoamingRoutes(command.Path);
+        }
+
+        var candidate = new RoamingCandidate
+        {
+            Generation = command.Generation,
+            CandidateId = command.CandidateId,
+            UpdateId = command.Path.UpdateId,
+            PathIdentity = observation.PathIdentity,
+            Config = observation.Config,
+            OldCarriers = observation.CarrierAddresses,
+            NewCarriers = next,
+            UnionCarriers = union,
+            PolicyCarriers = observation.CarrierAddresses,
+            Routes = routes,
+        };
+        try
+        {
+            SetCandidatePolicy(candidate, union);
+        }
+        catch (Exception setupError)
+        {
+            var rollbackFailures = new List<Exception>();
+            try { routes?.Abort(); }
+            catch (Exception error) { rollbackFailures.Add(error); }
+            try { SetCandidatePolicy(candidate, candidate.OldCarriers); }
+            catch (Exception error) { rollbackFailures.Add(error); }
+            if (rollbackFailures.Count != 0)
+            {
+                rollbackFailures.Insert(0, setupError);
+                throw new AggregateException(
+                    "Windows roaming PREPARE and rollback both failed", rollbackFailures);
+            }
+            throw;
+        }
+        _roamingCandidates.Add(command.CandidateId, candidate);
+        Log($"Windows roaming PREPARE {command.CandidateId}: interface "
+            + $"{command.Path.InterfaceIndex}, carriers {string.Join(", ", union)}");
+    }
+
+    private void BindRoamingCandidate(NativePathCommand command)
+    {
+        RoamingCandidate candidate = GetCandidate(command);
+        if (candidate.Bound)
+            throw new InvalidOperationException("Windows roaming candidate socket is already bound");
+        uint ifIndex = command.Path.InterfaceIndex
+            ?? throw new InvalidOperationException("Windows roaming BIND has no interface index");
+        long socket = command.SocketHandle
+            ?? throw new InvalidOperationException("Windows roaming BIND has no socket handle");
+        WindowsRoamingSocket.Bind(socket, ifIndex,
+            command.Path.LocalAddresses.Select(IPAddress.Parse).ToArray());
+        candidate.Bound = true;
+        Log($"Windows roaming BIND {command.CandidateId}: SOCKET {socket} -> if {ifIndex}");
+    }
+
+    private void CommitRoamingCandidate(NativePathCommand command)
+    {
+        RoamingCandidate candidate = GetCandidate(command);
+        if (!candidate.Bound)
+            throw new InvalidOperationException("Windows roaming COMMIT arrived before BIND");
+        SetCandidatePolicy(candidate, candidate.NewCarriers);
+        try { candidate.Routes?.Commit(); }
+        catch (Exception routeError)
+        {
+            try { SetCandidatePolicy(candidate, candidate.UnionCarriers); }
+            catch (Exception policyError)
+            {
+                throw new AggregateException(
+                    "Windows roaming route commit and policy rollback both failed",
+                    routeError, policyError);
+            }
+            throw;
+        }
+        _roamingCandidates.Remove(candidate.CandidateId);
+        _roamingObservations.Remove(candidate.UpdateId);
+        Log($"Windows roaming COMMIT {candidate.CandidateId}: "
+            + string.Join(", ", candidate.NewCarriers));
+    }
+
+    private void AbortRoamingCandidate(NativePathCommand command)
+    {
+        RoamingCandidate candidate = GetCandidate(command);
+        AbortCandidate(candidate);
+        _roamingCandidates.Remove(candidate.CandidateId);
+        _roamingObservations.Remove(candidate.UpdateId);
+        Log($"Windows roaming ABORT {candidate.CandidateId}");
+    }
+
+    private void AbortCandidate(RoamingCandidate candidate)
+    {
+        var failures = new List<Exception>();
+        try { candidate.Routes?.Abort(); }
+        catch (Exception error) { failures.Add(error); }
+        try { SetCandidatePolicy(candidate, candidate.OldCarriers); }
+        catch (Exception error) { failures.Add(error); }
+        if (failures.Count != 0)
+            throw new AggregateException("Windows roaming rollback failed", failures);
+    }
+
+    private RoamingCandidate GetCandidate(NativePathCommand command)
+    {
+        if (!_roamingCandidates.TryGetValue(command.CandidateId, out var candidate)
+            || candidate.Generation != command.Generation
+            || candidate.PathIdentity != PathIdentity(command.Path))
+            throw new InvalidOperationException("Windows roaming command is stale or mismatched");
+        return candidate;
+    }
+
+    private void SetCandidatePolicy(RoamingCandidate candidate, string[] next)
+    {
+        if (_tun is WinDivertAdapter divert)
+        {
+            divert.SetCarrierAddresses(next.Select(IPAddress.Parse),
+                candidate.Config.Port, candidate.Config.Protocol);
+        }
+        else if (EgressGuardEngaged)
+        {
+            KillSwitch.UpdateServerAddresses(candidate.PolicyCarriers, next, Log);
+        }
+        candidate.PolicyCarriers = next;
+    }
+
+    private static string PathIdentity(NativePathUpdate path) =>
+        JsonSerializer.Serialize(path);
 
     protected override void PrepareTransport(VpnConfig config) =>
         _useWinDivert = config.UsesAppFilter;
@@ -63,27 +321,42 @@ public sealed class VpnTunnel : VpnTunnelBase
         });
     }
 
-    protected override void SetupTun(VpnConfig config, Session session, IPAddress serverIp)
+    protected override void SetupTun(VpnConfig config, Session session, IPAddress serverIp,
+        IReadOnlyList<IPAddress> carrierCandidates,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+        var assigned = session.NetworkAddresses;
         // persist-tun: reuse only when the complete applied network-plan fingerprint matches;
         // the same client IP can arrive with different routes, DNS, prefix or MTU.
         if (ReusePersistedTun(config, session, serverIp))
         {
             if (_tun is WinDivertAdapter retained)
             {
+                var retainedIpv4 = assigned.FirstOrDefault(address =>
+                    address.Family.Equals("ipv4", StringComparison.OrdinalIgnoreCase));
+                var retainedIpv6 = assigned.FirstOrDefault(address =>
+                    address.Family.Equals("ipv6", StringComparison.OrdinalIgnoreCase));
                 retained.Reconfigure(
-                    IPAddress.Parse(session.ClientIp),
-                    EffectiveDns(config, session),
+                    retainedIpv4 == null ? null : IPAddress.Parse(retainedIpv4.Address),
+                    retainedIpv6 == null ? null : IPAddress.Parse(retainedIpv6.Address),
+                    config.Apps,
+                    config.AppsMode.Equals("include", StringComparison.OrdinalIgnoreCase),
+                    EffectiveDns(session),
+                    session.AllowIpv4Leak,
+                    session.AllowIpv6Leak,
                     config.IsFullTunnel,
-                    session.Prefix,
+                    ConnectedTunnelPrefixes(session),
                     config.RouteLocalNetworks,
-                    config.IncludeRoutes.Concat(EffectiveRouteFileRoutes(config, session)),
+                    config.IncludeRoutes.Concat(EffectiveRouteFileRoutes(session)),
                     config.ExcludeRoutes,
-                    PushedRouteCidrs(session.RoutesJson),
+                    PushedRouteCidrs(session.PlannedRoutes),
                     serverIp,
                     config.Port,
                     config.Protocol,
-                    EffectiveMtu(config.Mtu, session.PushedMtu));
+                    EffectiveMtu(config.Mtu, session.PushedMtu),
+                    physicalLocalRoutes:
+                        RouteLocalPolicy.DiscoverConnectedRfc1918Prefixes(log: Log));
                 retained.SetTunnelUp(true);
             }
             return;
@@ -92,24 +365,33 @@ public sealed class VpnTunnel : VpnTunnelBase
         if (_useWinDivert)
         {
             _net = null;
+            var ipv4 = assigned.FirstOrDefault(address =>
+                address.Family.Equals("ipv4", StringComparison.OrdinalIgnoreCase));
+            var ipv6 = assigned.FirstOrDefault(address =>
+                address.Family.Equals("ipv6", StringComparison.OrdinalIgnoreCase));
             var adapter = new WinDivertAdapter(
-                IPAddress.Parse(session.ClientIp),
+                ipv4 == null ? null : IPAddress.Parse(ipv4.Address),
+                ipv6 == null ? null : IPAddress.Parse(ipv6.Address),
                 config.Apps,
                 includeMode: config.AppsMode.Equals("include", StringComparison.OrdinalIgnoreCase),
-                dnsServers: EffectiveDns(config, session),
-                allowIpv6Leak: config.AllowIpv6Leak,
+                dnsServers: EffectiveDns(session),
+                allowIpv4Leak: session.AllowIpv4Leak,
+                allowIpv6Leak: session.AllowIpv6Leak,
                 fullTunnel: config.IsFullTunnel,
-                clientPrefix: session.Prefix,
+                tunnelSubnets: ConnectedTunnelPrefixes(session),
                 routeLocal: config.RouteLocalNetworks,
-                includeRoutes: config.IncludeRoutes.Concat(EffectiveRouteFileRoutes(config, session)),
+                includeRoutes: config.IncludeRoutes.Concat(EffectiveRouteFileRoutes(session)),
                 excludeRoutes: config.ExcludeRoutes,
-                pushedRoutes: PushedRouteCidrs(session.RoutesJson),
+                pushedRoutes: PushedRouteCidrs(session.PlannedRoutes),
                 carrierIp: serverIp,
                 carrierPort: config.Port,
                 carrierProtocol: config.Protocol,
                 tunnelMtu: EffectiveMtu(config.Mtu, session.PushedMtu),
-                log: Log);
+                log: Log,
+                physicalLocalRoutes:
+                    RouteLocalPolicy.DiscoverConnectedRfc1918Prefixes(log: Log));
             adapter.Open();
+            cancellationToken.ThrowIfCancellationRequested();
             adapter.SetTunnelUp(true);
             _tun = adapter;
             Log($"Per-app split tunnel ACTIVE: mode={config.AppsMode}, apps={config.Apps.Count}; "
@@ -118,8 +400,20 @@ public sealed class VpnTunnel : VpnTunnelBase
         }
 
         _net = new NetworkConfigurator(Log);
-        uint physicalIf = _net.PhysicalIfIndexFor(serverIp);
-        var gateway = _net.FindGatewayFor(serverIp);
+        // Resolve every possible A/AAAA carrier path before the /1 or /0 capture routes
+        // exist. The Rust core can select any candidate on a later reconnect; pinning
+        // only the first authenticated peer would let another candidate recurse into
+        // Wintun after DNS rotation.
+        var carrierPaths = carrierCandidates
+            .Distinct()
+            .Select(address =>
+            {
+                var path = _net.PhysicalPathFor(address);
+                return (address,
+                    ifIndex: path.ifIndex,
+                    gateway: path.gateway);
+            })
+            .ToArray();
         // Resolve every bypass before installing the /1 capture routes. IPv4 and IPv6
         // commonly leave through different gateways; reusing the carrier's IPv4 path made
         // an IPv6 exclude syntactically accepted but impossible to install.
@@ -156,11 +450,28 @@ public sealed class VpnTunnel : VpnTunnelBase
         Log($"Wintun adapter '{alias}' (if {tunIndex}, driver {drv >> 16}.{drv & 0xFF})");
         TunIfIndex = tunIndex;
         _tun = wintun;
+        var localCaptureRoutes = config.RouteLocalNetworks
+            && assigned.Any(address => address.Family == "ipv4")
+            ? RouteLocalPolicy.BuildCapturePrefixes(
+                RouteLocalPolicy.DiscoverConnectedRfc1918Prefixes(alias, tunIndex, Log),
+                config.ExcludeRoutes)
+            : Array.Empty<string>();
 
-        _net.SetAddress(alias, session.ClientIp, session.Prefix);
+        foreach (var address in assigned)
+            _net.SetAddress(alias, address.Address, address.PrefixLength);
+        var connectedPrefixes = ConnectedTunnelPrefixes(session);
+        foreach (var cidr in connectedPrefixes)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!_net.AddOnLinkRoute(cidr, session.ClientIp, tunIndex))
+                throw new InvalidOperationException(
+                    $"connected tunnel prefix {cidr} was not applied");
+        }
         int mtu = EffectiveMtu(config.Mtu, session.PushedMtu);  // explicit > pushed > 1400
         Log($"TUN MTU: {mtu}");
-        _net.SetMtu(alias, mtu);
+        _net.SetMtu(alias, mtu,
+            assigned.Any(address => address.Family == "ipv4"),
+            assigned.Any(address => address.Family == "ipv6"));
         // Prefer the tunnel over any competing VPN/NIC. Explicit InterfaceMetric wins;
         // full-tunnel defaults to metric 1 so 0.0.0.0/1 routes actually carry traffic.
         int metric = config.InterfaceMetric > 0 ? config.InterfaceMetric
@@ -176,62 +487,106 @@ public sealed class VpnTunnel : VpnTunnelBase
         // (issue #69).
         if (!string.IsNullOrEmpty(config.LocalAddress))
             Log($"local = {config.LocalAddress}: not pinning the server route — carrier follows the bound interface's routing");
-        else if (_net.IsServerOnLink(serverIp))
-            // Server is on the same subnet as the client (on-link). The connected-subnet route
-            // already keeps the carrier off the tunnel; pinning it via the gateway would make the
-            // path asymmetric and stall the tunnel on a same-LAN setup (see TROUBLESHOOTING §6.8).
-            Log($"server {serverIp} is on-link (same subnet) — not pinning via the gateway; the connected route keeps the carrier off the tunnel");
-        else if (gateway != null && physicalIf != 0)
-            _net.PinServerRoute(serverIp, gateway, physicalIf);
         else
-            Log("WARN: could not determine physical gateway; full-tunnel may loop");
+        {
+            foreach (var (address, ifIndex, gateway) in carrierPaths)
+            {
+                if (ifIndex != 0)
+                    _net.PinServerRoute(address, gateway, ifIndex);
+                else if (config.IsFullTunnel)
+                {
+                    throw new InvalidOperationException(
+                        $"carrier {address} has no usable physical path in full-tunnel mode");
+                }
+                else
+                {
+                    Log($"WARN: could not determine a physical path for carrier {address}");
+                }
+            }
+        }
 
         if (config.IsFullTunnel)
         {
-            _net.SetFullTunnelRoutes(session.ClientIp, tunIndex);
-            // Capture IPv6 into the (IPv4-only) tunnel to close the dual-stack leak (E2),
-            // unless the user opted out via allow_ipv6_leak to keep native IPv6.
-            if (!config.AllowIpv6Leak)
+            var ipv4 = assigned.FirstOrDefault(address => address.Family == "ipv4");
+            var ipv6 = assigned.FirstOrDefault(address => address.Family == "ipv6");
+            if (ipv4 != null)
+                _net.SetFullTunnelRoutes(TunnelGatewayForRoute(session, "0.0.0.0/0"), tunIndex);
+            else if (!session.AllowIpv4Leak)
+            {
+                const string sink = "169.254.71.1";
+                _net.SetAddress(alias, sink, 32);
+                _net.SetFullTunnelRoutes(sink, tunIndex);
+            }
+            if (ipv6 != null)
+                _net.SetFullTunnelRoutesV6(alias);
+            else if (!session.AllowIpv6Leak)
                 _net.CaptureIPv6(alias);
         }
         else if (!session.PlanIncludesClientRoutes)
         {
-            foreach (var r in config.IncludeRoutes) _net.AddRoute(r, session.ClientIp, tunIndex);
+            foreach (var r in config.IncludeRoutes)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!_net.AddRoute(r, TunnelGatewayForRoute(session, r), tunIndex))
+                    throw new InvalidOperationException($"include route {r} was not applied");
+            }
         }
         if (!config.IsFullTunnel)
-            foreach (var r in EffectiveRouteFileRoutes(config, session))
-                _net.AddRoute(r, session.ClientIp, tunIndex);  // OpenVPN route-file
+            ApplyRouteFileRoutes(session, tunIndex, cancellationToken);
 
         // Subnets the server advertised (`route = …` on the profile / per-user) are a
         // specific, explicit admin decision — always honoured, like OpenVPN's
         // `push "route …"`. Until 0.7.12 these sat behind RouteLocalNetworks, so a
         // correctly configured route was silently dropped on every default client.
-        ApplyPushedRoutes(session.RoutesJson, session.ClientIp, tunIndex);
+        ApplyPushedRoutes(session, tunIndex, connectedPrefixes, cancellationToken);
 
         // RouteLocalNetworks gates only the BLANKET RFC1918 pull, which stays off by
         // default because it would hijack the machine's own LAN (printers, NAS, router).
         if (config.RouteLocalNetworks && !session.PlanIncludesClientRoutes)
         {
             foreach (var r in new[] { "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16" })
-                _net.AddRoute(r, session.ClientIp, tunIndex);
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!_net.AddRoute(r, TunnelGatewayForRoute(session, r), tunIndex))
+                    throw new InvalidOperationException($"route_local route {r} was not applied");
+            }
             Log("Routing local networks (RFC1918 blanket) through the tunnel");
         }
+
+        foreach (string route in localCaptureRoutes)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!_net.AddRoute(route, TunnelGatewayForRoute(session, route), tunIndex))
+                throw new InvalidOperationException(
+                    $"route_local connected-prefix override {route} was not applied");
+        }
+        if (localCaptureRoutes.Count > 0)
+            Log($"route_local: {localCaptureRoutes.Count} connected-prefix override route(s) "
+                + "installed without replacing physical routes");
 
         // Exclude: carve these destinations out of the tunnel. Route them via the physical
         // gateway so exclusion works even in full-tunnel (a plain delete is a no-op there);
         // fall back to a delete only when the gateway is unknown (split-tunnel).
         foreach (var (r, path) in bypassPaths)
         {
-            if (path.gateway != null && path.ifIndex != 0)
+            if (path.ifIndex != 0)
                 _net.PinBypassRoute(r, path.gateway, path.ifIndex);
-            else _net.DeleteRoute(r);
+            else if (config.IsFullTunnel)
+                throw new InvalidOperationException(
+                    $"exclude route {r} has no usable physical path in full-tunnel mode");
+            else
+                _net.DeleteRoute(r);
         }
 
         // #13: pure L3 forwarding for a LAN BEHIND this Windows node (no NAT), so the far
         // side can route to it through the tunnel. Best-effort per-interface enable.
-        if (config.Forward) EnableIpForwarding(alias);
+        if (config.Forward)
+            EnableIpForwarding(
+                alias,
+                assigned.Any(address => address.Family == "ipv4"),
+                assigned.Any(address => address.Family == "ipv6"));
 
-        _net.SetDns(alias, EffectiveDns(config, session));
+        _net.SetDns(alias, EffectiveDns(session));
 
         // LAST step of bring-up: ask the OS whether the carrier still leaves via the
         // physical interface. Everything above only proved the commands were issued; this
@@ -239,82 +594,181 @@ public sealed class VpnTunnel : VpnTunnelBase
         // Skipped when `local` binds the carrier elsewhere (e.g. through another VPN) —
         // there the user owns the path and the server route is deliberately not pinned. (C-17)
         if (string.IsNullOrEmpty(config.LocalAddress))
-            _net.VerifyCarrierPath(serverIp, tunIndex);
+            foreach (var path in carrierPaths)
+                _net.VerifyCarrierPath(
+                    path.address, tunIndex, path.ifIndex, path.gateway);
     }
 
-    /// <summary>Enable IPv4 forwarding on the tunnel interface (no NAT) for a LAN behind this
-    /// node (#13). Best-effort. Note: for the LAN→tunnel direction the admin may also need
-    /// forwarding on the LAN NIC (or the global IPEnableRouter). Runs elevated already.</summary>
-    private void EnableIpForwarding(string alias)
+    private string? _forwardingAlias;
+    private bool? _ipv4ForwardingWasOn;
+    private bool? _ipv6ForwardingWasOn;
+
+    /// <summary>Enable forwarding only for address families present in the authenticated
+    /// NetworkPlan and retain their original values for teardown. A requested forwarding mode
+    /// is part of the plan, so a failed command aborts setup instead of reporting a feature
+    /// that is not active.</summary>
+    private void EnableIpForwarding(string alias, bool hasIpv4, bool hasIpv6)
     {
+        bool? ipv4WasOn = hasIpv4 ? ReadIpForwarding(alias, "IPv4") : null;
+        bool? ipv6WasOn = hasIpv6 ? ReadIpForwarding(alias, "IPv6") : null;
+        _forwardingAlias = alias;
+        _ipv4ForwardingWasOn = ipv4WasOn;
+        _ipv6ForwardingWasOn = ipv6WasOn;
         try
         {
-            // Absolute path, not a bare name — see SystemPaths. (Audit 2026-08-04, H-05.)
-            var psi = new System.Diagnostics.ProcessStartInfo(SystemPaths.Netsh,
-                $"interface ipv4 set interface \"{alias}\" forwarding=enabled")
-            {
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-                WorkingDirectory = SystemPaths.SystemDirectory,
-            };
-            using var p = System.Diagnostics.Process.Start(psi);
-            p?.WaitForExit(3000);
-            Log($"IP forwarding enabled on '{alias}' (no NAT). For LAN->tunnel routing enable " +
+            if (ipv4WasOn == false) SetIpForwarding(alias, "ipv4", enabled: true);
+            if (ipv6WasOn == false) SetIpForwarding(alias, "ipv6", enabled: true);
+            string families = hasIpv4 && hasIpv6 ? "IPv4 and IPv6" : hasIpv4 ? "IPv4" : "IPv6";
+            Log($"{families} forwarding enabled on '{alias}' (no NAT). For LAN->tunnel routing enable " +
                 "forwarding on the LAN NIC too (netsh …forwarding=enabled) or set IPEnableRouter.");
         }
-        catch (Exception e) { Log($"WARN: could not enable IP forwarding: {e.Message}"); }
+        catch (Exception setupError)
+        {
+            try { RestoreIpForwarding(); }
+            catch (Exception rollbackError)
+            {
+                throw new InvalidOperationException(
+                    $"could not enable IP forwarding ({setupError.Message}); rollback also failed: {rollbackError.Message}",
+                    setupError);
+            }
+            throw new InvalidOperationException($"could not enable IP forwarding: {setupError.Message}", setupError);
+        }
     }
 
-    private void ApplyPushedRoutes(string routesJson, string clientIp, uint tunIndex)
+    private static bool ReadIpForwarding(string alias, string family)
     {
-        if (string.IsNullOrWhiteSpace(routesJson) || routesJson == "[]") return;
-        try
+        string escapedAlias = alias.Replace("'", "''", StringComparison.Ordinal);
+        string script =
+            $"$v=(Get-NetIPInterface -InterfaceAlias '{escapedAlias}' -AddressFamily {family} -ErrorAction Stop).Forwarding;" +
+            "[Console]::Out.Write($v.ToString())";
+        var psi = new System.Diagnostics.ProcessStartInfo(SystemPaths.PowerShell)
         {
-            if (JsonNode.Parse(routesJson) is JsonArray arr)
-                foreach (var n in arr)
-                {
-                    string cidr = (n?["cidr"] as JsonValue)?.GetValue<string>() ?? "";
-                    if (cidr.Length == 0)
-                    {
-                        Log("pushed route IGNORED: empty CIDR (fix the server's `route =` line)");
-                        continue;
-                    }
-                    // Report the route EXACTLY as it arrived, then what actually happened to it.
-                    // Our routes are interface-scoped (CreateIpForwardEntry2 against the tun's
-                    // index), so a pushed next-hop/metric cannot be honoured — traffic enters the
-                    // tunnel and the server forwards it, which reaches the same place.
-                    string gw = (n?["gateway"] as JsonValue)?.GetValue<string>() ?? "";
-                    string mt = n?["metric"]?.ToString() ?? "";
-                    string got = cidr
-                               + (gw.Length > 0 ? $" gateway={gw}" : "")
-                               + (mt.Length > 0 && mt != "0" ? $" metric={mt}" : "");
-                    _net!.AddRoute(cidr, clientIp, tunIndex);
-                    Log(gw.Length > 0 || (mt.Length > 0 && mt != "0")
-                        ? $"pushed route: {got} -> APPLIED via the tunnel interface (next-hop/metric not settable here)"
-                        : $"pushed route: {got} -> APPLIED via the tunnel interface");
-                }
-        }
-        catch (Exception e) { Log($"routes parse error: {e.Message}"); }
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+            WorkingDirectory = SystemPaths.SystemDirectory,
+        };
+        psi.ArgumentList.Add("-NoLogo");
+        psi.ArgumentList.Add("-NoProfile");
+        psi.ArgumentList.Add("-NonInteractive");
+        psi.ArgumentList.Add("-EncodedCommand");
+        psi.ArgumentList.Add(Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(script)));
+        var result = RunForwardingCommand(psi, $"query {family} forwarding on '{alias}'");
+        return result.Trim() switch
+        {
+            "Enabled" => true,
+            "Disabled" => false,
+            var value => throw new InvalidOperationException(
+                $"unexpected {family} forwarding state '{value}' on '{alias}'"),
+        };
     }
 
-    private static IReadOnlyList<string> PushedRouteCidrs(string routesJson)
+    private static void SetIpForwarding(string alias, string family, bool enabled)
     {
-        var routes = new List<string>();
-        if (string.IsNullOrWhiteSpace(routesJson) || routesJson == "[]") return routes;
-        try
+        var psi = new System.Diagnostics.ProcessStartInfo(SystemPaths.Netsh)
         {
-            if (JsonNode.Parse(routesJson) is JsonArray arr)
-                foreach (var node in arr)
-                {
-                    string cidr = (node?["cidr"] as JsonValue)?.GetValue<string>() ?? "";
-                    if (cidr.Length > 0) routes.Add(cidr);
-                }
-        }
-        catch { }
-        return routes;
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+            WorkingDirectory = SystemPaths.SystemDirectory,
+        };
+        foreach (var argument in new[]
+        {
+            "interface", family, "set", "interface", alias,
+            $"forwarding={(enabled ? "enabled" : "disabled")}",
+        }) psi.ArgumentList.Add(argument);
+        _ = RunForwardingCommand(psi,
+            $"set {family} forwarding {(enabled ? "enabled" : "disabled")} on '{alias}'");
     }
+
+    private static string RunForwardingCommand(
+        System.Diagnostics.ProcessStartInfo startInfo, string operation)
+    {
+        using var process = System.Diagnostics.Process.Start(startInfo)
+            ?? throw new InvalidOperationException($"failed to start process to {operation}");
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
+        if (!process.WaitForExit(5_000))
+        {
+            try { process.Kill(entireProcessTree: true); } catch { }
+            throw new TimeoutException($"timed out while trying to {operation}");
+        }
+        string output = stdout.GetAwaiter().GetResult();
+        string error = stderr.GetAwaiter().GetResult();
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"failed to {operation} (exit {process.ExitCode}): " +
+                (string.IsNullOrWhiteSpace(error) ? output.Trim() : error.Trim()));
+        return output;
+    }
+
+    private void RestoreIpForwarding()
+    {
+        string? alias = _forwardingAlias;
+        if (alias == null) return;
+        if (_ipv4ForwardingWasOn == false) SetIpForwarding(alias, "ipv4", enabled: false);
+        if (_ipv6ForwardingWasOn == false) SetIpForwarding(alias, "ipv6", enabled: false);
+        _forwardingAlias = null;
+        _ipv4ForwardingWasOn = null;
+        _ipv6ForwardingWasOn = null;
+    }
+
+    private void ApplyRouteFileRoutes(Session session, uint tunIndex,
+        CancellationToken cancellationToken)
+    {
+        int installed = 0;
+        foreach (string route in EffectiveRouteFileRoutes(session))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!_net!.AddRoute(route, TunnelGatewayForRoute(session, route), tunIndex,
+                logSuccess: false))
+                throw new InvalidOperationException($"route_file route {route} was not applied");
+            installed++;
+        }
+        if (installed > 0)
+            Log($"route_file: installed {installed} unique route(s) via the tunnel gateway");
+    }
+
+    private void ApplyPushedRoutes(Session session, uint tunIndex,
+        IReadOnlyList<string> alreadyApplied, CancellationToken cancellationToken)
+    {
+        IReadOnlyList<PlannedRoute> routes = session.PlannedRoutes;
+        if (routes.Count == 0) return;
+        var seen = new HashSet<string>(alreadyApplied, StringComparer.OrdinalIgnoreCase);
+        foreach (var route in routes)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!seen.Add(route.Cidr)) continue;
+            string got = route.Cidr
+                + (route.Gateway.Length > 0 ? $" gateway={route.Gateway}" : "")
+                + (route.Metric != 0 ? $" metric={route.Metric}" : "");
+            string gateway = TunnelGatewayForRoute(session, route.Cidr, route.Gateway);
+            if (!_net!.AddRoute(route.Cidr, gateway, tunIndex))
+                throw new InvalidOperationException(
+                    $"canonical NetworkPlan route {route.Cidr} was not applied");
+            Log(route.Metric != 0
+                ? $"pushed route: {got} -> APPLIED via tunnel gateway {gateway} (metric not settable here)"
+                : $"pushed route: {got} -> APPLIED via tunnel gateway {gateway}");
+        }
+    }
+
+    private static string TunnelGatewayForRoute(Session session, string cidr,
+        string? requestedGateway = null)
+    {
+        bool ipv6 = cidr.Contains(':');
+        if (!string.IsNullOrWhiteSpace(requestedGateway)) return requestedGateway;
+        AssignedAddress? assigned = session.NetworkAddresses.FirstOrDefault(address =>
+            address.Family.Equals(ipv6 ? "ipv6" : "ipv4", StringComparison.OrdinalIgnoreCase));
+        if (assigned == null || string.IsNullOrWhiteSpace(assigned.Gateway))
+            throw new InvalidOperationException(
+                $"no authenticated tunnel gateway for route {cidr}");
+        return assigned.Gateway;
+    }
+
+    private static IReadOnlyList<string> PushedRouteCidrs(IReadOnlyList<PlannedRoute> routes) =>
+        routes.Select(route => route.Cidr).ToArray();
 
     protected override bool KeepTunDuringReconnect(VpnConfig config) =>
         config.UsesAppFilter || base.KeepTunDuringReconnect(config);
@@ -363,6 +817,7 @@ public sealed class VpnTunnel : VpnTunnelBase
 
     protected override void BeforeTunDispose()
     {
+        RestoreIpForwarding();
         // DNS belongs to the Wintun interface, so reset it before its last handle closes.
         // Retain the configurator on failure; CleanupPlatform below then retries and makes
         // the base lifecycle report Error instead of a false clean disconnect.
@@ -373,17 +828,28 @@ public sealed class VpnTunnel : VpnTunnelBase
 
     protected override void CleanupPlatform()
     {
-        // A prewarmed adapter that SetupTun never consumed (handshake failed before it ran)
-        // would otherwise leak a Wintun device — dispose it. Once consumed, _prewarm is null,
-        // so the live adapter (now _tun) is disposed by the base, not here.
-        if (_prewarm != null)
+        Exception? roamingCleanupError = null;
+        try { ResetNativeRoamingPath(); }
+        catch (Exception error) { roamingCleanupError = error; }
+        // Retry here if the pre-dispose restore failed; CleanupPlatform exceptions are
+        // surfaced by the shared lifecycle instead of claiming a clean disconnect.
+        try
         {
-            try { _prewarm.GetAwaiter().GetResult()?.Dispose(); } catch { }
-            _prewarm = null;
+            RestoreIpForwarding();
+            // A firewall rule may still name an unconsumed adapter after a partial engage.
+            // Keep that alias alive until KillSwitchDisengage has removed the rule.
+            if (!EgressGuardEngaged) DisposeUnusedPrewarm();
+            var network = _net;
+            network?.Dispose();
+            if (ReferenceEquals(_net, network)) _net = null;
         }
-        var network = _net;
-        network?.Dispose();
-        if (ReferenceEquals(_net, network)) _net = null;
+        catch (Exception platformError) when (roamingCleanupError != null)
+        {
+            throw new AggregateException(
+                "Windows roaming and platform cleanup both failed",
+                roamingCleanupError, platformError);
+        }
+        if (roamingCleanupError != null) throw roamingCleanupError;
     }
 
     // Firewall kill-switch (full-tunnel only). Allow the Wintun adapter by its
@@ -398,10 +864,21 @@ public sealed class VpnTunnel : VpnTunnelBase
     // adapter did not exist yet always failed — and fail-closed then refused to start the
     // profile at all. Bringing the adapter up here costs nothing extra: SetupTun consumes
     // exactly this prewarmed adapter (same name + GUID), so nothing is created twice.
+    protected override bool KillSwitchEngageFailureRetainsOwnership(Exception error) =>
+        error is AggregateException;
     protected override void KillSwitchEngage(VpnConfig config)
     {
-        EnsureTunAdapterExists(config);
-        KillSwitch.Engage(config.ServerAddress, AdapterIdentity(config).name, Log);
+        try
+        {
+            string actualAlias = EnsureTunAdapterExists(config);
+            KillSwitch.Engage(config.ServerAddress, actualAlias, Log);
+        }
+        catch (AggregateException) { throw; }
+        catch
+        {
+            DisposeUnusedPrewarm();
+            throw;
+        }
     }
 
     protected override void CarrierAddressesChanging(
@@ -415,18 +892,36 @@ public sealed class VpnTunnel : VpnTunnelBase
     /// it. Reuses the ordinary prewarm path (idempotent — SetupTun still consumes the warmed
     /// adapter). Throws with an actionable message when it cannot be created, so the caller's
     /// fail-closed path reports the real cause instead of an opaque firewall error.</summary>
-    private void EnsureTunAdapterExists(VpnConfig config)
+    private string EnsureTunAdapterExists(VpnConfig config)
     {
-        if (_tun != null) return;   // a persisted adapter is already up — nothing to create
+        if (_tun is WintunAdapter live && !string.IsNullOrWhiteSpace(live.AdapterName))
+            return live.AdapterName;
         PrewarmTun(config);         // no-op when a warm is already in flight
         WintunAdapter? warmed = null;
         try { warmed = _prewarm?.GetAwaiter().GetResult(); } catch { /* reported just below */ }
-        if (warmed == null)
+        if (warmed == null || string.IsNullOrWhiteSpace(warmed.AdapterName))
             throw new InvalidOperationException(
                 "the Wintun adapter could not be created, so no firewall rule can name it " +
                 "(Windows rejects a rule for a missing interface). Check that the Wintun driver " +
                 "loads and that qeli is running elevated.");
+        // WintunAdapter.Open may have resolved a name/GUID collision by creating name-0,
+        // name-1, ... . Firewall and WinDivert rules must use this actual alias, never the
+        // precomputed profile identity that collided.
+        return warmed.AdapterName;
     }
 
-    protected override void KillSwitchDisengage() => KillSwitch.Disengage(Log);
+    private void DisposeUnusedPrewarm()
+    {
+        var prewarm = _prewarm;
+        if (prewarm == null) return;
+        try { prewarm.GetAwaiter().GetResult()?.Dispose(); } catch { }
+        if (ReferenceEquals(_prewarm, prewarm)) _prewarm = null;
+    }
+
+    protected override void KillSwitchDisengage()
+    {
+        // Remove firewall rules before releasing the adapter alias they name.
+        KillSwitch.Disengage(Log);
+        if (_tun == null) DisposeUnusedPrewarm();
+    }
 }

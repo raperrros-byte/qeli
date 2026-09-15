@@ -1,4 +1,4 @@
-<div x-data="transportHealthPage()" x-init="init()" @keydown.escape.window="closeDetails()">
+<div x-data="transportHealthPage" @keydown.escape.window="closeDetails()">
   <div class="flex flex-col lg:flex-row lg:items-end justify-between gap-4 mb-5">
     <div>
       <h2 class="text-lg font-bold text-white">Transport health</h2>
@@ -6,7 +6,7 @@
     </div>
     <div class="flex flex-wrap items-center gap-2">
       <input x-model.debounce.200ms="query" class="inp inp-compact w-52" type="search" placeholder="Search profiles" aria-label="Search profiles">
-      <select x-model="statusFilter" class="inp inp-compact w-40" aria-label="Filter by state">
+      <select x-model="statusFilter" class="inp inp-compact inp-fit" aria-label="Filter by state">
         <option value="all">All states</option>
         <option value="active">Active</option>
         <option value="ready">Ready</option>
@@ -98,10 +98,16 @@
               <div class="text-[10px] uppercase tracking-wide mb-2" style="color:var(--txt-dim)">Tunnel and routing</div>
               <dl class="diag-grid">
                 <dt>Device</dt><dd x-text="selectedProfile.tunnel.device"></dd>
-                <dt>Address / pool</dt><dd x-text="selectedProfile.tunnel.address + ' · ' + selectedProfile.tunnel.pool"></dd>
+                <dt>Inner IP mode</dt><dd x-text="selectedProfile.tunnel.ip_mode"></dd>
+                <dt x-show="selectedProfile.tunnel.ip_mode !== 'ipv6'">IPv4 address / pool</dt>
+                <dd x-show="selectedProfile.tunnel.ip_mode !== 'ipv6'" x-text="selectedProfile.tunnel.ipv4_address + ' · ' + selectedProfile.tunnel.ipv4_pool"></dd>
+                <dt x-show="selectedProfile.tunnel.ip_mode !== 'ipv4'">IPv6 address / pool</dt>
+                <dd x-show="selectedProfile.tunnel.ip_mode !== 'ipv4'" x-text="(selectedProfile.tunnel.ipv6_address || '—') + ' · ' + (selectedProfile.tunnel.ipv6_pool || '—')"></dd>
                 <dt>Queues</dt><dd x-text="selectedProfile.tunnel.queues===0 ? qeliT('Automatic') : selectedProfile.tunnel.queues"></dd>
                 <dt>TX queue</dt><dd x-text="selectedProfile.tunnel.tx_queue_len"></dd>
                 <dt>NAT</dt><dd x-text="yesNo(selectedProfile.routing.nat) + (selectedProfile.routing.nat ? ' · ' + selectedProfile.routing.nat_interface : '')"></dd>
+                <dt x-show="selectedProfile.tunnel.ip_mode !== 'ipv4'">IPv6 forwarding</dt>
+                <dd x-show="selectedProfile.tunnel.ip_mode !== 'ipv4'" x-text="selectedProfile.routing.ipv6_mode + (selectedProfile.routing.ipv6_interface ? ' · ' + selectedProfile.routing.ipv6_interface : ' · ' + qeliT('Automatic')) + (selectedProfile.routing.ipv6_ndp_proxy !== 'off' ? ' · NDP ' + selectedProfile.routing.ipv6_ndp_proxy + (selectedProfile.routing.ipv6_ndp_proxy_interface ? '/' + selectedProfile.routing.ipv6_ndp_proxy_interface : '') : '')"></dd>
                 <dt>Advertised routes</dt><dd x-text="selectedProfile.routing.advertised_routes"></dd>
               </dl>
             </section>
@@ -110,6 +116,8 @@
               <dl class="diag-grid">
                 <dt>DNS proxy</dt><dd x-text="yesNo(selectedProfile.dns.enabled)"></dd>
                 <dt>DNS listen</dt><dd x-text="selectedProfile.dns.listen + ':' + selectedProfile.dns.port"></dd>
+                <dt x-show="selectedProfile.dns.listen_ipv6">DNS listen IPv6</dt>
+                <dd x-show="selectedProfile.dns.listen_ipv6" x-text="'[' + selectedProfile.dns.listen_ipv6 + ']:' + selectedProfile.dns.port"></dd>
                 <dt>DNS upstreams</dt><dd x-text="selectedProfile.dns.upstreams.join(', ') || qeliT('None')"></dd>
                 <dt>Heartbeat</dt><dd x-text="selectedProfile.wire.heartbeat ? selectedProfile.wire.heartbeat_interval_ms + ' ms' : qeliT('Disabled')"></dd>
                 <dt>Fragmentation</dt><dd x-text="yesNo(selectedProfile.wire.fragmentation)"></dd>
@@ -141,6 +149,8 @@ function transportHealthPage() {
   return {
     profiles: [], summary: {}, workerOk: false, loading: false, error: '',
     query: '', statusFilter: 'all', selectedName: null, updatedAt: '', timer: null,
+    fmt(value) { return window.fmt ? window.fmt(value) : String(value); },
+    qeliT(value) { return window.qeliT ? window.qeliT(value) : value; },
     init() {
       this.refresh();
       this.timer = setInterval(() => { if (!document.hidden) this.refresh(true); }, 5000);
@@ -191,4 +201,5 @@ function transportHealthPage() {
     },
   };
 }
+document.addEventListener('alpine:init', () => Alpine.data('transportHealthPage', transportHealthPage));
 </script>

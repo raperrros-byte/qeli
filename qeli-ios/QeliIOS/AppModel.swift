@@ -43,8 +43,12 @@ final class AppModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var automaticUpdateChecked = false
     private var updateTask: Task<Void, Never>?
+    private var updateTaskIsAutomatic = false
+    private var updateCheckGeneration: UInt64 = 0
+    private var updateChecksSuspendedForTunnelTeardown = false
     private var queuedProbes: [Profile] = []
     private var queuedOrActiveProbeIDs = Set<UUID>()
+    private var startupSigningInvalid = false
     private var activeProbeCount = 0
     private static let maximumConcurrentProbes = 4
 
@@ -62,12 +66,24 @@ final class AppModel: ObservableObject {
         self.tunnelManager = TunnelManager(sharedStore: sharedTunnelStore)
         self.tunnelSnapshot = sharedTunnelStore.snapshot()
         self.logLines = sharedTunnelStore.logLines()
-        do {
-            self.archive = try profileStore.load()
-        } catch {
+        let missingSigningRequirements = IOSSigningDiagnostics.missingRequirements()
+        if !missingSigningRequirements.isEmpty {
             self.archive = .initial
-            self.alert = AppAlert(title: "Profile store error", message: error.localizedDescription,
-                                  isLiteralMessage: true)
+            self.startupSigningInvalid = true
+            self.alert = Self.invalidSigningAlert
+        } else {
+            do {
+                self.archive = try profileStore.load()
+            } catch {
+                self.archive = .initial
+                if (error as? KeychainError)?.isMissingEntitlement == true {
+                    self.startupSigningInvalid = true
+                    self.alert = Self.invalidSigningAlert
+                } else {
+                    self.alert = AppAlert(title: "Profile store error", message: error.localizedDescription,
+                                          isLiteralMessage: true)
+                }
+            }
         }
         profiles = archive.profiles
         if managedConfiguration.hasActiveProfilePolicy {
@@ -84,20 +100,24 @@ final class AppModel: ObservableObject {
         tunnelManager.$snapshot
             .receive(on: RunLoop.main)
             .sink { [weak self] value in
-                let previousPhase = self?.tunnelSnapshot.phase
-                self?.tunnelSnapshot = value
-                self?.logLines = sharedTunnelStore.logLines()
+                guard let self else { return }
+                let previousPhase = tunnelSnapshot.phase
+                tunnelSnapshot = value
+                logLines = sharedTunnelStore.logLines()
                 if previousPhase != value.phase {
                     WidgetCenter.shared.reloadTimelines(ofKind: AppConstants.statusWidgetKind)
                     if #available(iOS 18.0, *) {
                         ControlCenter.shared.reloadControls(ofKind: AppConstants.connectionControlKind)
                     }
                 }
-                if self?.hasPrivateUpdatePath != true {
-                    self?.updateTask?.cancel()
-                    self?.updateTask = nil
+                if !hasPrivateUpdatePath,
+                   (updateTask != nil || updateCheckState == .checking) {
+                    // Unexpected provider loss cannot be awaited here, but cancellation is
+                    // still delivered immediately. Code-driven stops use the awaited barrier
+                    // in cancelUpdateCheckBeforeTunnelTeardown() below.
+                    _ = cancelUpdateCheck(resetAutomatic: true)
                 }
-                self?.maybeCheckForUpdates()
+                maybeCheckForUpdates()
             }
             .store(in: &cancellables)
 
@@ -112,6 +132,7 @@ final class AppModel: ObservableObject {
 
         Task { [weak self] in
             guard let self else { return }
+            guard !startupSigningInvalid else { return }
             do {
                 try await tunnelManager.prepare()
                 tunnelSnapshot = tunnelManager.snapshot
@@ -130,6 +151,13 @@ final class AppModel: ObservableObject {
                 present(error, title: "VPN configuration")
             }
         }
+    }
+
+    private static var invalidSigningAlert: AppAlert {
+        AppAlert(
+            title: "Invalid iOS signing",
+            message: "This copy of Qeli is missing the Apple VPN, App Group or Keychain entitlements. Install a correctly signed build from TestFlight, the App Store, or an authorized Apple Developer team."
+        )
     }
 
     var activeProfile: Profile? {
@@ -191,10 +219,6 @@ final class AppModel: ObservableObject {
     @discardableResult
     func handleWidgetControlURL(_ url: URL) async -> Bool {
         guard WidgetControlBridge.isControlURL(url) else { return false }
-        if WidgetControlBridge.isStatusURL(url) { return true }
-        if let request = WidgetControlBridge.consume(url: url) {
-            await applyWidgetCommand(request.command)
-        }
         return true
     }
 
@@ -210,8 +234,9 @@ final class AppModel: ObservableObject {
             }
             return
         }
+        let previous = archive
         archive.activeProfileID = id
-        persistArchive()
+        persistArchive(rollbackTo: previous)
     }
 
     func saveProfile(id: UUID?, name: String, configText: String) throws {
@@ -283,14 +308,26 @@ final class AppModel: ObservableObject {
             alert = AppAlert(title: "Tunnel active", message: "Disconnect before deleting the active profile.")
             return
         }
+        let previous = archive
         archive.profiles.remove(at: index)
         archive.normalize()
-        persistArchive()
+        persistArchive(rollbackTo: previous)
     }
 
     func move(fromOffsets: IndexSet, toOffset: Int) {
+        let previous = archive
         archive.profiles.move(fromOffsets: fromOffsets, toOffset: toOffset)
-        persistArchive()
+        persistArchive(rollbackTo: previous)
+    }
+
+    func move(_ id: UUID, by offset: Int) {
+        guard abs(offset) == 1,
+              let source = archive.profiles.firstIndex(where: { $0.id == id }) else { return }
+        let destination = source + offset
+        guard archive.profiles.indices.contains(destination) else { return }
+        let previous = archive
+        archive.profiles.swapAt(source, destination)
+        persistArchive(rollbackTo: previous)
     }
 
     func updateSettings(_ update: (inout AppSettings) -> Void) {
@@ -311,7 +348,12 @@ final class AppModel: ObservableObject {
         let onDemandRevision = onDemandPolicyChanged
             ? tunnelManager.reserveOnDemandUpdate()
             : nil
-        if current.checkForUpdates { maybeCheckForUpdates() }
+        if current.checkForUpdates {
+            maybeCheckForUpdates()
+        } else {
+            // Turning the opt-in off revokes an in-flight automatic or manual request too.
+            _ = cancelUpdateCheck(resetAutomatic: true)
+        }
         Task {
             if let onDemandRevision {
                 do {
@@ -363,6 +405,10 @@ final class AppModel: ObservableObject {
                     revision: onDemandRevision
                 )
                 guard !effectiveSettings.connectionDesired else { return }
+                // URLSession is not bindable to a specific iOS packet-tunnel interface.
+                // Wait until its cancellation has completed before removing that interface,
+                // so DNS/connect cannot be retried on the physical default route.
+                await cancelUpdateCheckBeforeTunnelTeardown()
                 tunnelManager.disconnect()
                 return
             } catch is CancellationError {
@@ -408,9 +454,9 @@ final class AppModel: ObservableObject {
             // While THIS profile's tunnel is up, dialing the public endpoint measures a
             // looped-back path (or is carried by the tunnel it is probing) and reports a
             // meaningless RTT. Probe the tunnel gateway instead, like Android does.
-            let viaTunnel = tunnelSnapshot.phase == .connected && profile.id == activeProfileID
+            let viaTunnel = tunnelSnapshot.phase.isActive && profile.id == activeProfileID
             let host = viaTunnel
-                ? (tunnelSnapshot.clientAddress.flatMap(Self.gateway(forClientAddress:)) ?? config.serverAddress)
+                ? (tunnelSnapshot.tunnelGateway ?? config.serverAddress)
                 : config.serverAddress
             let milliseconds: Int
             if config.isUDP {
@@ -418,9 +464,16 @@ final class AppModel: ObservableObject {
                 // active tunnel, replace only that target with the in-tunnel gateway;
                 // probing the public UDP endpoint through itself is meaningless, while
                 // falling through to a TCP connect marks every UDP-only listener down.
-                var probeConfig = config
-                probeConfig.serverAddress = host
-                let profileText = try probeConfig.toINI()
+                let profileText: String
+                if viaTunnel {
+                    // Keep identity/SNI/REALITY credentials unchanged and replace only the
+                    // validated network endpoint used by the handle-free UDP probe.
+                    var probeConfig = config
+                    probeConfig.serverAddress = host
+                    profileText = try probeConfig.toTransportCoreINI()
+                } else {
+                    profileText = profile.configText
+                }
                 milliseconds = try await Task.detached(priority: .utility) {
                     Int(try QeliNativeCore.udpProbe(
                         config: profileText,
@@ -453,11 +506,11 @@ final class AppModel: ObservableObject {
         guard hasPrivateUpdatePath else {
             alert = AppAlert(
                 title: "Private tunnel required",
-                message: "Update checks require a connected full-tunnel profile with IPv6 leak protection and no custom excluded routes."
+                message: "Update checks require a connected full-tunnel profile with IPv4/IPv6 leak protection, no LAN bypass and no custom excluded routes."
             )
             return
         }
-        runUpdateCheck(notifyWhenAvailable: false)
+        runUpdateCheck(notifyWhenAvailable: false, automatic: false)
     }
 
     func makeBackup(passphrase: String) async throws -> Data {
@@ -499,9 +552,11 @@ final class AppModel: ObservableObject {
             alert = AppAlert(title: "Tunnel active", message: "Disconnect before restoring profiles.")
             return
         }
+        let previous = self.archive
         self.archive = archive
-        persistArchive()
-        reachability.removeAll()
+        if persistArchive(rollbackTo: previous) {
+            reachability.removeAll()
+        }
     }
 
     /// Resolve a localization key in the *selected* UI language.
@@ -515,14 +570,6 @@ final class AppModel: ObservableObject {
             return NSLocalizedString(key, comment: "")
         }
         return NSLocalizedString(key, bundle: bundle, comment: "")
-    }
-
-    /// The tunnel gateway is `.1` of the assigned client address (10.9.2.2 → 10.9.2.1),
-    /// same derivation as the Android client. Nil for anything that isn't dotted IPv4.
-    static func gateway(forClientAddress address: String) -> String? {
-        let octets = address.split(separator: ".")
-        guard octets.count == 4 else { return nil }
-        return "\(octets[0]).\(octets[1]).\(octets[2]).1"
     }
 
     func present(_ error: Error, title: String) {
@@ -567,11 +614,39 @@ final class AppModel: ObservableObject {
         }
 
         switch command {
+        case .toggle:
+            // Resolve a toggle only after prepare() refreshed the real NEVPNStatus.
+            // App Group snapshots are display caches and may survive a provider crash.
+            if systemIsActive {
+                await disconnectManually()
+            } else {
+                await toggleConnection()
+            }
         case .connect:
-            guard !systemIsActive else { return }
-            await toggleConnection()
+            if !systemIsActive {
+                await toggleConnection()
+                return
+            }
+            // The Widget request is a desired-state command, not merely a request to flip
+            // the current NEVPNStatus. Reconcile the durable bit and On-Demand rules even
+            // when an older widget build already started the session directly.
+            let previousDesired = settings.connectionDesired
+            setConnectionDesired(true)
+            let onDemandRevision = tunnelManager.reserveOnDemandUpdate()
+            do {
+                try await tunnelManager.updateOnDemand(
+                    settings: effectiveSettings,
+                    revision: onDemandRevision
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                setConnectionDesired(previousDesired)
+                present(error, title: "VPN settings")
+            }
         case .disconnect:
-            guard systemIsActive else { return }
+            // Always persist connectionDesired=false and disable On Demand before stop.
+            // Skipping an already-disconnected session left the automatic policy armed.
             await disconnectManually()
         }
     }
@@ -603,7 +678,7 @@ final class AppModel: ObservableObject {
                 let profile: Profile?
                 if current.hasActiveProfilePolicy {
                     guard let managedID = current.activeProfileID else {
-                        try await tunnelManager.failClosedForManagedProfilePolicy()
+                        try await failClosedForManagedProfilePolicy()
                         throw ManagedConfigurationError.profileNotFound(nil)
                     }
                     profile = profiles.first(where: { $0.id == managedID })
@@ -612,7 +687,7 @@ final class AppModel: ObservableObject {
                 }
                 guard let profile else {
                     if current.hasActiveProfilePolicy {
-                        try await tunnelManager.failClosedForManagedProfilePolicy()
+                        try await failClosedForManagedProfilePolicy()
                     }
                     throw ManagedConfigurationError.profileNotFound(
                         current.activeProfileID ?? previous.activeProfileID
@@ -645,35 +720,87 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func persistArchive() {
+    @discardableResult
+    private func persistArchive(rollbackTo previous: ProfileArchive) -> Bool {
         do {
             try commitArchive()
+            return true
         } catch {
-            if let stored = try? profileStore.load() {
-                archive = stored
-                profiles = stored.profiles
-                synchronizeActiveProfile()
-            }
+            // Roll back from the in-memory snapshot first. Reloading the store can fail for the
+            // same reason as the save; relying on that second I/O operation left `archive`
+            // mutated while the published profile list still described the old state.
+            archive = (try? profileStore.load()) ?? previous
+            profiles = archive.profiles
+            synchronizeActiveProfile()
             present(error, title: "Could not save profiles")
+            return false
         }
     }
 
     private func maybeCheckForUpdates() {
         guard settings.checkForUpdates,
               !automaticUpdateChecked,
+              updateCheckState != .checking,
               hasPrivateUpdatePath else { return }
         automaticUpdateChecked = true
-        runUpdateCheck(notifyWhenAvailable: true)
+        runUpdateCheck(notifyWhenAvailable: true, automatic: true)
     }
 
-    private func runUpdateCheck(notifyWhenAvailable: Bool) {
+    /// Invalidate the current request synchronously and return its Task so callers that are
+    /// about to remove the packet tunnel can wait for URLSession cancellation to finish.
+    @discardableResult
+    private func cancelUpdateCheck(resetAutomatic: Bool) -> Task<Void, Never>? {
+        if resetAutomatic { automaticUpdateChecked = false }
+        guard updateTask != nil || updateCheckState == .checking else { return nil }
+        let task = updateTask
+        updateCheckGeneration &+= 1
+        task?.cancel()
+        updateTask = nil
+        updateTaskIsAutomatic = false
+        updateCheckState = .idle
+        return task
+    }
+
+    private func cancelUpdateCheckBeforeTunnelTeardown() async {
+        let task = cancelUpdateCheck(resetAutomatic: true)
+        await task?.value
+    }
+
+    /// Keep update checks suppressed across every suspension point in the managed
+    /// fail-closed transaction. `prepare()`/preference reloads may publish an intermediate
+    /// connected snapshot; without this guard that publication could start a fresh automatic
+    /// request after the cancellation barrier but before NetworkExtension removes the tunnel.
+    private func failClosedForManagedProfilePolicy() async throws {
+        updateChecksSuspendedForTunnelTeardown = true
+        defer { updateChecksSuspendedForTunnelTeardown = false }
+        await cancelUpdateCheckBeforeTunnelTeardown()
+        try await tunnelManager.failClosedForManagedProfilePolicy()
+    }
+
+    private func runUpdateCheck(notifyWhenAvailable: Bool, automatic: Bool) {
         guard updateCheckState != .checking else { return }
         updateCheckState = .checking
         updateTask?.cancel()
+        updateCheckGeneration &+= 1
+        let generation = updateCheckGeneration
+        updateTaskIsAutomatic = automatic
         updateTask = Task { [weak self] in
             guard let self else { return }
+            defer {
+                // An invalidated request must never clear or relabel a newer generation.
+                if updateCheckGeneration == generation {
+                    updateTask = nil
+                    updateTaskIsAutomatic = false
+                }
+            }
             do {
                 let info = try await UpdateChecker.check(currentVersion: AppConstants.version)
+                guard updateCheckGeneration == generation else { return }
+                if !automatic && settings.checkForUpdates {
+                    // A completed manual check already satisfies the opt-in once-per-launch
+                    // policy; do not immediately repeat the same request automatically.
+                    automaticUpdateChecked = true
+                }
                 if info.isNewer {
                     updateCheckState = .available(info)
                     sharedTunnelStore.appendLog("Update available: \(info.latest)")
@@ -692,18 +819,29 @@ final class AppModel: ObservableObject {
                     updateCheckState = .current
                 }
             } catch is CancellationError {
-                updateCheckState = .idle
+                if updateCheckGeneration == generation {
+                    updateCheckState = .idle
+                    if automatic { automaticUpdateChecked = false }
+                }
             } catch {
-                updateCheckState = .failed(error.localizedDescription)
+                if updateCheckGeneration == generation {
+                    if !automatic && settings.checkForUpdates {
+                        automaticUpdateChecked = true
+                    }
+                    updateCheckState = .failed(error.localizedDescription)
+                }
             }
-            updateTask = nil
         }
     }
 
     private var hasPrivateUpdatePath: Bool {
-        guard tunnelManager.systemStatus == .connected,
-              let config = activeProfile?.parsedConfig else { return false }
-        return config.isFullTunnel && !config.allowIPv6Leak && config.excludeRoutes.isEmpty
+        guard !updateChecksSuspendedForTunnelTeardown,
+              tunnelManager.systemStatus == .connected,
+              tunnelSnapshot.phase == .connected else { return false }
+        // Profiles can be edited while their previous config is still active. The provider
+        // publishes this from the immutable config it actually loaded, so never re-derive the
+        // decision from the current contents of the profile editor.
+        return tunnelSnapshot.privateUpdatePath == true
     }
 
     private static func commentLabel(_ text: String) -> String? {

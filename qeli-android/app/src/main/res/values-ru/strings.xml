@@ -3,7 +3,7 @@
       Русская локализация. Названия продукта (Qeli), протокольные термины (qeli://,
       RFC 3339, INI, LAN, VPN) и строки лога намеренно НЕ переводятся: лог и тексты
       ошибок остаются английскими, потому что по ним построен каталог ошибок в
-      docs/*/TROUBLESHOOTING.md — перевод сделал бы документацию нерабочей.
+      docs/*/manuals/TROUBLESHOOTING.md — перевод сделал бы документацию нерабочей.
     -->
     <string name="app_name">Qeli</string>
     <string name="app_subtitle">Quick Easy Link IP</string>
@@ -28,7 +28,6 @@
     <string name="move_up">Выше</string>
     <string name="move_down">Ниже</string>
     <string name="profile_actions">Действия</string>
-    <string name="check_servers">Проверить серверы</string>
     <string name="no_profiles">Профилей пока нет. Нажмите «Импорт» или «+ Новый».</string>
     <string name="save">Сохранить</string>
     <string name="cancel">Отмена</string>
@@ -47,7 +46,7 @@
     <string name="tap_to_cancel_resume">ОТМЕНИТЬ АВТОВОССТАНОВЛЕНИЕ</string>
     <string name="notif_trusted_wifi">Приостановлено в доверенном Wi-Fi %1$s</string>
     <string name="auto_probe_profiles">Опрашивать профили автоматически</string>
-    <string name="auto_probe_profiles_desc">Проверяет сохранённые профили, пока приложение открыто, а VPN отключён. Каждый опрос обращается ко всем настроенным серверам.</string>
+    <string name="auto_probe_profiles_desc">По умолчанию выключено. После включения проверяет сохранённые профили, пока приложение открыто, а VPN отключён. Каждый опрос обращается ко всем настроенным серверам.</string>
     <string name="probe_interval">Интервал опроса</string>
     <string name="seconds_short">с</string>
     <string name="backup_profiles">Сохранить профили в файл…</string>
@@ -115,6 +114,13 @@
     <string name="edit_profile_title">Изменить профиль</string>
     <string name="profile_name_hint">Название профиля</string>
     <string name="config_ini_label">Конфиг (INI)</string>
+    <string name="roaming_policy_label">Роуминг сессии</string>
+    <string-array name="roaming_policy_options">
+        <item>Автоматически (если поддерживается)</item>
+        <item>Обязательно</item>
+        <item>Отключено</item>
+    </string-array>
+    <string name="roaming_policy_hint">Авто сохраняет авторизованную сессию при смене сети, когда это поддерживается, иначе переподключается. «Обязательно» отклоняет неподдерживаемый сервер или платформу.</string>
     <string name="add_profile_title">Добавить профиль</string>
     <string name="add_scan_qr">Сканировать QR-код</string>
     <string name="add_paste_link">Вставить ссылку qeli://</string>
@@ -207,7 +213,7 @@
     <string name="update_available_open">Доступно обновление: %1$s — нажмите, чтобы открыть</string>
     <string name="check_now">Проверить сейчас</string>
     <string name="close">Закрыть</string>
-    <string name="update_connect_first">Сначала подключитесь — тогда проверка обновлений пойдёт приватно</string>
+    <string name="update_private_path_required">Нужен подключённый полный туннель без утечек IPv4/IPv6, обхода LAN, исключённых маршрутов и фильтра только выбранных приложений</string>
     <string name="update_checking">Проверка…</string>
     <string name="update_check_failed">Не удалось проверить обновления</string>
     <string name="update_latest">У вас последняя версия</string>
@@ -230,25 +236,19 @@
     <string name="chevron">›</string>
     <string name="protection_apps">Приложения</string>
     <string name="protection_always_on">Always-on</string>
-    <string name="protection_all_traffic">Весь трафик защищён</string>
     <string name="protection_selected_apps">Защищено приложений: %1$d</string>
     <string name="protection_except_apps">Защищены все приложения, кроме %1$d</string>
     <string name="protection_split">Раздельный туннель — только выбранные маршруты</string>
-    <string name="protection_idle">Будет использовано при подключении</string>
-    <string name="protection_no_profile">Профиль не выбран</string>
-    <string name="protection_invalid">Конфиг профиля некорректен</string>
     <string name="protection_pq">Гибридное постквантовое</string>
     <string name="protection_classic">X25519 (без постквантового)</string>
     <!-- Те же факты, но в размер однострочной полосы. -->
     <string name="protection_pq_short">PQ</string>
     <string name="protection_classic_short">X25519</string>
-    <string name="protection_dns_tunnel">DNS через VPN</string>
     <string name="protection_dns_system">системный DNS</string>
     <string name="protection_key_pinned">ключ сервера запинен</string>
     <string name="protection_key_tofu">ключ сервера на доверии (TOFU)</string>
-    <string name="protection_sep">%1$s · %2$s</string>
-    <string name="protection_mode_line">%1$s · %2$s · %3$s</string>
     <string name="protection_warn_lan">Локальная сеть остаётся вне туннеля</string>
+    <string name="protection_warn_ipv4">IPv4 идёт мимо туннеля</string>
     <string name="protection_warn_ipv6">IPv6 идёт мимо туннеля</string>
     <string name="protection_warn_excluded">Маршрутов исключено из туннеля: %1$d</string>
     <string name="protection_warn_no_key">Без запиненного ключа первое соединение доверяется на слово</string>
@@ -260,8 +260,19 @@
     <string name="detail_transport">Транспорт</string>
     <string name="detail_crypto">Шифрование</string>
     <string name="detail_server_key">Ключ сервера</string>
+    <string name="detail_warning">Предупреждение</string>
     <string name="detail_dns">DNS</string>
     <string name="detail_mtu">MTU</string>
+    <string name="detail_ip_family">Семейство IP</string>
+    <string name="detail_ipv4">IPv4</string>
+    <string name="detail_ipv6">IPv6</string>
+    <string name="detail_dual_stack">IPv4 + IPv6</string>
+    <string name="detail_carrier">Внешний канал</string>
+    <string name="detail_recordizer">Рекордайзер пакетов</string>
+    <string name="detail_roaming">Роуминг сессии</string>
+    <string name="detail_legacy_packet_record">Устаревший пакет на запись</string>
+    <string name="detail_reconnect_fallback">Обычное переподключение</string>
+    <string name="detail_mode_policy">%1$s (%2$s)</string>
     <string name="detail_multipath">Multipath</string>
     <string name="detail_streams">до %1$d потоков</string>
     <string name="detail_pushed_routes">Маршрутов от сервера</string>
@@ -270,7 +281,7 @@
     <string name="detail_reconnect">Автопереподключение</string>
     <string name="detail_on">Включено</string>
     <string name="detail_off">Выключено</string>
-    <string name="detail_tunnel_ip">IP в туннеле</string>
+    <string name="detail_tunnel_ip">Адреса туннеля</string>
     <string name="detail_adaptive">адаптивно</string>
     <string name="detail_padding">Padding</string>
     <string name="detail_heartbeat">Heartbeat</string>

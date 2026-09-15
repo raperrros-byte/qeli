@@ -4,15 +4,18 @@
     python3 scripts/sync_version.py            # check only (CI / pre-release)
     python3 scripts/sync_version.py --write     # stamp the versions into every file
 
-There are TWO versions in this repo and they are deliberately different:
+There are THREE versions in this repo and they are deliberately different:
 
   * the DEVELOPMENT version — what the tree currently builds. Source of truth:
     `qeli/Cargo.toml`. It is mirrored into the platform build files plus the two overview
     READMEs ("Rust 2021, version X").
+  * the PLANNED version — the next public release. Source of truth: the first
+    unreleased CHANGELOG heading. A development build may intentionally retain
+    an older version number; for example the 0.7.17 development tree is released
+    directly as 0.8.0, without a public 0.7.17 release.
   * the RELEASED version — the newest published package. Source of truth: the
-    newest `v*` git tag. It is quoted by the "these docs describe X" banner in
-    ten documents, because a reader installing from a `.deb` gets that version,
-    not whatever HEAD happens to be.
+    newest `v*` git tag. It is shown as the latest published release in the
+    ten-document status banner and owns released download/attestation commands.
 
 Bumping by hand means editing many files, which is how docs once ended up claiming
 0.7.11 while the crate was already 0.7.12. Markdown on GitHub has no variable
@@ -85,43 +88,53 @@ MAC_PER_APP_BUILD_TARGETS: list[tuple[str, str, str]] = [
     ),
 ]
 
-# The "these docs describe X" banner. Ten documents, two wordings.
+# The documentation status banner. It names the development tree, planned public
+# release, and latest published package independently. Collapsing these values was
+# the reason unreleased IPv6 material looked as if it belonged to stable 0.7.16.
 BANNER_DOCS = ("CONFIG", "GETTING-STARTED", "PANEL", "TROUBLESHOOTING", "OPERATIONS")
 BANNER_RE = {
-    "ru": r"\*\*Документация описывает (\S+)\*\*",
-    "eng": r"\*\*These docs describe (\S+)\*\*",
+    "ru": {
+        "dev": r"текущая ветка разработки \*\*([^*]+)\*\*",
+        "planned": r"планируемый full-IPv6 релиз \*\*([^*]+)\*\*",
+        "released": r"последний опубликованный релиз \*\*([^*]+)\*\*",
+    },
+    "eng": {
+        "dev": r"current development tree \*\*([^*]+)\*\*",
+        "planned": r"planned full-IPv6 release \*\*([^*]+)\*\*",
+        "released": r"latest published release \*\*([^*]+)\*\*",
+    },
 }
 
 # Commands that fetch or verify a released package must track the same release as the docs
 # banner. Checking only the banner let a 0.7.14 guide keep installing/attesting 0.7.13.
 RELEASE_ARTIFACT_TARGETS: list[tuple[str, str, str]] = [
     (
-        "docs/eng/GETTING-STARTED.md",
+        "docs/eng/manuals/GETTING-STARTED.md",
         r"releases/download/v([0-9]+\.[0-9]+\.[0-9]+)/",
         "release download URL (eng)",
     ),
     (
-        "docs/ru/GETTING-STARTED.md",
+        "docs/ru/manuals/GETTING-STARTED.md",
         r"releases/download/v([0-9]+\.[0-9]+\.[0-9]+)/",
         "release download URL (ru)",
     ),
     (
-        "docs/eng/GETTING-STARTED.md",
+        "docs/eng/manuals/GETTING-STARTED.md",
         r"qeli_([0-9]+\.[0-9]+\.[0-9]+)_amd64\.deb",
         "release package commands (eng)",
     ),
     (
-        "docs/ru/GETTING-STARTED.md",
+        "docs/ru/manuals/GETTING-STARTED.md",
         r"qeli_([0-9]+\.[0-9]+\.[0-9]+)_amd64\.deb",
         "release package commands (ru)",
     ),
     (
-        "docs/eng/OPERATIONS.md",
+        "docs/eng/manuals/OPERATIONS.md",
         r"qeli_([0-9]+\.[0-9]+\.[0-9]+)_amd64\.deb",
         "release attestation command (eng)",
     ),
     (
-        "docs/ru/OPERATIONS.md",
+        "docs/ru/manuals/OPERATIONS.md",
         r"qeli_([0-9]+\.[0-9]+\.[0-9]+)_amd64\.deb",
         "release attestation command (ru)",
     ),
@@ -149,14 +162,31 @@ def dev_version() -> str | None:
     return m.group(1) if m else None
 
 
-def apply(targets: list[tuple[str, str, str]], want: str, write: bool,
-          also_ok: str | None = None) -> None:
-    """Check (or rewrite) every occurrence the regexes select.
+def planned_version() -> str | None:
+    """First unreleased CHANGELOG heading, without brackets."""
+    text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    match = re.search(
+        r"^## \[([0-9]+\.[0-9]+\.[0-9]+)\]\s+[—-]\s+не выпущен\s*$",
+        text,
+        re.M | re.I,
+    )
+    return match.group(1) if match else None
 
-    `also_ok` is a second value the CHECK accepts (``--write`` always stamps `want`). It
-    exists for the docs banner, which names the RELEASED version and therefore has two
-    legitimate values around a release cut — see main().
-    """
+
+def tagged_file(version: str, path: str) -> str | None:
+    """Read one tracked file from a release tag without checking it out."""
+    out = subprocess.run(
+        ["git", "show", f"v{version}:{path}"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return out.stdout if out.returncode == 0 else None
+
+
+def apply(targets: list[tuple[str, str, str]], want: str, write: bool) -> None:
+    """Check (or rewrite) every occurrence the regexes select."""
     for rel, pattern, label in targets:
         path = ROOT / rel
         if not path.exists():
@@ -173,7 +203,7 @@ def apply(targets: list[tuple[str, str, str]], want: str, write: bool,
             # file drift forever while the script reports success.
             problems.append(f"{rel}: pattern for {label} matched nothing — it needs updating")
             continue
-        stale = [v for v in found if v != want and (also_ok is None or v != also_ok)]
+        stale = [v for v in found if v != want]
         if not stale:
             continue
         if write:
@@ -208,7 +238,7 @@ def apply_release_artifacts(write: bool) -> None:
             apply([target], "<missing-banner>", write)
             continue
         text = path.read_text(encoding="utf-8")
-        banner = re.search(BANNER_RE[lang], text, re.M)
+        banner = re.search(BANNER_RE[lang]["released"], text, re.M)
         if banner is None:
             problems.append(f"{rel}: cannot match release artifacts to a missing docs banner")
             continue
@@ -220,12 +250,14 @@ def main() -> int:
     ap.add_argument("--write", action="store_true", help="rewrite the files instead of only checking")
     ap.add_argument(
         "--releasing", action="store_true",
-        help="stamp the docs banner with the version being RELEASED (the crate version) "
-             "instead of the newest tag — use in the release cut, just before tagging",
+        help="stamp the published-release field with the planned release instead of the "
+             "newest tag — use just before tagging, after qeli/Cargo.toml has been bumped "
+             "to the planned version",
     )
     args = ap.parse_args()
 
     dev = dev_version()
+    planned = planned_version()
     rel = released_version()
     if not dev:
         print("cannot read the version from qeli/Cargo.toml", file=sys.stderr)
@@ -233,7 +265,22 @@ def main() -> int:
     if not rel:
         print("no v* git tag found — cannot tell which version is released", file=sys.stderr)
         return 1
-    print(f"development version {dev} (qeli/Cargo.toml) · released version {rel} (newest v* tag)")
+    if not planned:
+        print("cannot read the planned release from CHANGELOG.md", file=sys.stderr)
+        return 1
+    print(
+        f"development version {dev} (qeli/Cargo.toml) · "
+        f"planned release {planned} (CHANGELOG.md) · "
+        f"released version {rel} (newest v* tag)"
+    )
+    if args.releasing and dev != planned:
+        print(
+            f"refusing release mode: development binaries still identify as {dev}, "
+            f"but the planned public release is {planned}; bump qeli/Cargo.toml to "
+            f"{planned} and run --write --releasing again",
+            file=sys.stderr,
+        )
+        return 1
     if args.write:
         print("writing:")
 
@@ -250,6 +297,15 @@ def main() -> int:
     else:
         problems.append(f"development version {dev!r} is not three-part numeric SemVer")
 
+    planned_semver = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", planned)
+    if planned_semver and semver:
+        if tuple(map(int, planned_semver.groups())) < tuple(map(int, semver.groups())):
+            problems.append(
+                f"planned release {planned} is older than development version {dev}"
+            )
+    else:
+        problems.append(f"planned release {planned!r} is not three-part numeric SemVer")
+
     # Build numbers are monotonic counters, not a function of the version, so they are
     # not derived from Cargo.toml. But iOS and Android have always been released as a
     # pair (both 715 at 0.7.12), and iOS is the one that gets forgotten because nothing
@@ -258,6 +314,45 @@ def main() -> int:
     if gradle.exists():
         vc = re.search(r"versionCode\s*=\s*(\d+)", gradle.read_text(encoding="utf-8"))
         if vc:
+            # Keeping Android and iOS equal is insufficient: both counters must also remain
+            # strictly above the package already published by the latest release tag.
+            android_build = int(vc.group(1))
+            released_gradle = tagged_file(rel, "qeli-android/app/build.gradle.kts")
+            released_vc = (
+                re.search(r"versionCode\s*=\s*(\d+)", released_gradle)
+                if released_gradle is not None
+                else None
+            )
+            minimum_build: int | None = None
+            if released_vc is None:
+                problems.append(
+                    f"v{rel}: cannot read Android versionCode from the latest release tag"
+                )
+            else:
+                released_build = int(released_vc.group(1))
+                minimum_build = released_build + int(dev != rel)
+            if minimum_build is not None and android_build < minimum_build:
+                if args.write:
+                    next_build = str(minimum_build)
+                    apply(
+                        [
+                            (
+                                "qeli-android/app/build.gradle.kts",
+                                r"versionCode\s*=\s*(\d+)",
+                                "Android monotonic versionCode",
+                            )
+                        ],
+                        next_build,
+                        True,
+                    )
+                    android_build = int(next_build)
+                else:
+                    relation = "greater than" if dev != rel else "at least"
+                    problems.append(
+                        "qeli-android/app/build.gradle.kts: versionCode "
+                        f"{android_build} must be {relation} released v{rel} build "
+                        f"{released_vc.group(1)}"
+                    )
             apply(
                 [
                     ("qeli-ios/project.yml", r"CURRENT_PROJECT_VERSION:\s*(\S+)", "iOS build number"),
@@ -269,27 +364,26 @@ def main() -> int:
                         "iOS fallback build",
                     ),
                 ],
-                vc.group(1),
+                str(android_build),
                 args.write,
             )
-    banners = [
-        (f"docs/{lang}/{doc}.md", BANNER_RE[lang], f"docs banner ({lang})")
-        for lang in ("ru", "eng")
-        for doc in BANNER_DOCS
-    ]
-    # The banner names the version a reader actually installs, so it tracks the newest TAG —
-    # which makes it unsatisfiable exactly once per release. The commit being tagged cannot
-    # already quote a tag that does not exist yet, so `--write` stamps the PREVIOUS release
-    # into it; the moment the tag lands, that commit's own banner is one version behind and
-    # CI on the release branch goes red over a number that could not have been right. That is
-    # how v0.7.14 left `main` failing the docs job while every other check was green.
-    #
-    # So: `--releasing` stamps the version being cut (used in the release procedure, right
-    # before tagging), and the CHECK accepts either value. Both are true statements — "these
-    # docs describe the last release" and "…describe the release being cut" — and the drift
-    # this check exists to catch, a banner stuck several versions back, still fails.
-    banner_want = dev if args.releasing else rel
-    apply(banners, banner_want, args.write, also_ok=rel if args.releasing else dev)
+    def banners(field: str) -> list[tuple[str, str, str]]:
+        return [
+            (
+                f"docs/{lang}/manuals/{doc}.md",
+                BANNER_RE[lang][field],
+                f"docs banner {field} ({lang})",
+            )
+            for lang in ("ru", "eng")
+            for doc in BANNER_DOCS
+        ]
+
+    # Immediately before tagging, the "latest published release" field and package
+    # commands are intentionally staged to the release being cut. At all other times
+    # they remain tied to the newest existing tag.
+    apply(banners("dev"), dev, args.write)
+    apply(banners("planned"), planned, args.write)
+    apply(banners("released"), planned if args.releasing else rel, args.write)
     apply_release_artifacts(args.write)
 
     if problems:

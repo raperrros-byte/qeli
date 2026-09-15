@@ -5,9 +5,9 @@ Android-клиент qeli: системный VPN через `VpnService` (ве�
 выполняются общим Rust-ядром; Kotlin остаётся адаптером Android API и UI.
 
 - Общая карта документации — [docs/ru/index.md](../docs/ru/index.md)
-- Подключение «с нуля» (выдача `qeli://` на сервере) — [GETTING-STARTED §8.1](../docs/ru/GETTING-STARTED.md)
-- Все ключи конфигурации — [CONFIG.md](../docs/ru/CONFIG.md)
-- Если не подключается — [TROUBLESHOOTING.md](../docs/ru/TROUBLESHOOTING.md)
+- Подключение «с нуля» (выдача `qeli://` на сервере) — [GETTING-STARTED §8.1](../docs/ru/manuals/GETTING-STARTED.md)
+- Все ключи конфигурации — [CONFIG.md](../docs/ru/manuals/CONFIG.md)
+- Если не подключается — [TROUBLESHOOTING.md](../docs/ru/manuals/TROUBLESHOOTING.md)
 
 ## Технологии
 
@@ -51,7 +51,7 @@ app/src/main/kotlin/com/qeli/
 | **Виджет** | Статус и переключение с рабочего стола |
 | **Автоподключение** | После перезагрузки (`BOOT_COMPLETED`) и/или при запуске приложения |
 | **Доверенный Wi-Fi** | Локальный список точных SSID: Qeli снимает VPN в доверенной сети и восстанавливает его после выхода. При Android lockdown/`kill_switch` пауза запрещена, потому что TUN обязан оставаться установленным |
-| **Автоопрос профилей** | Настраиваемая проверка доступности только пока приложение видно и VPN отключён; её можно полностью выключить, при этом ручные проверки остаются доступны |
+| **Автоопрос профилей** | Opt-in, выключен по умолчанию; после включения проверяет доступность только пока приложение видно и VPN отключён, ручные проверки доступны всегда |
 | **Доступ к локальной сети** | Тумблер «разрешить LAN» при full-tunnel (принтеры, NAS, роутер) |
 | **Бэкап профилей** | Экспорт/импорт JSON; **с парольной фразой** — шифрованный контейнер (PBKDF2-HMAC-SHA256 + AES-256-GCM), совместимый с десктопом. Пустая фраза = **открытый JSON с паролями** |
 | **Формат времени в логе** | Пять вариантов, совпадают с серверным `[logging] time_format` — удобно сверять логи |
@@ -63,7 +63,7 @@ app/src/main/kotlin/com/qeli/
 |---|---|
 | `INTERNET`, `ACCESS_NETWORK_STATE`, `ACCESS_WIFI_STATE` | сеть, выбранный физический carrier и реакция на его смену (Wi-Fi ⇄ LTE) |
 | `NEARBY_WIFI_DEVICES`, `ACCESS_FINE_LOCATION` | чтение текущего SSID для доверенного Wi-Fi; без runtime-разрешения SSID считается неизвестным и VPN остаётся включённым |
-| `FOREGROUND_SERVICE` + `FOREGROUND_SERVICE_SPECIAL_USE` | туннель как foreground-сервис |
+| `FOREGROUND_SERVICE` + `FOREGROUND_SERVICE_SPECIAL_USE` + `FOREGROUND_SERVICE_LOCATION` | туннель и проверка доверенного SSID продолжают работать в foreground-сервисе без открытой Activity; location-тип включается только при активной функции и выданном разрешении |
 | `POST_NOTIFICATIONS` | уведомление активного туннеля (Android 13+) |
 | `WAKE_LOCK` | не терять соединение в глубоком сне |
 | `RECEIVE_BOOT_COMPLETED` | автоподключение после перезагрузки (если включено) |
@@ -155,3 +155,9 @@ docker run --rm -v "c:/projects/home/qeli/qeli-android:/project" -w /project `
 Runbook агента: [`../scripts/AGENT_DEB_BUILD_DEPLOY.md`](../scripts/AGENT_DEB_BUILD_DEPLOY.md) · [`../scripts/agent/README.md`](../scripts/agent/README.md)
 
 > Инкрементальная сборка иногда раздувает APK — `./gradlew clean` и пересобрать.
+
+`reality-tls` H2 реализован именно в `libqeli.so`: установленный APK не получает его после
+обновления сервера. Нужны пересборка native core, упаковка нового APK и обновление приложения.
+
+> Инкрементальная сборка иногда раздувает APK — если размер вырос неожиданно, сделайте
+> `./gradlew clean` и пересоберите.

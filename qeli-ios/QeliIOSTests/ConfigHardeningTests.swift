@@ -52,7 +52,7 @@ final class ConfigHardeningTests: XCTestCase {
     /// Nothing reads a typo, so the setting it was meant to change silently keeps its default:
     /// `gatway = true` left the tunnel split with nothing said. The trap is over-correcting:
     /// `keepalive`, `post_up`, `exit_node` and friends are real Rust-client file-only keys
-    /// (docs/ru/CONFIG.md, "Что пушем НЕ передаётся"), and refusing a CLI profile carrying
+    /// (docs/ru/manuals/CONFIG.md, "Что пушем НЕ передаётся"), and refusing a CLI profile carrying
     /// them would be a worse regression than the typo it catches. (Audit 2026-08-01, §14.)
     func testAMisspelledKeyIsRefusedButAnotherPortsKeyIsNot() throws {
         let typo = try VPNConfig.fromINI(ini("gatway = true"))
@@ -112,6 +112,29 @@ final class ConfigHardeningTests: XCTestCase {
         XCTAssertThrowsError(try VPNConfig.fromINI("[qeli]\nserver = 1.2.3.4:notnum\n"))
     }
 
+    func testInvertedShapingRangesAndInsufficientBudgetAreRefused() throws {
+        let invalid = [
+            ["shaping_gap_min = 500", "shaping_gap_max = 100"],
+            ["shaping_min_size = 900", "shaping_max_size = 300"],
+            ["shaping = true", "shaping_budget = 200", "shaping_max_size = 300"],
+        ]
+        for lines in invalid {
+            let config = try VPNConfig.fromINI(ini(
+                lines[0], lines[1], lines.count > 2 ? lines[2] : ""))
+            XCTAssertThrowsError(try config.validate(), "\(lines) must be refused")
+        }
+
+        let valid = try VPNConfig.fromINI(ini(
+            "shaping = true",
+            "shaping_gap_min = 40",
+            "shaping_gap_max = 6000",
+            "shaping_budget = 1024",
+            "shaping_min_size = 64",
+            "shaping_max_size = 1024"
+        ))
+        XCTAssertNoThrow(try valid.validate())
+    }
+
     /// A key written twice must be refused, not silently resolved.
     ///
     /// The ports disagreed on which line wins: this parser folds entries into a dictionary and
@@ -141,6 +164,16 @@ final class ConfigHardeningTests: XCTestCase {
         let thrice = try VPNConfig.fromINI(ini("mtu = 1400", "mtu = 1300", "mtu = 1200"))
         XCTAssertEqual(thrice.duplicateKeys, ["qeli.mtu"])
         XCTAssertEqual(thrice.mtu, 1200)
+    }
+
+    func testRepeatedRouteFilesAreAdditiveAndSurviveRoundTrip() throws {
+        let config = try VPNConfig.fromINI(ini(
+            "route_file = /tmp/cidrs.txt", "route_file = /tmp/openvpn.txt"))
+        XCTAssertEqual(config.routeFiles, ["/tmp/cidrs.txt", "/tmp/openvpn.txt"])
+        XCTAssertFalse(config.duplicateKeys.contains("qeli.route_file"))
+
+        let roundTrip = try VPNConfig.fromINI(config.toINI())
+        XCTAssertEqual(roundTrip.routeFiles, config.routeFiles)
     }
 
     /// A boolean nobody could parse must not read as `false`.

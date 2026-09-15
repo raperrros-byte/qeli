@@ -81,6 +81,45 @@ class ConfigHardeningTest {
         assertTrue(VpnConfig.fromIni("[qeli]\nserver = h:443\nuser = u\npass = p\nmtu_probe = maybe\n").mtuProbe)
     }
 
+    @Test
+    fun `required ipv6 refuses an explicit mtu below 1280`() {
+        try {
+            profile().copy(ipv6 = "required", mtu = 1200).validate()
+            fail("expected required IPv6 with mtu 1200 to be refused")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(e.message!!.contains("at least 1280"))
+        }
+        profile().copy(ipv6 = "auto", mtu = 1200).validate()
+    }
+
+    @Test
+    fun `roaming policy round trips and required rejects source pins`() {
+        val disabled = VpnConfig.fromIni(
+            "[qeli]\nserver = h:443\nuser = u\npass = p\nroaming = off\n"
+        )
+        assertEquals("off", disabled.roaming)
+        assertFalse(disabled.allowsNativePathRoaming)
+        assertEquals("off", VpnConfig.fromIni(disabled.toIni()).roaming)
+
+        val required = VpnConfig.fromIni(
+            "[qeli]\nserver = h:443\nuser = u\npass = p\nroaming = required\n"
+        )
+        required.validate()
+        assertEquals("required", VpnConfig.fromIni(required.toIni()).roaming)
+
+        for (pin in listOf("local = 192.0.2.10", "lport = 41000")) {
+            val pinned = VpnConfig.fromIni(
+                "[qeli]\nserver = h:443\nuser = u\npass = p\nroaming = required\n$pin\n"
+            )
+            try {
+                pinned.validate()
+                fail("expected required roaming with $pin to be refused")
+            } catch (e: IllegalArgumentException) {
+                assertTrue(e.message!!.contains("cannot be combined"))
+            }
+        }
+    }
+
     /** The `[logging]` section used to be parsed and thrown away, losing it on every save. */
     @Test
     fun `logging section survives a round trip`() {
@@ -138,6 +177,31 @@ class ConfigHardeningTest {
         val uri = profile(pass = "").toQeliUri()
         assertTrue("expected 'user:@host', got $uri", uri.startsWith("qeli://alice:@vpn.example.com:443"))
         assertEquals("", VpnConfig.fromQeliUri(uri).password)
+    }
+
+    @Test
+    fun `ipv6 endpoint is bracketed in every native config and round trips`() {
+        val cfg = profile().copy(serverAddress = "2001:db8::7", port = 8443)
+        assertTrue(cfg.toIni().contains("server = [2001:db8::7]:8443"))
+        assertTrue(cfg.toTransportProbeIni().contains("server = [2001:db8::7]:8443"))
+        val back = VpnConfig.fromIni(cfg.toIni())
+        assertEquals("2001:db8::7", back.serverAddress)
+        assertEquals(8443, back.port)
+        assertEquals("2001:db8::7", VpnConfig.fromQeliUri(cfg.toQeliUri()).serverAddress)
+    }
+
+    @Test
+    fun `bare or malformed ipv6 endpoint is never reinterpreted as host and port`() {
+        for (bad in listOf("2001:db8::443", "[2001:db8:::1]:443", "[vpn.example.com]:443")) {
+            try {
+                VpnConfig.fromIni("[qeli]\nserver = $bad\n")
+                fail("expected malformed endpoint to be refused: $bad")
+            } catch (_: IllegalArgumentException) { /* expected */ }
+        }
+        try {
+            VpnConfig.fromQeliUri("qeli://u:p@2001:db8::443?proto=tcp&mode=fake-tls")
+            fail("expected bare IPv6 qeli:// authority to be refused")
+        } catch (_: IllegalArgumentException) { /* expected */ }
     }
 
     /** Rust clamps an out-of-range link MTU to auto; iOS used to reject the whole link. */

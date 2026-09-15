@@ -70,6 +70,25 @@ pub const RETIRED_KEYS: &[&str] = &[
     "perf.connection.rate_limit_packets_per_sec",
 ];
 
+/// GUI-owned keys are valid only in the flat client `[qeli]` section. Matching the name
+/// alone would hide a misspelling or misplaced no-op setting in any other section.
+pub fn is_gui_only_client_key(section: &str, key: &str) -> bool {
+    section == "[qeli]" && GUI_ONLY_CLIENT_KEYS.contains(&key)
+}
+
+/// Retired keys remain recognised only where the old setting actually lived. In particular,
+/// `password_hash` is still security-critical under `[web]` and `[user:*]`, so a same-named
+/// unread key elsewhere must never be waved through as harmless legacy configuration.
+pub fn is_retired_key(section: &str, key: &str) -> bool {
+    match key {
+        "password_hash" | "token_ttl_secs" => section == "[auth]",
+        key if RETIRED_KEYS.contains(&key) => {
+            section == "[qeli]" || (section.starts_with("[profile:") && section.ends_with(']'))
+        }
+        _ => false,
+    }
+}
+
 /// Key NAMES nobody read — i.e. typos — with the two known-benign classes filtered out.
 ///
 /// `unread_keys` is the only thing that can catch a misspelled key name: a wrong name is not a
@@ -87,8 +106,8 @@ pub fn unknown_keys(doc: &format::IniDoc, client: bool) -> Vec<String> {
         // wants; comparing it against a bare "qeli" silently matched nothing and turned the
         // exemption off entirely, so every desktop profile went back to reporting 22
         // misspellings. Compared in the shape it actually has.
-        .filter(|(section, k)| !(client && section == "[qeli]" && GUI_ONLY_CLIENT_KEYS.contains(k)))
-        .filter(|(_, k)| !RETIRED_KEYS.contains(k))
+        .filter(|(section, key)| !(client && is_gui_only_client_key(section, key)))
+        .filter(|(section, key)| !is_retired_key(section, key))
         .map(|(section, k)| {
             if section.is_empty() {
                 k.to_string()
@@ -283,11 +302,15 @@ pub struct LoggingConfig {
     pub time_format: String,
 }
 
+/// Largest random padding accepted in one authenticated record.
+pub const MAX_PADDING_BYTES: u16 = 1_400;
+
 /// Obfuscation parameters the server pushes to the client at handshake time, so
 /// the client no longer has to carry (and keep in sync) these in its own config.
 /// Only the params used in the post-auth data phase are pushed — the wire `mode`,
 /// `obfs_key`, `cipher` and QUIC masking are needed *before* auth to wrap the
 /// handshake itself and therefore stay in the client link/config.
+
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct PushedObf {
     #[serde(default)]
@@ -298,6 +321,262 @@ pub struct PushedObf {
     pub traffic_normalization: TrafficNormalizationConfig,
     #[serde(default)]
     pub traffic_shaping: TrafficShapingConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recordizer: Option<RecordizerConfig>,
+}
+
+impl PushedObf {
+    /// Validate the authenticated post-authentication data-plane contract before either
+    /// peer applies it. Keeping this on the wire type prevents the server profile checker
+    /// and the client AuthOK parser from silently accepting different value domains.
+    pub fn validate(&self, label: &str) -> anyhow::Result<()> {
+        let padding = &self.padding;
+        if padding.enabled {
+            if padding.min_bytes > padding.max_bytes {
+                anyhow::bail!("{label}.padding.min_bytes must be <= max_bytes");
+            }
+            if padding.max_bytes > MAX_PADDING_BYTES {
+                anyhow::bail!("{label}.padding.max_bytes must be <= {MAX_PADDING_BYTES}");
+            }
+            if !(padding.probability.is_finite() && (0.0..=1.0).contains(&padding.probability)) {
+                anyhow::bail!("{label}.padding.probability must be in 0.0..=1.0");
+            }
+        }
+
+        let heartbeat = &self.heartbeat;
+        if heartbeat.enabled {
+            if heartbeat.interval_ms == 0 {
+                anyhow::bail!("{label}.heartbeat.interval_ms must be > 0 when enabled");
+            }
+            if heartbeat.jitter_ms >= heartbeat.interval_ms {
+                anyhow::bail!("{label}.heartbeat.jitter_ms must be smaller than interval_ms");
+            }
+            let maximum = crate::protocol::packet::MAX_TUNNEL_MTU.saturating_sub(32);
+            if usize::from(heartbeat.data_size_bytes) > maximum {
+                anyhow::bail!("{label}.heartbeat.data_size_bytes must be <= {maximum}");
+            }
+        }
+
+        let normalization = &self.traffic_normalization;
+        if normalization.enabled
+            && (normalization.round_sizes.is_empty()
+                || normalization.round_sizes.contains(&0)
+                || normalization
+                    .round_sizes
+                    .iter()
+                    .any(|size| usize::from(*size) > crate::protocol::packet::MAX_TUNNEL_MTU))
+        {
+            anyhow::bail!(
+                "{label}.traffic_normalization.round_sizes must be non-empty and each value must be in 1..={}",
+                crate::protocol::packet::MAX_TUNNEL_MTU
+            );
+        }
+        if normalization.enabled
+            && normalization
+                .round_sizes
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            anyhow::bail!("{label}.traffic_normalization.round_sizes must be strictly increasing");
+        }
+
+        let shaping = &self.traffic_shaping;
+        if shaping.enabled {
+            if shaping.idle_gap_mean_ms == 0
+                || shaping.idle_gap_min_ms == 0
+                || shaping.idle_gap_max_ms == 0
+                || shaping.budget_bytes_per_sec == 0
+                || shaping.min_size == 0
+                || shaping.max_size == 0
+                || shaping.stealth_rate_mbps == 0
+            {
+                anyhow::bail!(
+                    "{label}.traffic_shaping durations, sizes, budget and stealth rate must be positive"
+                );
+            }
+            if shaping.idle_gap_min_ms > shaping.idle_gap_max_ms {
+                anyhow::bail!("{label}.traffic_shaping.idle_gap_min_ms must be <= idle_gap_max_ms");
+            }
+            if shaping.min_size > shaping.max_size {
+                anyhow::bail!("{label}.traffic_shaping.min_size must be <= max_size");
+            }
+            if usize::from(shaping.max_size) > crate::protocol::packet::MAX_TUNNEL_MTU {
+                anyhow::bail!(
+                    "{label}.traffic_shaping.max_size must be <= {}",
+                    crate::protocol::packet::MAX_TUNNEL_MTU
+                );
+            }
+            if shaping.budget_bytes_per_sec < u32::from(shaping.max_size) {
+                anyhow::bail!(
+                    "{label}.traffic_shaping.budget_bytes_per_sec must be at least max_size"
+                );
+            }
+        }
+
+        if let Some(recordizer) = &self.recordizer {
+            recordizer.validate(&format!("{label}.recordizer"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Transport-independent post-auth packet-to-record morphology. The server owns
+/// these values and pushes them only after both peers negotiate PACKET_MUX_V1.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RecordizerConfig {
+    /// `off` keeps the legacy format, `prefer` negotiates when possible, and
+    /// `required` rejects a peer that cannot negotiate it.
+    #[serde(default = "default_recordizer_policy")]
+    pub policy: String,
+    #[serde(default)]
+    pub batch: RecordizerBatchConfig,
+    #[serde(default)]
+    pub record: RecordizerRecordConfig,
+    #[serde(default)]
+    pub fragment: RecordizerFragmentConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RecordizerBatchConfig {
+    #[serde(default = "default_recordizer_delay_min")]
+    pub delay_min_ms: u64,
+    #[serde(default = "default_recordizer_delay_max")]
+    pub delay_max_ms: u64,
+    #[serde(default = "default_recordizer_max_packets")]
+    pub max_packets: u16,
+    #[serde(default = "default_recordizer_queue_bytes")]
+    pub max_queue_bytes: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RecordizerRecordConfig {
+    /// Zero selects the largest safe plaintext for the active carrier/path.
+    #[serde(default)]
+    pub max_payload_bytes: u16,
+    #[serde(default = "default_recordizer_small_min_ratio")]
+    pub small_min_ratio: f64,
+    #[serde(default = "default_recordizer_small_max_ratio")]
+    pub small_max_ratio: f64,
+    #[serde(default = "default_recordizer_full_probability")]
+    pub full_probability: f64,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RecordizerFragmentConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_recordizer_reassembly_timeout")]
+    pub reassembly_timeout_ms: u64,
+    #[serde(default = "default_recordizer_max_inflight")]
+    pub max_inflight_packets: u16,
+    #[serde(default = "default_recordizer_reassembly_bytes")]
+    pub max_reassembly_bytes: u32,
+    #[serde(default = "default_recordizer_max_fragments")]
+    pub max_fragments_per_packet: u16,
+}
+
+impl Default for RecordizerConfig {
+    fn default() -> Self {
+        Self {
+            policy: default_recordizer_policy(),
+            batch: RecordizerBatchConfig::default(),
+            record: RecordizerRecordConfig::default(),
+            fragment: RecordizerFragmentConfig::default(),
+        }
+    }
+}
+
+impl Default for RecordizerBatchConfig {
+    fn default() -> Self {
+        Self {
+            delay_min_ms: default_recordizer_delay_min(),
+            delay_max_ms: default_recordizer_delay_max(),
+            max_packets: default_recordizer_max_packets(),
+            max_queue_bytes: default_recordizer_queue_bytes(),
+        }
+    }
+}
+
+impl Default for RecordizerRecordConfig {
+    fn default() -> Self {
+        Self {
+            max_payload_bytes: 0,
+            small_min_ratio: default_recordizer_small_min_ratio(),
+            small_max_ratio: default_recordizer_small_max_ratio(),
+            full_probability: default_recordizer_full_probability(),
+        }
+    }
+}
+
+impl Default for RecordizerFragmentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            reassembly_timeout_ms: default_recordizer_reassembly_timeout(),
+            max_inflight_packets: default_recordizer_max_inflight(),
+            max_reassembly_bytes: default_recordizer_reassembly_bytes(),
+            max_fragments_per_packet: default_recordizer_max_fragments(),
+        }
+    }
+}
+
+impl RecordizerConfig {
+    pub fn is_off(&self) -> bool {
+        self.policy.eq_ignore_ascii_case("off")
+    }
+
+    pub fn is_required(&self) -> bool {
+        self.policy.eq_ignore_ascii_case("required")
+    }
+
+    pub fn validate(&self, label: &str) -> anyhow::Result<()> {
+        if !matches!(
+            self.policy.to_ascii_lowercase().as_str(),
+            "off" | "prefer" | "required"
+        ) {
+            anyhow::bail!("{label}.policy must be off, prefer or required");
+        }
+        if self.batch.delay_min_ms > self.batch.delay_max_ms {
+            anyhow::bail!("{label}.batch.delay_min_ms must be <= delay_max_ms");
+        }
+        if self.batch.max_packets == 0 {
+            anyhow::bail!("{label}.batch.max_packets must be > 0");
+        }
+        if self.batch.max_queue_bytes < 64 || self.batch.max_queue_bytes > 4 * 1024 * 1024 {
+            anyhow::bail!("{label}.batch.max_queue_bytes must be in 64..=4194304");
+        }
+        if self.record.max_payload_bytes != 0
+            && (usize::from(self.record.max_payload_bytes) < 64
+                || usize::from(self.record.max_payload_bytes)
+                    > crate::protocol::packet::MAX_TUNNEL_MTU)
+        {
+            anyhow::bail!(
+                "{label}.record.max_payload_bytes must be 0 (auto) or 64..={}",
+                crate::protocol::packet::MAX_TUNNEL_MTU
+            );
+        }
+        let ratios_ok = self.record.small_min_ratio.is_finite()
+            && self.record.small_max_ratio.is_finite()
+            && self.record.small_min_ratio > 0.0
+            && self.record.small_min_ratio <= self.record.small_max_ratio
+            && self.record.small_max_ratio <= 1.0;
+        if !ratios_ok {
+            anyhow::bail!("{label}.record small ratios must satisfy 0 < min <= max <= 1");
+        }
+        if !(self.record.full_probability.is_finite()
+            && (0.0..=1.0).contains(&self.record.full_probability))
+        {
+            anyhow::bail!("{label}.record.full_probability must be in 0.0..=1.0");
+        }
+        if self.fragment.reassembly_timeout_ms == 0
+            || self.fragment.max_inflight_packets == 0
+            || self.fragment.max_reassembly_bytes < 64
+            || self.fragment.max_fragments_per_packet == 0
+        {
+            anyhow::bail!("{label}.fragment timeout and resource limits must be positive");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
@@ -574,6 +853,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retired_key_exemption_is_scoped_to_its_historical_section() {
+        assert!(super::is_retired_key("[auth]", "password_hash"));
+        assert!(super::is_retired_key("[auth]", "token_ttl_secs"));
+        assert!(!super::is_retired_key("[web]", "token_ttl_secs"));
+        assert!(!super::is_retired_key("[logging]", "password_hash"));
+
+        assert!(super::is_retired_key("[qeli]", "obf.cipher"));
+        assert!(super::is_retired_key(
+            "[profile:tcp]",
+            "perf.tun.write_buffer_size"
+        ));
+        assert!(!super::is_retired_key("[logging]", "obf.cipher"));
+    }
+
     /// A wire mode that needs a stream must not validate on a datagram transport.
     ///
     /// `proto` and `mode` were each checked against their own enum and never against each
@@ -590,6 +884,7 @@ mod tests {
             let extra = match mode {
                 "reality-tls" => concat!(
                     "reality_sid = 0123456789abcdef\n",
+                    "sni = www.cloudflare.com\n",
                     "key = 1111111111111111111111111111111111111111111111111111111111111111\n"
                 ),
                 "obfs" => "obfs_key = deadbeefcafe\n",
@@ -772,10 +1067,46 @@ fn default_heartbeat_data_size() -> u16 {
     16
 }
 fn default_heartbeat_jitter() -> u64 {
-    20
+    5_000
 }
 fn default_round_sizes() -> Vec<u16> {
     vec![64, 128, 256, 512, 1024, 1500]
+}
+fn default_recordizer_policy() -> String {
+    "off".into()
+}
+fn default_recordizer_delay_min() -> u64 {
+    2
+}
+fn default_recordizer_delay_max() -> u64 {
+    8
+}
+fn default_recordizer_max_packets() -> u16 {
+    16
+}
+fn default_recordizer_queue_bytes() -> u32 {
+    256 * 1024
+}
+fn default_recordizer_small_min_ratio() -> f64 {
+    0.25
+}
+fn default_recordizer_small_max_ratio() -> f64 {
+    0.875
+}
+fn default_recordizer_full_probability() -> f64 {
+    0.72
+}
+fn default_recordizer_reassembly_timeout() -> u64 {
+    3_000
+}
+fn default_recordizer_max_inflight() -> u16 {
+    64
+}
+fn default_recordizer_reassembly_bytes() -> u32 {
+    4 * 1024 * 1024
+}
+fn default_recordizer_max_fragments() -> u16 {
+    64
 }
 fn default_shaping_gap_mean() -> u64 {
     700

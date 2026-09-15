@@ -42,7 +42,7 @@ struct VPNConfig: Codable, Equatable, Sendable {
     ///
     /// The distinction is the whole point. A key this port ignores is not necessarily a typo:
     /// `keepalive`, `post_up`, `exit_node` and friends are real Rust-client file-only settings
-    /// (docs/ru/CONFIG.md, "Что пушем НЕ передаётся"), and a CLI profile carrying them must
+    /// (docs/ru/manuals/CONFIG.md, "Что пушем НЕ передаётся"), and a CLI profile carrying them must
     /// still open here. Only a name NOTHING understands is a typo.
     // Set(...) around the literal, not just the `Set<String>` annotation: a contextual type
     // does not propagate through a method call, so Swift types the literal as Array first and
@@ -54,11 +54,11 @@ struct VPNConfig: Codable, Equatable, Sendable {
         // carrying per-app tunnelling or allow-LAN from Android. An unknown-key check is only
         // as good as its list: a missing entry does not degrade to "ignored", it rejects the
         // whole config.
-        "allow_ipv6_leak", "allow_lan", "allow_unpinned_tofu", "apps", "apps_mode",
+        "allow_ipv4_leak", "allow_ipv6_leak", "allow_lan", "allow_unpinned_tofu", "apps", "apps_mode",
         "awg", "bind_static", "dns", "dns_servers", "exclude",
         "front", "gateway", "heartbeat", "heartbeat_interval", "heartbeat_jitter",
         "heartbeat_size", "include", "jc", "jmax", "jmin", "key",
-        "mode", "mtu", "mtu_probe", "obfs_key", "padding",
+        "ipv6", "mode", "mtu", "mtu_probe", "obfs_key", "padding", "roaming",
         "padding_max", "padding_min", "pass", "proto", "quic", "reality_sid",
         "reconnect", "reconnect_base_delay", "reconnect_max_delay", "reconnect_retries",
         "route_local", "server", "shaping", "shaping_budget", "shaping_gap_max",
@@ -78,11 +78,12 @@ struct VPNConfig: Codable, Equatable, Sendable {
     static let carriedINIKeys: Set<String> = [
         // Not edited by the iOS model. Foreign platform/lifecycle fields survive a round trip;
         // transport-owned socket settings are consumed by Rust at the native boundary.
-        "autostart", "dev", "dev_attach", "dev_node", "exit_node", "forward",
-        "gateway_nat", "keepalive", "lan_subnet", "post_down", "post_up", "tcp_nodelay",
+        "autostart", "dev", "dev_attach", "device_type", "dev_node", "exit_node", "forward",
+        "gateway_nat", "keepalive", "lan_subnet", "lan_subnet_ipv6", "post_down", "post_up", "tcp_nodelay",
         "kill_switch", "local", "lport", "metric", "name", "persist_tun", "route_file",
         // Socket settings plus headless-only password sources.
-        "password_command", "password_file", "recv_buffer_size", "send_buffer_size",
+        "password_command", "password_file", "reality_compact", "reality_split",
+        "reality_split_delay", "recv_buffer_size", "send_buffer_size",
     ]
 
     /// Accepted tunnel-MTU range. The ceiling is derived, in Rust, from the record format
@@ -92,7 +93,7 @@ struct VPNConfig: Codable, Equatable, Sendable {
     /// same number, because raising it in one place only is worse than not raising it.
     /// (Audit 2026-08-01, §1.)
     static let mtuMin = 576
-    static let mtuMax = 16638
+    static let mtuMax = 16602
 
     /// Upper bound for both reconnect delays, in seconds (one day). Shared with the Kotlin and
     /// C# ports; see the note at the parse site for why the desktop client cannot go higher.
@@ -117,11 +118,14 @@ struct VPNConfig: Codable, Equatable, Sendable {
     var mtu = 0
     var mtuProbe = true
     var routingMode = "full-tunnel"
+    var ipv6Policy = "auto"
+    var roamingPolicy = "auto"
     var addDefaultGateway = true
     var includeRoutes: [String] = []
     var excludeRoutes: [String] = []
     var routeLocalNetworks = false
     var allowIPv6Leak = false
+    var allowIPv4Leak = false
     var allowLAN = false
     var dnsServers: [String] = []
     /// DNS handling mode, mirroring `dns.mode` in the Rust client: `tunnel` (default — install
@@ -158,11 +162,9 @@ struct VPNConfig: Codable, Equatable, Sendable {
     /// legacy fixture while the production packet tunnel remains Rust-only.
     static let authCredentialBudget = 1_114
 
-    /// Largest `padding_max` that can be encoded, mirroring the Rust client's cap.
-    ///
-    /// Padding rides on EVERY record, so this bounds the record, not a one-off. It applies to
-    /// both a local profile (`validate()`) and a server-pushed value (`clampPushedObfuscation`)
-    /// — the local one used to go unchecked, and applies FIRST. (Audit 2026-08-02, §9.)
+    /// Largest `padding_max` accepted from a local profile, mirroring the Rust client cap.
+    /// Padding rides on every record, so this bounds the record rather than a one-off.
+    /// Server-pushed transport values are parsed and validated inside the Rust core.
     static let paddingMaxCeiling = 1_400
     var heartbeatEnabled = true
     var heartbeatIntervalMilliseconds = 15_000
@@ -184,6 +186,11 @@ struct VPNConfig: Codable, Equatable, Sendable {
     var appsMode = "all"
     var apps: [String] = []
 
+    /// Desktop-only route sources are preserved as an ordered list because `route_file` is
+    /// deliberately repeatable. iOS never opens these host paths; it only keeps a portable
+    /// desktop profile lossless while it is viewed or edited here.
+    var routeFiles: [String] = []
+
     /// `[qeli]` keys accepted but not modelled (``carriedINIKeys``), kept verbatim so a save
     /// does not delete them. Written back by ``toINI()`` after the modelled keys.
     var carriedKeys: [String: String] = [:]
@@ -203,6 +210,19 @@ struct VPNConfig: Codable, Equatable, Sendable {
     /// quietly sending everything outside the VPN past it. (Audit 2026-07-31, §2.)
     var isFullTunnel: Bool {
         addDefaultGateway || routingMode == "full-tunnel" || routingMode == "all"
+    }
+
+    /// A candidate path always uses a fresh ephemeral socket. An explicit source address or
+    /// source port is therefore a user routing contract that must retain full reconnect. The
+    /// decision is deliberately transport-agnostic: ordinary TCP and every UDP camouflage mode
+    /// use the same Rust roaming state machine once the iOS platform executor is available.
+    var allowsNativePathRoaming: Bool {
+        guard roamingPolicy.caseInsensitiveCompare("off") != .orderedSame else { return false }
+        let local = carriedKeys["local"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let port = carriedKeys["lport"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard local.isEmpty else { return false }
+        guard !port.isEmpty else { return true }
+        return Int(port) == 0
     }
 
     init(serverAddress: String, port: Int) {
@@ -238,42 +258,6 @@ struct VPNConfig: Codable, Equatable, Sendable {
         try validate()
     }
 
-    /// Clamp every obfuscation/shaping value the SERVER pushes in AuthOK into a usable
-    /// range.
-    ///
-    /// `validate()` covers what the user types (port, timeout, mtu, padding) but nothing
-    /// that arrives over the wire, and the AuthOK parsers assigned these fields straight
-    /// from the JSON. Two consequences, both remote and post-authentication:
-    ///
-    /// * a large `idle_gap_mean_ms` made `TrafficShaper.nextGapMilliseconds` produce a
-    ///   `Double` outside `Int`'s range, and `Int(_:)` TRAPS rather than saturating —
-    ///   killing the Network Extension process on the first heartbeat tick;
-    /// * a large `padding.max_bytes` pushed records past `MaxRecordSize`, so
-    ///   `PacketCodec.encrypt` threw, the uplink died, the client reconnected, got the
-    ///   same value and looped forever.
-    ///
-    /// Clamping rather than rejecting: a server that pushes an odd value is far more
-    /// likely misconfigured than hostile, and refusing to connect would be a worse
-    /// outcome than shaping slightly differently than asked. (Audit 2026-07-27, C10.)
-    mutating func clampPushedObfuscation() {
-        // Padding must leave room inside one record; the ceiling mirrors the Rust client's.
-        paddingMin = min(max(paddingMin, 0), Self.paddingMaxCeiling)
-        paddingMax = min(max(paddingMax, paddingMin), Self.paddingMaxCeiling)
-
-        shapingGapMeanMilliseconds = min(max(shapingGapMeanMilliseconds, 1), 60_000)
-        shapingGapMinMilliseconds = min(max(shapingGapMinMilliseconds, 0), 60_000)
-        shapingGapMaxMilliseconds = min(
-            max(shapingGapMaxMilliseconds, shapingGapMinMilliseconds),
-            60_000
-        )
-        shapingMinSize = min(max(shapingMinSize, 0), 1_400)
-        shapingMaxSize = min(max(shapingMaxSize, shapingMinSize), 1_400)
-        shapingBudgetBytesPerSecond = min(max(shapingBudgetBytesPerSecond, 0), 100_000_000)
-        shapingStealthRateMbps = min(max(shapingStealthRateMbps, 1), 10_000)
-
-        heartbeatIntervalMilliseconds = min(max(heartbeatIntervalMilliseconds, 1_000), 600_000)
-        heartbeatJitterMilliseconds = min(max(heartbeatJitterMilliseconds, 0), 60_000)
-    }
 
     func validate() throws {
         // A boolean nobody could parse is a typo, and every one of them used to read as `false`
@@ -316,12 +300,19 @@ struct VPNConfig: Codable, Equatable, Sendable {
         // already checked below. (Audit 2026-07-31, §3.)
         let enums: [(String, String, [String])] = [
             ("front", obfsFronting, ["websocket", "none"]),
-            ("routing_mode", routingMode, ["split-tunnel", "full-tunnel", "all"])
+            ("routing_mode", routingMode, ["split-tunnel", "full-tunnel", "all"]),
+            ("ipv6", ipv6Policy, ["auto", "required", "off"]),
+            ("roaming", roamingPolicy, ["off", "auto", "required"])
         ]
         for (field, value, allowed) in enums where !allowed.contains(value) {
             throw VPNConfigError.invalid(
                 "unknown \(field) '\(value)' — expected "
                 + allowed.map { "'\($0)'" }.joined(separator: " or "))
+        }
+
+        if roamingPolicy == "required" && !allowsNativePathRoaming {
+            throw VPNConfigError.invalid(
+                "roaming = required cannot be combined with local or a non-zero lport")
         }
 
         let scalarFields: [(String, String)] = [
@@ -352,7 +343,8 @@ struct VPNConfig: Codable, Equatable, Sendable {
             ("include", includeRoutes),
             ("exclude", excludeRoutes),
             ("dns", dnsServers),
-            ("apps", apps)
+            ("apps", apps),
+            ("route_file", routeFiles)
         ]
         for (field, values) in listFields where values.contains(where: Self.containsForbiddenINICharacters) {
             throw VPNConfigError.invalid("\(field) contains a forbidden line break or NUL character")
@@ -365,6 +357,13 @@ struct VPNConfig: Codable, Equatable, Sendable {
         }
         guard !serverAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw VPNConfigError.invalid("server host is empty")
+        }
+        guard !serverAddress.contains("[") && !serverAddress.contains("]") else {
+            throw VPNConfigError.invalid(
+                "serverAddress stores a bare host; brackets belong only around an IPv6 endpoint")
+        }
+        if serverAddress.contains(":"), !Self.isIPLiteral(serverAddress) {
+            throw VPNConfigError.invalid("server contains an invalid IPv6 address: \(serverAddress)")
         }
         guard (1...65_535).contains(port) else {
             throw VPNConfigError.invalid("server port must be between 1 and 65535")
@@ -437,6 +436,10 @@ struct VPNConfig: Codable, Equatable, Sendable {
         if mtu != 0 && !(Self.mtuMin...Self.mtuMax).contains(mtu) {
             throw VPNConfigError.invalid("mtu must be 0 or between \(Self.mtuMin) and \(Self.mtuMax)")
         }
+        if ipv6Policy == "required", mtu > 0, mtu < 1280 {
+            throw VPNConfigError.invalid(
+                "ipv6 = required needs an explicit mtu of at least 1280 (or 0 for auto), got \(mtu)")
+        }
         guard paddingMin >= 0, paddingMax >= paddingMin else {
             throw VPNConfigError.invalid("padding range is invalid")
         }
@@ -450,6 +453,29 @@ struct VPNConfig: Codable, Equatable, Sendable {
             throw VPNConfigError.invalid(
                 "padding_max must be at most \(Self.paddingMaxCeiling) — padding rides on every "
                     + "record, and a larger value cannot be encoded")
+        }
+        guard shapingGapMeanMilliseconds > 0,
+              shapingGapMinMilliseconds > 0,
+              shapingGapMaxMilliseconds > 0,
+              shapingBudgetBytesPerSecond > 0,
+              shapingMinSize > 0,
+              shapingMaxSize > 0,
+              shapingStealthRateMbps > 0 else {
+            throw VPNConfigError.invalid(
+                "shaping durations, sizes, budget and stealth rate must be positive")
+        }
+        guard shapingGapMinMilliseconds <= shapingGapMaxMilliseconds else {
+            throw VPNConfigError.invalid(
+                "shaping gap range is inverted: \(shapingGapMinMilliseconds)..\(shapingGapMaxMilliseconds)")
+        }
+        guard shapingMinSize <= shapingMaxSize else {
+            throw VPNConfigError.invalid(
+                "shaping size range is inverted: \(shapingMinSize)..\(shapingMaxSize)")
+        }
+        guard !shapingEnabled || shapingBudgetBytesPerSecond >= shapingMaxSize else {
+            throw VPNConfigError.invalid(
+                "shaping budget (\(shapingBudgetBytesPerSecond)) must be at least max_size "
+                    + "(\(shapingMaxSize)) so each scheduled cover record can be emitted")
         }
         // A misspelled `apps_mode` must not resolve to the WIDEST setting in silence.
         // Handled like `proto` and `mode` above: the raw value is kept and refused here,
@@ -533,7 +559,8 @@ struct VPNConfig: Codable, Equatable, Sendable {
 
     static func fromINI(_ text: String) throws -> VPNConfig {
         var dupKeys: [String] = []
-        let sections = parseINI(text, duplicates: &dupKeys)
+        var repeatedKeys: [String: [String]] = [:]
+        let sections = parseINI(text, duplicates: &dupKeys, repeatedKeys: &repeatedKeys)
         guard let qeli = sections["qeli"] else {
             throw VPNConfigError.invalid("config is missing [qeli] section")
         }
@@ -617,11 +644,14 @@ struct VPNConfig: Codable, Equatable, Sendable {
 
         let fullTunnel = boolAt("gateway", default: true)
         config.routingMode = fullTunnel ? "full-tunnel" : "split-tunnel"
+        config.ipv6Policy = qeli["ipv6"]?.lowercased() ?? "auto"
+        config.roamingPolicy = qeli["roaming"]?.lowercased() ?? "auto"
         config.addDefaultGateway = fullTunnel
         config.includeRoutes = list(qeli["include"])
         config.excludeRoutes = list(qeli["exclude"])
         config.routeLocalNetworks = boolAt("route_local", default: false)
         config.allowIPv6Leak = boolAt("allow_ipv6_leak", default: false)
+        config.allowIPv4Leak = boolAt("allow_ipv4_leak", default: false)
         config.allowLAN = boolAt("allow_lan", default: false)
         // `dns` is a resolver LIST here and a MODE in the Rust/router client (`off` / `tunnel`
         // / `system`). Legacy profiles overloaded the key; the mode is now kept independently
@@ -686,14 +716,18 @@ struct VPNConfig: Codable, Equatable, Sendable {
         // (Audit 2026-08-02, §10.)
         config.appsMode = qeli["apps_mode"]?.lowercased() ?? "all"
         config.apps = list(qeli["apps"])
+        config.routeFiles = repeatedKeys["qeli.route_file"] ?? []
         config.unparsedBooleanKeys = badBools
         config.duplicateKeys = dupKeys
         config.unparsedNumericKeys = badNums
         config.unknownKeys = qeli.keys
             .filter { !Self.knownINIKeys.contains($0.lowercased()) }
             .sorted()
-        // Accepted but not modelled — kept so saving does not delete them.
-        config.carriedKeys = qeli.filter { Self.carriedINIKeys.contains($0.key.lowercased()) }
+        // Accepted but not modelled — kept so saving does not delete them. route_file is
+        // stored separately because it is the one deliberately repeatable key.
+        config.carriedKeys = qeli.filter {
+            Self.carriedINIKeys.contains($0.key.lowercased()) && $0.key.lowercased() != "route_file"
+        }
         return config
     }
 
@@ -739,6 +773,7 @@ struct VPNConfig: Codable, Equatable, Sendable {
             case "obfs": config.obfsKey = value
             case "front": config.obfsFronting = value.nonEmpty ?? "websocket"
             case "quic": config.quicEnabled = value == "1" || value.lowercased() == "true"
+            case "roaming": config.roamingPolicy = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             case "awg": config.awgEnabled = value == "1" || value.lowercased() == "true"
             case "jc": config.awgJunkCount = Int(value) ?? 0
             case "jmin": config.awgJunkMin = Int(value) ?? 40
@@ -813,10 +848,13 @@ struct VPNConfig: Codable, Equatable, Sendable {
         if mtu != 0 { lines.append("mtu = \(mtu)") }
         if !mtuProbe { lines.append("mtu_probe = false") }
         lines.append("gateway = \(isFullTunnel ? "true" : "false")")
+        if ipv6Policy != "auto" { lines.append("ipv6 = \(ipv6Policy)") }
+        if roamingPolicy != "auto" { lines.append("roaming = \(roamingPolicy)") }
         if !includeRoutes.isEmpty { lines.append("include = \(includeRoutes.joined(separator: ", "))") }
         if !excludeRoutes.isEmpty { lines.append("exclude = \(excludeRoutes.joined(separator: ", "))") }
         if routeLocalNetworks { lines.append("route_local = true") }
         if allowIPv6Leak { lines.append("allow_ipv6_leak = true") }
+        if allowIPv4Leak { lines.append("allow_ipv4_leak = true") }
         if allowLAN { lines.append("allow_lan = true") }
         // One key, two meanings — mirroring the Rust client. A non-default MODE wins over the
         // server list: `dns = off` must survive a save/load round-trip, or re-saving a profile
@@ -846,6 +884,7 @@ struct VPNConfig: Codable, Equatable, Sendable {
         if reconnectBaseDelaySeconds != 1 { lines.append("reconnect_base_delay = \(reconnectBaseDelaySeconds)") }
         if reconnectMaxDelaySeconds != 60 { lines.append("reconnect_max_delay = \(reconnectMaxDelaySeconds)") }
         lines.append("timeout = \(connectionTimeoutSeconds)")
+        for path in routeFiles { lines.append("route_file = \(path)") }
         // Re-emit the keys this port accepts but does not model, verbatim and in a stable
         // order. Without this, opening a CLI profile here and saving it deleted its hooks
         // (`post_up`/`post_down`), socket policy and routing policy — silently, and as
@@ -892,12 +931,14 @@ struct VPNConfig: Codable, Equatable, Sendable {
             query += ["awg=1", "jc=\(awgJunkCount)", "jmin=\(awgJunkMin)", "jmax=\(awgJunkMax)"]
         }
         if mtu != 0 { query.append("mtu=\(mtu)") }
+        if roamingPolicy != "auto" { query.append("roaming=\(roamingPolicy)") }
         let fragment = label?.nonEmpty.map { "#\(Self.percentEncode($0))" } ?? ""
         return "qeli://\(auth)\(Self.formatEndpoint(host: serverAddress, port: port))?\(query.joined(separator: "&"))\(fragment)"
     }
 
     private static func parseINI(
-        _ text: String, duplicates: inout [String]
+        _ text: String, duplicates: inout [String],
+        repeatedKeys: inout [String: [String]]
     ) -> [String: [String: String]] {
         var result: [String: [String: String]] = [:]
         var section: String?
@@ -920,6 +961,13 @@ struct VPNConfig: Codable, Equatable, Sendable {
                 // Keep LAST-wins, so a file that never had a duplicate parses exactly as it did
                 // before, and record the ambiguity for validate() to refuse.
                 let qualified = "\(section).\(key)"
+                if qualified == "qeli.route_file" {
+                    if !value.isEmpty {
+                        repeatedKeys[qualified, default: []].append(value)
+                    }
+                    result[section, default: [:]][key] = value
+                    continue
+                }
                 if result[section, default: [:]][key] != nil, !duplicates.contains(qualified) {
                     duplicates.append(qualified)
                 }
@@ -937,18 +985,32 @@ struct VPNConfig: Codable, Equatable, Sendable {
                   let port = Int(endpoint[endpoint.index(close, offsetBy: 2)...]) else {
                 throw VPNConfigError.invalid("IPv6 endpoint must be [host]:port")
             }
-            return (String(endpoint[endpoint.index(after: endpoint.startIndex)..<close]), port)
+            let host = String(endpoint[endpoint.index(after: endpoint.startIndex)..<close])
+            guard host.contains(":"), isIPLiteral(host) else {
+                throw VPNConfigError.invalid("invalid IPv6 endpoint address: \(host)")
+            }
+            guard (1...65_535).contains(port) else {
+                throw VPNConfigError.invalid("server port must be between 1 and 65535")
+            }
+            return (host, port)
         }
         guard let colon = endpoint.lastIndex(of: ":"),
               colon > endpoint.startIndex,
               let port = Int(endpoint[endpoint.index(after: colon)...]) else {
             throw VPNConfigError.invalid("server must be host:port")
         }
-        return (String(endpoint[..<colon]), port)
+        let host = String(endpoint[..<colon])
+        guard !host.contains(":"), !host.contains("["), !host.contains("]") else {
+            throw VPNConfigError.invalid("IPv6 endpoint must be bracketed as [address]:port")
+        }
+        guard (1...65_535).contains(port) else {
+            throw VPNConfigError.invalid("server port must be between 1 and 65535")
+        }
+        return (host, port)
     }
 
     private static func formatEndpoint(host: String, port: Int) -> String {
-        host.contains(":") && !host.hasPrefix("[") ? "[\(host)]:\(port)" : "\(host):\(port)"
+        host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
     }
 
     private static let unreserved: CharacterSet = {

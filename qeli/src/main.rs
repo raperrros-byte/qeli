@@ -4,9 +4,17 @@
 use qeli::config;
 #[cfg(target_os = "linux")]
 use qeli::{client, server};
+use qeli_core as qeli;
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("the qeli *binary* is Linux-only (the realtls FFI library is cross-platform)");
+
+// A glibc-allocator server is valid for debug/test work, but must never become a
+// deployable release binary: under handshake churn its retained arenas caused the
+// production RSS regression that jemalloc was introduced to prevent. Keep the guard
+// in this binary target so FFI cdylibs and the standalone router client stay isolated.
+#[cfg(all(target_os = "linux", not(debug_assertions), not(feature = "jemalloc")))]
+compile_error!("release qeli server builds require --features jemalloc");
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -199,8 +207,9 @@ enum Commands {
         username: String,
         /// Password (plaintext). VISIBLE TO EVERY LOCAL USER in /proc/<pid>/cmdline and in
         /// the shell history — prefer --password-stdin, or omit it entirely and let a
-        /// strong random one be generated and printed once (it cannot be recovered later;
-        /// only the hash is stored).
+        /// strong random one be generated and printed once. The users database stores its
+        /// Argon2 hash and may also store a reversibly encrypted `password_enc` for panel
+        /// link/QR re-issue; protect `/var/lib/qeli/panel-secret.key` accordingly.
         #[arg(short, long)]
         password: Option<String>,
         /// Read the password from stdin (first line), so it never appears in the process
@@ -219,6 +228,9 @@ enum Commands {
         /// Static tunnel IP for this client (optional).
         #[arg(long)]
         static_ip: Option<String>,
+        /// Static IPv6 tunnel address for this client (optional).
+        #[arg(long)]
+        static_ipv6: Option<String>,
         /// Max concurrent sessions (0 = group/default).
         #[arg(long, default_value_t = 0)]
         max_sessions: u32,
@@ -333,18 +345,15 @@ enum Commands {
 
 /// Report unread/retired/GUI-only keys and bad values for one parsed INI document.
 fn report_ini_findings(path: &str, doc: &config::format::IniDoc, client: bool) -> usize {
-    use config::GUI_ONLY_CLIENT_KEYS;
-    use config::RETIRED_KEYS;
-
     let mut problems = 0usize;
 
     let (gui_only, rest): (Vec<_>, Vec<_>) = doc
         .unread_keys()
         .into_iter()
-        .partition(|(_, k)| client && GUI_ONLY_CLIENT_KEYS.contains(k));
+        .partition(|(section, key)| client && config::is_gui_only_client_key(section, key));
     let (retired, unknown): (Vec<_>, Vec<_>) = rest
         .into_iter()
-        .partition(|(_, k)| RETIRED_KEYS.contains(k));
+        .partition(|(section, key)| config::is_retired_key(section, key));
 
     if !gui_only.is_empty() {
         println!(
@@ -814,6 +823,7 @@ async fn main() -> anyhow::Result<()> {
             password_stdin,
             profiles,
             static_ip,
+            static_ipv6,
             max_sessions,
             link,
             link_profile,
@@ -828,6 +838,7 @@ async fn main() -> anyhow::Result<()> {
                     password,
                     profiles,
                     static_ip,
+                    static_ipv6,
                     max_sessions,
                     link,
                     link_profile,
@@ -1163,6 +1174,7 @@ fn add_client(
     password: Option<String>,
     profiles: Option<String>,
     static_ip: Option<String>,
+    static_ipv6: Option<String>,
     max_sessions: u32,
     link: bool,
     link_profile: Option<String>,
@@ -1229,14 +1241,8 @@ fn add_client(
     };
 
     // Argon2id hash with a fresh random salt (same scheme as the web API).
-    let password_hash = {
-        use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
-        let salt = SaltString::generate(&mut OsRng);
-        qeli::crypto::password_hasher()
-            .hash_password(plaintext.as_bytes(), &salt)
-            .map_err(|e| anyhow::anyhow!("hashing failed: {}", e))?
-            .to_string()
-    };
+    let password_hash = qeli::crypto::hash_password(plaintext.as_bytes())
+        .map_err(|e| anyhow::anyhow!("hashing failed: {}", e))?;
 
     let profile_list: Vec<String> = profiles
         .as_deref()
@@ -1255,6 +1261,7 @@ fn add_client(
         // later without the plaintext (best-effort; None if the panel key is absent).
         password_enc: qeli::crypto::secret::encrypt_password(&plaintext).ok(),
         static_ip,
+        static_ipv6,
         enabled: true,
         max_sessions,
         profiles: profile_list,
@@ -1264,31 +1271,55 @@ fn add_client(
     // copy loaded earlier and writing the whole thing back raced a RUNNING server: the
     // worker holds its own copy and rewrites the file on any control-socket change, so a
     // client added here could be silently reverted minutes later (seen in the lab).
-    qeli::config::users::UsersDb::update_locked(&users_file, |fresh| {
+    let (_, added) = qeli::config::users::UsersDb::update_locked(&users_file, |fresh| {
         // Re-check on the just-read state: the name may have appeared since.
         if fresh.users.iter().any(|u| u.username == entry.username) {
-            return false;
+            return Ok(false);
         }
         fresh.users.push(entry);
-        true
-    })
-    .map_err(|e| anyhow::anyhow!("cannot write users file {}: {}", users_file, e))
-    .and_then(|(_, added)| {
-        if added {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(
-                "user '{}' already exists in {} (added concurrently)",
-                username,
-                users_file
-            ))
+
+        // Validate the exact effective file+inline union while the cross-process lock is
+        // held. This prevents a concurrent add from creating a duplicate fixed address and
+        // keeps CLI, panel, check-config and runtime startup on the same gate.
+        let mut effective = fresh.clone();
+        let file_users: std::collections::HashSet<String> = effective
+            .users
+            .iter()
+            .map(|user| user.username.clone())
+            .collect();
+        for inline in &server_cfg.auth.users {
+            if !file_users.contains(&inline.username) {
+                effective.users.push(inline.clone());
+            }
         }
+        for (name, group) in &server_cfg.auth.groups {
+            effective
+                .groups
+                .entry(name.clone())
+                .or_insert_with(|| group.clone());
+        }
+        if let Err(error) = qeli::server::validate_static_address_sources(&server_cfg, &effective) {
+            fresh.users.pop();
+            return Err(error);
+        }
+        Ok(true)
+    })
+    .map_err(|e| anyhow::anyhow!("cannot write users file {}: {}", users_file, e))?;
+    let added: bool = added.map_err(|error| {
+        anyhow::anyhow!("client address validation failed; users file was not changed: {error}")
     })?;
+    if !added {
+        anyhow::bail!(
+            "user '{}' already exists in {} (added concurrently)",
+            username,
+            users_file
+        );
+    }
 
     println!("Added client '{}' to {}", username, users_file);
     if generated {
         println!(
-            "Generated password (store it now — only the hash is kept):\n  {}",
+            "Generated password (store it securely; an Argon2 hash and a panel-encrypted recovery value are kept):\n  {}",
             plaintext
         );
     }
@@ -1356,14 +1387,8 @@ fn set_web_password(
     };
 
     // Argon2id with a fresh random salt (same scheme as the web API / add-client).
-    let password_hash = {
-        use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
-        let salt = SaltString::generate(&mut OsRng);
-        qeli::crypto::password_hasher()
-            .hash_password(plaintext.as_bytes(), &salt)
-            .map_err(|e| anyhow::anyhow!("hashing failed: {}", e))?
-            .to_string()
-    };
+    let password_hash = qeli::crypto::hash_password(plaintext.as_bytes())
+        .map_err(|e| anyhow::anyhow!("hashing failed: {}", e))?;
 
     let mut updates: Vec<(&str, String)> = vec![
         ("username", username.clone()),
@@ -1481,14 +1506,8 @@ fn share_link(
         ),
         None => {
             let new_pw = generate_password(20);
-            let hash = {
-                use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
-                let salt = SaltString::generate(&mut OsRng);
-                qeli::crypto::password_hasher()
-                    .hash_password(new_pw.as_bytes(), &salt)
-                    .map_err(|e| anyhow::anyhow!("hashing failed: {}", e))?
-                    .to_string()
-            };
+            let hash = qeli::crypto::hash_password(new_pw.as_bytes())
+                .map_err(|e| anyhow::anyhow!("hashing failed: {}", e))?;
             let enc2 = qeli::crypto::secret::encrypt_password(&new_pw).ok();
             // Re-read under the cross-process lock and edit THERE: a running worker holds
             // its own copy and rewrites the file on any control-socket change, so writing
@@ -2060,7 +2079,7 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::{validate_service_unit, validate_service_user};
-    use qeli::config::set_section_keys;
+    use qeli_core::config::set_section_keys;
 
     fn ups() -> Vec<(&'static str, String)> {
         vec![

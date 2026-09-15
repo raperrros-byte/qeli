@@ -58,7 +58,7 @@
   "max_chunk_accept": 1200,
   "max_frags": 24,
   "msg_auth_ok": 6,
-  "platforms": ["rust", "csharp", "swift"],
+  "platforms": ["rust", "kotlin", "csharp", "swift"],
   "fragment": [
     {
       "name": "single-fragment",
@@ -117,6 +117,12 @@
       "expect": { "message": "414141414242424243434343" }
     },
     {
+      "name": "conflicting-duplicate-fragment",
+      "why": "The same index cannot authenticate two different byte strings. Keeping the first silently makes the reconstructed handshake depend on arrival order and lets an injected duplicate hide corruption instead of failing closed.",
+      "feed": ["f09b7102000341414141", "f09b7102000342424242"],
+      "expect": { "reject": true }
+    },
+    {
       "name": "missing-fragment",
       "why": "A gap must stay incomplete — never completed with a hole, never padded.",
       "feed": ["f09b7102000341414141", "f09b7102020343434343"],
@@ -168,13 +174,13 @@
     },
     {
       "name": "mtu-probe-ack",
-      "why": "The probe ACK is fully deterministic (id + outer_size, little-endian), so it is pinned byte for byte here — id 0xBEEF, outer size 1400.",
+      "why": "The probe ACK is fully deterministic (id + probe_payload_size, little-endian), so it is pinned byte for byte here — id 0xBEEF, pre-wrapper payload size 1400.",
       "datagram": "f09b71050001efbe7805",
       "expect": { "is_fragment": true, "is_junk": false, "is_mtu_probe": false, "is_mtu_probe_ack": true, "is_auth_ok": false }
     },
     {
       "name": "auth-ok-fragment",
-      "why": "The AuthOK, msg_id 6 — fragment 0 of 2. Unambiguous against a real record in either framing: TLS framing opens 0x17 0x03 0x03, and raw framing opens with a u16 payload length bounded by MAX_RECORD_SIZE (0x4124), so its high byte is at most 0x41 and 0xF0 is unreachable both ways. Same property that lets a server tell a fragmented ClientHello from a legacy single-datagram one.",
+      "why": "The AuthOK, msg_id 6 — fragment 0 of 2. Unambiguous against a real record in either framing: TLS framing opens 0x17 0x03 0x03, and raw framing opens with a u16 payload length bounded by MAX_RECORD_SIZE (0x4100), so its high byte is at most 0x41 and 0xF0 is unreachable both ways. Same property that lets a server tell a fragmented ClientHello from a legacy single-datagram one.",
       "datagram": "f09b71060002deadbeef",
       "expect": { "is_fragment": true, "is_junk": false, "is_mtu_probe": false, "is_mtu_probe_ack": false, "is_auth_ok": true }
     },

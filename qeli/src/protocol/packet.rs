@@ -10,7 +10,11 @@ pub const RAW_RECORD_HEADER: usize = 2;
 pub const NONCE_SIZE: usize = 12;
 pub const TAG_SIZE: usize = 16;
 pub const COUNTER_SIZE: usize = 8;
-pub const MAX_RECORD_SIZE: usize = 16384 + NONCE_SIZE + TAG_SIZE + COUNTER_SIZE + 256;
+/// RFC 8446 section 5.2: TLSCiphertext.length must not exceed 2^14 + 256 bytes.
+pub const TLS_CIPHERTEXT_MAX: usize = (1 << 14) + 256;
+/// One shared record cap for raw and TLS-shaped framing. Raw could encode more, but keeping the
+/// lower TLS limit makes every negotiated MTU valid in every supported wire mode.
+pub const MAX_RECORD_SIZE: usize = TLS_CIPHERTEXT_MAX;
 
 /// The largest INNER (tunnel) packet the record format can carry.
 ///
@@ -35,11 +39,12 @@ const REPLAY_WORDS: usize = REPLAY_WINDOW_SIZE / 64;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Framing {
     /// TLS application-data record: `[0x17 0x03 0x03][u16 len][nonce][ct]`. Used
-    /// by the fake-tls / obfs / reality-tls wire modes (the qeli payload is
-    /// dressed as a TLS 1.2 application-data record).
+    /// by fake-tls, obfs, and the legacy reality-tls inner carrier (the qeli
+    /// payload is dressed as a TLS 1.2 application-data record).
     Tls,
-    /// Bare length-prefixed record: `[u16 len][nonce][ct]`. Used by the `plain`
-    /// wire mode — no TLS mimicry at all, just an encrypted tunnel.
+    /// Bare length-prefixed record: `[u16 len][nonce][ct]`. Used directly by
+    /// `plain`, or privately inside the genuine HTTP/2 stream of current
+    /// reality-tls clients.
     Raw,
 }
 
@@ -282,6 +287,49 @@ impl PacketCodec {
     ) -> Result<usize, PacketError> {
         let (_, plaintext_len, header_len) = self.record_sizes(data_len, padding_len)?;
         Ok(header_len + NONCE_SIZE + plaintext_len + TAG_SIZE)
+    }
+
+    /// Largest padding region that keeps the complete encrypted record within
+    /// `max_record_len`. UDP callers use this after subtracting outer QUIC/obfs and IP/UDP
+    /// overhead, so heartbeat and cover records obey the same no-fragmentation budget as
+    /// ordinary DATA records.
+    pub(crate) fn max_padding_for_record_budget(
+        &self,
+        data_len: usize,
+        max_record_len: usize,
+    ) -> Result<usize, PacketError> {
+        let base_len = self.encrypted_record_len(data_len, 0)?;
+        if base_len > max_record_len {
+            return Err(PacketError::PacketTooLarge);
+        }
+        let (_, _, header_len) = self.record_sizes(data_len, 0)?;
+        let format_ceiling = header_len
+            .checked_add(MAX_RECORD_SIZE)
+            .ok_or(PacketError::PacketTooLarge)?;
+        Ok(max_record_len
+            .min(format_ceiling)
+            .saturating_sub(base_len)
+            .min(u16::MAX as usize))
+    }
+
+    /// Largest application payload that fits in a complete encrypted record budget
+    /// when no optional padding is present.
+    pub(crate) fn max_data_for_record_budget(
+        &self,
+        max_record_len: usize,
+    ) -> Result<usize, PacketError> {
+        let base_len = self.encrypted_record_len(0, 0)?;
+        if base_len > max_record_len {
+            return Err(PacketError::PacketTooLarge);
+        }
+        let (_, _, header_len) = self.record_sizes(0, 0)?;
+        let format_ceiling = header_len
+            .checked_add(MAX_RECORD_SIZE)
+            .ok_or(PacketError::PacketTooLarge)?;
+        Ok(max_record_len
+            .min(format_ceiling)
+            .saturating_sub(base_len)
+            .min(MAX_TUNNEL_MTU))
     }
 
     pub fn new(key: [u8; 32]) -> Self {
@@ -849,6 +897,58 @@ mod tests {
             PacketCodec::new(key).encrypt_packet(&big, &[]),
             Err(PacketError::PacketTooLarge)
         ));
+    }
+
+    #[test]
+    fn padding_budget_matches_exact_tls_and_raw_record_lengths() {
+        for mut codec in [
+            PacketCodec::new([0x21; 32]),
+            PacketCodec::new_raw([0x22; 32]),
+        ] {
+            for budget in [512usize, 1232, TLS_RECORD_HEADER + MAX_RECORD_SIZE] {
+                let cap = codec.max_padding_for_record_budget(0, budget).unwrap();
+                let format_ceiling = match codec.framing {
+                    Framing::Tls => TLS_RECORD_HEADER + MAX_RECORD_SIZE,
+                    Framing::Raw => RAW_RECORD_HEADER + MAX_RECORD_SIZE,
+                };
+                let mut record = Vec::new();
+                codec
+                    .encrypt_packet_into(&[], &vec![0xA5; cap], &mut record)
+                    .unwrap();
+                assert!(record.len() <= budget);
+                if cap < u16::MAX as usize {
+                    assert_eq!(
+                        record.len(),
+                        budget.min(format_ceiling),
+                        "the computed cap must use all available wire budget"
+                    );
+                }
+            }
+        }
+
+        let codec = PacketCodec::new([0x23; 32]);
+        assert!(matches!(
+            codec.max_padding_for_record_budget(0, 1),
+            Err(PacketError::PacketTooLarge)
+        ));
+    }
+
+    #[test]
+    fn data_budget_produces_a_record_that_exactly_fits_tls_and_raw_limits() {
+        for mut codec in [
+            PacketCodec::new([0x31; 32]),
+            PacketCodec::new_raw([0x32; 32]),
+        ] {
+            for budget in [512usize, 1232, TLS_RECORD_HEADER + MAX_RECORD_SIZE] {
+                let cap = codec.max_data_for_record_budget(budget).unwrap();
+                let mut record = Vec::new();
+                codec
+                    .encrypt_packet_into(&vec![0xA5; cap], &[], &mut record)
+                    .unwrap();
+                assert!(record.len() <= budget);
+                assert_eq!(codec.max_padding_for_record_budget(cap, budget).unwrap(), 0);
+            }
+        }
     }
 
     #[test]

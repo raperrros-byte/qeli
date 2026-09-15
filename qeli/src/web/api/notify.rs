@@ -16,25 +16,28 @@ fn mask(s: &str) -> String {
     }
 }
 
+fn public_config(c: &NotifyConfig) -> Value {
+    json!({
+        "server_name": c.server_name,
+        "telegram_enabled": c.telegram_enabled,
+        "telegram_token_set": !c.telegram_token.is_empty(),
+        "telegram_token_hint": mask(&c.telegram_token),
+        "telegram_chat_id": c.telegram_chat_id,
+        "telegram_events": c.telegram_events,
+        "webhook_enabled": c.webhook_enabled,
+        "webhook_url": c.webhook_url,
+        "webhook_events": c.webhook_events,
+    })
+}
+
 /// Current notify config. The Telegram token is never sent back in clear — only a
 /// "set" flag and a masked hint — so the panel shows it's configured without
 /// leaking it to the browser. Telegram and the webhook are independent.
 pub async fn get_notify(_guard: auth::AuthGuard) -> Result<Json<Value>, AuthError> {
-    let c = notify::load();
-    Ok(Json(json!({
-        "ok": true,
-        "config": {
-            "server_name": c.server_name,
-            "telegram_enabled": c.telegram_enabled,
-            "telegram_token_set": !c.telegram_token.is_empty(),
-            "telegram_token_hint": mask(&c.telegram_token),
-            "telegram_chat_id": c.telegram_chat_id,
-            "telegram_events": c.telegram_events,
-            "webhook_enabled": c.webhook_enabled,
-            "webhook_url": c.webhook_url,
-            "webhook_events": c.webhook_events,
-        }
-    })))
+    Ok(Json(match notify::load_checked() {
+        Ok(config) => json!({ "ok": true, "config": public_config(&config) }),
+        Err(error) => json!({ "ok": false, "error": error }),
+    }))
 }
 
 fn merge_events(ev: &mut ChannelEvents, v: Option<&Value>) {
@@ -71,8 +74,8 @@ fn merge_events(ev: &mut ChannelEvents, v: Option<&Value>) {
 /// Build an updated config from the request body, layered over the saved one. An
 /// empty `telegram_token` means "keep the existing one" (write-only field), so
 /// saving other settings never wipes a configured token.
-fn merge(body: &Value) -> NotifyConfig {
-    let mut c = notify::load();
+fn merge(body: &Value) -> Result<NotifyConfig, String> {
+    let mut c = notify::load_checked()?;
     if let Some(v) = body.get("server_name").and_then(Value::as_str) {
         c.server_name = v.trim().to_string();
     }
@@ -106,7 +109,7 @@ fn merge(body: &Value) -> NotifyConfig {
         c.webhook_url = v.trim().to_string();
     }
     merge_events(&mut c.webhook_events, body.get("webhook_events"));
-    c
+    Ok(c)
 }
 
 /// Persist the notify config.
@@ -114,7 +117,10 @@ pub async fn put_notify(
     _guard: auth::AuthGuard,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, AuthError> {
-    let mut c = merge(&body);
+    let mut c = match merge(&body) {
+        Ok(config) => config,
+        Err(error) => return Ok(Json(json!({ "ok": false, "error": error }))),
+    };
     // Disabling the channel also drops the secret — leaving a live bot token on disk
     // for a channel the operator believes is off is a needless exposure. Done HERE and
     // not in `merge`, because `merge` is shared with the test endpoint (where clearing
@@ -122,8 +128,11 @@ pub async fn put_notify(
     if !c.telegram_enabled {
         c.telegram_token.clear();
     }
+    if let Err(error) = notify::validate_enabled(&c) {
+        return Ok(Json(json!({ "ok": false, "error": error })));
+    }
     Ok(Json(match notify::save(&c) {
-        Ok(_) => json!({ "ok": true }),
+        Ok(_) => json!({ "ok": true, "config": public_config(&c) }),
         Err(e) => json!({ "ok": false, "error": e.to_string() }),
     }))
 }
@@ -135,7 +144,10 @@ pub async fn test_notify(
     _guard: auth::AuthGuard,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, AuthError> {
-    let c = merge(&body);
+    let c = match merge(&body) {
+        Ok(config) => config,
+        Err(error) => return Ok(Json(json!({ "ok": false, "error": error }))),
+    };
     let result = match body.get("channel").and_then(Value::as_str).unwrap_or("") {
         "telegram" => notify::test_telegram(&c).await,
         "webhook" => notify::test_webhook(&c).await,

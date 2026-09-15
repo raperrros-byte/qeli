@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.IO;
@@ -24,18 +24,18 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<VpnConfig> _profiles = new();
     private readonly VpnTunnel _tunnel = new();
     // The profile the tunnel is currently running (last passed to _tunnel.Start). Its
-    // reconnect loop lives inside the tunnel, decoupled from the list — so deleting or
+    // reconnect loop lives inside the tunnel, decoupled from the list вЂ” so deleting or
     // editing THIS profile must stop/restart the tunnel, or the old loop keeps hammering
     // the stale server IP after the config is gone/changed. Cleared when the tunnel stops.
     private VpnConfig? _activeProfile;
     // Per-profile log buffers (keyed by VpnConfig.Id). The tunnel runs ONE profile at a
-    // time, so a log line belongs to the running profile (_activeProfile) — or, when idle,
+    // time, so a log line belongs to the running profile (_activeProfile) вЂ” or, when idle,
     // to the selected one. Selecting a profile shows that profile's buffer (separate logs).
     private readonly Dictionary<string, StringBuilder> _logs = new();
     private const int MaxProfileLogChars = 256 * 1024;
     // Set while the app changes the profile selection/list programmatically (startup, edit,
     // import, delete), so the OnProfileSelected auto-restart fires ONLY for a genuine user
-    // pick — not for a selection that shifts because the collection was mutated.
+    // pick вЂ” not for a selection that shifts because the collection was mutated.
     private bool _suppressAutoSwitch;
     private VpnStatus _status = VpnStatus.Disconnected;
     private VpnStatus _prevStatus = VpnStatus.Disconnected;
@@ -81,7 +81,7 @@ public partial class MainWindow : Window
         LogoImage.Source = Ui.Png(Branding.LogoPng(64));
         VersionText.Text = $"v{AboutWindow.AppVersion()}";
 
-        // Gradient stroke for the connecting spinner — amber (the StatusConnecting
+        // Gradient stroke for the connecting spinner вЂ” amber (the StatusConnecting
         // colour), so "connecting / reconnecting / TUN-not-up-yet" reads as a distinct
         // YELLOW light (like OpenVPN / TunSafe), not the blue accent (issue #69).
         var a = Color.FromRgb(0xF0, 0xA9, 0x11);
@@ -135,7 +135,7 @@ public partial class MainWindow : Window
         Closing += OnWindowClosing;
         // Log off / shut down / restart: the OS ends the session and `Closing` is NOT a
         // reliable teardown hook there. It runs with `_exiting == false`, takes the tray
-        // branch, sets `e.Cancel = true` (which the shutdown path ignores) and returns —
+        // branch, sets `e.Cancel = true` (which the shutdown path ignores) and returns вЂ”
         // so the process died with the Wintun adapter up, the 0.0.0.0/1 + 128.0.0.0/1
         // routes installed, DNS overridden and, with kill_switch on, egress still blocked.
         // The next boot then started on a machine whose networking qeli had configured and
@@ -169,7 +169,7 @@ public partial class MainWindow : Window
     private void UpdateEmptyHint() =>
         EmptyHint.Visibility = _profiles.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
 
-    // ── window / tray plumbing ──────────────────────────────────────────────────
+    // в”Ђв”Ђ window / tray plumbing в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     private void OnWindowClosing(object? sender, CancelEventArgs e)
     {
         if (_exiting)
@@ -192,7 +192,7 @@ public partial class MainWindow : Window
     /// <remarks>
     /// Synchronous ON PURPOSE, unlike <see cref="ExitApp"/>: Windows gives a session-ending
     /// app a limited window and then kills it, so deferring to a continuation would lose the
-    /// race. The teardown runs on a worker thread with a bounded wait — `Stop()` joins the
+    /// race. The teardown runs on a worker thread with a bounded wait вЂ” `Stop()` joins the
     /// tunnel task, whose status callback marshals to THIS thread, so calling it inline
     /// would deadlock exactly as it did in the exit path (N4). `_exiting` is set first so
     /// the `Closing` handler that follows takes the already-torn-down branch instead of
@@ -207,7 +207,7 @@ public partial class MainWindow : Window
             // Bounded: never hold up a shutdown longer than the teardown legitimately needs.
             Task.Run(() => { try { _tunnel.Stop(); } catch { } }).Wait(TimeSpan.FromSeconds(10));
         }
-        catch { /* shutting down anyway — nothing useful to report */ }
+        catch { /* shutting down anyway вЂ” nothing useful to report */ }
         _tray?.Dispose();
     }
 
@@ -264,7 +264,7 @@ public partial class MainWindow : Window
 
     /// <summary>Resolve a saved profile reference (service / auto-connect) to a live profile.
     /// New settings store the stable <see cref="VpnConfig.Id"/>; older ones stored a
-    /// DisplayName — which collides across accounts on one server and silently picked the
+    /// DisplayName вЂ” which collides across accounts on one server and silently picked the
     /// wrong one. Match by Id first, then fall back to the legacy string forms so an upgrade
     /// keeps working until the user re-saves Settings (which rewrites it as an Id).</summary>
     private VpnConfig? ResolveProfile(string? saved)
@@ -289,7 +289,7 @@ public partial class MainWindow : Window
         await StartTunnel(p);
     }
 
-    // ── Windows-service mode ─────────────────────────────────────────────────────
+    // в”Ђв”Ђ Windows-service mode в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     private void RefreshServiceMode()
     {
         bool nowService = ServiceManager.IsInstalled();
@@ -412,7 +412,7 @@ public partial class MainWindow : Window
     ///
     /// Asynchronous on purpose. Stop() blocks up to ~8 s joining the tunnel task, and that
     /// task reports its final status through StatusChanged, which marshals back with
-    /// Dispatcher.Invoke — so calling Stop() straight from the UI thread deadlocked the two
+    /// Dispatcher.Invoke вЂ” so calling Stop() straight from the UI thread deadlocked the two
     /// against each other: the window froze for the whole join timeout on every quit, and the
     /// teardown that timed out left the adapter, routes and DNS behind. Run it off the UI
     /// thread (exactly what ToggleConnection already does) and only shut down once it has
@@ -438,14 +438,14 @@ public partial class MainWindow : Window
 
     private void SelectProfileFromTray(VpnConfig p)
     {
-        // Setting the selection routes through OnProfileSelected, which — if a tunnel is
-        // running on a different profile — restarts it on `p` and clears the log. Single
+        // Setting the selection routes through OnProfileSelected, which вЂ” if a tunnel is
+        // running on a different profile вЂ” restarts it on `p` and clears the log. Single
         // code path with the in-window list pick, so both behave identically.
         ProfilesList.SelectedItem = p;
     }
 
-    // ── tunnel events (marshalled to UI thread) ─────────────────────────────────
-    // ── per-profile log ─────────────────────────────────────────────────────────
+    // в”Ђв”Ђ tunnel events (marshalled to UI thread) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    // в”Ђв”Ђ per-profile log в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     private static string LogKey(VpnConfig? p) => p?.Id ?? "";
 
     private StringBuilder LogBuf(string id)
@@ -469,11 +469,13 @@ public partial class MainWindow : Window
     }
 
     private void OnLog(string line) =>
+        // Logging must never block network setup. Large route_file imports used to perform
+        // one synchronous UI round-trip per route, freezing both Connect and Disconnect.
         Dispatcher.BeginInvoke(() =>
         {
             // A line belongs to the RUNNING profile (its reconnect loop is what emits them);
             // when nothing is running it belongs to the selected profile. The stamp shape
-            // follows Settings → Log timestamp (default: local date+time+ms, because the
+            // follows Settings в†’ Log timestamp (default: local date+time+ms, because the
             // old ISO-8601 UTC stamp confused users whose clock differs from Z); it is read
             // per line, so a change applies to new lines without a restart.
             var id = LogKey(_activeProfile ?? Selected);
@@ -503,7 +505,7 @@ public partial class MainWindow : Window
             {
                 case VpnStatus.Connected:
                     Toast.Show(ToastKind.Success, Loc.T("ToastConnected"),
-                        $"{Selected?.DisplayName}{(string.IsNullOrEmpty(extra) ? "" : $" · {extra}")}");
+                        $"{Selected?.DisplayName}{(string.IsNullOrEmpty(extra) ? "" : $" В· {extra}")}");
                     _ = MaybeCheckForUpdatesAsync();
                     break;
                 case VpnStatus.Error:
@@ -514,7 +516,7 @@ public partial class MainWindow : Window
                         Toast.Show(ToastKind.Info, Loc.T("ToastDisconnected"), Selected?.DisplayName ?? "");
                     if (!_tunnel.IsRunning)
                     {
-                        _activeProfile = null; // tunnel is down → no profile is running
+                        _activeProfile = null; // tunnel is down в†’ no profile is running
                         CheckReachabilityAll();
                     }
                     break;
@@ -540,7 +542,7 @@ public partial class MainWindow : Window
     public bool IsTunnelUp => _status == VpnStatus.Connected;
 
     /// <summary>Opt-in, notification-only update check. Runs once per app session, only while the
-    /// tunnel is up, and fails soft (any error → nothing shown).</summary>
+    /// tunnel is up, and fails soft (any error в†’ nothing shown).</summary>
     private async Task MaybeCheckForUpdatesAsync()
     {
         if (!AppSettings.Current.CheckForUpdates || _updateChecked) return;
@@ -573,12 +575,12 @@ public partial class MainWindow : Window
             using var _ = System.Diagnostics.Process.Start(
                 new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true });
         }
-        catch { /* no browser / bad url — ignore */ }
+        catch { /* no browser / bad url вЂ” ignore */ }
     }
 
     /// <summary>
     /// True while a tunnel is up, so the profile list can grey out every row except the
-    /// running one — the visual half of "can't switch profiles while connected". The
+    /// running one вЂ” the visual half of "can't switch profiles while connected". The
     /// functional half is the refusal in <see cref="OnProfileSelected"/>; this just makes
     /// it obvious before the click. Bound from the ProfileItem template in XAML.
     /// </summary>
@@ -596,6 +598,8 @@ public partial class MainWindow : Window
     private void RenderStatus(VpnStatus status, string? extra)
     {
         _status = status;
+        if (status is VpnStatus.Connected or VpnStatus.Connecting)
+            _profileReachabilityGeneration.Clear();
         _lastExtra = extra;
         _tray?.Update(status, extra);
         // Connecting counts as locked too: the tunnel is already bound to a profile and
@@ -653,15 +657,15 @@ public partial class MainWindow : Window
 
     private void ApplyTileLabels()
     {
-        DownLabel.Text = "↓ " + Loc.T("StatDownload");
-        UpLabel.Text = "↑ " + Loc.T("StatUpload");
-        SessionLabel.Text = "⏱ " + Loc.T("StatSession");
+        DownLabel.Text = "в†“ " + Loc.T("StatDownload");
+        UpLabel.Text = "в†‘ " + Loc.T("StatUpload");
+        SessionLabel.Text = "вЏ± " + Loc.T("StatSession");
         IpLabel.Text = Loc.T("StatTunnelIp");
         if (CpuLabel != null) CpuLabel.Text = Loc.T("StatServerCpu");
         if (MemLabel != null) MemLabel.Text = Loc.T("StatServerMem");
     }
 
-    // ── global traffic mode (tunnel XOR local proxy → all profiles) ─────────────
+    // в”Ђв”Ђ global traffic mode (tunnel XOR local proxy в†’ all profiles) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     private void InitTrafficModeUi()
     {
         _suppressTrafficUi = true;
@@ -817,7 +821,7 @@ public partial class MainWindow : Window
         }
     }
 
-    // ── bulk profile selection / delete ─────────────────────────────────────────
+    // в”Ђв”Ђ bulk profile selection / delete в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     private void OnProfileCheckLoaded(object sender, RoutedEventArgs e)
     {
         if (sender is CheckBox cb && cb.DataContext is VpnConfig p)
@@ -856,7 +860,7 @@ public partial class MainWindow : Window
         UpdateEmptyHint();
     }
 
-    // ── search filter ────────────────────────────────────────────────────────────
+    // в”Ђв”Ђ search filter в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     private void OnSearchChanged(object sender, TextChangedEventArgs e)
     {
         // Placeholder visibility is handled by a pure-XAML trigger on SearchPlaceholder.
@@ -893,11 +897,11 @@ public partial class MainWindow : Window
             || c.Endpoint.Contains(q, StringComparison.OrdinalIgnoreCase);
     }
 
-    // ── profile UI ──────────────────────────────────────────────────────────────
+    // в”Ђв”Ђ profile UI в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
     /// <summary>Run a selection/list mutation with the auto-switch restart suppressed, so
     /// programmatic selection changes (startup, edit, import, delete) don't restart the
-    /// tunnel — only a genuine user pick in <see cref="OnProfileSelected"/> does.</summary>
+    /// tunnel вЂ” only a genuine user pick in <see cref="OnProfileSelected"/> does.</summary>
     private void Programmatic(Action mutate)
     {
         bool prev = _suppressAutoSwitch;
@@ -912,18 +916,18 @@ public partial class MainWindow : Window
         if (p == null) return;
         RefreshSniField();
 
-        // Connected/Connecting: switching profiles is REFUSED — it used to silently tear the
+        // Connected/Connecting: switching profiles is REFUSED вЂ” it used to silently tear the
         // live tunnel down and restart it on the newly picked profile. Checked FIRST, before
         // the log is re-rendered below, so a refused pick doesn't even swap the log view.
         //
         // Gate on _status, NOT _activeProfile: on a stable connection _activeProfile is set,
         // but it is null in service mode and after a transient reconnect, and the earlier
         // version keyed off it and so let the switch through. Revert to the row that WAS
-        // selected (e.RemovedItems) — that is the running profile while connected — and do it
+        // selected (e.RemovedItems) вЂ” that is the running profile while connected вЂ” and do it
         // deferred via the dispatcher: setting SelectedItem synchronously inside a
         // SelectionChanged handler is not reliably honored by WPF (the reason the previous
         // revert didn't stick and the selection visibly moved). Per-row actions (Edit /
-        // Duplicate / Share / Delete) are unaffected — they come off the kebab's DataContext.
+        // Duplicate / Share / Delete) are unaffected вЂ” they come off the kebab's DataContext.
         if (!_suppressAutoSwitch && !_serviceMode
             && _status is VpnStatus.Connected or VpnStatus.Connecting
             && e.RemovedItems.Count > 0 && e.RemovedItems[0] is VpnConfig prev
@@ -946,7 +950,7 @@ public partial class MainWindow : Window
         if (_suppressAutoSwitch || _serviceMode || _activeProfile == null) return;
         if (ReferenceEquals(_activeProfile, p) || _activeProfile.Id == p.Id) return;
         // Error: the tunnel is down but its reconnect loop may still be alive, and picking
-        // another profile is a normal way to recover — keep the restart-on-switch behavior.
+        // another profile is a normal way to recover вЂ” keep the restart-on-switch behavior.
         ClearLog(p);
         // Restart off the UI thread: Start()->Stop() now fully joins the previous attempt
         // (a full-tunnel teardown can take a few seconds), so run it async to avoid freezing
@@ -956,7 +960,7 @@ public partial class MainWindow : Window
 
     private void OnImport(object sender, RoutedEventArgs e)
     {
-        // Open file first (multi-profile .conf). Cancel → paste dialog.
+        // Open file first (multi-profile .conf). Cancel в†’ paste dialog.
         string? text = null;
         var dlg = new Microsoft.Win32.OpenFileDialog
         {
@@ -1013,7 +1017,7 @@ public partial class MainWindow : Window
         PersistAndSelect(_profiles[^1]);
     }
 
-    // Per-card "⋯" menu: Edit / Duplicate / Share-QR / Delete.
+    // Per-card "в‹Ї" menu: Edit / Duplicate / Share-QR / Delete.
     private void OnKebab(object sender, RoutedEventArgs e)
     {
         if (sender is Button b && b.ContextMenu is { } cm)
@@ -1083,7 +1087,7 @@ public partial class MainWindow : Window
             }
         }
         // Replacing the item + reselecting it both raise SelectionChanged; suppress the
-        // auto-switch so it doesn't restart the tunnel here — the wasRunning branch below
+        // auto-switch so it doesn't restart the tunnel here вЂ” the wasRunning branch below
         // owns the restart (and only when the LIVE profile was the one edited).
         Programmatic(() =>
         {
@@ -1093,7 +1097,7 @@ public partial class MainWindow : Window
         ProfileStore.Save(_profiles);
         CheckReachability(edited);
         // If we just edited the live profile (e.g. changed the server IP), the running
-        // tunnel is still on the OLD config — restart it on the edited one so the change
+        // tunnel is still on the OLD config вЂ” restart it on the edited one so the change
         // takes effect instead of the reconnect loop retrying the stale endpoint.
         if (wasRunning && !_serviceMode)
         {
@@ -1106,7 +1110,7 @@ public partial class MainWindow : Window
     {
         if (MessageBox.Show(this, Loc.F("DeleteConfirm", p.DisplayName), Loc.T("DeleteTitle"),
                 MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
-        // Tear down the tunnel FIRST if we're deleting the profile it's running on —
+        // Tear down the tunnel FIRST if we're deleting the profile it's running on вЂ”
         // otherwise its reconnect loop (owned by the tunnel, not the list) keeps trying
         // the deleted server's IP long after the profile is gone.
         if (IsRunning(p) && !_serviceMode)
@@ -1120,7 +1124,7 @@ public partial class MainWindow : Window
             }
             _activeProfile = null;
         }
-        // Removing the selected item shifts the selection → SelectionChanged; suppress so a
+        // Removing the selected item shifts the selection в†’ SelectionChanged; suppress so a
         // delete of a NON-running profile while connected doesn't restart onto whatever
         // becomes selected. The running-profile case is handled above.
         Programmatic(() => _profiles.Remove(p));
@@ -1128,15 +1132,17 @@ public partial class MainWindow : Window
         UpdateEmptyHint();
     }
 
-    // ── server reachability probe ────────────────────────────────────────────────
+    // в”Ђв”Ђ server reachability probe в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     private const int MinimumProbeIntervalSeconds = 10;
     private static readonly TimeSpan ReachabilitySweepCooldown =
         TimeSpan.FromSeconds(MinimumProbeIntervalSeconds);
     private DateTime _lastReachAll = DateTime.MinValue;
     private bool _reachPending;
     private DispatcherTimer? _probeTimer;
+    private long _nextReachabilityGeneration;
+    private readonly Dictionary<VpnConfig, long> _profileReachabilityGeneration = new();
 
-    /// <summary>(Re)configure the auto-poll timer from settings. Auto off → no timer
+    /// <summary>(Re)configure the auto-poll timer from settings. Auto off в†’ no timer
     /// (reachability is then updated only by the manual "check" button / dot click).</summary>
     private void ConfigureProbeTimer()
     {
@@ -1161,16 +1167,16 @@ public partial class MainWindow : Window
             CheckReachability(p, manual: true);
     }
 
-    // manual=true: an explicit user action — probe even when auto-poll is off, and bypass
+    // manual=true: an explicit user action вЂ” probe even when auto-poll is off, and bypass
     // the debounce. Both paths still skip while the tunnel is up (the result would be moot).
     private async void CheckReachabilityAll(bool manual = false)
     {
-        // Auto-poll off: don't auto-probe, and DON'T wipe the dots — a manual "check" result
-        // must survive, and connecting fires an internal Disconnected → this method, which
+        // Auto-poll off: don't auto-probe, and DON'T wipe the dots вЂ” a manual "check" result
+        // must survive, and connecting fires an internal Disconnected в†’ this method, which
         // otherwise reset every dot to grey. Dots default to Unknown (grey) until a manual
         // check; the distinctive hybrid-PQ ClientHello per profile is opt-in via that action.
         if (!manual && !AppSettings.Current.ProbeReachability) return;
-        // Skip while the tunnel is up — traffic would route oddly and the result is moot.
+        // Skip while the tunnel is up вЂ” traffic would route oddly and the result is moot.
         if (_status is VpnStatus.Connected or VpnStatus.Connecting) return;
         if (!manual)
         {
@@ -1197,6 +1203,12 @@ public partial class MainWindow : Window
     {
         // Auto-poll off: leave the dot as-is (default Unknown / last manual result), don't wipe it.
         if (!manual && !AppSettings.Current.ProbeReachability) return;
+        // A manual dot click must obey the same active-tunnel guard as the all-profile sweep.
+        // Probing while connected measures the endpoint through a different routing state and
+        // can overwrite a valid pre-connect result with a misleading one.
+        if (_status is VpnStatus.Connected or VpnStatus.Connecting) return;
+        var generation = ++_nextReachabilityGeneration;
+        _profileReachabilityGeneration[p] = generation;
         p.Reachability = ProfileReachability.Checking;
         _ = Task.Run(async () =>
         {
@@ -1219,6 +1231,12 @@ public partial class MainWindow : Window
             }
             Dispatcher.Invoke(() =>
             {
+                if (_status is VpnStatus.Connected or VpnStatus.Connecting
+                    || !_profileReachabilityGeneration.TryGetValue(p, out var current)
+                    || current != generation)
+                    return;
+                _profileReachabilityGeneration.Remove(p);
+                if (!_profiles.Contains(p)) return;
                 p.LatencyMs = ok ? ms : null;
                 p.Reachability = ok ? ProfileReachability.Reachable : ProfileReachability.Unreachable;
             });
@@ -1237,7 +1255,7 @@ public partial class MainWindow : Window
         catch { return false; }
     }
 
-    // ── live stats: speed tiles, session, IP + throughput sparkline ───────────────
+    // в”Ђв”Ђ live stats: speed tiles, session, IP + throughput sparkline в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     private (long up, long down, DateTime? since) StatsSource() => _serviceMode
         ? (_svc?.BytesUp ?? 0, _svc?.BytesDown ?? 0, _svc?.Since)
         : (_tunnel.BytesUp, _tunnel.BytesDown, _tunnel.ConnectedSince);
@@ -1281,11 +1299,11 @@ public partial class MainWindow : Window
     private void ResetTiles()
     {
         if (DownVal == null) return;
-        DownVal.Text = UpVal.Text = SessionVal.Text = IpVal.Text = "—";
-        TotalDownVal.Text = TotalUpVal.Text = "—";
+        DownVal.Text = UpVal.Text = SessionVal.Text = IpVal.Text = "вЂ”";
+        TotalDownVal.Text = TotalUpVal.Text = "вЂ”";
         SessionSubVal.Text = IpSubVal.Text = "";
-        if (CpuVal != null) CpuVal.Text = "—";
-        if (MemVal != null) MemVal.Text = "—";
+        if (CpuVal != null) CpuVal.Text = "вЂ”";
+        if (MemVal != null) MemVal.Text = "вЂ”";
         if (CpuSubVal != null) CpuSubVal.Text = "";
         if (MemSubVal != null) MemSubVal.Text = "";
         _cpuHist.Clear();
@@ -1305,8 +1323,8 @@ public partial class MainWindow : Window
 
         DownVal.Text = FormatRate(downRate);
         UpVal.Text = FormatRate(upRate);
-        SessionVal.Text = since is DateTime t ? FormatDuration(DateTime.Now - t) : "—";
-        IpVal.Text = string.IsNullOrEmpty(_lastExtra) ? "—" : _lastExtra;
+        SessionVal.Text = since is DateTime t ? FormatDuration(DateTime.Now - t) : "вЂ”";
+        IpVal.Text = string.IsNullOrEmpty(_lastExtra) ? "вЂ”" : _lastExtra;
 
         TotalDownVal.Text = Loc.F("StatTotal", FormatBytes(down));
         TotalUpVal.Text = Loc.F("StatTotal", FormatBytes(up));
@@ -1322,7 +1340,7 @@ public partial class MainWindow : Window
                 // CPU: % + nominal busy cores / total cores + loadavg-1m
                 double busyCores = m.Cores > 0 ? m.CpuPct / 100.0 * m.Cores : 0;
                 CpuVal.Text = m.Cores > 0
-                    ? $"{m.CpuPct:0.0}% · {busyCores:0.00}/{m.Cores}"
+                    ? $"{m.CpuPct:0.0}% В· {busyCores:0.00}/{m.Cores}"
                     : $"{m.CpuPct:0.0}%";
                 CpuSubVal.Text = $"load {m.Load1:0.00}";
 
@@ -1407,7 +1425,7 @@ public partial class MainWindow : Window
         CheckReachability(cfg);
     }
 
-    // ── connect/disconnect ───────────────────────────────────────────────────────
+    // в”Ђв”Ђ connect/disconnect в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     private void OnConnectToggle(object sender, RoutedEventArgs e) => ToggleConnection();
 
     private bool _toggleBusy;
@@ -1415,7 +1433,7 @@ public partial class MainWindow : Window
     {
         if (_serviceMode) { ToggleService(); return; }
         // Debounce: ignore re-entrant taps while a transition is in flight. This is the
-        // fix for the "click once → window froze → clicked again → it disconnected then
+        // fix for the "click once в†’ window froze в†’ clicked again в†’ it disconnected then
         // reconnected" report: the second click used to queue behind the blocked UI
         // thread and fire a fresh connect once Stop() returned.
         if (_toggleBusy) return;
@@ -1426,7 +1444,7 @@ public partial class MainWindow : Window
             if (_tunnel.IsRunning)
             {
                 // Stop() blocks up to ~8 s joining the tunnel task; run it OFF the UI
-                // thread so the window can't freeze — and so the tunnel's final status
+                // thread so the window can't freeze вЂ” and so the tunnel's final status
                 // event (marshalled back via Dispatcher.Invoke) can't deadlock the join.
                 await Task.Run(_tunnel.Stop);
                 _activeProfile = null;
@@ -1574,7 +1592,7 @@ public partial class MainWindow : Window
             _profiles[idx] = edited;
             ProfileStore.Save(_profiles);
             Programmatic(() => ProfilesList.SelectedItem = edited);
-            AppendLog($"SNI → {host} ({edited.DisplayName})");
+            AppendLog($"SNI в†’ {host} ({edited.DisplayName})");
             SniEditBox.Text = host;
             if (reconnect && _status is VpnStatus.Connected or VpnStatus.Connecting)
             {
@@ -1687,7 +1705,7 @@ public partial class MainWindow : Window
 
         if (bestProfile == null || bestSni == null)
         {
-            AppendLog("auto-pick: no reachable mode×SNI combo");
+            AppendLog("auto-pick: no reachable modeГ—SNI combo");
             return await PickBestTransportAsync();
         }
 
@@ -1729,7 +1747,7 @@ public partial class MainWindow : Window
         }
         var best = snapshot[ranked[0].Index];
         Programmatic(() => ProfilesList.SelectedItem = best);
-        AppendLog($"auto-transport → {best.DisplayName}");
+        AppendLog($"auto-transport в†’ {best.DisplayName}");
         return best;
     }
 

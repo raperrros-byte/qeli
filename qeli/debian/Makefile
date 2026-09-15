@@ -17,8 +17,8 @@ VERSION := $(shell sed -n 's/^Version: //p' control)
 ARCH    := $(shell sed -n 's/^Architecture: //p' control)
 BINARY  ?= ../target/release/$(PACKAGE_NAME)
 # The server .deb ships the jemalloc allocator (bounded RSS under handshake churn).
-# Override with `CARGO_FEATURES=` to build with the plain glibc allocator.
-CARGO_FEATURES ?= --features jemalloc
+# Keep the feature literal in both build recipes: a command-line Make variable must not
+# be able to turn a release package back into a glibc-allocator server.
 
 BUILD_DIR := build
 DEB_DIR   := $(BUILD_DIR)/$(PACKAGE_NAME)_$(VERSION)_$(ARCH)
@@ -39,12 +39,12 @@ ZIG_BINARY := ../target/x86_64-unknown-linux-gnu/release/$(PACKAGE_NAME)
 all: deb
 
 deb:
-	cargo build --release $(CARGO_FEATURES)
+	cargo build --locked --release --features jemalloc --bin $(PACKAGE_NAME)
 	$(MAKE) deb-prebuilt BINARY=../target/release/$(PACKAGE_NAME)
 
 # Release build: pinned glibc ABI. Needs cargo-zigbuild + zig on PATH.
 deb-portable:
-	cargo zigbuild --release $(CARGO_FEATURES) --target $(ZIG_TARGET)
+	cargo zigbuild --locked --release --features jemalloc --bin $(PACKAGE_NAME) --target $(ZIG_TARGET)
 	$(MAKE) check-abi BINARY=$(ZIG_BINARY)
 	$(MAKE) deb-prebuilt BINARY=$(ZIG_BINARY)
 
@@ -87,9 +87,12 @@ stage:
 	install -m755 "$(BINARY)" $(DEB_DIR)/usr/bin/$(PACKAGE_NAME)
 	install -m644 ../config/server.conf $(DEB_DIR)/etc/$(PACKAGE_NAME)/server.conf.example
 	install -m644 ../config/server-multiprofile.conf $(DEB_DIR)/etc/$(PACKAGE_NAME)/server-multiprofile.conf.example
+	install -m644 ../config/server-ipv6.conf $(DEB_DIR)/etc/$(PACKAGE_NAME)/server-ipv6.conf.example
+	install -m644 ../config/server-maxobf.conf $(DEB_DIR)/etc/$(PACKAGE_NAME)/server-maxobf.conf.example
 	install -m644 ../config/users.conf  $(DEB_DIR)/etc/$(PACKAGE_NAME)/users.conf.example
 	install -m644 ../config/client.conf $(DEB_DIR)/etc/$(PACKAGE_NAME)/client.conf.example
 	install -m644 ../config/client-reality.conf $(DEB_DIR)/etc/$(PACKAGE_NAME)/client-reality.conf.example
+	install -m644 ../config/client-maxobf.conf $(DEB_DIR)/etc/$(PACKAGE_NAME)/client-maxobf.conf.example
 	install -m644 qeli.service $(DEB_DIR)/lib/systemd/system/qeli.service
 	install -d $(DEB_DIR)/etc/polkit-1/rules.d
 	install -m644 49-qeli.rules $(DEB_DIR)/etc/polkit-1/rules.d/49-qeli.rules
@@ -99,9 +102,12 @@ stage:
 	install -m644 templates $(DEB_DIR)/DEBIAN/templates
 	echo /etc/qeli/server.conf.example >  $(DEB_DIR)/DEBIAN/conffiles
 	echo /etc/qeli/server-multiprofile.conf.example >> $(DEB_DIR)/DEBIAN/conffiles
+	echo /etc/qeli/server-ipv6.conf.example >> $(DEB_DIR)/DEBIAN/conffiles
+	echo /etc/qeli/server-maxobf.conf.example >> $(DEB_DIR)/DEBIAN/conffiles
 	echo /etc/qeli/users.conf.example  >> $(DEB_DIR)/DEBIAN/conffiles
 	echo /etc/qeli/client.conf.example >> $(DEB_DIR)/DEBIAN/conffiles
 	echo /etc/qeli/client-reality.conf.example >> $(DEB_DIR)/DEBIAN/conffiles
+	echo /etc/qeli/client-maxobf.conf.example >> $(DEB_DIR)/DEBIAN/conffiles
 	install -m644 control $(DEB_DIR)/DEBIAN/control
 	echo "Installed-Size: $$(du -sk --exclude=DEBIAN $(DEB_DIR) | cut -f1)" >> $(DEB_DIR)/DEBIAN/control
 

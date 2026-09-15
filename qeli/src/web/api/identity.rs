@@ -26,6 +26,17 @@ fn hex_public(kp: &crate::crypto::StaticKeypair) -> String {
         .map(|b| format!("{:02x}", b))
         .collect()
 }
+fn format_bind_endpoint(transport: impl std::fmt::Display, address: &str, port: u16) -> String {
+    let address = address.trim();
+    let host = if address.starts_with('[') && address.ends_with(']') {
+        address.to_owned()
+    } else if address.contains(':') {
+        format!("[{address}]")
+    } else {
+        address.to_owned()
+    };
+    format!("{transport}://{host}:{port}")
+}
 
 /// List each profile's pinned server public key (loading or first-time
 /// generating the key file, exactly like `show-identity`).
@@ -42,7 +53,7 @@ pub async fn list_identity(
         let entry = match crate::server::load_or_generate_profile_key(p) {
             Ok(kp) => json!({
                 "name": p.name,
-                "bind": format!("{}://{}:{}", p.bind.transport, p.bind.address, p.bind.port),
+                "bind": format_bind_endpoint(&p.bind.transport, &p.bind.address, p.bind.port),
                 "public_key": hex_public(&kp),
             }),
             Err(e) => json!({ "name": p.name, "error": e.to_string() }),
@@ -86,5 +97,35 @@ pub async fn rotate_identity(
             })))
         }
         Err(e) => Ok(Json(super::err_json(format!("rotate failed: {}", e)))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_bind_endpoint;
+
+    #[test]
+    fn formats_ipv4_and_hostnames_without_brackets() {
+        assert_eq!(
+            format_bind_endpoint("tcp", "0.0.0.0", 443),
+            "tcp://0.0.0.0:443"
+        );
+        assert_eq!(
+            format_bind_endpoint("udp", "vpn.example.test", 8449),
+            "udp://vpn.example.test:8449"
+        );
+    }
+
+    #[test]
+    fn brackets_ipv6_literals_once() {
+        assert_eq!(
+            format_bind_endpoint("tcp", "2001:db8:85a3::8a2e:370:7334", 443),
+            "tcp://[2001:db8:85a3::8a2e:370:7334]:443"
+        );
+        assert_eq!(format_bind_endpoint("udp", "[::]", 8449), "udp://[::]:8449");
+        assert_eq!(
+            format_bind_endpoint("udp", "fe80::1%eth0", 8449),
+            "udp://[fe80::1%eth0]:8449"
+        );
     }
 }

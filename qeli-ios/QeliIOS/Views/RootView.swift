@@ -14,13 +14,9 @@ struct RootView: View {
     @State private var showingSettings = false
 
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 10) {
             header
-            Picker("Section", selection: $tab) {
-                ForEach(RootTab.allCases) { item in Text(item.title).tag(item) }
-            }
-            .pickerStyle(.segmented)
-            .padding(.horizontal)
+            tabControl
 
             Group {
                 switch tab {
@@ -71,6 +67,41 @@ struct RootView: View {
         }
     }
 
+    private var tabControl: some View {
+        HStack(spacing: 0) {
+            ForEach(RootTab.allCases) { item in
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) { tab = item }
+                } label: {
+                    Text(item.title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(item == tab ? Color.white : QeliTheme.textSecondary)
+                        .frame(maxWidth: .infinity, minHeight: 40)
+                        .background {
+                            if item == tab {
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .fill(QeliTheme.primary)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(item == tab ? .isSelected : [])
+            }
+        }
+        .padding(4)
+        .frame(height: 48)
+        .background(
+            QeliTheme.surfaceVariant,
+            in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(QeliTheme.outline, lineWidth: 1)
+        }
+        .padding(.horizontal, 16)
+    }
+
     private var pendingDeepLinkSummary: String {
         guard let url = model.pendingDeepLink,
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
@@ -90,15 +121,17 @@ struct RootView: View {
         HStack(spacing: 12) {
             QeliLogo()
             VStack(alignment: .leading, spacing: 1) {
-                Text("Qeli").font(.title2.bold())
+                Text("Qeli").font(.title2.bold()).foregroundStyle(QeliTheme.textPrimary)
                 Text("Quick Easy Link IP")
                     .font(.caption)
                     .foregroundStyle(QeliTheme.primary)
             }
             Spacer()
             Button { showingSettings = true } label: {
-                Image(systemName: "gearshape.fill").frame(width: 34, height: 34)
+                Image(systemName: "gearshape.fill").frame(width: 44, height: 44)
             }
+            .buttonStyle(.plain)
+            .foregroundStyle(QeliTheme.textSecondary)
             .accessibilityLabel("Settings")
             Button {
                 model.updateSettings { settings in
@@ -106,11 +139,13 @@ struct RootView: View {
                 }
             } label: {
                 Image(systemName: model.settings.appearance == .dark ? "sun.max.fill" : "moon.fill")
-                    .frame(width: 34, height: 34)
+                    .frame(width: 44, height: 44)
             }
+            .buttonStyle(.plain)
+            .foregroundStyle(QeliTheme.textSecondary)
             .accessibilityLabel("Toggle theme")
         }
         .padding(.horizontal, 20)
-        .padding(.top, 8)
+        .padding(.top, 18)
     }
 }

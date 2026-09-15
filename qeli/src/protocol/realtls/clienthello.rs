@@ -22,10 +22,13 @@ use rand::prelude::*;
 use rand::seq::SliceRandom;
 use sha2::{Digest, Sha256};
 
+const MAX_SNI_BYTES: usize = 253;
+const MAX_CLIENT_HELLO_BODY: usize = 1 << 14;
+
 /// Chrome's TLS cipher suites (GREASE is prepended at build time, not listed
 /// here). Order matches Chrome's ClientHello. The sorted form hashes to the
 /// canonical Chrome JA4_b `8daaf6152771`.
-const CHROME_CIPHERS: &[u16] = &[
+pub(crate) const CHROME_CIPHERS: &[u16] = &[
     0x1301, 0x1302, 0x1303, // TLS 1.3 AES-128-GCM / AES-256-GCM / ChaCha20
     0xc02b, 0xc02f, 0xc02c, 0xc030, // ECDHE AES-GCM (ECDSA/RSA)
     0xcca9, 0xcca8, // ECDHE ChaCha20 (ECDSA/RSA)
@@ -46,9 +49,13 @@ fn is_grease(v: u16) -> bool {
     hi == lo && (lo & 0x0f) == 0x0a
 }
 
+fn tls_u16_len(len: usize, field: &str) -> u16 {
+    u16::try_from(len).unwrap_or_else(|_| panic!("{field} exceeds the TLS u16 length field"))
+}
+
 fn ext(buf: &mut Vec<u8>, ext_type: u16, data: &[u8]) {
     buf.extend_from_slice(&ext_type.to_be_bytes());
-    buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    buf.extend_from_slice(&tls_u16_len(data.len(), "extension data").to_be_bytes());
     buf.extend_from_slice(data);
 }
 
@@ -59,6 +66,33 @@ pub fn build_client_hello(
     server_name: &str,
     session_id: &[u8; 32],
 ) -> (Vec<u8>, crate::crypto::mlkem::DecapKey) {
+    build_client_hello_inner(key_public, server_name, session_id, true)
+}
+
+/// Build a compact Chrome-like ClientHello without the 1216-byte
+/// X25519MLKEM768 key share. Some mobile DPI paths mishandle a ClientHello that
+/// crosses the first TCP segment; the classic X25519 offer keeps the complete
+/// REALITY discriminator in a single packet while retaining a genuine TLS 1.3
+/// handshake. The server already falls back to X25519 when the hybrid share is
+/// absent.
+pub fn build_client_hello_compact(
+    key_public: &PublicKey,
+    server_name: &str,
+    session_id: &[u8; 32],
+) -> (Vec<u8>, crate::crypto::mlkem::DecapKey) {
+    build_client_hello_inner(key_public, server_name, session_id, false)
+}
+
+fn build_client_hello_inner(
+    key_public: &PublicKey,
+    server_name: &str,
+    session_id: &[u8; 32],
+    include_pq: bool,
+) -> (Vec<u8>, crate::crypto::mlkem::DecapKey) {
+    assert!(
+        server_name.is_ascii() && server_name.len() <= MAX_SNI_BYTES,
+        "REALITY SNI must be ASCII and at most {MAX_SNI_BYTES} bytes"
+    );
     let mut rng = rand::rng();
     // Real hybrid key exchange (L3.2): generate the ML-KEM-768 keypair and keep
     // the decapsulation key, so the client handshake can open the server's
@@ -86,9 +120,9 @@ pub fn build_client_hello(
     {
         let name = server_name.as_bytes();
         let mut d = Vec::new();
-        d.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes()); // server_name_list len
+        d.extend_from_slice(&tls_u16_len(name.len() + 3, "server_name_list").to_be_bytes());
         d.push(0x00); // host_name
-        d.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        d.extend_from_slice(&tls_u16_len(name.len(), "server_name").to_be_bytes());
         d.extend_from_slice(name);
         ext(&mut e_sni, 0x0000, &d);
     }
@@ -103,7 +137,9 @@ pub fn build_client_hello(
     {
         let mut list = Vec::new();
         list.extend_from_slice(&grease_group.to_be_bytes());
-        list.extend_from_slice(&crate::crypto::mlkem::X25519MLKEM768.to_be_bytes());
+        if include_pq {
+            list.extend_from_slice(&crate::crypto::mlkem::X25519MLKEM768.to_be_bytes());
+        }
         list.extend_from_slice(&0x001du16.to_be_bytes());
         list.extend_from_slice(&0x0017u16.to_be_bytes());
         list.extend_from_slice(&0x0018u16.to_be_bytes());
@@ -163,9 +199,11 @@ pub fn build_client_hello(
         shares.extend_from_slice(&grease_group.to_be_bytes());
         shares.extend_from_slice(&0x0001u16.to_be_bytes());
         shares.push(0x00);
-        shares.extend_from_slice(&crate::crypto::mlkem::X25519MLKEM768.to_be_bytes());
-        shares.extend_from_slice(&(pq.len() as u16).to_be_bytes());
-        shares.extend_from_slice(&pq);
+        if include_pq {
+            shares.extend_from_slice(&crate::crypto::mlkem::X25519MLKEM768.to_be_bytes());
+            shares.extend_from_slice(&(pq.len() as u16).to_be_bytes());
+            shares.extend_from_slice(&pq);
+        }
         shares.extend_from_slice(&0x001du16.to_be_bytes());
         shares.extend_from_slice(&0x0020u16.to_be_bytes());
         shares.extend_from_slice(key_public.as_bytes());
@@ -255,19 +293,23 @@ pub fn build_client_hello(
     body.push(0x01); // compression methods length
     body.push(0x00); // null compression
 
-    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&tls_u16_len(extensions.len(), "ClientHello extensions").to_be_bytes());
     body.extend_from_slice(&extensions);
 
     let body_len = body.len() - 4;
     body[1] = (body_len >> 16) as u8;
     body[2] = (body_len >> 8) as u8;
     body[3] = body_len as u8;
+    assert!(
+        body.len() <= MAX_CLIENT_HELLO_BODY,
+        "ClientHello body exceeds the local TLS handshake limit"
+    );
 
     // Wrap in a TLS record (handshake, 0x16).
     let mut record = Vec::with_capacity(5 + body.len());
     record.push(0x16);
     record.extend_from_slice(&[0x03, 0x01]); // record version TLS 1.0 (Chrome)
-    record.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    record.extend_from_slice(&tls_u16_len(body.len(), "ClientHello record").to_be_bytes());
     record.extend_from_slice(&body);
     (record, mlkem_dk)
 }
@@ -290,7 +332,7 @@ fn pad_extensions(extensions: &mut Vec<u8>) {
     let target: usize = 512;
     let pad = target.saturating_sub(projected);
     extensions.extend_from_slice(&[0x00, 0x15]); // padding extension
-    extensions.extend_from_slice(&(pad as u16).to_be_bytes());
+    extensions.extend_from_slice(&tls_u16_len(pad, "ClientHello padding").to_be_bytes());
     extensions.extend(std::iter::repeat_n(0u8, pad));
 }
 
@@ -496,6 +538,83 @@ mod tests {
         build_client_hello(eph.public(), "www.microsoft.com", &sid).0
     }
 
+    fn extension_data(record: &[u8], target: u16) -> Option<&[u8]> {
+        let inner = record.get(5..)?;
+        if inner.first() != Some(&0x01) || inner.len() < 39 {
+            return None;
+        }
+        let mut offset = 39usize.checked_add(*inner.get(38)? as usize)?;
+        let cipher_len =
+            u16::from_be_bytes([*inner.get(offset)?, *inner.get(offset.checked_add(1)?)?]) as usize;
+        offset = offset.checked_add(2)?.checked_add(cipher_len)?;
+        let compression_len = *inner.get(offset)? as usize;
+        offset = offset.checked_add(1)?.checked_add(compression_len)?;
+        let extensions_len =
+            u16::from_be_bytes([*inner.get(offset)?, *inner.get(offset.checked_add(1)?)?]) as usize;
+        offset = offset.checked_add(2)?;
+        let extensions_end = offset.checked_add(extensions_len)?;
+        if extensions_end > inner.len() {
+            return None;
+        }
+
+        while offset.checked_add(4)? <= extensions_end {
+            let extension_type =
+                u16::from_be_bytes([*inner.get(offset)?, *inner.get(offset.checked_add(1)?)?]);
+            let extension_len = u16::from_be_bytes([
+                *inner.get(offset.checked_add(2)?)?,
+                *inner.get(offset.checked_add(3)?)?,
+            ]) as usize;
+            let data_start = offset.checked_add(4)?;
+            let data_end = data_start.checked_add(extension_len)?;
+            if data_end > extensions_end {
+                return None;
+            }
+            if extension_type == target {
+                return inner.get(data_start..data_end);
+            }
+            offset = data_end;
+        }
+        None
+    }
+
+    fn supported_groups_contains(data: &[u8], target: u16) -> bool {
+        let Some(prefix) = data.get(..2) else {
+            return false;
+        };
+        let declared = u16::from_be_bytes([prefix[0], prefix[1]]) as usize;
+        let Some(groups) = data.get(2..2usize.saturating_add(declared)) else {
+            return false;
+        };
+        let (groups, _) = groups.as_chunks::<2>();
+        groups
+            .iter()
+            .any(|group| u16::from_be_bytes(*group) == target)
+    }
+
+    fn key_shares_contains(data: &[u8], target: u16) -> bool {
+        let Some(prefix) = data.get(..2) else {
+            return false;
+        };
+        let end = 2usize.saturating_add(u16::from_be_bytes([prefix[0], prefix[1]]) as usize);
+        if end > data.len() {
+            return false;
+        }
+        let mut offset = 2usize;
+        while offset.saturating_add(4) <= end {
+            let group = u16::from_be_bytes([data[offset], data[offset + 1]]);
+            let key_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+            offset = offset.saturating_add(4);
+            if offset.saturating_add(key_len) > end {
+                return false;
+            }
+            if group == target {
+                return true;
+            }
+            offset = offset.saturating_add(key_len);
+        }
+        false
+    }
+
     #[test]
     fn ja4_matches_chrome() {
         let hello = sample_hello();
@@ -568,9 +687,14 @@ mod tests {
         // The Chrome-grade hello carries the X25519MLKEM768 share (group 0x11ec,
         // key length 1216 = 0x04c0), and the x25519 key_share is still recoverable.
         let hello = sample_hello();
+        let group = crate::crypto::mlkem::X25519MLKEM768;
         assert!(
-            hello.windows(4).any(|w| w == [0x11, 0xEC, 0x04, 0xC0]),
-            "hello must carry X25519MLKEM768 (0x11ec, 1216 B)"
+            supported_groups_contains(extension_data(&hello, 0x000a).unwrap(), group),
+            "hello must advertise X25519MLKEM768 in supported_groups"
+        );
+        assert!(
+            key_shares_contains(extension_data(&hello, 0x0033).unwrap(), group),
+            "hello must carry an X25519MLKEM768 key_share"
         );
         let (_sid, ks) = FakeTlsHandshake::parse_client_hello_full(&hello).unwrap();
         assert_eq!(
@@ -581,11 +705,58 @@ mod tests {
     }
 
     #[test]
+    fn compact_hello_fits_one_lte_segment_and_keeps_reality_token() {
+        let reality_kp = StaticKeypair::generate();
+        let eph = Keypair::generate();
+        let id = reality::short_id_from_hex("0123456789abcdef");
+        let sid = reality::seal_session_id(&reality_kp.public, &eph, &id);
+        let hello = build_client_hello_compact(eph.public(), "account.microsoft.com", &sid).0;
+
+        assert!(
+            hello.len() < 1200,
+            "compact ClientHello is {} bytes",
+            hello.len()
+        );
+        let group = crate::crypto::mlkem::X25519MLKEM768;
+        assert!(
+            !supported_groups_contains(extension_data(&hello, 0x000a).unwrap(), group),
+            "compact hello must not advertise X25519MLKEM768 in supported_groups"
+        );
+        assert!(
+            !key_shares_contains(extension_data(&hello, 0x0033).unwrap(), group),
+            "compact hello must not carry an X25519MLKEM768 key_share"
+        );
+        let (got_sid, key_share) =
+            FakeTlsHandshake::parse_client_hello_full(&hello).expect("server parses compact hello");
+        assert_eq!(got_sid, sid);
+        assert_eq!(key_share, eph.public().as_bytes());
+    }
+
+    #[test]
     fn hello_is_well_formed_record() {
         let hello = sample_hello();
         assert_eq!(hello[0], 0x16, "TLS handshake record");
         let rec_len = u16::from_be_bytes([hello[3], hello[4]]) as usize;
         assert_eq!(hello.len(), 5 + rec_len, "record length matches");
         assert_eq!(hello[5], 0x01, "ClientHello handshake type");
+    }
+
+    #[test]
+    fn maximum_valid_sni_keeps_all_tls_lengths_honest() {
+        let eph = Keypair::generate();
+        let sid = [7u8; 32];
+        let sni = "a".repeat(MAX_SNI_BYTES);
+        let hello = build_client_hello(eph.public(), &sni, &sid).0;
+        let declared = u16::from_be_bytes([hello[3], hello[4]]) as usize;
+        assert_eq!(declared + 5, hello.len());
+        assert!(declared <= MAX_CLIENT_HELLO_BODY);
+        assert!(parse(&hello).is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "REALITY SNI must be ASCII")]
+    fn oversized_sni_is_rejected_before_any_length_cast() {
+        let eph = Keypair::generate();
+        let _ = build_client_hello(eph.public(), &"a".repeat(MAX_SNI_BYTES + 1), &[0u8; 32]);
     }
 }

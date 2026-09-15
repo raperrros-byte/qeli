@@ -14,6 +14,7 @@ internal sealed class WinDivertDestinationPolicy
 {
     private readonly List<Cidr> _tunnelRoutes = new();
     private readonly List<Cidr> _exclude = new();
+    private readonly List<Cidr> _physicalLocalRoutes = new();
     private readonly bool _fullTunnel;
 
     public WinDivertDestinationPolicy(
@@ -22,10 +23,12 @@ internal sealed class WinDivertDestinationPolicy
         IEnumerable<string>? excludeRoutes,
         IEnumerable<string>? pushedRoutes,
         bool fullTunnel = true,
-        string? tunnelSubnet = null)
+        IEnumerable<string>? tunnelSubnets = null,
+        IEnumerable<string>? physicalLocalRoutes = null)
     {
         _fullTunnel = fullTunnel;
-        if (!string.IsNullOrWhiteSpace(tunnelSubnet)) AddTunnel(tunnelSubnet);
+        if (tunnelSubnets != null)
+            foreach (var cidr in tunnelSubnets) AddTunnel(cidr);
         if (routeLocal)
         {
             AddTunnel("10.0.0.0/8");
@@ -38,7 +41,20 @@ internal sealed class WinDivertDestinationPolicy
             foreach (var c in pushedRoutes) AddTunnel(c);
         if (excludeRoutes != null)
             foreach (var c in excludeRoutes) AddExclude(c);
+        if (physicalLocalRoutes != null)
+            foreach (var c in physicalLocalRoutes)
+                if (TryParseCidr(c, out var route)) _physicalLocalRoutes.Add(route);
     }
+
+    /// <summary>
+    /// True when the destination was explicitly assigned to the tunnel by an include,
+    /// pushed/connected route, or route_local. Unlike an ordinary full-tunnel default,
+    /// this intent must fail closed when the negotiated address family is unavailable;
+    /// allow_ipv4/ipv6_leak only opts out of capturing the otherwise-default family.
+    /// Explicit exclusions still win.
+    /// </summary>
+    public bool RequiresTunnel(IPAddress dst) =>
+        !Matches(_exclude, dst) && Matches(_tunnelRoutes, dst);
 
     /// <summary>True → reinject without app filtering (keep on physical path).</summary>
     public bool ShouldBypassTunnel(IPAddress dst)
@@ -49,15 +65,13 @@ internal sealed class WinDivertDestinationPolicy
         if (dst.AddressFamily == AddressFamily.InterNetworkV6)
         {
             if (IsIpv6LinkLocalOrLoopback(dst)) return true;
-            // An explicit IPv6 include remains captured (and is dropped by the IPv4-only
-            // per-app data plane); otherwise split tunnel must leave native IPv6 direct.
-            return !Matches(_tunnelRoutes, dst) && !_fullTunnel;
+            if (Matches(_tunnelRoutes, dst)) return false;
+            return !_fullTunnel;
         }
 
         if (IsIpv4LoopbackOrLinkLocal(dst)) return true;
         if (Matches(_tunnelRoutes, dst)) return false;
-        if (IsRfc1918(dst))
-            return true;
+        if (Matches(_physicalLocalRoutes, dst)) return true;
         return !_fullTunnel;
     }
 
@@ -91,7 +105,8 @@ internal sealed class WinDivertDestinationPolicy
 
     private void AddTunnel(string cidr)
     {
-        if (TryParseCidr(cidr, out var c)) _tunnelRoutes.Add(c);
+        if (TryParseCidr(cidr, out var c))
+            _tunnelRoutes.Add(c);
     }
 
     private void AddExclude(string cidr)

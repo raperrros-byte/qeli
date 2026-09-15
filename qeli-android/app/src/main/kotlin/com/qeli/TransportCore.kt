@@ -1,12 +1,17 @@
 package com.qeli
 
+import com.qeli.model.VpnConfig
+
 /**
  * Generation-safe JNI owner for the shared Rust transport control plane.
  *
  * Kotlin services platform-only requests (VpnService.protect, trust and NetworkPlan/TUN).
  * The blocking [runTransport] entry point owns every handshake and payload byte in Rust.
  */
-internal class TransportCore private constructor(private var handle: Long) : AutoCloseable {
+internal class TransportCore private constructor(
+    private var handle: Long,
+    val pathTransactionsEnabled: Boolean,
+) : AutoCloseable {
     @Synchronized
     fun start() = requireSuccess(nativeStart(requireHandle()), "start")
 
@@ -87,7 +92,9 @@ internal class TransportCore private constructor(private var handle: Long) : Aut
         fallbackDnsServers: List<String> = emptyList(),
     ): TransportCoreNetworkPlan {
         require(authOk.startsWith("OK:")) { "authenticated network input must start with OK:" }
-        require(effectiveMtu in 576..65535) { "effective MTU is outside the ABI range" }
+        require(effectiveMtu in VpnConfig.MTU_MIN..VpnConfig.MTU_MAX) {
+            "effective MTU is outside ${VpnConfig.MTU_MIN}..${VpnConfig.MTU_MAX}"
+        }
         val envelope = org.json.JSONObject()
             .put("auth_ok", authOk)
             .put("effective_mtu", effectiveMtu)
@@ -198,6 +205,56 @@ internal class TransportCore private constructor(private var handle: Long) : Aut
         }
     }
 
+    /** Submit one fully-resolved physical path to the common Rust roaming controller. */
+    @Synchronized
+    fun pathUpdate(updateJson: String): Long {
+        check(pathTransactionsEnabled) { "path transactions are not enabled for this core" }
+        val bytes = updateJson.toByteArray(Charsets.UTF_8)
+        return try {
+            val candidateId = nativePathUpdate(requireHandle(), bytes)
+            check(candidateId > 0) { "transport core pathUpdate failed (rc=$candidateId)" }
+            candidateId
+        } finally {
+            bytes.fill(0)
+        }
+    }
+
+    /** Acknowledge the exact generation/candidate/event triple emitted by Rust. */
+    @Synchronized
+    fun pathCommandResult(
+        generation: Long,
+        candidateId: Long,
+        requestSequence: Long,
+        accepted: Boolean,
+        reason: String? = null,
+    ): Boolean {
+        require(generation > 0 && candidateId > 0 && requestSequence > 0) {
+            "path command correlation values must be positive"
+        }
+        val bytes = if (accepted) {
+            ByteArray(0)
+        } else {
+            (reason ?: "platform rejected the path command")
+                .take(512)
+                .toByteArray(Charsets.UTF_8)
+        }
+        try {
+            return acceptResult(
+                nativePathCommandResult(
+                    requireHandle(),
+                    generation,
+                    candidateId,
+                    requestSequence,
+                    if (accepted) 0 else 1,
+                    bytes,
+                ),
+                "pathCommandResult",
+            )
+        } finally {
+            bytes.fill(0)
+        }
+    }
+
     @Synchronized
     override fun close() {
         val current = handle
@@ -232,13 +289,23 @@ internal class TransportCore private constructor(private var handle: Long) : Aut
         const val PLATFORM_TUN_FD = 1L shl 3
         const val PLATFORM_SOCKET_PROTECT = 1L shl 5
         const val PLATFORM_SERVER_IDENTITY = 1L shl 6
+        const val PLATFORM_IPV6_TUN = 1L shl 8
+        const val PLATFORM_IPV6_ROUTES = 1L shl 9
+        const val PLATFORM_IPV6_DNS = 1L shl 10
+        const val PLATFORM_IPV6_KILL_SWITCH = 1L shl 11
+        const val PLATFORM_PATH_TRANSACTIONS = AndroidRoamingPolicy.PLATFORM_PATH_TRANSACTIONS
+        const val PLATFORM_PATH_SOCKET_BINDING = AndroidRoamingPolicy.PLATFORM_PATH_SOCKET_BINDING
+        const val PLATFORM_PATH_REFRESH = AndroidRoamingPolicy.PLATFORM_PATH_REFRESH
+        const val PLATFORM_ROAMING_PATH = AndroidRoamingPolicy.PLATFORM_ROAMING_PATH
+        const val PLATFORM_MANAGEMENT_EVENTS = 1L shl 15
         const val PLATFORM_SYSTEM_PLAN =
             PLATFORM_ROUTES or PLATFORM_DNS or PLATFORM_KILL_SWITCH
 
         const val STATE_CREATED = 0
         const val STATE_CONNECTING = 1
 
-        private const val ABI_VERSION = 0x0001000a
+        private const val COMPATIBILITY_ABI_VERSION = 0x0001000b
+        private const val PATH_TRANSACTION_ABI_VERSION = 0x0001000e
         private const val CORE_STRICT_CONFIG = 1L shl 0
         private const val CORE_LIFECYCLE_EVENTS = 1L shl 1
         private const val CORE_NETWORK_PLAN_ACK = 1L shl 2
@@ -248,6 +315,8 @@ internal class TransportCore private constructor(private var handle: Long) : Aut
         private const val CORE_SERVER_IDENTITY_ACK = 1L shl 6
         private const val CORE_HANDSHAKE_NETWORK_INPUT = 1L shl 7
         private const val CORE_NATIVE_DATA_PLANE = 1L shl 8
+        private const val CORE_PATH_TRANSACTIONS = 1L shl 13
+        private const val CORE_PATH_REFRESH_EVENTS = 1L shl 14
         private const val REQUIRED_CORE_CAPABILITIES =
             CORE_STRICT_CONFIG or CORE_LIFECYCLE_EVENTS or CORE_NETWORK_PLAN_ACK or
                 CORE_TUN_FD_OWNERSHIP or CORE_SOCKET_PROTECT_ACK or CORE_DEVICE_ID_INPUT or
@@ -269,9 +338,13 @@ internal class TransportCore private constructor(private var handle: Long) : Aut
             }
             val libraryVersion = nativeAbiVersion()
             check(
-                libraryVersion ushr 16 == ABI_VERSION ushr 16 &&
-                    (libraryVersion and 0xffff) >= (ABI_VERSION and 0xffff)
-            ) { "incompatible transport core ABI 0x${libraryVersion.toUInt().toString(16)}" }
+                libraryVersion ushr 16 == COMPATIBILITY_ABI_VERSION ushr 16 &&
+                    (libraryVersion and 0xffff) >= (COMPATIBILITY_ABI_VERSION and 0xffff)
+            ) {
+                "incompatible transport core ABI ${formatAbiVersion(libraryVersion)} " +
+                    "(0x${libraryVersion.toUInt().toString(16)}); compatibility floor " +
+                    formatAbiVersion(COMPATIBILITY_ABI_VERSION)
+            }
             val capabilities = nativeCoreCapabilities()
             check(capabilities and REQUIRED_CORE_CAPABILITIES == REQUIRED_CORE_CAPABILITIES) {
                 "transport core is missing required lifecycle capabilities"
@@ -288,7 +361,11 @@ internal class TransportCore private constructor(private var handle: Long) : Aut
             }
             try {
                 requireSuccess(nativeSetDeviceId(nativeHandle, deviceId), "setDeviceId")
-                return TransportCore(nativeHandle)
+                val pathTransactionsEnabled =
+                    libraryVersion >= PATH_TRANSACTION_ABI_VERSION &&
+                        capabilities and CORE_PATH_TRANSACTIONS != 0L &&
+                        platformCapabilities and PLATFORM_ROAMING_PATH == PLATFORM_ROAMING_PATH
+                return TransportCore(nativeHandle, pathTransactionsEnabled)
             } catch (error: Throwable) {
                 nativeFree(nativeHandle)
                 throw error
@@ -297,7 +374,22 @@ internal class TransportCore private constructor(private var handle: Long) : Aut
 
         fun abiVersion(): Int = nativeAbiVersion()
 
-        fun coreCapabilities(): Long = nativeCoreCapabilities()
+        fun abiVersionDescription(): String {
+            val loaded = abiVersion()
+            return "${formatAbiVersion(loaded)}, compatibility floor " +
+                formatAbiVersion(COMPATIBILITY_ABI_VERSION)
+        }
+
+        internal fun formatAbiVersion(version: Int): String =
+            "${version ushr 16}.${version and 0xffff}"
+
+        fun supportsPathTransactions(): Boolean =
+            nativeAbiVersion() >= PATH_TRANSACTION_ABI_VERSION &&
+                nativeCoreCapabilities() and CORE_PATH_TRANSACTIONS != 0L
+
+        fun supportsPathRefreshRequests(): Boolean =
+            supportsPathTransactions() &&
+                nativeCoreCapabilities() and CORE_PATH_REFRESH_EVENTS != 0L
 
         /**
          * Send the shared Rust UDP ClientHello first flight and return milliseconds to any
@@ -402,6 +494,15 @@ internal class TransportCore private constructor(private var handle: Long) : Aut
         @JvmStatic private external fun nativeNetworkPlanResult(
             handle: Long,
             generation: Long,
+            resultCode: Int,
+            reason: ByteArray,
+        ): Int
+        @JvmStatic private external fun nativePathUpdate(handle: Long, input: ByteArray): Long
+        @JvmStatic private external fun nativePathCommandResult(
+            handle: Long,
+            generation: Long,
+            candidateId: Long,
+            requestSequence: Long,
             resultCode: Int,
             reason: ByteArray,
         ): Int

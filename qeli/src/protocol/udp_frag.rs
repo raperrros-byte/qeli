@@ -99,15 +99,18 @@ pub const MSG_SERVER_HELLO: u8 = 2;
 /// need only agree that junk is DROPPED (they never agree on the count — a lost or
 /// reordered junk datagram is harmless), unlike the count-based TCP obfs junk.
 pub const MSG_JUNK: u8 = 3;
-/// Path-MTU **probe** (client→server): a single-fragment datagram padded so the whole
-/// outer datagram is exactly the size being tested. Sent with DF set, so if it exceeds
-/// the path MTU it is dropped (not IP-fragmented) → no ACK → that size fails. The body
-/// is `[id(2 LE)][outer_size(2 LE)]` then random padding. Rides the same obfs-XOR /
-/// QUIC wrap as data, so it measures the REAL data-plane path. Recognized and handled
-/// (echoed) before the reassembler, so its oversized "chunk" never hits [`MAX_CHUNK_ACCEPT`].
+/// Directional path-MTU **probe**: a single-fragment payload padded to the exact
+/// pre-wrapper `probe_payload_size`. Callers reserve the selected QUIC/obfs/UDP/IP overhead;
+/// this builder does not add those layers. Once wrapped like data, the probe is sent with DF,
+/// so a packet exceeding the path MTU is dropped rather than IP-fragmented: no ACK means that
+/// rung failed. The body is `[id(2 LE)][probe_payload_size(2 LE)]` plus random padding.
+/// Recognized and handled
+/// (echoed) before the reassembler, so its oversized "chunk" never hits
+/// [`MAX_CHUNK_ACCEPT`]. The client probes uplink; a DATA_FRAG-capable server may use the
+/// same frame in reverse and widen downlink only after the client echoes the ACK.
 pub const MSG_MTU_PROBE: u8 = 4;
-/// Path-MTU probe **ACK** (server→client): a tiny datagram echoing the probe's
-/// `[id(2 LE)][outer_size(2 LE)]`, confirming the big probe arrived intact.
+/// Path-MTU probe **ACK**: a tiny datagram in the opposite direction, echoing the probe's
+/// `[id(2 LE)][probe_payload_size(2 LE)]`, confirming the big probe arrived intact.
 pub const MSG_MTU_PROBE_ACK: u8 = 5;
 /// The **AuthOK** (server→client), fragmented for the same reason as the ServerHello.
 ///
@@ -130,7 +133,7 @@ pub const MSG_MTU_PROBE_ACK: u8 = 5;
 ///
 /// There is no ambiguity against a real record, in either framing: TLS framing opens
 /// `0x17 0x03 0x03`, and raw framing opens with a u16 payload length bounded by
-/// [`crate::protocol::packet::MAX_RECORD_SIZE`] (0x4124), so its high byte is at most 0x41 —
+/// [`crate::protocol::packet::MAX_RECORD_SIZE`] (0x4100), so its high byte is at most 0x41 —
 /// `0xF0` is unreachable both ways. That is the same property [`is_fragment`] already relies
 /// on to tell a fragmented ClientHello from a legacy single-datagram one.
 ///
@@ -139,8 +142,40 @@ pub const MSG_MTU_PROBE_ACK: u8 = 5;
 /// produce one, so a narrow check is a narrow surface.
 pub const MSG_AUTH_OK: u8 = 6;
 
-/// Probe/ACK body after the 6-byte fragment header: `id(2) + outer_size(2)`.
+/// Probe/ACK body after the 6-byte fragment header: `id(2) + probe_payload_size(2)`.
 pub const PROBE_BODY_LEN: usize = 4;
+/// Reverse PMTU challenge. A separate message id keeps old clients connected: they ignore
+/// it and retain the conservative downlink budget, while current clients echo its token.
+pub const MSG_MTU_PROBE_V2: u8 = 7;
+/// ACK for [`MSG_MTU_PROBE_V2`]. Only this strong form may widen a current server's
+/// server-to-client payload budget. Legacy ACKs remain supported for older uplink clients.
+pub const MSG_MTU_PROBE_ACK_V2: u8 = 8;
+/// V2 reverse-probe body: `token(16 LE) + probe_payload_size(2 LE)`.
+pub const PROBE_V2_BODY_LEN: usize = 18;
+/// PacketCodec framing/nonce/counter/tag/padding-trailer plus the probe safety margin.
+/// Both directions use the same inner-shaped PMTU ladder and translate it to an outer UDP
+/// payload budget with this allowance.
+pub(crate) const UDP_RECORD_PROBE_OVERHEAD: usize = 48;
+
+/// Build the shared descending inner-shaped PMTU ladder between an already-derived floor and
+/// ceiling. Callers account for their exact seal/CID/UDP/IP overhead when deriving the floor and
+/// when translating a certified rung back to a UDP payload budget.
+pub(crate) fn mtu_probe_ladder(ceiling: i32, floor: i32) -> Vec<i32> {
+    let floor = floor.clamp(crate::config::server::MTU_MIN as i32, ceiling);
+    // Fixed rungs are intentionally conservative: they certify the best known rung that fits,
+    // not the path's exact maximum. Keeping this list in the protocol core prevents client uplink
+    // and server downlink probing from silently choosing different ceilings on asymmetric paths.
+    let mut ladder: Vec<i32> = [
+        ceiling, 12000, 9000, 6000, 4000, 2500, 2000, 1500, 1360, 1320, 1280, 1200, 1100, 1000,
+        900, 800, 700, floor,
+    ]
+    .into_iter()
+    .filter(|&candidate| (floor..=ceiling).contains(&candidate))
+    .collect();
+    ladder.sort_unstable_by(|left, right| right.cmp(left));
+    ladder.dedup();
+    ladder
+}
 
 /// True if `d` (a datagram payload, after obfs/QUIC unwrap) is a qeli handshake
 /// fragment. Lets a backward-compatible peer tell fragments from a legacy single
@@ -162,7 +197,7 @@ pub fn is_mtu_probe_ack(d: &[u8]) -> bool {
     is_fragment(d) && d[3] == MSG_MTU_PROBE_ACK && d.len() >= FRAG_HDR_LEN + PROBE_BODY_LEN
 }
 
-/// Read `(id, outer_size)` from a probe or probe-ACK datagram (after unwrap).
+/// Read `(id, probe_payload_size)` from a probe or probe-ACK datagram (after unwrap).
 #[inline]
 pub fn parse_mtu_probe(d: &[u8]) -> Option<(u16, u16)> {
     if d.len() < FRAG_HDR_LEN + PROBE_BODY_LEN {
@@ -173,35 +208,59 @@ pub fn parse_mtu_probe(d: &[u8]) -> Option<(u16, u16)> {
     Some((id, size))
 }
 
-/// Build a probe datagram padded so the TOTAL outer datagram is `outer_size` bytes.
-/// `id` correlates the ACK. `None` if `outer_size` can't hold header+body.
-pub fn mtu_probe_datagram(id: u16, outer_size: usize) -> Option<Vec<u8>> {
-    use rand::prelude::*;
-    let min = FRAG_HDR_LEN + PROBE_BODY_LEN;
-    if outer_size < min || outer_size > u16::MAX as usize {
+/// Parse a directional path-MTU probe only when its complete wire shape is valid.
+///
+/// The size field is a claim about this payload before QUIC/obfs wrapping. Echoing it from a
+/// short packet would let a spoofed source obtain an ACK for a size that never crossed the
+/// server ingress path. The generic [`parse_mtu_probe`] remains deliberately length-agnostic
+/// because a probe ACK is tiny while echoing the original (large) probe size.
+pub fn parse_mtu_probe_request(d: &[u8]) -> Option<(u16, u16)> {
+    if !is_mtu_probe(d) || d[4] != 0 || d[5] != 1 {
         return None;
     }
-    let mut out = Vec::with_capacity(outer_size);
+    let parsed = parse_mtu_probe(d)?;
+    (usize::from(parsed.1) == d.len()).then_some(parsed)
+}
+
+/// Parse the fixed-size ACK form. Trailing bytes and fragment-like
+/// `idx/count` values are rejected so the PMTU state machine accepts one unambiguous shape.
+pub fn parse_mtu_probe_ack(d: &[u8]) -> Option<(u16, u16)> {
+    if !is_mtu_probe_ack(d) || d.len() != FRAG_HDR_LEN + PROBE_BODY_LEN || d[4] != 0 || d[5] != 1 {
+        return None;
+    }
+    parse_mtu_probe(d)
+}
+
+/// Build a probe payload whose length before QUIC/obfs wrapping is `probe_payload_size`.
+/// The caller accounts for wrapper and UDP/IP overhead. `id` correlates the ACK; `None` is
+/// returned if the requested payload cannot hold the fragment header and probe body.
+pub fn mtu_probe_datagram(id: u16, probe_payload_size: usize) -> Option<Vec<u8>> {
+    use rand::prelude::*;
+    let min = FRAG_HDR_LEN + PROBE_BODY_LEN;
+    if probe_payload_size < min || probe_payload_size > u16::MAX as usize {
+        return None;
+    }
+    let mut out = Vec::with_capacity(probe_payload_size);
     out.extend_from_slice(&FRAG_MAGIC);
     out.push(MSG_MTU_PROBE);
     out.push(0); // idx
     out.push(1); // count (single fragment)
     out.extend_from_slice(&id.to_le_bytes());
-    out.extend_from_slice(&(outer_size as u16).to_le_bytes());
-    out.resize(outer_size, 0);
+    out.extend_from_slice(&(probe_payload_size as u16).to_le_bytes());
+    out.resize(probe_payload_size, 0);
     rand::rng().fill_bytes(&mut out[min..]); // random pad, not a zero run
     Some(out)
 }
 
-/// Build the tiny ACK for a received probe (echoes its `id` + `outer_size`).
-pub fn mtu_probe_ack_datagram(id: u16, outer_size: u16) -> Vec<u8> {
+/// Build the tiny ACK for a received probe (echoes its `id` + `probe_payload_size`).
+pub fn mtu_probe_ack_datagram(id: u16, probe_payload_size: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(FRAG_HDR_LEN + PROBE_BODY_LEN);
     out.extend_from_slice(&FRAG_MAGIC);
     out.push(MSG_MTU_PROBE_ACK);
     out.push(0);
     out.push(1);
     out.extend_from_slice(&id.to_le_bytes());
-    out.extend_from_slice(&outer_size.to_le_bytes());
+    out.extend_from_slice(&probe_payload_size.to_le_bytes());
     out
 }
 
@@ -215,6 +274,79 @@ pub fn is_junk(d: &[u8]) -> bool {
 #[inline]
 pub fn is_auth_ok_fragment(d: &[u8]) -> bool {
     is_fragment(d) && d[3] == MSG_AUTH_OK
+}
+
+#[inline]
+pub fn is_mtu_probe_v2(d: &[u8]) -> bool {
+    is_fragment(d) && d[3] == MSG_MTU_PROBE_V2 && d.len() >= FRAG_HDR_LEN + PROBE_V2_BODY_LEN
+}
+
+#[inline]
+pub fn is_mtu_probe_ack_v2(d: &[u8]) -> bool {
+    is_fragment(d) && d[3] == MSG_MTU_PROBE_ACK_V2 && d.len() >= FRAG_HDR_LEN + PROBE_V2_BODY_LEN
+}
+
+fn parse_mtu_probe_v2(d: &[u8]) -> Option<(u128, u16)> {
+    if d.len() < FRAG_HDR_LEN + PROBE_V2_BODY_LEN {
+        return None;
+    }
+    let token = u128::from_le_bytes(d[FRAG_HDR_LEN..FRAG_HDR_LEN + 16].try_into().ok()?);
+    let size = u16::from_le_bytes(
+        d[FRAG_HDR_LEN + 16..FRAG_HDR_LEN + PROBE_V2_BODY_LEN]
+            .try_into()
+            .ok()?,
+    );
+    Some((token, size))
+}
+
+pub fn parse_mtu_probe_v2_request(d: &[u8]) -> Option<(u128, u16)> {
+    if !is_mtu_probe_v2(d) || d[4] != 0 || d[5] != 1 {
+        return None;
+    }
+    let parsed = parse_mtu_probe_v2(d)?;
+    (usize::from(parsed.1) == d.len()).then_some(parsed)
+}
+
+pub fn parse_mtu_probe_v2_ack(d: &[u8]) -> Option<(u128, u16)> {
+    if !is_mtu_probe_ack_v2(d)
+        || d.len() != FRAG_HDR_LEN + PROBE_V2_BODY_LEN
+        || d[4] != 0
+        || d[5] != 1
+    {
+        return None;
+    }
+    parse_mtu_probe_v2(d)
+}
+
+/// Build a strong directional probe with the same pre-wrapper payload-size contract as
+/// [`mtu_probe_datagram`]. Both current uplink and downlink PMTU state machines use this form.
+pub fn mtu_probe_v2_datagram(token: u128, probe_payload_size: usize) -> Option<Vec<u8>> {
+    use rand::prelude::*;
+    let min = FRAG_HDR_LEN + PROBE_V2_BODY_LEN;
+    if probe_payload_size < min || probe_payload_size > u16::MAX as usize {
+        return None;
+    }
+    let mut out = Vec::with_capacity(probe_payload_size);
+    out.extend_from_slice(&FRAG_MAGIC);
+    out.push(MSG_MTU_PROBE_V2);
+    out.push(0);
+    out.push(1);
+    out.extend_from_slice(&token.to_le_bytes());
+    out.extend_from_slice(&(probe_payload_size as u16).to_le_bytes());
+    out.resize(probe_payload_size, 0);
+    rand::rng().fill_bytes(&mut out[min..]);
+    Some(out)
+}
+
+pub fn mtu_probe_v2_ack_datagram(token: u128, probe_payload_size: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(FRAG_HDR_LEN + PROBE_V2_BODY_LEN);
+    out.extend_from_slice(&FRAG_MAGIC);
+    out.push(MSG_MTU_PROBE_ACK_V2);
+    out.push(0);
+    out.push(1);
+    out.extend_from_slice(&token.to_le_bytes());
+    out.extend_from_slice(&probe_payload_size.to_le_bytes());
+    out
 }
 
 /// Build ONE junk decoy datagram: a single-fragment [`MSG_JUNK`] message with `len`
@@ -326,11 +458,16 @@ impl Reassembler {
             return Err("inconsistent fragment (msg_id/count changed)");
         }
         let slot = &mut self.parts[idx as usize];
-        if slot.is_none() {
-            *slot = Some(chunk.to_vec());
-            self.have += 1;
+        match slot {
+            Some(existing) if existing.as_slice() != chunk => {
+                return Err("conflicting duplicate fragment");
+            }
+            Some(_) => {} // A byte-identical retransmission is idempotent.
+            None => {
+                *slot = Some(chunk.to_vec());
+                self.have += 1;
+            }
         }
-        // A duplicate fragment is silently ignored.
         if self.have == self.count {
             let total: usize = self.parts.iter().map(|p| p.as_ref().unwrap().len()).sum();
             let mut out = Vec::with_capacity(total);
@@ -532,21 +669,77 @@ mod tests {
     #[test]
     fn mtu_probe_roundtrips_and_is_recognized() {
         let d = mtu_probe_datagram(0xBEEF, 1400).expect("builds");
-        assert_eq!(d.len(), 1400, "outer datagram padded to the target size");
+        assert_eq!(
+            d.len(),
+            1400,
+            "pre-wrapper payload padded to the target size"
+        );
         assert!(is_mtu_probe(&d));
         assert!(!is_mtu_probe_ack(&d));
         assert!(!is_junk(&d));
         assert_eq!(parse_mtu_probe(&d), Some((0xBEEF, 1400)));
+        assert_eq!(parse_mtu_probe_request(&d), Some((0xBEEF, 1400)));
+        assert_eq!(parse_mtu_probe_ack(&d), None);
 
         // Server echo: tiny, carries the same id/size.
         let ack = mtu_probe_ack_datagram(0xBEEF, 1400);
         assert!(is_mtu_probe_ack(&ack));
         assert!(!is_mtu_probe(&ack));
         assert_eq!(parse_mtu_probe(&ack), Some((0xBEEF, 1400)));
+        assert_eq!(parse_mtu_probe_ack(&ack), Some((0xBEEF, 1400)));
+        assert_eq!(parse_mtu_probe_request(&ack), None);
         assert!(
             ack.len() < 32,
             "the ACK is small — only the big probe tests the path"
         );
+    }
+
+    #[test]
+    fn reverse_mtu_probe_v2_roundtrips_unpredictable_token_and_exact_shape() {
+        let token = 0x0123456789abcdef_fedcba9876543210u128;
+        let probe = mtu_probe_v2_datagram(token, 1400).unwrap();
+        assert_eq!(probe.len(), 1400);
+        assert!(is_mtu_probe_v2(&probe));
+        assert!(!is_mtu_probe(&probe));
+        assert_eq!(parse_mtu_probe_v2_request(&probe), Some((token, 1400)));
+        assert_eq!(parse_mtu_probe_v2_ack(&probe), None);
+
+        let ack = mtu_probe_v2_ack_datagram(token, 1400);
+        assert!(is_mtu_probe_ack_v2(&ack));
+        assert!(!is_mtu_probe_ack(&ack));
+        assert_eq!(ack.len(), FRAG_HDR_LEN + PROBE_V2_BODY_LEN);
+        assert_eq!(parse_mtu_probe_v2_ack(&ack), Some((token, 1400)));
+        assert_eq!(
+            parse_mtu_probe_v2_ack(&mtu_probe_ack_datagram(0x3210, 1400)),
+            None,
+        );
+
+        let mut trailing = ack.clone();
+        trailing.push(0);
+        assert_eq!(parse_mtu_probe_v2_ack(&trailing), None);
+        let mut short_claim = probe;
+        short_claim.truncate(FRAG_HDR_LEN + PROBE_V2_BODY_LEN);
+        assert_eq!(parse_mtu_probe_v2_request(&short_claim), None);
+    }
+
+    #[test]
+    fn mtu_probe_parsers_reject_false_size_and_ambiguous_shapes() {
+        let mut short_claim = mtu_probe_datagram(7, 1200).unwrap();
+        short_claim.truncate(FRAG_HDR_LEN + PROBE_BODY_LEN);
+        assert_eq!(parse_mtu_probe(&short_claim), Some((7, 1200)));
+        assert_eq!(parse_mtu_probe_request(&short_claim), None);
+
+        let mut multi = mtu_probe_datagram(8, 1200).unwrap();
+        multi[5] = 2;
+        assert_eq!(parse_mtu_probe_request(&multi), None);
+
+        let mut ack_with_trailing = mtu_probe_ack_datagram(9, 1200);
+        ack_with_trailing.push(0);
+        assert_eq!(parse_mtu_probe_ack(&ack_with_trailing), None);
+        let mut fragmented_ack = mtu_probe_ack_datagram(10, 1200);
+        fragmented_ack[4] = 1;
+        fragmented_ack[5] = 2;
+        assert_eq!(parse_mtu_probe_ack(&fragmented_ack), None);
     }
 
     #[test]

@@ -21,6 +21,7 @@
 //! `**/bin/`, which would silently keep this file out of git (same reason as
 //! `src/client_main.rs`).
 
+use qeli_core as qeli;
 use std::path::{Path, PathBuf};
 
 /// Repo-root-relative output directory for every fixture.
@@ -150,7 +151,7 @@ fn build_prp_nonce() -> String {
   ],
   "primitive": "prp-nonce",
   "generator": "qeli/src/gen_conformance_main.rs",
-  "platforms": ["rust", "csharp", "swift"],
+  "platforms": ["rust", "kotlin", "csharp", "swift"],
   "cases": [
 "#,
     );
@@ -340,7 +341,7 @@ fn build_packet_decode() -> String {
   ],
   "primitive": "packet-decode",
   "generator": "qeli/src/gen_conformance_main.rs",
-  "platforms": ["rust", "csharp", "swift"],
+  "platforms": ["rust", "kotlin", "csharp", "swift"],
   "cases": [
 "#,
     );
@@ -501,7 +502,7 @@ fn build_replay_window() -> String {
   "primitive": "replay-window",
   "generator": "qeli/src/gen_conformance_main.rs",
   "window_size": 2048,
-  "platforms": ["rust", "csharp", "swift"],
+  "platforms": ["rust", "kotlin", "csharp", "swift"],
   "cases": [
 "#,
     );
@@ -651,7 +652,7 @@ fn build_hkdf() -> String {
   ],
   "primitive": "hkdf",
   "generator": "qeli/src/gen_conformance_main.rs",
-  "platforms": ["rust", "csharp", "swift"],
+  "platforms": ["rust", "kotlin", "csharp", "swift"],
   "cases": [
 "#,
     );
@@ -838,7 +839,7 @@ fn build_quic() -> String {
   ],
   "primitive": "quic",
   "generator": "qeli/src/gen_conformance_main.rs",
-  "platforms": ["rust", "csharp", "swift"],
+  "platforms": ["rust", "kotlin", "csharp", "swift"],
   "wrap": [
 "#,
     );
@@ -985,7 +986,9 @@ fn build_udp_frag() -> String {
     s.push_str(&format!(
         "{MAX_CHUNK},\n  \"max_chunk_accept\": {MAX_CHUNK_ACCEPT},\n  \"max_frags\": {MAX_FRAGS},\n  \"msg_auth_ok\": {MSG_AUTH_OK},\n"
     ));
-    s.push_str("  \"platforms\": [\"rust\", \"csharp\", \"swift\"],\n  \"fragment\": [\n");
+    s.push_str(
+        "  \"platforms\": [\"rust\", \"kotlin\", \"csharp\", \"swift\"],\n  \"fragment\": [\n",
+    );
 
     struct FragCase {
         name: &'static str,
@@ -1115,6 +1118,16 @@ fn build_udp_frag() -> String {
             ],
         },
         ReCase {
+            name: "conflicting-duplicate-fragment",
+            why: "The same index cannot authenticate two different byte strings. Keeping the \
+                  first silently makes the reconstructed handshake depend on arrival order and \
+                  lets an injected duplicate hide corruption instead of failing closed.",
+            feed: vec![
+                frag(MSG_SERVER_HELLO, 0, 3, a),
+                frag(MSG_SERVER_HELLO, 0, 3, bb),
+            ],
+        },
+        ReCase {
             name: "missing-fragment",
             why: "A gap must stay incomplete — never completed with a hole, never padded.",
             feed: vec![
@@ -1209,15 +1222,15 @@ fn build_udp_frag() -> String {
         ),
         (
             "mtu-probe-ack",
-            "The probe ACK is fully deterministic (id + outer_size, little-endian), so it is \
-             pinned byte for byte here — id 0xBEEF, outer size 1400.",
+            "The probe ACK is fully deterministic (id + probe_payload_size, little-endian), so it is \
+             pinned byte for byte here — id 0xBEEF, pre-wrapper payload size 1400.",
             ack.clone(),
         ),
         (
             "auth-ok-fragment",
             "The AuthOK, msg_id 6 — fragment 0 of 2. Unambiguous against a real record in \
              either framing: TLS framing opens 0x17 0x03 0x03, and raw framing opens with a \
-             u16 payload length bounded by MAX_RECORD_SIZE (0x4124), so its high byte is at \
+             u16 payload length bounded by MAX_RECORD_SIZE (0x4100), so its high byte is at \
              most 0x41 and 0xF0 is unreachable both ways. Same property that lets a server \
              tell a fragmented ClientHello from a legacy single-datagram one.",
             frag(MSG_AUTH_OK, 0, 2, b"\xde\xad\xbe\xef"),

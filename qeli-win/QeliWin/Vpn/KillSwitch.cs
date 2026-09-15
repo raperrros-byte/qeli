@@ -157,6 +157,7 @@ public static class KillSwitch
     public static void UpdateServerAddresses(
         IReadOnlyList<string> previous, IReadOnlyList<string> refreshed, Action<string> log)
     {
+        using var operation = AcquireOperation();
         var oldSet = previous.ToHashSet(StringComparer.Ordinal);
         var newSet = refreshed.ToHashSet(StringComparer.Ordinal);
         if (newSet.Count == 0)
@@ -166,17 +167,62 @@ public static class KillSwitch
         var removed = oldSet.Except(newSet).ToArray();
         if (added.Length == 0 && removed.Length == 0) return;
 
-        var script = new StringBuilder();
-        foreach (var ip in added)
-            script.AppendLine($"New-NetFirewallRule -DisplayName 'qeli kill-switch: server {ip}' -Group '{Group}' " +
-                $"-Direction Outbound -RemoteAddress {ip} -Action Allow -Profile Any | Out-Null");
-        foreach (var ip in removed)
-            script.AppendLine($"Remove-NetFirewallRule -DisplayName 'qeli kill-switch: server {ip}' " +
-                "-ErrorAction SilentlyContinue");
-        Ps(script.ToString(), critical: true);
-        ReplaceStrictGate(_strictTunAlias
-            ?? throw new InvalidOperationException("kill-switch: strict gate has no tunnel interface"),
-            refreshed, ResolveDnsServers());
+        string oldAlias;
+        string[] oldStrictServers;
+        string[] oldDns;
+        lock (StrictGateLock)
+        {
+            oldAlias = _strictTunAlias
+                ?? throw new InvalidOperationException("kill-switch: strict gate has no tunnel interface");
+            oldStrictServers = _strictServers.ToArray();
+            oldDns = _strictDns.ToArray();
+        }
+        var nextDns = ResolveDnsServers();
+
+        // Add new firewall permits while the old strict gate still blocks them, atomically
+        // swap the WinDivert generation, and only then retire obsolete firewall permits.
+        try
+        {
+            Ps(ServerRuleScript(add: added), critical: true);
+            ReplaceStrictGate(oldAlias, refreshed, nextDns);
+        }
+        catch (Exception gateError)
+        {
+            try { Ps(ServerRuleScript(remove: added), critical: true); }
+            catch (Exception cleanupError)
+            {
+                throw new AggregateException(
+                    "kill-switch gate refresh failed and new firewall permits could not be removed; " +
+                    "the previous strict gate remains active",
+                    gateError,
+                    cleanupError);
+            }
+            throw;
+        }
+
+        try
+        {
+            Ps(ServerRuleScript(remove: removed), critical: true);
+        }
+        catch (Exception removeError)
+        {
+            var rollbackErrors = new List<Exception> { removeError };
+            try { ReplaceStrictGate(oldAlias, oldStrictServers, oldDns); }
+            catch (Exception error) { rollbackErrors.Add(error); }
+            try
+            {
+                // Removal may have stopped part-way through. Recreate the exact old set
+                // idempotently and remove every address introduced by this transaction.
+                Ps(ServerRuleScript(add: removed, remove: added, replaceAdded: true), critical: true);
+            }
+            catch (Exception error) { rollbackErrors.Add(error); }
+            if (rollbackErrors.Count > 1)
+                throw new AggregateException(
+                    "kill-switch allowlist refresh failed and rollback was incomplete; " +
+                    "egress remains guarded by every strict gate that could be restored",
+                    rollbackErrors);
+            throw;
+        }
         log($"Kill-switch server allowlist refreshed: {string.Join(", ", refreshed)}");
     }
 
@@ -252,6 +298,30 @@ public static class KillSwitch
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
+    private static string ServerRuleScript(
+        IEnumerable<string>? add = null,
+        IEnumerable<string>? remove = null,
+        bool replaceAdded = false)
+    {
+        var script = new StringBuilder();
+        foreach (var ip in remove ?? [])
+            script.AppendLine(
+                $"Get-NetFirewallRule -Group '{Group}' -ErrorAction SilentlyContinue | " +
+                $"Where-Object {{ $_.DisplayName -eq 'qeli kill-switch: server {ip}' }} | " +
+                "Remove-NetFirewallRule -ErrorAction SilentlyContinue");
+        foreach (var ip in add ?? [])
+        {
+            if (replaceAdded)
+                script.AppendLine(
+                    $"Get-NetFirewallRule -Group '{Group}' -ErrorAction SilentlyContinue | " +
+                    $"Where-Object {{ $_.DisplayName -eq 'qeli kill-switch: server {ip}' }} | " +
+                    "Remove-NetFirewallRule -ErrorAction SilentlyContinue");
+            script.AppendLine($"New-NetFirewallRule -DisplayName 'qeli kill-switch: server {ip}' -Group '{Group}' " +
+                $"-Direction Outbound -RemoteAddress {ip} -Action Allow -Profile Any | Out-Null");
+        }
+        return script.ToString();
+    }
+
     private static void ReplaceStrictGate(
         string tunAlias, IEnumerable<string> servers, IEnumerable<string> dnsServers)
     {
@@ -259,39 +329,24 @@ public static class KillSwitch
         var nextDns = dnsServers.ToArray();
         lock (StrictGateLock)
         {
-            // WinDivert filters are immutable. Close then replace under one lock; the
-            // persistent firewall default-block remains active during this tiny swap.
-            var oldAlias = _strictTunAlias;
-            var oldServers = _strictServers;
-            var oldDns = _strictDns;
-            bool hadOld = _strictGate != null;
-            _strictGate?.Dispose();
-            _strictGate = null;
+            // Open the complete immutable filter before publishing it or closing the current
+            // handle. A failed Open leaves the old gate and its metadata untouched. While both
+            // filters coexist they can briefly block a carrier, but cannot create a leak.
+            var nextGate = WinDivertKillSwitchGate.Open(tunAlias, nextServers, nextDns);
+            var oldGate = _strictGate;
             try
             {
-                _strictGate = WinDivertKillSwitchGate.Open(tunAlias, nextServers, nextDns);
+                _strictGate = nextGate;
                 _strictTunAlias = tunAlias;
                 _strictServers = nextServers;
                 _strictDns = nextDns;
             }
             catch
             {
-                // A DDNS refresh must not downgrade a working strict gate merely
-                // because the replacement filter could not be opened. Restore the
-                // previous generation best-effort, then surface the original error.
-                if (hadOld && oldAlias != null)
-                {
-                    try
-                    {
-                        _strictGate = WinDivertKillSwitchGate.Open(oldAlias, oldServers, oldDns);
-                        _strictTunAlias = oldAlias;
-                        _strictServers = oldServers;
-                        _strictDns = oldDns;
-                    }
-                    catch { }
-                }
+                nextGate.Dispose();
                 throw;
             }
+            oldGate?.Dispose();
         }
     }
 
@@ -417,6 +472,10 @@ public static class KillSwitch
 
     internal static string BuildRestoreScriptForTest(IReadOnlyDictionary<string, string> prior) =>
         BuildRestoreScript(prior);
+    internal static string ServerRuleScriptForTest(
+        IEnumerable<string>? add = null, IEnumerable<string>? remove = null) =>
+        ServerRuleScript(add, remove);
+
 
     private static string BuildRestoreScript(IReadOnlyDictionary<string, string> prior)
     {

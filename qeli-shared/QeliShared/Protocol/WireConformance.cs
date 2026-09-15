@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Qeli.Shared.Crypto;
+using Qeli.Shared.Vpn;
 
 namespace Qeli.Shared.Protocol;
 
@@ -32,10 +33,85 @@ public static class WireConformance
         ok &= RunUdpFrag(check);
         ok &= RunCtrlFrame(check);
         ok &= RunMtuLadder(check);
+        ok &= RunRouteFileScale(check);
         ok &= RunIniBounds(check);
         ok &= RunEditorPresetSelection(check);
-        Qeli.Shared.Vpn.VpnTunnelBase.RunNetworkPolicySelfTests(check);
+        NetworkPolicyConformance.Run(check);
         return ok;
+    }
+
+    /// <summary>Regression coverage for the 14,113-route files attached to issue #69.
+    /// The real files contain the same ordered networks in CIDR and OpenVPN-netmask forms;
+    /// generate the equivalent shape here so CI does not depend on mutable GitHub attachments.</summary>
+    private static bool RunRouteFileScale(Action<string, bool> check)
+    {
+        const int routeCount = 14_113;
+        var cidrLines = new string[routeCount];
+        var openVpnLines = new string[routeCount];
+        for (int i = 0; i < routeCount; i++)
+        {
+            string network = $"100.{i / 256}.{i % 256}.0";
+            cidrLines[i] = $"{network}/24";
+            openVpnLines[i] = $"route {network} 255.255.255.0";
+        }
+
+        IReadOnlyList<string> cidrRoutes = RouteFileParser.ParseLines(cidrLines, "all-cidrs");
+        IReadOnlyList<string> openVpnRoutes =
+            RouteFileParser.ParseLines(openVpnLines, "all-openvpn-routes");
+        bool equivalent = cidrRoutes.Count == routeCount
+            && openVpnRoutes.SequenceEqual(cidrRoutes)
+            && cidrRoutes.All(route => !route.EndsWith("/32", StringComparison.Ordinal));
+        check("route_file: issue #69 14,113-line CIDR/OpenVPN lists stay equivalent without invented /32 routes",
+            equivalent);
+
+        string tempDir = Path.Combine(Path.GetTempPath(), $"qeli-route-file-{Guid.NewGuid():N}");
+        bool multipleFilesDeduplicated = false;
+        try
+        {
+            Directory.CreateDirectory(tempDir);
+            string cidrPath = Path.Combine(tempDir, "All CIDRs.txt");
+            string openVpnPath = Path.Combine(tempDir, "All OpenVPN routes.txt");
+            File.WriteAllLines(cidrPath, cidrLines);
+            File.WriteAllLines(openVpnPath, openVpnLines);
+            var logs = new List<string>();
+            IReadOnlyList<string> loaded = RouteFileParser.Load(
+                new[] { cidrPath, openVpnPath }, CancellationToken.None, logs.Add);
+            multipleFilesDeduplicated = loaded.Count == routeCount
+                && loaded.SequenceEqual(cidrRoutes)
+                && logs.Any(line => line.Contains(
+                    $"Loaded {routeCount} unique route(s) from 2 route_file source(s)",
+                    StringComparison.Ordinal));
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { }
+        }
+        check("route_file: two issue-sized files merge and deduplicate across sources",
+            multipleFilesDeduplicated);
+
+        using var cancellation = new CancellationTokenSource();
+        IEnumerable<string> CancelDuringEnumeration()
+        {
+            for (int i = 0; i < routeCount; i++)
+            {
+                if (i == 128) cancellation.Cancel();
+                yield return cidrLines[i];
+            }
+        }
+        bool cancelledMidFile = false;
+        try
+        {
+            RouteFileParser.ParseLines(
+                CancelDuringEnumeration(), "cancelled-route-file", cancellation.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            cancelledMidFile = true;
+        }
+        check("route_file: cancellation interrupts an issue-sized file during parsing",
+            cancelledMidFile);
+
+        return equivalent && multipleFilesDeduplicated && cancelledMidFile;
     }
 
     /// <summary>Manual INI values that do not match a visual preset must remain exact.
@@ -166,6 +242,10 @@ public static class WireConformance
         var patient = Ini("reconnect_max_delay = 3600");
         check("ini-bounds: an hour-long reconnect delay is left alone",
             patient.ReconnectMaxDelaySecs == 3600 && patient.UnparsedNumericKeys.Count == 0);
+        bool jitterBounded = Enumerable.Range(0, 256)
+            .Select(_ => Vpn.VpnTunnelBase.JitterReconnectDelay(60_000))
+            .All(delay => delay is >= 48_000 and <= 60_000);
+        check("reconnect: jitter stays within 80-100% of the capped schedule", jitterBounded);
 
         // padding_min > padding_max is an inverted range; a five-digit padding is past the
         // ceiling. Each field only checked `>= 0` on its own, so both parsed.
@@ -178,6 +258,32 @@ public static class WireConformance
         var keep = Ini("padding_min = 10", "padding_max = 200");
         bool kept = keep.PaddingMin == 10 && keep.PaddingMax == 200;
         check("ini-bounds: a valid padding range is left alone", kept);
+
+        bool shapingRefused = true;
+        foreach (var lines in new[]
+                 {
+                     new[] { "shaping_gap_min = 500", "shaping_gap_max = 100" },
+                     new[] { "shaping_min_size = 900", "shaping_max_size = 300" },
+                     new[]
+                     {
+                         "shaping = true", "shaping_budget = 200",
+                         "shaping_max_size = 300",
+                     },
+                 })
+        {
+            try { Ini(lines).Validate(); shapingRefused = false; }
+            catch (ArgumentException) { }
+        }
+        bool shapingValid = true;
+        try
+        {
+            Ini("shaping = true", "shaping_gap_min = 40", "shaping_gap_max = 6000",
+                "shaping_budget = 1024", "shaping_min_size = 64", "shaping_max_size = 1024")
+                .Validate();
+        }
+        catch (ArgumentException) { shapingValid = false; }
+        check("ini-shaping: inverted ranges and insufficient budget are refused", shapingRefused);
+        check("ini-shaping: a coherent enabled profile remains valid", shapingValid);
 
         // A boolean nobody could parse must NOT read as false. Every unknown value used to be
         // falsey, so `kill_switch = ture` silently disabled the kill switch and
@@ -231,6 +337,39 @@ public static class WireConformance
         check("ini-dups: recorded once, last value still wins", dupOnce);
         check("ini-dups: a clean config records nothing", cleanQuiet);
 
+        // route_file is deliberately repeatable: each occurrence contributes one desktop
+        // source and a save/load round-trip must preserve their declaration order.
+        var routeSources = Ini(
+            @"route_file = C:\qeli\cidrs.txt",
+            @"route_file = C:\qeli\openvpn.txt");
+        bool routeSourcesAccepted = routeSources.RouteFilePaths.SequenceEqual(new[]
+            { @"C:\qeli\cidrs.txt", @"C:\qeli\openvpn.txt" })
+            && !routeSources.DuplicateKeys.Contains("route_file");
+        var routeSourcesRoundTrip = Model.VpnConfig.FromIni(routeSources.ToIni());
+        check("route_file: repeated keys are additive and ordered", routeSourcesAccepted);
+        check("route_file: repeated keys survive INI round-trip",
+            routeSourcesRoundTrip.RouteFilePaths.SequenceEqual(routeSources.RouteFilePaths));
+
+        IReadOnlyList<string> parsedRoutes = RouteFileParser.ParseLines(new[]
+        {
+            "10.20.1.9/16 # canonicalized CIDR",
+            "route 172.16.9.7 255.255.0.0 vpn_gateway 10",
+            "route-ipv6 2001:db8:42:ffff::1/48",
+            "route 192.0.2.7",
+        }, "route-fixture");
+        check("route_file: CIDR and OpenVPN formats parse and canonicalize",
+            parsedRoutes.SequenceEqual(new[]
+            {
+                "10.20.0.0/16", "172.16.0.0/16", "2001:db8:42::/48", "192.0.2.7/32"
+            }));
+        bool malformedRouteRefused = false;
+        try { RouteFileParser.ParseLines(new[] { "route 10.0.0.0 255.0.255.0" }, "bad-routes"); }
+        catch (InvalidDataException e)
+        {
+            malformedRouteRefused = e.Message.Contains("bad-routes:1");
+        }
+        check("route_file: malformed netmask fails closed with source line", malformedRouteRefused);
+
         // A number nobody could parse must not become a default in silence. `server =
         // host:notnum` became `host:443` — a DIFFERENT server — with nothing reported, the same
         // failure mode the boolean handling already fixed. (Audit 2026-08-01, §P2.)
@@ -275,6 +414,10 @@ public static class WireConformance
         var outOfRange = Ini("lport = 99999", "heartbeat_interval = -5");
         bool rangedRecorded = outOfRange.UnparsedNumericKeys.Contains("lport")
             && outOfRange.UnparsedNumericKeys.Contains("heartbeat_interval");
+        var automaticLocalPort = Ini("lport = 0");
+        check("ini-nums: explicit lport zero means automatic/ephemeral",
+            automaticLocalPort.LocalPort == 0
+            && !automaticLocalPort.UnparsedNumericKeys.Contains("lport"));
         bool rangeRefused = false;
         try { outOfRange.Validate(); }
         catch (ArgumentException e) { rangeRefused = e.Message.Contains("lport"); }
@@ -323,6 +466,16 @@ public static class WireConformance
         check("ini-tofu: escape hatch is modelled and defaults fail-closed",
             carried.AllowUnpinnedTofu && !Ini().AllowUnpinnedTofu);
 
+        var roamingOff = Ini("roaming = off");
+        var roamingBack = Model.VpnConfig.FromIni(roamingOff.ToIni());
+        check("ini-roaming: non-default policy survives an open-and-save",
+            roamingOff.RoamingPolicy == "off" && roamingBack.RoamingPolicy == "off"
+            && roamingBack.UnknownKeys.Count == 0);
+        bool requiredPinRejected = false;
+        try { Ini("roaming = required", "local = 192.0.2.10").Validate(); }
+        catch (ArgumentException e) { requiredPinRejected = e.Message.Contains("cannot be combined"); }
+        check("ini-roaming: required rejects an explicit source pin", requiredPinRejected);
+
         // The sparse portable serializer is made explicit at the transport boundary: desktop
         // full-tunnel and GUI data-plane defaults differ from an absent Rust key.
         var nativeIni = Ini().ToTransportCoreIni();
@@ -370,12 +523,21 @@ public static class WireConformance
             heartbeatIntervalMs: edited.HeartbeatIntervalMs,
             heartbeatJitterMs: edited.HeartbeatJitterMs,
             connectionTimeoutSecs: 45, reconnectEnabled: false, reconnectMaxRetries: 5,
-            persistTun: true, mtuProbe: false, killSwitch: true, dnsMode: "system");
+            persistTun: true, mtuProbe: false, killSwitch: true, dnsMode: "system",
+            ipv6Policy: "required", roamingPolicy: "required",
+            allowIpv4Leak: true, allowIpv6Leak: true);
+        string extendedIni = extendedEdit.ToIni();
         check("ini-editor: extended desktop controls persist",
             extendedEdit.ConnectionTimeoutSecs == 45 && !extendedEdit.ReconnectEnabled
             && extendedEdit.ReconnectMaxRetries == 5 && extendedEdit.PersistTun
             && !extendedEdit.MtuProbe && extendedEdit.KillSwitch
-            && extendedEdit.DnsMode == "system");
+            && extendedEdit.DnsMode == "system" && extendedEdit.Ipv6Policy == "required"
+            && extendedEdit.RoamingPolicy == "required"
+            && extendedEdit.AllowIpv4Leak && extendedEdit.AllowIpv6Leak
+            && extendedIni.Contains("ipv6 = required")
+            && extendedIni.Contains("roaming = required")
+            && extendedIni.Contains("allow_ipv4_leak = true")
+            && extendedIni.Contains("allow_ipv6_leak = true"));
 
         // The editor must not LAUNDER a typo either.
         //
@@ -618,6 +780,7 @@ public static class WireConformance
 
         return timeoutClamped && noOverflow && zeroTimeout && negTimeout && sane
                && ordered && capped && kept
+               && shapingRefused && shapingValid
                && recorded && notFalsey && refuses && spellings && enums && cidrs;
     }
 
@@ -632,7 +795,7 @@ public static class WireConformance
         bool floorFits = true, descending = true, nonEmpty = true;
         foreach (int overhead in new[] { 48 + 8 + 20, 48 + 13 + 9 + 8 + 40 })
         {
-            var ladder = Vpn.VpnTunnelBase.MtuProbeLadder(1400, overhead);
+            var ladder = MtuProbeLadder(1400, overhead);
             nonEmpty &= ladder.Length > 0;
             if (ladder.Length == 0) continue;
             // The narrowest rung's WIRE size must fit a 1280-byte path.
@@ -645,23 +808,23 @@ public static class WireConformance
 
         // A ceiling already below the floor must still yield something to try, not an empty
         // ladder (which would report "no result" and silently keep the pushed MTU).
-        var tiny = Vpn.VpnTunnelBase.MtuProbeLadder(700, 48 + 13 + 9 + 8 + 40);
+        var tiny = MtuProbeLadder(700, 48 + 13 + 9 + 8 + 40);
         check("mtu-ladder: a low ceiling still produces a rung", tiny.Length > 0 && tiny[0] <= 700);
 
         // A JUMBO ceiling must not fall straight to 1360. The ladder was written when the
         // ceiling was an Ethernet-sized number, so the rung below it was 1360 and the gap was
-        // 140 bytes; raising the ceiling to 16638 turned that gap into 15278, and a path
+        // 140 bytes; raising the ceiling to 16602 turned that gap into 15242, and a path
         // carrying 9000 was certified at 1360. (Audit 2026-08-01, §8.)
         int jumboOverhead = 48 + 13 + 9 + 8 + 40;
-        var jumbo = Vpn.VpnTunnelBase.MtuProbeLadder(16638, jumboOverhead);
-        bool hasMiddle = jumbo.Count(m => m >= 1360 && m < 16638) >= 3;
+        var jumbo = MtuProbeLadder(16602, jumboOverhead);
+        bool hasMiddle = jumbo.Count(m => m >= 1360 && m < 16602) >= 3;
         int under9000 = jumbo.FirstOrDefault(m => m + jumboOverhead <= 9000);
         bool jumboUseful = under9000 >= 4000;
         check("mtu-ladder: a jumbo ceiling has rungs between it and 1360", hasMiddle);
         check("mtu-ladder: a 9000-byte path certifies near 9000, not 1360", jumboUseful);
         // ...and a normal path is probed exactly as before, so the jumbo rungs cost no extra
         // round-trips for the common case.
-        bool normalUnchanged = Vpn.VpnTunnelBase.MtuProbeLadder(1400, jumboOverhead)
+        bool normalUnchanged = MtuProbeLadder(1400, jumboOverhead)
             .SequenceEqual(new[] { 1400, 1360, 1320, 1280, 1200, 1280 - jumboOverhead });
         check("mtu-ladder: a normal ceiling gains no extra rungs", normalUnchanged);
 
@@ -673,9 +836,9 @@ public static class WireConformance
         static (int Result, int Probes) Search(int lo, int hi, int real)
         {
             int probes = 0;
-            for (int i = 0; i < Vpn.VpnTunnelBase.MtuRefineMaxProbes; i++)
+            for (int i = 0; i < MtuRefineMaxProbes; i++)
             {
-                int mid = Vpn.VpnTunnelBase.MtuRefineStep(lo, hi);
+                int mid = MtuRefineStep(lo, hi);
                 if (mid < 0) break;
                 probes++;
                 if (mid <= real) lo = mid; else hi = mid;
@@ -687,19 +850,36 @@ public static class WireConformance
         {
             var (got, probes) = Search(lo0, hi0, real);
             neverOver &= got <= real;
-            converges &= real - got <= Vpn.VpnTunnelBase.MtuRefineStepBytes && got > lo0;
-            bounded &= probes <= Vpn.VpnTunnelBase.MtuRefineMaxProbes;
+            converges &= real - got <= MtuRefineStepBytes && got > lo0;
+            bounded &= probes <= MtuRefineMaxProbes;
         }
         // A path barely above the rung must not be made worse, and a narrow bracket must stop.
         var (atRung, _) = Search(6000, 9000, 6001);
         check("mtu-refine: converges to within one step of the real path MTU", converges);
         check("mtu-refine: never certifies above what the path carries", neverOver && atRung == 6000);
-        check("mtu-refine: probe budget is bounded", bounded && Vpn.VpnTunnelBase.MtuRefineStep(6000, 6200) < 0);
+        check("mtu-refine: probe budget is bounded", bounded && MtuRefineStep(6000, 6200) < 0);
         normalUnchanged &= converges && neverOver && bounded;
 
         return floorFits && descending && nonEmpty && tiny.Length > 0
             && hasMiddle && jumboUseful && normalUnchanged;
     }
+
+    // Conformance mirror of Rust's live MTU probe policy. These helpers deliberately stay
+    // out of QeliShared.dll: desktop production uses the negotiated Rust NetworkPlan.
+    private static int[] MtuProbeLadder(int ceiling, int outerOverhead)
+    {
+        const int pathFloor = 1280;
+        int floor = Math.Clamp(pathFloor - outerOverhead, 576, Math.Max(ceiling, 576));
+        return new[] { ceiling, 12000, 9000, 6000, 4000, 2500, 2000, 1500,
+                1360, 1320, 1280, 1200, floor }
+            .Where(m => m >= floor && m <= ceiling)
+            .Distinct().OrderByDescending(m => m).ToArray();
+    }
+
+    private const int MtuRefineStepBytes = 256;
+    private const int MtuRefineMaxProbes = 5;
+    private static int MtuRefineStep(int lo, int hi) =>
+        hi - lo <= MtuRefineStepBytes ? -1 : lo + (hi - lo) / 2;
 
     /// <summary>In-tunnel control frames. Not fixture-driven — the frame is six bytes, so the
     /// bytes themselves are pinned here and in the Rust/Kotlin/Swift tests. What this catches is

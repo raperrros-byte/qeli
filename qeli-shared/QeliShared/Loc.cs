@@ -7,7 +7,7 @@ namespace Qeli.Shared;
 /// entries (Windows service vs launchd daemon, tray vs menu bar, Wintun vs utun, …)
 /// at startup via <see cref="AddOrReplace"/>. The framework-specific bindable source
 /// and {l:Loc} markup extension stay per-client (WPF vs Avalonia); UI layers refresh
-/// on the <see cref="LanguageChanged"/> event. See docs/REFACTOR-PLAN.md (R4).
+/// on the <see cref="LanguageChanged"/> event. See docs/*/archive/plans/REFACTOR-PLAN.md (R4).
 /// </summary>
 public static class Loc
 {
@@ -52,12 +52,10 @@ public static class Loc
         ["Exit"] = ("Exit", "Выход"),
 
         // ── main window ──
-        ["ProfilesHeader"] = ("Profiles", "Профили"),
         ["LogHeader"] = ("Log", "Журнал"),
         ["Profile"] = ("Profile", "Профиль"),
         ["NoProfilesMenu"] = ("No profiles", "Нет профилей"),
         ["SelectProfile"] = ("Select a profile", "Выберите профиль"),
-        ["TunnelIp"] = ("Tunnel IP: {0}", "IP в туннеле: {0}"),
         ["NoProfilesHint"] = ("No profiles yet.\nClick “Import” or “New”.", "Нет профилей.\nНажмите «Импорт» или «Новый»."),
 
         // ── statuses ──
@@ -212,8 +210,6 @@ public static class Loc
         ["FieldName"] = ("Name", "Название"),
         ["FieldServer"] = ("Server address", "Адрес сервера"),
         ["FieldPort"] = ("Port", "Порт"),
-        ["FieldProtocol"] = ("Protocol", "Протокол"),
-        ["FieldWireMode"] = ("Wire mode", "Wire-режим"),
         // Connection-mode presets: each sets transport + wire mode + fronting + QUIC.
         ["FieldMode"] = ("Connection mode", "Режим подключения"),
         ["PresetFakeTls"] = ("Fake-TLS · TCP", "Fake-TLS · TCP"),
@@ -228,12 +224,23 @@ public static class Loc
         ["FieldLogin"] = ("Username", "Логин"),
         ["FieldPassword"] = ("Password", "Пароль"),
         ["FieldSni"] = ("SNI (domain masking)", "SNI (маскировка домена)"),
-        ["FieldQuic"] = ("QUIC masking (UDP)", "QUIC-маскировка (UDP)"),
         ["FieldPadding"] = ("Padding (size masking)", "Паддинг (маскировка размера)"),
         ["FieldHeartbeat"] = ("Heartbeat (keep-alive)", "Heartbeat (keep-alive)"),
         ["FieldObfsKey"] = ("Obfs key (PSK)", "Ключ obfs (PSK)"),
         ["FieldServerKey"] = ("Server key (pinning)", "Ключ сервера (пиннинг)"),
         ["FieldRouting"] = ("Routing", "Маршрутизация"),
+        ["FieldIpv6Policy"] = ("Inner IPv6 policy", "Политика IPv6 внутри туннеля"),
+        ["Ipv6Auto"] = ("Automatic (accept server plan)", "Авто (принять план сервера)"),
+        ["Ipv6Required"] = ("Required", "Обязателен"),
+        ["Ipv6Off"] = ("Disabled inside tunnel", "Отключён внутри туннеля"),
+        ["Ipv6PolicyHint"] = (
+            "Auto accepts IPv4, dual-stack or IPv6-only. Required refuses a plan without IPv6; Off refuses tunneled IPv6.",
+            "Авто принимает IPv4, dual-stack или IPv6-only. «Обязателен» отклоняет план без IPv6; «Отключён» запрещает IPv6 в туннеле."),
+        ["FamilyLeakHint"] = (
+            "Advanced full-tunnel exceptions. Keep both off to block a missing address family fail-closed.",
+            "Дополнительные исключения full-tunnel. Оставьте оба выключенными, чтобы отсутствующее семейство блокировалось fail-closed."),
+        ["AllowIpv4Leak"] = ("Allow native IPv4 outside an IPv6-only tunnel", "Разрешить нативный IPv4 вне IPv6-only туннеля"),
+        ["AllowIpv6Leak"] = ("Allow native IPv6 outside an IPv4-only tunnel", "Разрешить нативный IPv6 вне IPv4-only туннеля"),
         ["FieldDns"] = ("DNS servers", "DNS-серверы"),
         ["FieldMtu"] = ("MTU (0 = automatic)", "MTU (0 = автоматически)"),
         ["FieldDnsMode"] = ("DNS mode", "Режим DNS"),
@@ -247,6 +254,16 @@ public static class Loc
         ["KillSwitch"] = ("Block traffic if the tunnel is interrupted (kill switch)", "Блокировать трафик при разрыве туннеля (kill switch)"),
         ["ConnectionBehavior"] = ("Connection behavior", "Поведение подключения"),
         ["FieldTimeout"] = ("Connection timeout, seconds (1–300)", "Таймаут подключения, секунд (1–300)"),
+        ["FieldRoamingPolicy"] = ("Session roaming", "Роуминг сессии"),
+        ["RoamingAuto"] = ("Automatic (when supported)", "Автоматически (если поддерживается)"),
+        ["RoamingRequired"] = ("Required", "Обязательно"),
+        ["RoamingOff"] = ("Disabled", "Отключено"),
+        ["RoamingPolicyHint"] = (
+            "Auto keeps the authenticated session across network and address changes when both endpoints support it, otherwise reconnects. Required refuses a server or platform without roaming.",
+            "Авто сохраняет авторизованную сессию при смене сети и адреса, когда это поддерживают обе стороны, иначе переподключается. «Обязательно» отклоняет сервер или платформу без роуминга."),
+        ["RoamingRequiredPinned"] = (
+            "Required roaming cannot be combined with local or a non-zero lport. Remove the source pin in Edit INI, or choose Automatic/Disabled.",
+            "Обязательный роуминг нельзя сочетать с local или ненулевым lport. Удалите привязку исходного адреса в редакторе INI либо выберите «Автоматически»/«Отключено»."),
         ["ReconnectAutomatically"] = ("Reconnect automatically", "Переподключаться автоматически"),
         ["ReconnectRetries"] = ("Retry limit", "Лимит попыток"),
         ["RetriesUnlimited"] = ("Unlimited", "Без ограничений"),
@@ -315,7 +332,7 @@ public static class Loc
         ["NeedServer"] = ("Enter the server address.", "Укажите адрес сервера."),
         ["BadPort"] = ("Invalid port (1–65535).", "Некорректный порт (1–65535)."),
         ["BadTimeout"] = ("Invalid connection timeout (1–300 seconds).", "Некорректный таймаут подключения (1–300 секунд)."),
-        ["BadMtu"] = ("MTU must be 0 (automatic) or 576–16638.", "MTU должен быть 0 (автоматически) или 576–16638."),
+        ["BadMtu"] = ("MTU must be 0 (automatic) or 576–16602.", "MTU должен быть 0 (автоматически) или 576–16602."),
         ["NeedLogin"] = ("Enter the username.", "Укажите логин."),
         ["ManualEdit"] = ("Edit INI configuration", "Редактирование INI-конфига"),
         ["ManualEditPrompt"] = ("Edit the INI configuration:", "Редактирование INI-конфига:"),
@@ -333,13 +350,12 @@ public static class Loc
         ["StatDownload"] = ("Download", "Приём"),
         ["StatUpload"] = ("Upload", "Отдача"),
         ["StatSession"] = ("Session", "Сессия"),
-        ["StatTunnelIp"] = ("Server IP", "IP сервера"),
+        ["StatTunnelIp"] = ("Tunnel addresses", "Адреса туннеля"),
         ["StatTotal"] = ("total {0}", "всего {0}"),
         ["StatSince"] = ("since {0}", "с {0}"),
         ["LogCopy"] = ("Copy log", "Копировать лог"),
         ["LogClear"] = ("Clear log", "Очистить лог"),
         ["Throughput"] = ("Throughput", "Трафик"),
-        ["ChartWindow"] = ("60 s", "60 с"),
         ["Offline"] = ("offline", "офлайн"),
         ["QrTitle"] = ("Share profile", "Поделиться профилём"),
         ["CopyLink"] = ("Copy link", "Копировать ссылку"),

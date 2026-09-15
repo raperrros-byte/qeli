@@ -4,45 +4,227 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
+use std::path::{Component, Path};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const MANAGED_BACKUP_ROOT: &str = "/etc/qeli";
+const TRANSIENT_TAR_EXCLUDES: &[&str] = &[
+    "qeli/.pre-restore-*.tgz",
+    "qeli/.restore-upload-*.tgz",
+    "qeli/.restore-staging-*",
+];
+const PORTABLE_TAR_EXCLUDES: &[&str] = &[
+    "qeli/.config-history",
+    // The legacy key can remain after migration to /var/lib/qeli. Never export it beside the
+    // encrypted password values: the portable archive deliberately excludes encryption keys.
+    "qeli/panel-secret.key",
+];
+
+fn append_tar_excludes(command: &mut std::process::Command, portable: bool) {
+    for pattern in TRANSIENT_TAR_EXCLUDES {
+        command.arg(format!("--exclude={pattern}"));
+    }
+    if portable {
+        for pattern in PORTABLE_TAR_EXCLUDES {
+            command.arg(format!("--exclude={pattern}"));
+        }
+    }
+}
+
+fn validate_critical_sources(paths: &[CriticalBackupPath]) -> Result<(), String> {
+    for item in paths {
+        let path = Path::new("/etc").join(&item.archive_path);
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            format!(
+                "backup aborted: '{}' is unavailable ({}) — {error}",
+                path.display(),
+                item.reason
+            )
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "backup aborted: '{}' is not a regular file ({})",
+                path.display(),
+                item.reason
+            ));
+        }
+        std::fs::File::open(&path).map_err(|error| {
+            format!(
+                "backup aborted: '{}' is unreadable ({}) — {error}",
+                path.display(),
+                item.reason
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn inspect_backup_archive(
+    bytes: Vec<u8>,
+) -> Result<(Vec<u8>, std::collections::HashSet<String>), String> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new("tar")
+        .args(["tzf", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot inspect generated backup: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "cannot open tar stdin for backup verification".to_string())?;
+    let writer = std::thread::spawn(move || {
+        let result = stdin.write_all(&bytes);
+        (bytes, result)
+    });
+    let listing = child
+        .wait_with_output()
+        .map_err(|error| format!("cannot wait for backup verification: {error}"))?;
+    let (bytes, write_result) = writer
+        .join()
+        .map_err(|_| "backup verification writer panicked".to_string())?;
+    write_result.map_err(|error| format!("cannot feed generated backup to tar: {error}"))?;
+    if !listing.status.success() {
+        return Err(format!(
+            "generated backup cannot be listed: {}",
+            String::from_utf8_lossy(&listing.stderr).trim()
+        ));
+    }
+    let members = String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .map(|line| {
+            line.trim()
+                .trim_start_matches("./")
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .collect();
+    Ok((bytes, members))
+}
+
+#[derive(Debug)]
+struct CriticalBackupPath {
+    archive_path: String,
+    reason: &'static str,
+}
+
+/// Map an active configuration path to the member name used by the portable panel archive.
+/// The panel archive deliberately has one managed root. Silently accepting a path outside
+/// that root is worse than refusing the operation: the resulting archive looks complete but
+/// cannot reproduce the running server.
+fn managed_archive_path(path: &str, label: &str) -> Result<String, String> {
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return Err(format!(
+            "panel backup unavailable: active {label} path '{}' is relative; move it below {MANAGED_BACKUP_ROOT} or take a manual backup",
+            path.display()
+        ));
+    }
+    let relative = path.strip_prefix(MANAGED_BACKUP_ROOT).map_err(|_| {
+        format!(
+            "panel backup unavailable: active {label} path '{}' is outside {MANAGED_BACKUP_ROOT}; the panel will not claim that a partial archive is complete. Move it below {MANAGED_BACKUP_ROOT} or take a manual backup that includes the external path",
+            path.display()
+        )
+    })?;
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(format!(
+            "panel backup unavailable: active {label} path '{}' is not a normal file below {MANAGED_BACKUP_ROOT}",
+            path.display()
+        ));
+    }
+    Ok(format!(
+        "qeli/{}",
+        relative.to_string_lossy().replace('\\', "/")
+    ))
+}
+
+fn critical_backup_paths(
+    config: &crate::config::server::ServerConfig,
+    config_path: &str,
+) -> Result<Vec<CriticalBackupPath>, String> {
+    let mut paths = vec![CriticalBackupPath {
+        archive_path: managed_archive_path(config_path, "server config")?,
+        reason: "the active server configuration",
+    }];
+    paths.push(CriticalBackupPath {
+        archive_path: managed_archive_path(&config.auth.users_file, "users database")?,
+        reason: "the active users database",
+    });
+    for profile in &config.profiles {
+        paths.push(CriticalBackupPath {
+            archive_path: managed_archive_path(
+                &crate::server::profile_identity_path(profile),
+                &format!("identity key for profile '{}'", profile.name),
+            )?,
+            reason: "a server identity key; restoring without it would break pinned clients",
+        });
+    }
+    if config.web.tls {
+        for (path, label) in [
+            (
+                if config.web.tls_cert.is_empty() {
+                    "/etc/qeli/web-tls-cert.pem"
+                } else {
+                    &config.web.tls_cert
+                },
+                "panel TLS certificate",
+            ),
+            (
+                if config.web.tls_key.is_empty() {
+                    "/etc/qeli/web-tls-key.pem"
+                } else {
+                    &config.web.tls_key
+                },
+                "panel TLS private key",
+            ),
+        ] {
+            paths.push(CriticalBackupPath {
+                archive_path: managed_archive_path(path, label)?,
+                reason: "the active panel TLS material",
+            });
+        }
+    }
+    paths.sort_by(|a, b| a.archive_path.cmp(&b.archive_path));
+    paths.dedup_by(|a, b| a.archive_path == b.archive_path);
+    Ok(paths)
+}
 
 /// Stream a gzip tarball of `/etc/qeli` (config + users file + identity keys) for
 /// off-box backup. Authed-admin only; a GET so the browser downloads it straight
 /// to disk carrying the session cookie. Restore = extract it back into `/etc`
 /// (`tar xzf qeli-backup-*.tar.gz -C /etc`) and restart.
-pub async fn download_backup(_guard: auth::AuthGuard) -> Result<Response, AuthError> {
+pub async fn download_backup(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::server::ServerState>>,
+    _guard: auth::AuthGuard,
+) -> Result<Response, AuthError> {
+    let config_path = state
+        .config_path
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(|| "/etc/qeli/server.conf".to_string());
+    let critical_paths = match critical_backup_paths(&state.config, &config_path) {
+        Ok(paths) => paths,
+        Err(error) => return Ok((StatusCode::CONFLICT, error).into_response()),
+    };
+    if let Err(error) = validate_critical_sources(&critical_paths) {
+        return Ok((StatusCode::INTERNAL_SERVER_ERROR, error).into_response());
+    }
     let out = tokio::task::spawn_blocking(|| {
-        // `--ignore-failed-read`: the panel runs as the `qeli` user and some items
-        // under /etc/qeli (e.g. root-owned client-links/, mode 0700) are unreadable
-        // to it — skip those rather than abort, so the restore-critical files
-        // (server config, users, identity keys) still get backed up.
-        // `--xattrs`: preserve extended attributes so a restore keeps them.
-        std::process::Command::new("tar")
-            .args([
-                "czf",
-                "-",
-                "--ignore-failed-read",
-                "--xattrs",
-                // Don't fold prior restore artefacts into a new backup — each restore leaves
-                // up to 5 snapshots, so re-downloading would balloon the archive and a
-                // re-upload could exceed the 16 MiB restore limit (413).
-                // The patterns MUST track the names restore_blocking actually writes:
-                // `.restore-upload-<ts>-<pid>.tgz` and the `.restore-staging-<ts>/` dir. The
-                // old `--exclude=qeli/.restore-upload.tgz` matched neither, so an interrupted
-                // (or concurrent) restore left them behind to be swallowed by the next
-                // backup — the nesting this exclude exists to prevent. (S-07)
-                "--exclude=qeli/.pre-restore-*.tgz",
-                "--exclude=qeli/.restore-upload-*.tgz",
-                "--exclude=qeli/.restore-staging-*",
-                // Config-editor rollback points are local operational history, not part of
-                // the portable configuration. Including ten old configs would retain
-                // superseded credentials and inflate every off-box archive.
-                "--exclude=qeli/.config-history",
-                "-C",
-                "/etc",
-                "qeli",
-            ])
-            .output()
+        // Non-critical local artefacts may be unreadable; the critical set is preflighted and
+        // then verified against the actual archive member list below.
+        let mut command = std::process::Command::new("tar");
+        command.args(["czf", "-", "--ignore-failed-read", "--xattrs"]);
+        append_tar_excludes(&mut command, true);
+        command.args(["-C", "/etc", "qeli"]).output()
     })
     .await;
 
@@ -73,52 +255,34 @@ pub async fn download_backup(_guard: auth::AuthGuard) -> Result<Response, AuthEr
         )
             .into_response());
     }
-    // `--ignore-failed-read` silently drops files the qeli user can't read. That is
-    // fine for the root-owned client-links/, but if it drops the IDENTITY KEYS
-    // (root-owned 0600) the archive looks successful yet restores a server with a
-    // DIFFERENT identity — every client would need re-pinning. tar names any file it
-    // skipped on stderr (success is silent), so a mention of qeli/identity means the
-    // keys are missing: refuse rather than hand out a broken backup.
-    // The same reasoning applies to every file a restore cannot rebuild, not just the
-    // identity keys: a dropped users file restores a server nobody can log into, a
-    // dropped server.conf restores an empty config, a dropped panel-secret.key logs
-    // every panel session out. Any of those silently missing is worse than no backup,
-    // so refuse the download instead of handing out an archive that looks complete. (S-13)
-    let stderr = String::from_utf8_lossy(&o.stderr);
-    const CRITICAL: &[(&str, &str)] = &[
-        (
-            "qeli/identity",
-            "the server identity key(s) — a restore would change the server identity and \
-             break every pinned client",
-        ),
-        (
-            "qeli/server.conf",
-            "the server configuration — a restore would come up with no profiles",
-        ),
-        // NB: `panel-secret.key` is deliberately NOT here any more. It moved to
-        // /var/lib/qeli (machine-local state), precisely so it does NOT travel inside an
-        // unencrypted archive together with the `password_enc` values it decrypts — see
-        // crypto::secret::PANEL_KEY_PATH. tar over /etc therefore never sees it, and its
-        // absence from the archive is correct rather than a failure to report.
-        // (Audit 2026-08-04.)
-        (
-            "users.conf",
-            "a users database — a restore would come up with no accounts",
-        ),
-    ];
-    if let Some((path, why)) = CRITICAL.iter().find(|(p, _)| stderr.contains(p)) {
+    // Do not infer completeness from tar stderr: an already-missing path need not be named.
+    // List the archive that will actually be returned and require every runtime dependency.
+    let tar_stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+    let inspected = tokio::task::spawn_blocking(move || inspect_backup_archive(o.stdout)).await;
+    let (bytes, members) = match inspected {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => return Ok((StatusCode::INTERNAL_SERVER_ERROR, error).into_response()),
+        Err(error) => {
+            return Ok((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("backup verification task failed: {error}"),
+            )
+                .into_response())
+        }
+    };
+    if let Some(item) = critical_paths
+        .iter()
+        .find(|item| !members.contains(&item.archive_path))
+    {
         return Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
-                "backup aborted: '{path}' was unreadable and would be MISSING from the \
-                 archive ({why}). Fix the permissions (`chown -R qeli:qeli /etc/qeli`) or \
-                 take the backup as root. tar: {}",
-                stderr.trim()
+                "backup aborted: '{}' is MISSING from the generated archive ({}). tar: {}",
+                item.archive_path, item.reason, tar_stderr
             ),
         )
             .into_response());
     }
-    let bytes = o.stdout;
 
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -181,6 +345,7 @@ const SERVER_FAULT_MARKERS: &[&str] = &[
     "could not run tar for the pre-restore snapshot",
     "could not take the pre-restore snapshot",
     "staged tree unreadable",
+    "cannot normalize restored config/key permissions",
 ];
 
 fn restore_error_status(msg: &str) -> StatusCode {
@@ -207,19 +372,26 @@ pub async fn restore_backup(
     axum::extract::Query(q): axum::extract::Query<RestoreQuery>,
     body: Bytes,
 ) -> Result<Response, AuthError> {
-    // A restore replaces the same files as Configuration/Quick Start. Keep it mutually
-    // exclusive with those read-modify-write operations so neither can publish a stale tree
-    // over the other while extraction and validation are in progress.
-    let _config_write_guard = state.config_write_lock.lock().await;
-    // The LIVE config path. The hook-overwrite gate used to read a hard-coded
-    // /etc/qeli/server.conf, so a server started with `-c <anything else>` had no hooks to
-    // protect and the gate did nothing at all. (Audit 2026-08-04.)
     let config_path = state
         .config_path
         .lock()
         .await
         .clone()
         .unwrap_or_else(|| "/etc/qeli/server.conf".to_string());
+    if let Err(error) = critical_backup_paths(&state.config, &config_path) {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "error": format!("restore unavailable: {error}")
+            })),
+        )
+            .into_response());
+    }
+    // A restore replaces the same files as Configuration/Quick Start. Keep it mutually
+    // exclusive with those read-modify-write operations so neither can publish a stale tree
+    // over the other while extraction and validation are in progress.
+    let _config_write_guard = state.config_write_lock.lock().await;
     // `?exact=1` opts into deleting live files the archive does not contain. Default stays
     // OVERLAY: exact restore removes data, and that must never be what a plain "Restore"
     // click does. (Р1)
@@ -281,7 +453,7 @@ static RESTORE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// out of the staging directory with `fs::rename`, so by the time this runs the staging
 /// tree no longer contains the files it just delivered. Testing "is it still in staging?"
 /// therefore answered "no" for everything and deleted `server.conf`, `users.conf` and
-/// `panel-secret.key` moments after restoring them — while the endpoint reported success.
+/// profile identity keys moments after restoring them — while the endpoint reported success.
 fn prune_absent(
     archive_names: &std::collections::HashSet<String>,
     dest: &str,
@@ -477,18 +649,14 @@ fn restore_blocking(data: &[u8], exact: bool, config_path: &str) -> Result<Strin
             ));
         }
     }
-    match std::process::Command::new("tar")
-        .args([
-            "czf",
-            &bak,
-            "--ignore-failed-read",
-            "--xattrs",
-            "-C",
-            "/etc",
-            "qeli",
-        ])
-        .output()
-    {
+    let snapshot = {
+        let mut command = std::process::Command::new("tar");
+        command.args(["czf", &bak, "--ignore-failed-read", "--xattrs"]);
+        // Never archive the output file, prior snapshots, uploads or staging directories.
+        append_tar_excludes(&mut command, false);
+        command.args(["-C", "/etc", "qeli"]).output()
+    };
+    match snapshot {
         Ok(o) if o.status.success() => {}
         Ok(o) => {
             cleanup();
@@ -567,6 +735,12 @@ fn restore_blocking(data: &[u8], exact: bool, config_path: &str) -> Result<Strin
     if let Err(e) = vet_staged_tree(&staged_root, config_path) {
         stage_cleanup();
         return Err(e);
+    }
+    if let Err(error) = normalize_staged_permissions(std::path::Path::new(&staged_root)) {
+        stage_cleanup();
+        return Err(format!(
+            "cannot normalize restored config/key permissions: {error}"
+        ));
     }
     if let Err(e) = vet_publish_shape(
         std::path::Path::new(&staged_root),
@@ -738,18 +912,15 @@ fn vet_staged_tree(root: &str, config_path: &str) -> Result<(), String> {
             let live = std::fs::read_to_string(config_path).unwrap_or_default();
             vet_server_config(&relative.to_string_lossy(), &staged, &live)?;
 
-            // The restored main config is authoritative. Its external users database
-            // must be present in the same archive unless inline users/groups make the
-            // external file optional. Otherwise restore can report success and leave a
-            // configuration that deterministically fails at the next worker start.
+            // The restored main config is authoritative. Runtime merges its external users
+            // database with inline users/groups, so the external dependency is mandatory even
+            // when inline entries exist. Otherwise restore silently loses part of the ACL.
             let staged_config = crate::config::parse_server_config(&staged).map_err(|e| {
                 format!(
                     "refused: active server config '{}' could not be parsed after validation: {e}",
                     relative.display()
                 )
             })?;
-            let has_inline =
-                !staged_config.auth.users.is_empty() || !staged_config.auth.groups.is_empty();
             let users_claims_qeli = std::path::Path::new(&staged_config.auth.users_file)
                 .strip_prefix("/etc/qeli")
                 .is_ok();
@@ -776,7 +947,7 @@ fn vet_staged_tree(root: &str, config_path: &str) -> Result<(), String> {
                                 users_relative.display()
                             )
                         })?;
-                } else if !has_inline {
+                } else {
                     return Err(format!(
                         "refused: active server config '{}' requires users database '{}', but the archive does not contain it",
                         relative.display(),
@@ -791,16 +962,11 @@ fn vet_staged_tree(root: &str, config_path: &str) -> Result<(), String> {
                 match crate::config::users::UsersDb::load(&staged_config.auth.users_file) {
                     Ok(_) => {}
                     Err(error) => {
-                        let missing = error
-                            .downcast_ref::<std::io::Error>()
-                            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
-                        if !missing || !has_inline {
-                            return Err(format!(
-                                "refused: active server config '{}' refers to unusable users database '{}': {error}",
-                                relative.display(),
-                                staged_config.auth.users_file
-                            ));
-                        }
+                        return Err(format!(
+                            "refused: active server config '{}' refers to unusable users database '{}': {error}",
+                            relative.display(),
+                            staged_config.auth.users_file
+                        ));
                     }
                 }
             }
@@ -815,6 +981,27 @@ fn vet_staged_tree(root: &str, config_path: &str) -> Result<(), String> {
     vet_staged_dir(std::path::Path::new(root), &hook_files)
 }
 
+#[cfg(unix)]
+fn normalize_staged_permissions(root: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            normalize_staged_permissions(&path)?;
+        } else {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn normalize_staged_permissions(_root: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
 fn vet_staged_dir(
     root: &std::path::Path,
     hook_files: &std::collections::HashSet<String>,
@@ -1091,6 +1278,98 @@ fn prune_pre_restore_snapshots(keep: usize) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn panel_backup_accepts_custom_managed_paths() {
+        let mut config = crate::config::server::ServerConfig::default();
+        config.auth.users_file = "/etc/qeli/auth/custom-users.ini".into();
+        config.auth.users.push(Default::default());
+        let profile = crate::config::server::ProfileConfig {
+            name: "tcp".into(),
+            identity_key: Some("/etc/qeli/keys/tcp.key".into()),
+            ..Default::default()
+        };
+        config.profiles.push(profile);
+        let paths = critical_backup_paths(&config, "/etc/qeli/config/server.ini").unwrap();
+        let names: Vec<&str> = paths
+            .iter()
+            .map(|path| path.archive_path.as_str())
+            .collect();
+        assert!(names.contains(&"qeli/config/server.ini"));
+        assert!(names.contains(&"qeli/auth/custom-users.ini"));
+        assert!(names.contains(&"qeli/keys/tcp.key"));
+    }
+
+    #[test]
+    fn backup_excludes_transient_archives_and_legacy_secret() {
+        assert!(TRANSIENT_TAR_EXCLUDES.contains(&"qeli/.pre-restore-*.tgz"));
+        assert!(TRANSIENT_TAR_EXCLUDES.contains(&"qeli/.restore-upload-*.tgz"));
+        assert!(TRANSIENT_TAR_EXCLUDES.contains(&"qeli/.restore-staging-*"));
+        assert!(PORTABLE_TAR_EXCLUDES.contains(&"qeli/panel-secret.key"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_normalizes_private_file_and_directory_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "qeli-restore-mode-test-{}-{}",
+            std::process::id(),
+            RESTORE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let nested = root.join("identity");
+        std::fs::create_dir_all(&nested).unwrap();
+        let key = nested.join("profile.key");
+        std::fs::write(&key, b"secret").unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        normalize_staged_permissions(&root).unwrap();
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn panel_backup_refuses_external_or_ambiguous_active_paths() {
+        let config = crate::config::server::ServerConfig::default();
+        let outside = critical_backup_paths(&config, "/srv/qeli/server.conf").unwrap_err();
+        assert!(outside.contains("outside /etc/qeli"));
+        let relative = critical_backup_paths(&config, "server.conf").unwrap_err();
+        assert!(relative.contains("relative"));
+        let traversal = critical_backup_paths(&config, "/etc/qeli/../secret.conf").unwrap_err();
+        assert!(traversal.contains("not a normal file"));
+    }
+
+    #[test]
+    fn restore_requires_external_users_even_when_inline_users_exist() {
+        let root = std::env::temp_dir().join(format!(
+            "qeli-restore-users-test-{}-{}",
+            std::process::id(),
+            RESTORE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = format!(
+            "[auth]\nusers_file = /etc/qeli/auth/users.conf\n\
+             [user:inline]\npassword_hash = x\n{}",
+            srv("")
+        );
+        std::fs::write(root.join("server.conf"), config).unwrap();
+        let error = vet_staged_tree(&root.to_string_lossy(), "/etc/qeli/server.conf")
+            .expect_err("inline users do not make the configured external database optional");
+        assert!(error.contains("requires users database"), "{error}");
+        let _ = std::fs::remove_dir_all(root);
+    }
     /// Minimal server config; `hooks` is spliced into the profile verbatim.
     fn srv(hooks: &str) -> String {
         format!(
@@ -1111,7 +1390,7 @@ mod tests {
     /// The exact-restore prune must key off the archive's file list captured BEFORE
     /// publishing. `publish_staged_tree` MOVES files out of staging, so a prune that
     /// re-reads staging afterwards sees an empty tree and deletes everything it just
-    /// restored — `server.conf`, `users.conf`, `panel-secret.key` — while reporting
+    /// restored — `server.conf`, `users.conf`, profile identity keys — while reporting
     /// success. This test pins the contract that made that possible. (Р1)
     #[test]
     fn exact_prune_keeps_what_the_archive_delivered() {

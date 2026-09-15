@@ -60,6 +60,9 @@ struct DnsBackup {
 /// Resolve the DNS part of a core `NetworkPlan` without changing host state.
 /// `None` means the platform must leave the system resolver untouched: DNS is disabled,
 /// or an untrusted server push was rejected by the split-tunnel reachability policy.
+/// Test-only compatibility seam: production resolves the complete dual-stack list in
+/// `transport_core::network` and applies it through `setup_network_plan_dns` below.
+#[cfg(test)]
 pub fn planned_dns_server(
     config: &ClientDnsConfig,
     pushed_server: &str,
@@ -78,6 +81,9 @@ pub fn planned_dns_server(
     .map(|servers| servers.into_iter().next())
 }
 
+/// Historical singular/IPv4 seam retained only in test builds. Production must consume the
+/// authenticated dual-stack NetworkPlan instead of silently discarding an IPv6 resolver.
+#[cfg(test)]
 pub fn setup_dns_for_interface(
     config: &ClientDnsConfig,
     dns_server: &str,
@@ -140,7 +146,7 @@ pub fn setup_dns_for_interface(
                 anyhow::bail!(
                     "dns = tunnel but the server pushed no DNS address and this client has no \
                      resolver configured — set `dns_servers = <ip>[, <ip>…]` in the client \
-                     config (`dns.servers` in JSON), or `dns = off` to keep the host's \
+                     flat-INI config, or `dns = off` to keep the host's \
                      resolver. Until then the host's own resolvers stay in place, so in a \
                      full-tunnel profile DNS may go to the physical network."
                 );
@@ -236,6 +242,69 @@ pub fn setup_dns_for_interface(
          system resolver, so an unclean exit or uninstall could strand the host on a dead \
          resolver. Enable systemd-resolved and point {RESOLV_PATH} at its stub, or set \
          `dns = off` when NetworkManager/dnsmasq/the platform manages DNS"
+    )
+}
+
+/// Apply exactly the resolver set already validated into the shared NetworkPlan.
+/// Unlike the legacy singular seam, this preserves both IPv4 and IPv6 resolvers.
+pub fn setup_network_plan_dns(
+    config: &ClientDnsConfig,
+    servers: &[NetworkDns],
+    ifname: &str,
+) -> anyhow::Result<()> {
+    if config.mode != "tunnel" || servers.is_empty() {
+        return Ok(());
+    }
+    let mut resolver_args = Vec::with_capacity(servers.len());
+    for server in servers {
+        let address: std::net::IpAddr = server.address.parse().map_err(|_| {
+            anyhow::anyhow!("invalid network-plan DNS address '{}'", server.address)
+        })?;
+        if server.port == 0 {
+            anyhow::bail!("invalid network-plan DNS port 0 for {address}");
+        }
+        resolver_args.push(if server.port == 53 {
+            address.to_string()
+        } else {
+            format!("{address}#{}", server.port)
+        });
+    }
+
+    if !resolved_is_active() {
+        anyhow::bail!(
+            "refusing to replace {RESOLV_PATH} with tunnel DNS: systemd-resolved is not the active \
+             system resolver, so an unclean exit or uninstall could strand the host on a dead \
+             resolver. Enable systemd-resolved and point {RESOLV_PATH} at its stub, or set \
+             `dns = off` when NetworkManager/dnsmasq/the platform manages DNS"
+        );
+    }
+
+    // Persist ownership before changing the link. This is essential for attach mode, where
+    // deleting qeli does not delete the externally owned interface and therefore does not
+    // automatically discard its per-link resolver state.
+    ensure_state_dir()?;
+    let marker = resolvectl_mark_path(ifname);
+    crate::util::write_atomic_private(&marker, ifname.as_bytes()).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot persist resolvectl ownership marker {}: {} — DNS was not changed",
+            marker,
+            error
+        )
+    })?;
+    if try_resolvectl_many(config, ifname, &resolver_args) {
+        log::info!(
+            "DNS set via resolvectl on {}: {}",
+            ifname,
+            resolver_args.join(", ")
+        );
+        return Ok(());
+    }
+    // Keep the marker after the immediate revert attempt. Generation cleanup will retry the
+    // revert and only remove the marker after a confirmed successful command.
+    anyhow::bail!(
+        "systemd-resolved is the active resolver, but per-link DNS could not be fully applied \
+         to {ifname}; the partial change was reverted and qeli refused a persistent \
+         {RESOLV_PATH} takeover. Check the preceding resolvectl error, or set `dns = off`"
     )
 }
 
@@ -505,7 +574,7 @@ fn resolvectl_cmd() -> std::process::Command {
 
 /// The `resolvectl domain` list for the tunnel link.
 ///
-/// Split out of [`try_resolvectl`] so the decision can be tested without spawning anything —
+/// Shared with [`try_resolvectl_many`] so the decision can be tested without spawning anything —
 /// it is the difference between "all DNS goes through the tunnel" and a silent split.
 fn routing_domains(config: &ClientDnsConfig) -> Vec<String> {
     let mut domains: Vec<String> = config.search_domains.clone();
@@ -515,8 +584,16 @@ fn routing_domains(config: &ClientDnsConfig) -> Vec<String> {
     domains
 }
 
+#[cfg(test)]
 fn try_resolvectl(config: &ClientDnsConfig, ifname: &str, dns_addr: &str) -> bool {
-    let result = resolvectl_cmd().args(["dns", ifname, dns_addr]).output();
+    try_resolvectl_many(config, ifname, &[dns_addr.to_string()])
+}
+
+fn try_resolvectl_many(config: &ClientDnsConfig, ifname: &str, dns_addrs: &[String]) -> bool {
+    let result = resolvectl_cmd()
+        .args(["dns", ifname])
+        .args(dns_addrs)
+        .output();
     let applied = result
         .as_ref()
         .map(|output| output.status.success())
@@ -529,8 +606,8 @@ fn try_resolvectl(config: &ClientDnsConfig, ifname: &str, dns_addr: &str) -> boo
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "command unavailable or returned failure".to_string());
         log::warn!(
-            "resolvectl refused DNS {} on {} ({}) — reverting the link state",
-            dns_addr,
+            "resolvectl refused DNS [{}] on {} ({}) — reverting the link state",
+            dns_addrs.join(", "),
             ifname,
             detail
         );
@@ -774,10 +851,22 @@ fn write_managed_resolv(
     search: &[String],
     marker: &str,
 ) -> anyhow::Result<()> {
+    write_managed_resolv_many(resolv, &[dns_server.to_string()], search, marker)
+}
+
+#[cfg(test)]
+fn write_managed_resolv_many(
+    resolv: &Path,
+    dns_servers: &[String],
+    search: &[String],
+    marker: &str,
+) -> anyhow::Result<()> {
     let mut content = String::new();
     content.push_str(marker);
     content.push('\n');
-    content.push_str(&format!("nameserver {}\n", dns_server));
+    for dns_server in dns_servers {
+        content.push_str(&format!("nameserver {}\n", dns_server));
+    }
     if !search.is_empty() {
         content.push_str(&format!("search {}\n", search.join(" ")));
     }

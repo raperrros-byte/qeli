@@ -2,13 +2,25 @@ use crate::crypto::{
     build_server_auth_message, derive_keys, derive_keys_bound, derive_keys_hybrid,
     derive_keys_hybrid_bound, handshake_transcript_hash, Keypair,
 };
+#[cfg(feature = "experimental-roaming")]
+use crate::crypto::{
+    derive_session_material, derive_session_material_bound, derive_session_material_hybrid,
+    derive_session_material_hybrid_bound,
+};
 use crate::protocol::obfs::SplitStream;
 use crate::protocol::{
     read_record, read_record_into, read_tls_record, FakeTlsHandshake, Framing, Obfuscator,
     PacketCodec,
 };
-use crate::server::{lock_or_recover, ProfileRuntime, ServerState, ServerTunPacket, TunIngress};
+use crate::server::{
+    lock_or_recover, ExitAccess, ProfileRuntime, ServerState, ServerTunPacket, TunIngress,
+};
 use crate::transport_core::buffer_pool::{BufferPool, PooledBuffer};
+#[cfg(feature = "experimental-roaming")]
+use crate::transport_core::tcp_roaming::{
+    CommitOutcome, DetachOutcome, DetachReason, LifecycleError, OrphanLimiter, ReapTicket,
+    ResumeReservation, SessionLifecycle,
+};
 use rand::prelude::*;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -17,8 +29,16 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+#[cfg(feature = "experimental-roaming")]
+type HandshakeResumeSecret = zeroize::Zeroizing<[u8; 32]>;
+#[cfg(not(feature = "experimental-roaming"))]
+type HandshakeResumeSecret = ();
+
 /// Default fallback heartbeat interval when none is configured.
 pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
+#[cfg(feature = "experimental-roaming")]
+const TCP_RESUME_COMMIT_TIMEOUT: Duration =
+    Duration::from_secs(crate::protocol::roaming::TCP_RESUME_SERVER_COMMIT_TIMEOUT_SECS);
 
 /// Per-session encrypted-record budget for server→client traffic. The pool is shared by
 /// every bonded stream, so multipath cannot multiply queued memory by its stream count.
@@ -141,20 +161,33 @@ impl RateBucket {
     }
 }
 
-/// (codec, writer-channel, shared record pool) of the stream chosen for an outgoing packet.
-pub(crate) type StreamPick = (
-    Arc<std::sync::Mutex<PacketCodec>>,
-    mpsc::Sender<PooledBuffer>,
-    BufferPool,
-);
+/// (plaintext writer-channel, shared bounded pool) selected for an outgoing flow.
+pub(crate) type StreamPick = (mpsc::Sender<PooledBuffer>, BufferPool);
+
+#[cfg(feature = "experimental-roaming")]
+pub(crate) struct TerminalManagementWrite {
+    pub(crate) frames: Vec<Vec<u8>>,
+    pub(crate) repetitions: usize,
+    /// Completes only after the writer attempted every frame on the live carrier.
+    pub(crate) sent: tokio::sync::oneshot::Sender<bool>,
+}
 
 /// One bonded connection within a [`SessionShared`]. Each stream has its own
 /// independent crypto (its connection did its own key exchange) and its own write
 /// channel; outgoing packets are striped across streams round-robin.
 pub struct StreamHandle {
+    /// Stable protocol slot.  The transport id changes on handover; this id does not.
+    #[cfg(feature = "experimental-roaming")]
+    pub(crate) logical_slot_id: u32,
+    /// Scheduler visibility, mutated only while the session's `streams` lock is held.
+    #[cfg(feature = "experimental-roaming")]
+    pub(crate) ready: bool,
     pub stream_id: u64,
     pub codec: Arc<std::sync::Mutex<PacketCodec>>,
     pub(crate) writer: mpsc::Sender<PooledBuffer>,
+    /// Priority lane for terminal management. It cannot be trapped behind data backlog.
+    #[cfg(feature = "experimental-roaming")]
+    pub(crate) terminal_management: mpsc::Sender<TerminalManagementWrite>,
     pub kick_tx: mpsc::Sender<()>,
     /// Stops the READER half. `kick_tx` only reaches the writer, so a kicked or
     /// superseded client kept uploading into the TUN until it chose to close the
@@ -167,6 +200,123 @@ pub struct StreamHandle {
     /// raised before the reader parks is still observed, so there is no lost-wakeup
     /// race with a client that is mid-`read_record`.
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
+#[cfg(feature = "experimental-roaming")]
+pub(crate) struct TcpRoamingSession {
+    lifecycle: std::sync::Mutex<SessionLifecycle>,
+    resume_secret: zeroize::Zeroizing<[u8; 32]>,
+    limiter: Arc<std::sync::Mutex<OrphanLimiter>>,
+    initial_transport_attached: std::sync::atomic::AtomicBool,
+    retained_bytes: usize,
+    handover_enabled: bool,
+}
+#[cfg(feature = "experimental-roaming")]
+#[derive(Clone, Copy)]
+struct TcpRoamingPolicy {
+    grace: Duration,
+    handover_enabled: bool,
+}
+
+#[cfg(feature = "experimental-roaming")]
+impl TcpRoamingSession {
+    fn new(
+        session_id: u64,
+        locator: [u8; crate::protocol::roaming::SESSION_LOCATOR_LEN],
+        max_slots: u32,
+        primary_transport: u64,
+        resume_secret: HandshakeResumeSecret,
+        limiter: Arc<std::sync::Mutex<OrphanLimiter>>,
+        policy: TcpRoamingPolicy,
+    ) -> Result<Self, LifecycleError> {
+        Ok(Self {
+            lifecycle: std::sync::Mutex::new(SessionLifecycle::new(
+                session_id,
+                locator,
+                max_slots,
+                policy.grace,
+                primary_transport,
+            )?),
+            resume_secret,
+            limiter,
+            initial_transport_attached: std::sync::atomic::AtomicBool::new(false),
+            // The fixed encrypted-record pool dominates retained session memory and is shared
+            // by all streams.  Count the complete allocation, not only currently checked-out
+            // records, so the profile-wide byte cap is conservative and deterministic.
+            retained_bytes: SERVER_WIRE_BUFFER_BYTES,
+            handover_enabled: policy.handover_enabled,
+        })
+    }
+
+    fn mark_initial_transport_attached(&self) {
+        self.initial_transport_attached
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn begin_resume(
+        &self,
+        join: &crate::protocol::roaming::TcpResumeJoin,
+        transcript_hash: &[u8; 32],
+    ) -> Result<ResumeReservation, LifecycleError> {
+        if !self
+            .initial_transport_attached
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(LifecycleError::InitialTransportPending);
+        }
+        if join.input().is_handover() && !self.handover_enabled {
+            return Err(LifecycleError::HandoverNotNegotiated);
+        }
+        lock_or_recover(&self.lifecycle, "TcpRoamingSession::begin_resume").begin_resume(
+            join,
+            transcript_hash,
+            &self.resume_secret,
+        )
+    }
+
+    fn commit_resume(
+        &self,
+        reservation: ResumeReservation,
+        transport_id: u64,
+    ) -> Result<CommitOutcome, LifecycleError> {
+        let mut lifecycle = lock_or_recover(&self.lifecycle, "TcpRoamingSession::commit_resume");
+        let mut limiter = lock_or_recover(&self.limiter, "TcpRoamingSession::commit_limiter");
+        lifecycle.commit_resume(reservation, transport_id, &mut limiter)
+    }
+
+    fn abort_resume(&self, reservation: ResumeReservation) {
+        let _ = lock_or_recover(&self.lifecycle, "TcpRoamingSession::abort_resume")
+            .abort_resume(reservation);
+    }
+
+    fn detach(
+        &self,
+        transport_id: u64,
+        reason: DetachReason,
+        now: Instant,
+    ) -> Result<DetachOutcome, LifecycleError> {
+        let mut lifecycle = lock_or_recover(&self.lifecycle, "TcpRoamingSession::detach");
+        let mut limiter = lock_or_recover(&self.limiter, "TcpRoamingSession::detach_limiter");
+        lifecycle.detach(transport_id, reason, now, self.retained_bytes, &mut limiter)
+    }
+
+    fn reap(&self, ticket: ReapTicket, now: Instant) -> bool {
+        let mut lifecycle = lock_or_recover(&self.lifecycle, "TcpRoamingSession::reap");
+        let mut limiter = lock_or_recover(&self.limiter, "TcpRoamingSession::reap_limiter");
+        lifecycle.reap(ticket, now, &mut limiter)
+    }
+
+    fn revoke(&self) {
+        let mut lifecycle = lock_or_recover(&self.lifecycle, "TcpRoamingSession::revoke");
+        let mut limiter = lock_or_recover(&self.limiter, "TcpRoamingSession::revoke_limiter");
+        lifecycle.revoke(&mut limiter);
+    }
+
+    fn close(&self) {
+        let mut lifecycle = lock_or_recover(&self.lifecycle, "TcpRoamingSession::close");
+        let mut limiter = lock_or_recover(&self.limiter, "TcpRoamingSession::close_limiter");
+        lifecycle.close(&mut limiter);
+    }
 }
 
 /// A client tunnel session, aggregating one or more bonded connections (streams)
@@ -189,6 +339,24 @@ pub fn downlink_mtu_for(reported: u32, profile_mtu: i32) -> Option<u16> {
         return None;
     }
     u16::try_from(reported).ok()
+}
+
+/// Apply the address-family floor to a client-reported downlink MTU.
+///
+/// The control frame is shared by IPv4 and IPv6, so its parser deliberately accepts the IPv4
+/// minimum of 576.  That value must never become an IPv6 next-hop MTU: IPv6 links are required
+/// to expose at least 1280 bytes, and advertising anything smaller in Packet Too Big creates an
+/// invalid PMTU state.  Keep the original IPv4 policy while making the packet family explicit at
+/// the only point where it is known.
+pub fn downlink_mtu_for_packet(
+    reported: u32,
+    profile_mtu: i32,
+    version: crate::protocol::ip::IpVersion,
+) -> Option<u16> {
+    downlink_mtu_for(reported, profile_mtu).map(|mtu| match version {
+        crate::protocol::ip::IpVersion::V4 => mtu,
+        crate::protocol::ip::IpVersion::V6 => mtu.max(1280),
+    })
 }
 
 /// Store a client-reported tunnel MTU, logging only when it actually changes.
@@ -240,7 +408,11 @@ pub struct SessionShared {
     /// superseded by this, so multiple devices of one login coexist while the same
     /// device cleanly replaces its own old session on reconnect.
     pub device_key: String,
-    pub client_ip: std::net::Ipv4Addr,
+    /// Stable primary address used as the unique session-map key (IPv4 for dual stack,
+    /// otherwise the only assigned family).
+    pub client_ip: std::net::IpAddr,
+    pub client_ipv4: Option<std::net::Ipv4Addr>,
+    pub client_ipv6: Option<std::net::Ipv6Addr>,
     /// Source address of the PRIMARY (auth) connection — shown in list-clients.
     pub peer: SocketAddr,
     pub token: [u8; JOIN_TOKEN_LEN],
@@ -251,6 +423,24 @@ pub struct SessionShared {
     /// Active bonded streams; outgoing traffic is flow-pinned across them
     /// (see [`SessionShared::pick_stream`]).
     pub streams: std::sync::Mutex<Vec<StreamHandle>>,
+    /// Present only after authenticated capability negotiation in an experimental build.
+    #[cfg(feature = "experimental-roaming")]
+    pub(crate) tcp_roaming: Option<TcpRoamingSession>,
+    /// True only after authenticated bidirectional CONTROL_V2 negotiation on a TCP session.
+    #[cfg(feature = "experimental-roaming")]
+    pub(crate) tcp_control_v2: bool,
+    /// Authenticated server-to-client KICK/NOTICE support. Kept independent from roaming so
+    /// disabling path migration does not disable account and administrative control events.
+    #[cfg(feature = "experimental-roaming")]
+    pub(crate) management_v1: bool,
+    /// Datagram carriers repeat an identical logical event three times. The shared message id
+    /// lets the bounded client reassembler deduplicate them while avoiding a lost UDP KICK.
+    #[cfg(feature = "experimental-roaming")]
+    pub(crate) management_datagram: bool,
+    /// End-to-end receipts for terminal KICK messages. A local writer send is not delivery.
+    #[cfg(feature = "experimental-roaming")]
+    pub(crate) management_acks:
+        std::sync::Mutex<std::collections::HashMap<u32, tokio::sync::oneshot::Sender<()>>>,
     pub connected_at: Instant,
     pub bytes_sent: Arc<AtomicU64>,
     pub bytes_recv: Arc<AtomicU64>,
@@ -263,6 +453,11 @@ pub struct SessionShared {
     /// direction enforces `bandwidth_limit_mbps` across the whole session, not
     /// per stream, without consuming the other direction's allowance.
     pub rates: DirectionalRateBuckets,
+    /// Aggregate server→client cover budget shared by all bonded TCP writers.
+    pub(crate) cover_budget: crate::protocol::SharedCoverBudget,
+    /// Effective mux configuration after authenticated PACKET_MUX_V1 negotiation.
+    pub(crate) recordizer: Option<crate::config::RecordizerConfig>,
+
     /// Compiled `allowed_networks` (user's own, else the group's) — the destination
     /// ACL applied to every inner packet before it reaches the TUN. Empty =
     /// unrestricted, which is the documented default and costs nothing per packet.
@@ -271,6 +466,10 @@ pub struct SessionShared {
     /// subnets). Without it an authenticated client could forge any source and
     /// walk past `client_to_client = false`.
     pub src_guard: crate::server::acl::SrcGuard,
+    /// Per-family permission to use a registered client `/0` exit. Derived from this
+    /// session's effective pushed routes, so the documented per-user `route = .../0`
+    /// actually acts as authorization rather than a cosmetic config line.
+    pub(crate) exit_access: ExitAccess,
     /// Tunnel MTU the client reported after probing its path, or 0 when it never told us
     /// (every pre-#13 client, and any client with probing off).
     ///
@@ -296,6 +495,9 @@ pub struct SessionShared {
     /// receive loop drops (and forgets) the peer the moment it sees it.
     /// (Audit 2026-07-27, A1/A2/A3.)
     pub revoked: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by authenticated CLOSE_SESSION before the bonded stream tasks are stopped. Unlike
+    /// revocation this is an orderly terminal state and must never enter roaming grace.
+    pub closing: Arc<std::sync::atomic::AtomicBool>,
     /// `(version, platform)` the client reported about itself over the tunnel, so
     /// `list-clients` and the panel can answer "which build is this session running?".
     /// `None` for every client that predates the report, and for anything that failed
@@ -310,21 +512,36 @@ pub struct SessionShared {
 }
 
 impl SessionShared {
+    pub fn assigned_addresses(&self) -> impl Iterator<Item = std::net::IpAddr> + '_ {
+        self.client_ipv4
+            .map(std::net::IpAddr::V4)
+            .into_iter()
+            .chain(self.client_ipv6.map(std::net::IpAddr::V6))
+    }
+
     /// The MTU the downlink to this client must respect: the profile's `tun.mtu` narrowed
     /// by whatever the client reported, if anything.
     ///
     /// Returns `None` when there is nothing to enforce — no report, or a report that is not
     /// narrower than the profile — so the hot path can skip the check entirely and behave
     /// bit-for-bit as it did before #13.
-    pub fn downlink_mtu(&self, profile_mtu: i32) -> Option<u16> {
-        downlink_mtu_for(self.path_mtu.load(Ordering::Relaxed), profile_mtu)
+    pub fn downlink_mtu(
+        &self,
+        profile_mtu: i32,
+        version: crate::protocol::ip::IpVersion,
+    ) -> Option<u16> {
+        downlink_mtu_for_packet(self.path_mtu.load(Ordering::Relaxed), profile_mtu, version)
     }
 
     /// Record a client's reported tunnel MTU (see [`note_path_mtu`]).
     pub fn note_path_mtu(&self, mtu: u16) {
         note_path_mtu(
             &self.path_mtu,
-            format_args!("'{}' ({})", self.username, self.client_ip),
+            format_args!(
+                "'{}' ({})",
+                crate::util::log_identity(&self.username),
+                self.client_ip
+            ),
             mtu,
         );
     }
@@ -335,7 +552,7 @@ impl SessionShared {
             &self.client_info,
             format_args!(
                 "'{}' ({})",
-                crate::util::log_sanitize(&self.username),
+                crate::util::log_identity(&self.username),
                 self.client_ip
             ),
             version,
@@ -354,15 +571,167 @@ impl SessionShared {
     /// if every stream has detached (session is dying).
     pub(crate) fn pick_stream(&self, flow_hash: u64) -> Option<StreamPick> {
         let streams = lock_or_recover(&self.streams, "pick_stream");
+        #[cfg(feature = "experimental-roaming")]
+        if self.tcp_roaming.is_some() {
+            let ready = streams.iter().filter(|stream| stream.ready);
+            let ready_count = ready.clone().count();
+            if ready_count == 0 {
+                return None;
+            }
+            let width = self.max_streams.max(1);
+            let desired = (flow_hash % u64::from(width)) as u32;
+            let selected = streams
+                .iter()
+                .filter(|stream| stream.ready)
+                .find(|stream| stream.logical_slot_id == desired)
+                .or_else(|| {
+                    // Walk clockwise through stable slot ids. Adding/removing another slot does
+                    // not renumber the survivors, so only flows owned by an unavailable slot move.
+                    streams
+                        .iter()
+                        .filter(|stream| stream.ready)
+                        .min_by_key(|stream| {
+                            let slot = stream.logical_slot_id % width;
+                            (slot + width - desired) % width
+                        })
+                })?;
+            return Some((selected.writer.clone(), self.wire_pool.clone()));
+        }
+
+        // Preserve the exact legacy scheduler for normal and feature-disabled sessions. Merely
+        // compiling roaming support must not alter stream selection for existing clients.
         if streams.is_empty() {
             return None;
         }
         let i = (flow_hash % streams.len() as u64) as usize;
-        Some((
-            streams[i].codec.clone(),
-            streams[i].writer.clone(),
-            self.wire_pool.clone(),
-        ))
+        Some((streams[i].writer.clone(), self.wire_pool.clone()))
+    }
+
+    /// Queue one authenticated management event on every live carrier. CONTROL_V2 frames
+    /// use the ordinary bounded queue for advisory NOTICE, while terminal KICK uses a priority
+    /// lane and waits for an authenticated client ACK. A false return means the peer is legacy,
+    /// no live writer sent the event, or the peer did not acknowledge it before the deadline;
+    /// callers must still enforce their local revocation decision.
+    #[cfg(feature = "experimental-roaming")]
+    pub async fn send_management(
+        &self,
+        event: &crate::protocol::control_v2::ManagementEvent,
+    ) -> bool {
+        if !self.management_v1 || self.is_revoked() {
+            return false;
+        }
+        let message_id: u32 = rand::random();
+        let frames = match crate::protocol::control_v2::management_frames(event, message_id) {
+            Ok(frames) => frames,
+            Err(error) => {
+                log::error!("refusing invalid outbound CONTROL_V2 management event: {error}");
+                return false;
+            }
+        };
+        if matches!(event, crate::protocol::control_v2::ManagementEvent::Kick(_)) {
+            let (ack_sender, ack_receiver) = tokio::sync::oneshot::channel();
+            {
+                let mut pending = lock_or_recover(&self.management_acks, "send_management_acks");
+                // A random collision must not replace an in-flight terminal receipt.
+                if pending.contains_key(&message_id) {
+                    log::warn!("terminal management message-id collision; refusing delivery");
+                    return false;
+                }
+                pending.insert(message_id, ack_sender);
+            }
+            let writers = lock_or_recover(&self.streams, "send_terminal_management")
+                .iter()
+                .filter(|stream| stream.ready)
+                .map(|stream| stream.terminal_management.clone())
+                .collect::<Vec<_>>();
+            let repetitions = if self.management_datagram { 3 } else { 1 };
+            let mut receipts = Vec::with_capacity(writers.len());
+            for writer in writers {
+                let (sent, receipt) = tokio::sync::oneshot::channel();
+                let write = TerminalManagementWrite {
+                    frames: frames.clone(),
+                    repetitions,
+                    sent,
+                };
+                if writer.try_send(write).is_ok() {
+                    receipts.push(receipt);
+                }
+            }
+            if receipts.is_empty() {
+                lock_or_recover(&self.management_acks, "send_management_acks").remove(&message_id);
+                return false;
+            }
+            let write_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let mut written = false;
+            for receipt in receipts {
+                if matches!(
+                    tokio::time::timeout_at(write_deadline, receipt).await,
+                    Ok(Ok(true))
+                ) {
+                    written = true;
+                }
+            }
+            if !written {
+                lock_or_recover(&self.management_acks, "send_management_acks").remove(&message_id);
+                return false;
+            }
+            let acknowledged = matches!(
+                tokio::time::timeout(Duration::from_secs(2), ack_receiver).await,
+                Ok(Ok(()))
+            );
+            lock_or_recover(&self.management_acks, "send_management_acks").remove(&message_id);
+            if !acknowledged {
+                log::warn!(
+                    "terminal management event for '{}' was written but not acknowledged",
+                    crate::util::log_identity(&self.username)
+                );
+            }
+            return acknowledged;
+        }
+        let writers = lock_or_recover(&self.streams, "send_management")
+            .iter()
+            .filter(|stream| stream.ready)
+            .map(|stream| stream.writer.clone())
+            .collect::<Vec<_>>();
+        let mut accepted = false;
+        let repetitions = if self.management_datagram { 3 } else { 1 };
+        for writer in writers {
+            for _ in 0..repetitions {
+                for frame in &frames {
+                    let Some(mut packet) = self.wire_pool.try_acquire() else {
+                        log::debug!(
+                            "management event dropped for one carrier: wire pool exhausted"
+                        );
+                        break;
+                    };
+                    if frame.len() > packet.capacity() {
+                        log::error!("management event exceeds the negotiated writer buffer");
+                        break;
+                    }
+                    packet.as_vec_mut().extend_from_slice(frame);
+                    match writer.try_send(packet) {
+                        Ok(()) => accepted = true,
+                        Err(error) => {
+                            log::debug!("management event could not be queued: {error}");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        accepted
+    }
+
+    #[cfg(feature = "experimental-roaming")]
+    pub(crate) fn acknowledge_management(&self, message_id: u32) -> bool {
+        let sender =
+            lock_or_recover(&self.management_acks, "acknowledge_management").remove(&message_id);
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+            true
+        } else {
+            false
+        }
     }
 
     /// All streams' kick channels (used by control-plane kick / supersede).
@@ -371,32 +740,104 @@ impl SessionShared {
     /// handles below only cover the TCP reader and the (UDP or TCP) writer. See the
     /// `revoked` field for why the two paths need separate treatment.
     pub fn kick_all(&self) {
-        self.revoked
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Serialize revocation with try_add_stream. Whichever operation obtains the streams
+        // lock first wins: an already-attached stream is kicked, while a later JOIN observes
+        // revoked=true and is rejected. There is no window in which a stream can attach after
+        // the kick snapshot and escape both mechanisms.
         let streams = lock_or_recover(&self.streams, "kick_all");
+        self.revoked
+            .store(true, std::sync::atomic::Ordering::Release);
         for s in streams.iter() {
             let _ = s.kick_tx.try_send(());
             // ...and the reader, which kick_tx never reached.
             let _ = s.shutdown_tx.send(true);
         }
+        drop(streams);
+        #[cfg(feature = "experimental-roaming")]
+        if let Some(roaming) = &self.tcp_roaming {
+            roaming.revoke();
+        }
+    }
+
+    /// Orderly session shutdown requested by the authenticated peer. Publish the terminal flag
+    /// before stopping streams so concurrent JOIN/resume admission fails closed and every detach
+    /// observes CleanClose rather than incorrectly entering orphan grace.
+    #[cfg(feature = "experimental-roaming")]
+    fn close_all(&self) {
+        self.closing
+            .store(true, std::sync::atomic::Ordering::Release);
+        #[cfg(feature = "experimental-roaming")]
+        if let Some(roaming) = &self.tcp_roaming {
+            roaming.close();
+        }
+        let streams = lock_or_recover(&self.streams, "close_all");
+        for stream in streams.iter() {
+            let _ = stream.kick_tx.try_send(());
+            let _ = stream.shutdown_tx.send(true);
+        }
     }
 
     /// True once this session has been kicked / cut off / superseded.
     pub fn is_revoked(&self) -> bool {
-        self.revoked.load(std::sync::atomic::Ordering::Relaxed)
+        self.revoked.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Atomically attach a stream iff the session is still under its
-    /// `max_streams` cap. Returns `false` (and adds nothing) when the cap is
-    /// already reached: the length check and the push share one lock, so N
-    /// concurrent JOINs can never race past the limit (T8).
-    fn try_add_stream(&self, h: StreamHandle) -> bool {
+    #[cfg(feature = "experimental-roaming")]
+    fn is_closing(&self) -> bool {
+        self.closing.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Atomically attach a stream iff the session is live and under its `max_streams` cap.
+    /// Revocation, the length check and the push are serialized by the same lock, so neither
+    /// a concurrent kick nor N concurrent JOINs can race past the decision.
+    fn try_add_stream(&self, h: StreamHandle, authenticated_resume_overflow: bool) -> bool {
         let mut streams = lock_or_recover(&self.streams, "try_add_stream");
-        if streams.len() >= self.max_streams as usize {
+        // An authenticated resume gets one temporary candidate above max_streams even without
+        // make-before-break negotiation: after an asymmetric failure the server can still hold
+        // the dead old carrier. SessionLifecycle::ResumeBusy bounds the overflow to one, and
+        // commit immediately drains the obsolete carrier occupying the same stable slot.
+        let limit = self.max_streams as usize + usize::from(authenticated_resume_overflow);
+        if self.revoked.load(std::sync::atomic::Ordering::Acquire)
+            || self.closing.load(std::sync::atomic::Ordering::Acquire)
+            || streams.len() >= limit
+        {
             return false;
         }
         streams.push(h);
         true
+    }
+
+    #[cfg(feature = "experimental-roaming")]
+    fn activate_resume_stream(&self, new_transport: u64, outcome: CommitOutcome) {
+        let mut streams = lock_or_recover(&self.streams, "activate_resume_stream");
+        if self.revoked.load(std::sync::atomic::Ordering::Acquire)
+            || self.closing.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+
+        for stream in streams.iter_mut() {
+            if stream.stream_id == new_transport {
+                stream.ready = true;
+            }
+            if Some(stream.stream_id) == outcome.drain_transport {
+                stream.ready = false;
+                let _ = stream.kick_tx.try_send(());
+                let _ = stream.shutdown_tx.send(true);
+            }
+        }
+    }
+
+    #[cfg(feature = "experimental-roaming")]
+    fn begin_tcp_resume(
+        &self,
+        join: &crate::protocol::roaming::TcpResumeJoin,
+        transcript_hash: &[u8; 32],
+    ) -> Result<ResumeReservation, LifecycleError> {
+        self.tcp_roaming
+            .as_ref()
+            .ok_or(LifecycleError::Terminal)?
+            .begin_resume(join, transcript_hash)
     }
 
     /// Remove a stream by id; returns true if NO streams remain (session empty).
@@ -421,14 +862,109 @@ enum FirstMessage {
         password: String,
         /// Stable per-device id (None = old client without one).
         device_id: Option<[u8; DEVICE_ID_LEN]>,
+        /// Present only when this server advertised the authenticated extension.
+        capabilities: Option<crate::protocol::capabilities::ClientCapabilities>,
     },
     Join {
         token: [u8; JOIN_TOKEN_LEN],
         stream_index: u8,
     },
+    #[cfg(feature = "experimental-roaming")]
+    Resume {
+        join: crate::protocol::roaming::TcpResumeJoin,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum StreamAttach {
+    Primary,
+    LegacyJoin {
+        logical_slot_id: u32,
+    },
+    #[cfg(feature = "experimental-roaming")]
+    Resume {
+        reservation: ResumeReservation,
+    },
+}
+
+impl StreamAttach {
+    #[cfg(feature = "experimental-roaming")]
+    fn logical_slot_id(self) -> u32 {
+        match self {
+            Self::Primary => 0,
+            Self::LegacyJoin { logical_slot_id } => logical_slot_id,
+            #[cfg(feature = "experimental-roaming")]
+            Self::Resume { reservation } => reservation.logical_slot_id(),
+        }
+    }
+
+    #[cfg(feature = "experimental-roaming")]
+    fn initially_ready(self) -> bool {
+        #[cfg(feature = "experimental-roaming")]
+        if matches!(self, Self::Resume { .. }) {
+            return false;
+        }
+        true
+    }
+
+    fn authenticated_resume_overflow(self) -> bool {
+        match self {
+            #[cfg(feature = "experimental-roaming")]
+            Self::Resume { .. } => true,
+            _ => false,
+        }
+    }
 }
 
 pub(crate) async fn handle_client<S>(
+    server_state: Arc<ServerState>,
+    profile: Arc<ProfileRuntime>,
+    stream: S,
+    addr: SocketAddr,
+    tun_tx: TunIngress,
+    pre_auth_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static + SplitStream,
+{
+    handle_client_inner(
+        server_state,
+        profile,
+        stream,
+        addr,
+        tun_tx,
+        pre_auth_permit,
+        false,
+    )
+    .await
+}
+
+/// Handle a new maximum-stealth REALITY connection. The outer TLS + genuine
+/// HTTP/2 carrier already supplies public framing, so the inner qeli exchange
+/// uses raw records and cannot create a second fake-TLS fingerprint.
+pub(crate) async fn handle_h2_client<S>(
+    server_state: Arc<ServerState>,
+    profile: Arc<ProfileRuntime>,
+    stream: S,
+    addr: SocketAddr,
+    tun_tx: TunIngress,
+    pre_auth_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static + SplitStream,
+{
+    handle_client_inner(
+        server_state,
+        profile,
+        stream,
+        addr,
+        tun_tx,
+        pre_auth_permit,
+        true,
+    )
+    .await
+}
+async fn handle_client_inner<S>(
     server_state: Arc<ServerState>,
     profile: Arc<ProfileRuntime>,
     mut stream: S,
@@ -439,46 +975,60 @@ pub(crate) async fn handle_client<S>(
     // an established session never occupies a slot. `None` for callers with no gate
     // (tests, and transports that do their own admission control). (S-01)
     mut pre_auth_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    inner_raw: bool,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static + SplitStream,
 {
     let pcfg = &profile.config;
     let handshake_timeout = Duration::from_secs(pcfg.performance.connection.handshake_timeout_secs);
-    let framing = if pcfg.obfuscation.mode == "plain" {
+    let framing = if pcfg.obfuscation.mode == "plain" || inner_raw {
         Framing::Raw
     } else {
         Framing::Tls
     };
 
     // KE + server identity proof + read the first client message (AUTH or JOIN).
-    let (mut server_tx_codec, server_rx, static_shared, shared, transcript_hash, first) =
-        tokio::time::timeout(
-            handshake_timeout,
-            qeli_handshake(&server_state, &profile, &mut stream, addr, pcfg),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("handshake timeout for {}", addr))?
-        .map_err(|e| anyhow::anyhow!("handshake failed for {}: {}", addr, e))?;
-
+    let (
+        mut server_tx_codec,
+        server_rx,
+        static_shared,
+        shared,
+        transcript_hash,
+        _handshake_resume_secret,
+        first,
+    ) = tokio::time::timeout(
+        handshake_timeout,
+        qeli_handshake(&server_state, &profile, &mut stream, addr, pcfg, inner_raw),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("handshake timeout for {}", addr))?
+    .map_err(|e| anyhow::anyhow!("handshake failed for {}: {}", addr, e))?;
     let max_streams = if pcfg.obfuscation.multipath.enabled {
         pcfg.obfuscation.multipath.max_streams.max(1)
     } else {
         1
     };
 
-    let (session, _is_primary): (Arc<SessionShared>, bool) = match first {
+    let stream_id = loop {
+        let candidate = rand::random::<u64>();
+        if candidate != 0 {
+            break candidate;
+        }
+    };
+    let (session, stream_attach): (Arc<SessionShared>, StreamAttach) = match first {
         FirstMessage::Auth {
             proof,
             username,
             password,
             device_id,
+            capabilities,
         } => {
             log::info!(
                 "AUTH attempt from {} on profile '{}': user={}",
                 addr,
                 pcfg.name,
-                crate::util::log_sanitize(&username)
+                crate::util::log_identity(&username)
             );
             verify_client_auth(
                 &server_state,
@@ -493,6 +1043,53 @@ where
                 &transcript_hash,
             )
             .await?;
+
+            // Select the wire-breaking post-auth format before allocating a lease.
+            let negotiated_recordizer = match crate::protocol::capabilities::negotiate_recordizer(
+                &pcfg.obfuscation.recordizer,
+                capabilities,
+            ) {
+                Ok(config) => config,
+                Err(error) => {
+                    let reason = error.to_string();
+                    let message = build_auth_error(&reason);
+                    if let Ok(record) = server_tx_codec.encrypt_packet(message.as_bytes(), &[]) {
+                        if let Err(send_error) = stream.write_all(&record).await {
+                            log::debug!(
+                                "TCP {addr}: failed to send recordizer negotiation error: {send_error}"
+                            );
+                        }
+                    }
+                    return Err(anyhow::anyhow!("profile '{}': {error}", pcfg.name));
+                }
+            };
+
+            // Negotiate the family set before touching either pool. IPv6-only incapable
+            // clients fail here; dual profiles downgrade old/off clients to legacy IPv4.
+            let negotiated_ip_mode = match crate::protocol::capabilities::negotiated_profile_ip_mode(
+                pcfg.tun.ip_mode,
+                capabilities,
+            ) {
+                Ok(mode) => mode,
+                Err(error) => {
+                    let reason = error.to_string();
+                    let message = build_auth_error(&reason);
+                    match server_tx_codec.encrypt_packet(message.as_bytes(), &[]) {
+                        Ok(record) => {
+                            if let Err(send_error) = stream.write_all(&record).await {
+                                log::debug!(
+                                    "TCP {addr}: failed to send authenticated negotiation error: {send_error}"
+                                );
+                            }
+                        }
+                        Err(send_error) => log::debug!(
+                            "TCP {addr}: failed to encrypt authenticated negotiation error: \
+                             {send_error}"
+                        ),
+                    }
+                    return Err(anyhow::anyhow!("profile '{}': {error}", pcfg.name));
+                }
+            };
 
             // Identify the device: same login + same device-id supersedes its own
             // old session (clean reconnect on IP change); different devices of one
@@ -517,9 +1114,9 @@ where
             // LIVE users db (so a panel edit + SIGHUP applies at once); the holder is evicted
             // below and the address is stolen, so a reconnect from a new source IP keeps the
             // same tunnel IP. None = normal dynamic allocation.
-            let fixed_ip = {
+            let (fixed_ip, fixed_ipv6) = {
                 let db = server_state.users_db.read().await;
-                resolve_static_ip(&db, pcfg, &username)
+                resolve_static_addresses(&db, pcfg, &username, negotiated_ip_mode)?
             };
             // #13 iroute: subnets/addresses behind THIS client (its extra address or LAN),
             // from the LIVE users db so a panel edit + SIGHUP applies. Registered in the
@@ -534,48 +1131,77 @@ where
             // CIDRs actually registered below (valid + not refused) — their kernel routes
             // are programmed AFTER the session locks drop (an `ip` command must not run
             // while holding the sessions write lock).
+            // Pool leases, session ownership and kernel iroutes must change atomically
+            // across TCP and UDP authentication for this profile.
+            let admission_guard = profile.admission.lock().await;
             let mut programmed_client_routes: Vec<String> = Vec::new();
+            let mut evicted_client_routes: Vec<String> = Vec::new();
             // Devices evicted by the per-user session cap below whose pool IP must be
             // released AFTER the sessions write lock drops (lock order: sessions → pool).
             let mut cap_evicted = Vec::new();
+            let mut superseded = Vec::new();
             {
                 let mut sessions = profile.sessions.write().await;
-                let stale: Vec<std::net::Ipv4Addr> = sessions
+                let stale: Vec<std::net::IpAddr> = sessions
                     .by_ip
                     .iter()
                     .filter(|(_, s)| s.device_key == dkey)
                     .map(|(ip, _)| *ip)
                     .collect();
                 for ip in stale {
-                    if let Some(old) = sessions.by_ip.remove(&ip) {
-                        sessions.by_token.remove(&old.token);
+                    if let Some(old) = sessions.remove(ip) {
                         old.kick_all();
                         // Strip the old session's inbound iroutes from the map — a dead
                         // ClientRoute would otherwise win route_lookup or stack a duplicate
-                        // on this same-device reconnect. Map only: the new session
-                        // re-registers (and `ip route replace`s) below, so an `ip route del`
-                        // here would race that replace and blackhole the re-added subnet.
-                        let _ = sessions.take_client_routes(ip);
+                        // on this same-device reconnect. Kernel deletion is deferred until
+                        // after the sessions lock drops, then completed under the same
+                        // admission guard before the replacement uses fail-closed `route add`.
+                        evicted_client_routes.extend(sessions.take_client_routes(ip));
                         log::info!(
                             "Superseding previous session for device '{}' (was {}) on profile '{}' — reconnect from {}",
                             dkey, ip, profile.name, addr
                         );
+                        superseded.push(old);
                     }
                 }
                 // Static IP (variant-b): evict whoever currently holds this user's fixed
                 // address — a different device of theirs, or a dynamic user who grabbed it
                 // while the owner was offline — so we can steal it below. (Our own prior
                 // session was already dropped by the supersede loop above.)
-                if let Some(ip) = fixed_ip {
-                    if let Some(old) = sessions.by_ip.remove(&ip) {
-                        sessions.by_token.remove(&old.token);
+                let fixed_addresses = fixed_ip
+                    .filter(|_| {
+                        matches!(
+                            negotiated_ip_mode,
+                            crate::config::server::IpMode::Ipv4
+                                | crate::config::server::IpMode::Dual
+                        )
+                    })
+                    .map(std::net::IpAddr::V4)
+                    .into_iter()
+                    .chain(
+                        fixed_ipv6
+                            .filter(|_| {
+                                matches!(
+                                    negotiated_ip_mode,
+                                    crate::config::server::IpMode::Ipv6
+                                        | crate::config::server::IpMode::Dual
+                                )
+                            })
+                            .map(std::net::IpAddr::V6),
+                    )
+                    .collect::<Vec<_>>();
+                for address in fixed_addresses {
+                    let holder_primary = sessions
+                        .get_by_address(address)
+                        .map(|holder| holder.client_ip);
+                    if let Some(old) = holder_primary.and_then(|primary| sessions.remove(primary)) {
                         old.kick_all();
                         // Strip the evicted holder's iroutes (map only — see the supersede
                         // note above; the admitted session re-programs the kernel).
-                        let _ = sessions.take_client_routes(ip);
+                        evicted_client_routes.extend(sessions.take_client_routes(old.client_ip));
                         log::info!(
                             "Static IP {} for user '{}' — evicting current holder device '{}' on profile '{}'",
-                            ip, username, old.device_key, profile.name
+                            address, crate::util::log_identity(&username), crate::util::log_device_identity(&old.device_key), profile.name
                         );
                         cap_evicted.push(old);
                     }
@@ -584,7 +1210,7 @@ where
                 // OTHER devices of this user; evict the oldest until the new one fits.
                 if max_sessions > 0 {
                     loop {
-                        let mut user_sessions: Vec<(std::net::Ipv4Addr, Instant)> = sessions
+                        let mut user_sessions: Vec<(std::net::IpAddr, Instant)> = sessions
                             .by_ip
                             .iter()
                             .filter(|(_, s)| s.username == username)
@@ -595,15 +1221,15 @@ where
                         }
                         user_sessions.sort_by_key(|(_, t)| *t); // oldest first
                         let oldest_ip = user_sessions[0].0;
-                        match sessions.by_ip.remove(&oldest_ip) {
+                        match sessions.remove(oldest_ip) {
                             Some(old) => {
-                                sessions.by_token.remove(&old.token);
                                 old.kick_all();
                                 // Strip the evicted device's iroutes (map only).
-                                let _ = sessions.take_client_routes(oldest_ip);
+                                evicted_client_routes
+                                    .extend(sessions.take_client_routes(oldest_ip));
                                 log::info!(
                                     "User '{}' at session cap {} — evicting oldest device {} on profile '{}' for new device '{}'",
-                                    username, max_sessions, oldest_ip, profile.name, dkey
+                                    crate::util::log_identity(&username), max_sessions, oldest_ip, profile.name, crate::util::log_device_identity(&dkey)
                                 );
                                 // This evicted device's own stream won't release its IP
                                 // (it's no longer in by_ip under its session_id), so the
@@ -631,24 +1257,53 @@ where
             // IP. The orphan keeps injecting packets with that source while all return
             // traffic — including replies to its own connections — is routed to the other
             // client. (Audit 2026-08-04.)
-            for s in &cap_evicted {
+            for s in superseded.iter().chain(&cap_evicted) {
                 crate::server::notify::fire_disconnect(&s.username, &profile.name, s.peer);
             }
 
-            {
-                let max_clients = pcfg.performance.connection.max_clients;
+            let max_clients = pcfg.performance.connection.max_clients;
+            let capacity_rejected = {
                 let sessions = profile.sessions.read().await;
-                if sessions.by_ip.len() >= max_clients as usize {
-                    return Err(anyhow::anyhow!(
-                        "max clients ({}) reached on profile '{}'",
-                        max_clients,
-                        profile.name
-                    ));
+                sessions.by_ip.len() >= max_clients as usize
+            };
+            if capacity_rejected {
+                // Evictions already removed these sessions from the authoritative map.
+                // Release their leases and routes even when a lowered global cap still
+                // leaves no room for the replacement.
+                {
+                    let mut pool = profile.pool.lock().await;
+                    for session in &cap_evicted {
+                        pool.release(&session.device_key);
+                    }
+                    // A same-device reconnect was removed above but deliberately kept its
+                    // lease for reuse. If the replacement is rejected, no live session owns
+                    // that lease any more.
+                    pool.release(&dkey);
                 }
+                for cidr in &evicted_client_routes {
+                    let _ = program_client_subnet_route(false, cidr, &pcfg.tun.name).await;
+                }
+                drop(admission_guard);
+                return Err(anyhow::anyhow!(
+                    "max clients ({}) reached on profile '{}'",
+                    max_clients,
+                    profile.name
+                ));
             }
 
-            let session_id = rand::random::<u64>();
-            let client_ip = {
+            // Old ownership is gone from the in-memory router. Remove the corresponding
+            // host routes before any replacement route is installed below.
+            for cidr in &evicted_client_routes {
+                let _ = program_client_subnet_route(false, cidr, &pcfg.tun.name).await;
+            }
+
+            let session_id = loop {
+                let candidate = rand::random::<u64>();
+                if candidate != 0 {
+                    break candidate;
+                }
+            };
+            let assigned_result: Result<crate::server::pool::AssignedAddresses, anyhow::Error> = {
                 // ONE pool lock for "give back what we evicted, then take ours". Splitting
                 // the two — as this used to — leaves the freed address on the pool's `freed`
                 // stack across an await, and `allocate` pops that stack first. See the
@@ -657,32 +1312,40 @@ where
                 for s in &cap_evicted {
                     pool.release(&s.device_key);
                 }
-                let ip = match fixed_ip {
-                    // Fixed address for this user; if it's out of the pool / excluded,
-                    // allocate_fixed returns None and we fall back to a dynamic address.
-                    Some(want) => pool.allocate_fixed(&dkey, want).or_else(|| {
-                        log::warn!(
-                            "static IP {} for user '{}' is outside profile '{}' pool or excluded — using a dynamic address",
-                            want, username, profile.name
-                        );
-                        pool.allocate(&dkey)
-                    }),
-                    None => pool.allocate(&dkey),
-                };
-                ip.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no IP available for {} on profile '{}'",
-                        username,
-                        profile.name
-                    )
-                })?
+                let result = pool
+                    .allocate_for_mode(&dkey, negotiated_ip_mode, fixed_ip, fixed_ipv6)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "cannot allocate {} address set for '{}' on profile '{}': {}",
+                            negotiated_ip_mode,
+                            crate::util::log_identity(&username),
+                            profile.name,
+                            error
+                        )
+                    });
+                // A reconnect removes the old authoritative session before allocation. The
+                // allocator transaction intentionally restores this device's previous leases
+                // on failure, but with no session left those leases would be orphaned forever.
+                // Roll back the admission as a whole while the same pool lock is still held.
+                if result.is_err() {
+                    pool.release(&dkey);
+                }
+                result
             };
+            let assigned = assigned_result?;
+            let client_ip = assigned
+                .ipv4
+                .map(std::net::IpAddr::V4)
+                .or_else(|| assigned.ipv6.map(std::net::IpAddr::V6))
+                .expect("negotiated address mode assigns at least one family");
             let mut token = [0u8; JOIN_TOKEN_LEN];
             rand::rng().fill_bytes(&mut token[..]);
 
-            let (routes_json, initial_bandwidth_mbps, dst_acl, src_subnets) = {
+            let (routes_json, exit_access, initial_bandwidth_mbps, dst_acl, src_subnets) = {
                 let users_db = server_state.users_db.read().await;
-                let routes = build_routes_json_for_user(pcfg, &users_db, &username);
+                let raw_routes = build_routes_json_for_user(pcfg, &users_db, &username, assigned);
+                let exit_access = exit_access_from_routes_json(&raw_routes);
+                let routes = routes_without_exit_defaults(&raw_routes);
                 let u = users_db.find_user(&username);
                 let bw = u
                     .map(|u| u.effective_bandwidth_limit(&users_db.groups))
@@ -692,16 +1355,26 @@ where
                 let acl = crate::server::acl::DstAcl::compile(
                     &u.map(|u| crate::server::acl::effective_allowed_networks(u, &users_db.groups))
                         .unwrap_or_default(),
-                    &username,
+                    &crate::util::log_identity(&username),
                 );
                 let subnets = u.map(|u| u.client_subnets.clone()).unwrap_or_default();
-                (routes, bw, acl, subnets)
+                (routes, exit_access, bw, acl, subnets)
             };
-            let src_guard = crate::server::acl::SrcGuard::new(client_ip, &src_subnets, &username);
+            let assigned_sources: Vec<std::net::IpAddr> = assigned
+                .ipv4
+                .map(std::net::IpAddr::V4)
+                .into_iter()
+                .chain(assigned.ipv6.map(std::net::IpAddr::V6))
+                .collect();
+            let src_guard = crate::server::acl::SrcGuard::new_dual(
+                &assigned_sources,
+                &src_subnets,
+                &crate::util::log_identity(&username),
+            );
             if !dst_acl.is_unrestricted() {
                 log::info!(
                     "User '{}' is restricted to {} destination network(s) (allowed_networks)",
-                    username,
+                    crate::util::log_identity(&username),
                     dst_acl.rule_count()
                 );
             }
@@ -712,7 +1385,7 @@ where
                     profile.pool.lock().await.release(&dkey);
                     return Err(anyhow::anyhow!(
                         "cannot allocate the bounded wire-record pool for user '{}' on profile '{}': {}",
-                        username,
+                        crate::util::log_identity(&username),
                         profile.name,
                         error
                     ));
@@ -724,68 +1397,145 @@ where
                 username: username.clone(),
                 device_key: dkey.clone(),
                 client_ip,
+                client_ipv4: assigned.ipv4,
+                client_ipv6: assigned.ipv6,
                 peer: addr,
                 token,
                 max_streams,
                 wire_pool,
                 streams: std::sync::Mutex::new(Vec::new()),
+                #[cfg(feature = "experimental-roaming")]
+                tcp_roaming: if pcfg.roaming.enabled
+                    && crate::protocol::capabilities::tcp_resume_supported(capabilities)
+                {
+                    Some(TcpRoamingSession::new(
+                        session_id,
+                        token,
+                        max_streams,
+                        stream_id,
+                        _handshake_resume_secret,
+                        profile.tcp_orphans.clone(),
+                        TcpRoamingPolicy {
+                            grace: Duration::from_secs(pcfg.roaming.grace_secs),
+                            handover_enabled: crate::protocol::capabilities::tcp_handover_supported(
+                                capabilities,
+                            ),
+                        },
+                    )?)
+                } else {
+                    None
+                },
+                #[cfg(feature = "experimental-roaming")]
+                tcp_control_v2: crate::protocol::capabilities::control_v2_supported(capabilities),
+                #[cfg(feature = "experimental-roaming")]
+                management_v1: crate::protocol::capabilities::management_v1_negotiated(
+                    Some(
+                        crate::protocol::capabilities::server_capabilities_for_profile(
+                            pcfg.roaming.enabled,
+                        ),
+                    ),
+                    capabilities,
+                ),
+                #[cfg(feature = "experimental-roaming")]
+                management_datagram: false,
+                #[cfg(feature = "experimental-roaming")]
+                management_acks: std::sync::Mutex::new(std::collections::HashMap::new()),
                 connected_at: Instant::now(),
                 bytes_sent: Arc::new(AtomicU64::new(0)),
                 bytes_recv: Arc::new(AtomicU64::new(0)),
                 dropped: Arc::new(AtomicU64::new(0)),
                 bandwidth_limit_mbps: Arc::new(AtomicU32::new(initial_bandwidth_mbps)),
                 rates: DirectionalRateBuckets::new(),
+                cover_budget: crate::protocol::Shaper::shared_budget(
+                    &pcfg.obfuscation.traffic_shaping.to_shaping(),
+                    std::time::Instant::now(),
+                ),
                 dst_acl,
                 src_guard,
+                exit_access,
+                recordizer: negotiated_recordizer,
                 // 0 = the client has not reported a path MTU. Every pre-#13 client stays
                 // here, and the downlink check stays switched off for them.
                 path_mtu: Arc::new(AtomicU32::new(0)),
                 revoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 // None = the client has not said what it is. Every client that predates
                 // the report stays here, and both surfaces show it as unknown.
                 client_info: Arc::new(std::sync::Mutex::new(None)),
             });
+            let mut replaced_session = None;
+            let mut replaced_routes = Vec::new();
             {
                 let mut sessions = profile.sessions.write().await;
-                // Authoritative re-check under the SAME write lock as the insert:
-                // the earlier read-lock check is only a fast-path, so without this
-                // N concurrent connects could each pass it and race past
-                // max_clients (T7). On rejection, release the IP we reserved.
-                if sessions.by_ip.len() >= pcfg.performance.connection.max_clients as usize {
-                    drop(sessions);
-                    profile.pool.lock().await.release(&dkey);
-                    return Err(anyhow::anyhow!(
-                        "max clients ({}) reached on profile '{}'",
-                        pcfg.performance.connection.max_clients,
-                        profile.name
-                    ));
+                // Admission is serialized across TCP and UDP, so this insert cannot race a
+                // competing authenticator. Handle an inconsistent pre-existing owner
+                // defensively instead of silently dropping its routes and lease.
+                if let Some(old) = sessions.insert(session.clone()) {
+                    old.kick_all();
+                    replaced_routes.extend(sessions.take_client_routes(old.client_ip));
+                    replaced_session = Some(old);
                 }
-                sessions.by_ip.insert(client_ip, session.clone());
-                sessions.by_token.insert(token, client_ip);
                 // #13 iroute: register the subnets behind this client for INBOUND routing.
-                // Refuse a default route or one covering the server's own tunnel IP (would
-                // hijack the pool), and skip a subnet already claimed by a DIFFERENT client
-                // (first-registered wins). Admin-configured here (per-user client_subnets),
-                // so this is a footgun guard, not an untrusted-input gate.
-                let server_tun: Option<std::net::Ipv4Addr> = pcfg.tun.address.parse().ok();
+                // Defaults are internal-only exit next hops; non-default routes covering the
+                // server's own tunnel IP are refused, and a subnet already claimed by a
+                // DIFFERENT client is skipped (first-registered wins). Admin-configured here
+                // (per-user client_subnets), so this is a footgun guard, not an
+                // untrusted-input gate.
+                let server_tun = configured_tun_addresses(pcfg);
                 programmed_client_routes.extend(register_client_subnets(
                     &mut sessions,
                     &client_subnets,
                     client_ip,
                     &session,
-                    server_tun,
+                    &server_tun,
                     &username,
                     &profile.name,
                 ));
             }
             // Program the kernel routes now that the sessions write lock is released.
-            for cidr in &programmed_client_routes {
-                program_client_subnet_route(true, cidr, &pcfg.tun.name).await;
+            for cidr in &replaced_routes {
+                let _ = program_client_subnet_route(false, cidr, &pcfg.tun.name).await;
             }
-
-            // Notify (opt-in, off by default): a new session came up.
-            crate::server::notify::fire_connect(&username, &profile.name, addr);
-
+            if let Some(old) = &replaced_session {
+                if old.device_key != dkey {
+                    profile.pool.lock().await.release(&old.device_key);
+                }
+                crate::server::notify::fire_disconnect(&old.username, &profile.name, old.peer);
+            }
+            let mut installed_client_routes: Vec<String> = Vec::new();
+            for cidr in &programmed_client_routes {
+                if let Err(error) = program_client_subnet_route(true, cidr, &pcfg.tun.name).await {
+                    // The session is not client-visible until AUTH OK. Roll back every part
+                    // of the admission when the host route cannot be owned; otherwise the
+                    // panel reports a connected client whose site-to-site route black-holes.
+                    let orphan_routes = {
+                        let mut sessions = profile.sessions.write().await;
+                        if sessions
+                            .by_ip
+                            .get(&client_ip)
+                            .is_some_and(|current| current.session_id == session_id)
+                        {
+                            sessions.remove(client_ip);
+                            sessions.take_client_routes(client_ip)
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    for installed in installed_client_routes.iter().rev() {
+                        let _ = program_client_subnet_route(false, installed, &pcfg.tun.name).await;
+                    }
+                    profile.pool.lock().await.release(&dkey);
+                    return Err(anyhow::anyhow!(
+                        "cannot install client_subnet '{}' for user '{}' on profile '{}': {} ({} in-memory route(s) rolled back)",
+                        cidr,
+                        crate::util::log_identity(&username),
+                        profile.name,
+                        error,
+                        orphan_routes.len()
+                    ));
+                }
+                installed_client_routes.push(cidr.clone());
+            }
             // AUTH OK carries the join token + stream cap so the client can open
             // the remaining bonded streams.
             // Everything from here is already COMMITTED: the session sits in
@@ -800,12 +1550,13 @@ where
             // default). Roll the whole thing back before propagating the error.
             // (Audit 2026-07-27, B5.)
             let send_result = async {
-                let msg = build_auth_ok(
-                    &client_ip.to_string(),
+                let msg = build_auth_ok_for_addresses(
+                    assigned,
                     pcfg,
                     &routes_json,
                     &token,
                     max_streams,
+                    capabilities,
                 );
                 let auth_response = server_tx_codec.encrypt_packet(msg.as_bytes(), &[])?;
                 stream.write_all(&auth_response).await?;
@@ -815,19 +1566,18 @@ where
             if let Err(e) = send_result {
                 let orphan_routes = {
                     let mut sessions = profile.sessions.write().await;
-                    sessions.by_ip.remove(&client_ip);
-                    sessions.by_token.remove(&token);
+                    sessions.remove(client_ip);
                     sessions.take_client_routes(client_ip)
                 };
                 for cidr in &orphan_routes {
-                    program_client_subnet_route(false, cidr, &pcfg.tun.name).await;
+                    let _ = program_client_subnet_route(false, cidr, &pcfg.tun.name).await;
                 }
                 profile.pool.lock().await.release(&dkey);
                 log::warn!(
                     "Client {} ({}) failed to receive AUTH OK on profile '{}' ({}) — session, \
                      pool address {} and {} iroute(s) rolled back",
                     addr,
-                    username,
+                    crate::util::log_identity(&username),
                     profile.name,
                     e,
                     client_ip,
@@ -836,11 +1586,22 @@ where
                 return Err(e);
             }
 
+            // Client-visible admission commits at AUTH OK. Keeping the profile admission
+            // guard through this small write prevents a concurrent TCP/UDP reconnect from
+            // superseding the session before the older handler has even acknowledged it.
+            drop(admission_guard);
+            crate::server::notify::fire_connect(&username, &profile.name, addr);
+
             log::info!(
                 "Client {} ({}) connected on profile '{}', IP: {}, bandwidth_limit: {} Mbps, streams<={}",
-                addr, username, profile.name, client_ip, initial_bandwidth_mbps, max_streams
+                addr,
+                crate::util::log_identity(&username),
+                profile.name,
+                client_ip,
+                initial_bandwidth_mbps,
+                max_streams
             );
-            (session, true)
+            (session, StreamAttach::Primary)
         }
         FirstMessage::Join {
             token,
@@ -855,25 +1616,56 @@ where
             };
             let session = session
                 .ok_or_else(|| anyhow::anyhow!("JOIN with unknown/stale token from {}", addr))?;
-            if session.stream_count() >= session.max_streams as usize {
+            if session.is_revoked() || session.stream_count() >= session.max_streams as usize {
                 return Err(anyhow::anyhow!(
-                    "JOIN exceeds max_streams ({}) for user '{}'",
+                    "JOIN rejected for revoked/full session (max_streams={}) for user '{}'",
                     session.max_streams,
-                    session.username
+                    crate::util::log_identity(&session.username)
                 ));
             }
-            // Ack so the client confirms attachment before pumping data.
-            let ack = server_tx_codec.encrypt_packet(b"JOINOK", &[])?;
-            stream.write_all(&ack).await?;
+            #[cfg(feature = "experimental-roaming")]
+            if session.tcp_roaming.is_some() {
+                return Err(anyhow::anyhow!(
+                    "legacy bearer JOIN rejected for an authenticated-resume session"
+                ));
+            }
+            // The authoritative check and JOINOK are deliberately deferred until run_stream
+            // has atomically inserted this connection into the session.
+            (
+                session,
+                StreamAttach::LegacyJoin {
+                    logical_slot_id: u32::from(stream_index),
+                },
+            )
+        }
+        #[cfg(feature = "experimental-roaming")]
+        FirstMessage::Resume { join } => {
+            let locator = *join.input().session_locator();
+            let session = {
+                let sessions = profile.sessions.read().await;
+                sessions
+                    .by_token
+                    .get(&locator)
+                    .and_then(|ip| sessions.by_ip.get(ip).cloned())
+            }
+            .ok_or_else(|| anyhow::anyhow!("resume JOIN with unknown locator from {addr}"))?;
+            profile.tcp_roaming_metrics.note_attempt();
+            let reservation = match session.begin_tcp_resume(&join, &transcript_hash) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    profile.tcp_roaming_metrics.note_failure();
+                    return Err(anyhow::anyhow!(
+                        "authenticated resume JOIN rejected: {error}"
+                    ));
+                }
+            };
             log::info!(
-                "Stream #{} JOINed session for user '{}' (IP {}) on profile '{}' from {}",
-                stream_index,
-                session.username,
-                session.client_ip,
+                "ROAMING transport=tcp event=attempt profile='{}' user='{}' peer={}",
                 profile.name,
+                crate::util::log_identity(&session.username),
                 addr
             );
-            (session, false)
+            (session, StreamAttach::Resume { reservation })
         }
     };
 
@@ -887,7 +1679,17 @@ where
     let server_tx = Arc::new(std::sync::Mutex::new(server_tx_codec));
     let (read_half, write_half) = stream.split_io();
     run_stream(
-        profile, session, addr, tun_tx, read_half, write_half, server_tx, server_rx, framing,
+        profile,
+        session,
+        addr,
+        tun_tx,
+        read_half,
+        write_half,
+        server_tx,
+        server_rx,
+        framing,
+        stream_id,
+        stream_attach,
     )
     .await;
     Ok(())
@@ -902,18 +1704,22 @@ async fn qeli_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     addr: SocketAddr,
     pcfg: &crate::config::server::ProfileConfig,
+    inner_raw: bool,
 ) -> anyhow::Result<(
     PacketCodec,
     PacketCodec,
     [u8; 32],
     [u8; 32],
     [u8; 32],
+    HandshakeResumeSecret,
     FirstMessage,
 )> {
     let server_kp = Keypair::generate();
-    let plain = pcfg.obfuscation.mode == "plain";
-    // `plain` has no TLS-shaped handshake to carry an ML-KEM share → classic X25519.
-    // Every other mode runs the hybrid X25519+ML-KEM exchange (PQ tunnel).
+    let plain = pcfg.obfuscation.mode == "plain" || inner_raw;
+    // Plain has no outer carrier; current reality-tls already has an authenticated
+    // PQ-capable TLS layer and deliberately avoids a second visible fake-TLS
+    // handshake. Both use classic X25519 for this private inner exchange. Legacy
+    // camouflage modes keep the hybrid X25519+ML-KEM inner exchange.
     let (client_pub, transcript_hash, mlkem_shared) = if plain {
         let (cp, th) = raw_server_handshake(stream, &server_kp).await?;
         (cp, th, None)
@@ -938,6 +1744,21 @@ async fn qeli_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         (None, Some(es)) => derive_keys_bound(&shared.0, es),
         (None, None) => derive_keys(&shared.0),
     };
+    // The original authenticated handshake is the sole source of the resume secret.  Keep
+    // legacy builds bit-for-bit on the existing KDF path; the extra domain-separated material
+    // is derived only in an experimental-roaming build and is zeroized when its owner drops.
+    #[cfg(feature = "experimental-roaming")]
+    let resume_secret = {
+        let material = match (&mlkem_shared, &es) {
+            (Some(ml), Some(es)) => derive_session_material_hybrid_bound(&shared.0, ml, es),
+            (Some(ml), None) => derive_session_material_hybrid(&shared.0, ml),
+            (None, Some(es)) => derive_session_material_bound(&shared.0, es),
+            (None, None) => derive_session_material(&shared.0),
+        };
+        zeroize::Zeroizing::new(*material.resume_secret())
+    };
+    #[cfg(not(feature = "experimental-roaming"))]
+    let resume_secret = ();
     let (mut server_tx, mut server_rx) = if plain {
         (
             PacketCodec::new_raw(server_to_client),
@@ -953,12 +1774,13 @@ async fn qeli_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     let static_shared = profile.static_keypair.derive_shared(&client_pub);
     let hide_identity = server_state.config.auth.require_client_key_proof;
     {
-        let auth_msg = build_server_auth_msg(
+        let auth_msg = build_server_auth_msg_with_capabilities(
             &profile.static_keypair,
             &client_pub,
             &shared.0,
             &transcript_hash,
             hide_identity,
+            crate::protocol::capabilities::server_capabilities_for_profile(pcfg.roaming.enabled),
         );
         let encrypted = server_tx.encrypt_packet(&auth_msg, &[])?;
         stream.write_all(&encrypted).await?;
@@ -978,6 +1800,7 @@ async fn qeli_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         static_shared.0,
         shared.0,
         transcript_hash,
+        resume_secret,
         first,
     ))
 }
@@ -986,6 +1809,12 @@ async fn qeli_handshake<S: AsyncRead + AsyncWrite + Unpin>(
 /// `[proof:32][user:pass]`). The 8-byte magic can't collide with a real auth's
 /// random proof, so old single-stream clients are still parsed as AUTH.
 fn parse_first_message(plaintext: &[u8]) -> anyhow::Result<FirstMessage> {
+    #[cfg(feature = "experimental-roaming")]
+    if plaintext.starts_with(crate::protocol::roaming::TCP_RESUME_MAGIC.as_slice()) {
+        let join = crate::protocol::roaming::TcpResumeJoin::decode(plaintext)
+            .map_err(|error| anyhow::anyhow!("invalid TCP resume JOIN: {error}"))?;
+        return Ok(FirstMessage::Resume { join });
+    }
     if plaintext.len() > JOIN_MAGIC.len() + JOIN_TOKEN_LEN
         && &plaintext[..JOIN_MAGIC.len()] == JOIN_MAGIC.as_slice()
     {
@@ -1003,7 +1832,9 @@ fn parse_first_message(plaintext: &[u8]) -> anyhow::Result<FirstMessage> {
     }
     let mut proof = [0u8; 32];
     proof.copy_from_slice(&plaintext[..32]);
-    let (device_id, creds) = split_device_id(&plaintext[32..]);
+    let (device_id, auth_bytes) = split_device_id(&plaintext[32..]);
+    let (capabilities, creds) =
+        crate::protocol::capabilities::split_client_capabilities(auth_bytes)?;
     let auth_str = String::from_utf8(creds.to_vec())?;
     let (user, pass) = auth_str
         .split_once(':')
@@ -1013,7 +1844,177 @@ fn parse_first_message(plaintext: &[u8]) -> anyhow::Result<FirstMessage> {
         username: user.to_string(),
         password: pass.to_string(),
         device_id,
+        capabilities,
     })
+}
+
+#[cfg(all(test, feature = "experimental-roaming"))]
+mod tcp_resume_handler_tests {
+    use super::{
+        classify_control_v2, parse_first_message, ControlV2Disposition, FirstMessage,
+        TcpRoamingPolicy, TcpRoamingSession,
+    };
+    use crate::protocol::roaming::{ResumeProofInput, TcpResumeJoin, TCP_RESUME_MAGIC};
+    use crate::transport_core::tcp_roaming::{
+        DetachOutcome, DetachReason, LifecycleError, OrphanLimiter,
+    };
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    const LOCATOR: [u8; 16] = [0x61; 16];
+    const SECRET: [u8; 32] = [0x72; 32];
+
+    fn resume(transcript: [u8; 32], epoch: u64, handover: bool) -> TcpResumeJoin {
+        TcpResumeJoin::new(
+            ResumeProofInput::new(transcript, LOCATOR, epoch, 0, handover),
+            &SECRET,
+        )
+    }
+
+    #[test]
+    fn resume_magic_is_parsed_strictly_and_never_falls_back_to_auth() {
+        let transcript = [0x53; 32];
+        let wire = resume(transcript, 1, false).encode();
+        match parse_first_message(&wire).expect("authenticated resume message") {
+            FirstMessage::Resume { join } => {
+                assert!(join.matches_transcript(&transcript));
+                assert!(join.verify(&SECRET));
+            }
+            _ => panic!("resume wire was misclassified"),
+        }
+
+        let mut truncated = Vec::from(TCP_RESUME_MAGIC);
+        truncated.extend_from_slice(&[0u8; 40]);
+        assert!(parse_first_message(&truncated).is_err());
+    }
+
+    #[test]
+    fn handler_wrapper_uses_original_secret_and_shared_orphan_budget() {
+        let limiter = Arc::new(Mutex::new(OrphanLimiter::new(1, 4 * 1024 * 1024)));
+        let session = TcpRoamingSession::new(
+            9,
+            LOCATOR,
+            1,
+            90,
+            zeroize::Zeroizing::new(SECRET),
+            limiter.clone(),
+            TcpRoamingPolicy {
+                grace: Duration::from_secs(30),
+                handover_enabled: true,
+            },
+        )
+        .unwrap();
+        session.mark_initial_transport_attached();
+        let now = Instant::now();
+        let ticket = match session.detach(90, DetachReason::Unexpected, now).unwrap() {
+            DetachOutcome::Orphaned(ticket) => ticket,
+            _ => panic!("last transport must enter grace"),
+        };
+        {
+            let limiter = limiter.lock().unwrap();
+            assert_eq!(limiter.sessions(), 1);
+            assert_eq!(limiter.bytes(), 4 * 1024 * 1024);
+        }
+
+        let transcript = [0x44; 32];
+        let reservation = session
+            .begin_resume(&resume(transcript, 1, false), &transcript)
+            .unwrap();
+        session.commit_resume(reservation, 91).unwrap();
+        let limiter = limiter.lock().unwrap();
+        assert_eq!((limiter.sessions(), limiter.bytes()), (0, 0));
+        drop(limiter);
+        assert!(!session.reap(ticket, now + Duration::from_secs(31)));
+    }
+
+    #[test]
+    fn handover_requires_its_own_authenticated_capability() {
+        let limiter = Arc::new(Mutex::new(OrphanLimiter::new(1, 4 * 1024 * 1024)));
+        let session = TcpRoamingSession::new(
+            10,
+            LOCATOR,
+            1,
+            100,
+            zeroize::Zeroizing::new(SECRET),
+            limiter,
+            TcpRoamingPolicy {
+                grace: Duration::from_secs(30),
+                handover_enabled: false,
+            },
+        )
+        .unwrap();
+        let transcript = [0x45; 32];
+        assert_eq!(
+            session
+                .begin_resume(&resume(transcript, 1, false), &transcript)
+                .unwrap_err(),
+            LifecycleError::InitialTransportPending
+        );
+        session.mark_initial_transport_attached();
+        let now = Instant::now();
+        match session.detach(100, DetachReason::Unexpected, now).unwrap() {
+            DetachOutcome::Orphaned(_) => {}
+            _ => panic!("last transport must enter grace"),
+        }
+        assert_eq!(
+            session
+                .begin_resume(&resume(transcript, 1, true), &transcript)
+                .unwrap_err(),
+            LifecycleError::HandoverNotNegotiated
+        );
+        // Rejection happens before epoch reservation, so a permitted hard resume with the same
+        // fresh handshake and epoch can still commit.
+        let reservation = session
+            .begin_resume(&resume(transcript, 1, false), &transcript)
+            .unwrap();
+        session.commit_resume(reservation, 101).unwrap();
+    }
+
+    #[test]
+    fn control_v2_dispatch_accepts_only_the_strict_terminal_close_shape() {
+        let ack = crate::protocol::control_v2::ack(11);
+        assert_eq!(
+            classify_control_v2(&ack),
+            ControlV2Disposition::ManagementAck(11)
+        );
+
+        let close = crate::protocol::control_v2::close_session(7);
+        assert_eq!(
+            classify_control_v2(&close),
+            ControlV2Disposition::CloseSession
+        );
+
+        let fragmented_close = crate::protocol::control_v2::Frame {
+            message_type: crate::protocol::control_v2::TYPE_CLOSE_SESSION,
+            flags: 0,
+            message_id: 8,
+            part_index: 0,
+            part_count: 2,
+            payload: &[],
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            classify_control_v2(&fragmented_close),
+            ControlV2Disposition::ProtocolViolation
+        );
+
+        let notice = crate::protocol::control_v2::fragment_message(
+            crate::protocol::control_v2::TYPE_NOTICE,
+            0,
+            9,
+            b"future-safe",
+        )
+        .unwrap();
+        assert_eq!(
+            classify_control_v2(&notice[0]),
+            ControlV2Disposition::Ignore
+        );
+        assert_eq!(
+            classify_control_v2(&crate::protocol::control_v2::MAGIC),
+            ControlV2Disposition::ProtocolViolation
+        );
+    }
 }
 
 /// Split the post-proof auth bytes into (optional device-id, `user:pass` bytes).
@@ -1044,6 +2045,180 @@ pub fn device_key(username: &str, device_id: Option<[u8; DEVICE_ID_LEN]>) -> Str
     }
 }
 
+#[cfg(feature = "experimental-roaming")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlV2Disposition {
+    Ignore,
+    ManagementAck(u32),
+    CloseSession,
+    ProtocolViolation,
+}
+
+#[cfg(feature = "experimental-roaming")]
+fn classify_control_v2(bytes: &[u8]) -> ControlV2Disposition {
+    match crate::protocol::control_v2::decode(bytes) {
+        Ok(frame) if frame.message_type == crate::protocol::control_v2::TYPE_ACK => {
+            ControlV2Disposition::ManagementAck(frame.message_id)
+        }
+        Ok(frame) if crate::protocol::control_v2::is_close_session(frame) => {
+            ControlV2Disposition::CloseSession
+        }
+        Ok(frame) if frame.message_type == crate::protocol::control_v2::TYPE_CLOSE_SESSION => {
+            ControlV2Disposition::ProtocolViolation
+        }
+        Ok(_) => ControlV2Disposition::Ignore,
+        Err(_) => ControlV2Disposition::ProtocolViolation,
+    }
+}
+
+/// Consume an authenticated in-tunnel control frame before it can reach the packet ACL/TUN.
+/// `Some(false)` means the current reader must stop because the whole session is terminal.
+fn handle_server_control(
+    packet: &[u8],
+    session: &Arc<SessionShared>,
+    _peer: SocketAddr,
+) -> Option<bool> {
+    #[cfg(feature = "experimental-roaming")]
+    if crate::protocol::control_v2::is_control_v2(packet) {
+        if !session.tcp_control_v2 {
+            log::debug!(
+                "dropping unnegotiated CONTROL_V2 frame from {} for '{}'",
+                _peer,
+                crate::util::log_identity(&session.username)
+            );
+            return Some(true);
+        }
+        return match classify_control_v2(packet) {
+            ControlV2Disposition::CloseSession => {
+                log::info!(
+                    "client '{}' ({}) requested orderly session close",
+                    crate::util::log_identity(&session.username),
+                    _peer
+                );
+                session.close_all();
+                Some(false)
+            }
+            ControlV2Disposition::ManagementAck(message_id) => {
+                if !session.acknowledge_management(message_id) {
+                    log::debug!("ignoring stale management ACK {message_id} from {}", _peer);
+                }
+                Some(true)
+            }
+            ControlV2Disposition::Ignore => Some(true),
+            ControlV2Disposition::ProtocolViolation => {
+                log::warn!(
+                    "malformed CONTROL_V2 frame from {} for '{}' - revoking session",
+                    _peer,
+                    crate::util::log_identity(&session.username)
+                );
+                session.kick_all();
+                Some(false)
+            }
+        };
+    }
+
+    if crate::protocol::ctrl::is_ctrl(packet) {
+        if let Some(mtu) = crate::protocol::ctrl::parse_mtu_report(packet) {
+            session.note_path_mtu(mtu);
+        } else if let Some((version, platform)) = crate::protocol::ctrl::parse_client_info(packet) {
+            session.note_client_info(&version, &platform);
+        }
+        return Some(true);
+    }
+    None
+}
+async fn forward_server_uplink_packet(
+    packet: ServerTunPacket,
+    profile: &Arc<ProfileRuntime>,
+    session: &Arc<SessionShared>,
+    tun_tx: &TunIngress,
+    bytes_recv: &AtomicU64,
+    stream_id: u64,
+) -> bool {
+    if let Some(keep_reading) = handle_server_control(&packet, session, session.peer) {
+        return keep_reading;
+    }
+    if packet.is_empty() {
+        return true;
+    }
+    if !session.src_guard.allows_packet(&packet) {
+        log::debug!(
+            "dropped packet from '{}' - disallowed inner source {} (expected {} or a routed subnet)",
+            crate::util::log_identity(&session.username),
+            crate::server::acl::packet_source(&packet)
+                .map(|source| source.to_string())
+                .unwrap_or_else(|| "<malformed>".to_string()),
+            session.client_ip
+        );
+        return true;
+    }
+    if !session.dst_acl.is_unrestricted() && !session.dst_acl.allows_packet(&packet) {
+        log::debug!(
+            "ACL: dropped packet from '{}' - destination not in allowed_networks",
+            crate::util::log_identity(&session.username)
+        );
+        return true;
+    }
+    let limit = session.bandwidth_limit_mbps.load(Ordering::Relaxed);
+    let delay = session.rates.upload.consume(packet.len() as u64 * 8, limit);
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+    bytes_recv.fetch_add(packet.len() as u64, Ordering::Relaxed);
+    crate::trace::record(
+        crate::trace::Dir::Rx,
+        "server.stream",
+        packet.len(),
+        stream_id,
+    );
+    tun_tx
+        .send_client_packet(profile, session.session_id, session.exit_access, packet)
+        .await
+        .is_ok()
+}
+
+pub(crate) fn encrypt_server_stream_payload(
+    server_tx: &std::sync::Mutex<PacketCodec>,
+    data: &[u8],
+    payload_budget: usize,
+    pcfg: &crate::config::server::ProfileConfig,
+    wire_record: &mut Vec<u8>,
+    padding: &mut Vec<u8>,
+) -> bool {
+    let pad_cfg = &pcfg.obfuscation.padding;
+    let norm_cfg = &pcfg.obfuscation.traffic_normalization;
+    let mut obf = Obfuscator::new();
+    let normalization_padding = if norm_cfg.enabled && !norm_cfg.round_sizes.is_empty() {
+        Obfuscator::normalization_padding_len(data.len(), &norm_cfg.round_sizes, payload_budget)
+    } else {
+        0
+    };
+    let base = data
+        .len()
+        .saturating_add(normalization_padding)
+        .saturating_add(60);
+    let pad_cap = (pad_cfg.max_bytes as usize).min(payload_budget.saturating_sub(base)) as u16;
+    obf.generate_padding_opts_into(
+        pad_cfg.enabled,
+        pad_cfg.min_bytes,
+        pad_cap,
+        pad_cfg.randomize,
+        pad_cfg.probability,
+        padding,
+    );
+    if normalization_padding != 0 {
+        obf.append_normalization_padding_into(
+            data.len(),
+            &norm_cfg.round_sizes,
+            payload_budget,
+            padding,
+        );
+    }
+    lock_or_recover(server_tx, "handler::data_encrypt")
+        .encrypt_packet_into(data, padding, wire_record)
+        .is_ok()
+}
+
 /// Run one bonded connection (stream) of a session: a reader task (decrypt →
 /// TUN) and the writer/heartbeat/idle loop. Adds itself to the session on entry
 /// and detaches on exit, tearing the session down when it was the last stream.
@@ -1058,13 +2233,17 @@ async fn run_stream<R, W>(
     server_tx: Arc<std::sync::Mutex<PacketCodec>>,
     server_rx: PacketCodec,
     framing: Framing,
+    stream_id: u64,
+    stream_attach: StreamAttach,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send,
 {
     let pcfg = &profile.config;
     let hb_config = &pcfg.obfuscation.heartbeat;
-    let heartbeat_enabled = hb_config.enabled && hb_config.interval_ms > 0;
+    let heartbeat_enabled = hb_config.enabled
+        && hb_config.interval_ms > 0
+        && !(framing == Framing::Raw && pcfg.obfuscation.mode == "reality-tls");
     let heartbeat_interval = Duration::from_millis(if heartbeat_enabled {
         hb_config.interval_ms
     } else {
@@ -1073,26 +2252,188 @@ async fn run_stream<R, W>(
     let idle_timeout = Duration::from_secs(pcfg.performance.connection.idle_timeout_secs);
 
     let (tx, mut rx) = mpsc::channel::<PooledBuffer>(session.wire_pool.buffer_count());
+    #[cfg(feature = "experimental-roaming")]
+    let (terminal_management_tx, mut terminal_management_rx) = mpsc::channel(1);
     let (kick_tx, mut kick_rx) = mpsc::channel::<()>(1);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let stream_id = rand::random::<u64>();
-    if !session.try_add_stream(StreamHandle {
-        stream_id,
-        codec: server_tx.clone(),
-        writer: tx,
-        kick_tx,
-        shutdown_tx: shutdown_tx.clone(),
-    }) {
-        // Lost the race against a concurrent JOIN that filled the last slot
-        // (the early stream_count check is only a fast-path). Drop this stream
-        // rather than exceed max_streams.
+    if !session.try_add_stream(
+        StreamHandle {
+            #[cfg(feature = "experimental-roaming")]
+            logical_slot_id: stream_attach.logical_slot_id(),
+            #[cfg(feature = "experimental-roaming")]
+            ready: stream_attach.initially_ready(),
+            stream_id,
+            codec: server_tx.clone(),
+            writer: tx,
+            #[cfg(feature = "experimental-roaming")]
+            terminal_management: terminal_management_tx,
+            kick_tx,
+            shutdown_tx: shutdown_tx.clone(),
+        },
+        stream_attach.authenticated_resume_overflow(),
+    ) {
+        // The lookup/count in handle_client is only a fast-path. This is the authoritative,
+        // lock-serialized admission against both max_streams and session revocation.
         log::warn!(
-            "Stream from {} dropped: session for '{}' already at max_streams ({})",
+            "Stream from {} dropped: session for '{}' is revoked or at max_streams ({})",
             addr,
-            session.username,
+            crate::util::log_identity(&session.username),
             session.max_streams
         );
+        #[cfg(feature = "experimental-roaming")]
+        if let StreamAttach::Resume { reservation } = stream_attach {
+            profile.tcp_roaming_metrics.note_failure();
+            if let Some(roaming) = &session.tcp_roaming {
+                roaming.abort_resume(reservation);
+            }
+        }
         return;
+    }
+
+    #[cfg(feature = "experimental-roaming")]
+    if matches!(stream_attach, StreamAttach::Primary) {
+        if let Some(roaming) = &session.tcp_roaming {
+            roaming.mark_initial_transport_attached();
+        }
+    }
+
+    // Keep the receive codec here until a resume transaction has completed its second phase.
+    // A candidate occupies a non-ready overflow slot while the old carrier remains schedulable.
+    let mut server_rx = server_rx;
+
+    // A JOIN is prepared only after its StreamHandle occupies a real slot. For authenticated
+    // resume this acknowledgement is deliberately not the commit point: the client must first
+    // commit its exact platform path and prove that fact over this fresh carrier.
+    let join_slot = match stream_attach {
+        StreamAttach::Primary => None,
+        StreamAttach::LegacyJoin { logical_slot_id } => Some(logical_slot_id),
+        #[cfg(feature = "experimental-roaming")]
+        StreamAttach::Resume { reservation } => Some(reservation.logical_slot_id()),
+    };
+    if let Some(stream_index) = join_slot {
+        let ack = {
+            let mut codec = lock_or_recover(&server_tx, "handler::join_ack");
+            codec.encrypt_packet(crate::protocol::roaming::TCP_RESUME_PREPARED_ACK, &[])
+        };
+        let ack_result = match ack {
+            Ok(bytes) => write_half
+                .write_all(&bytes)
+                .await
+                .map_err(anyhow::Error::from),
+            Err(error) => Err(anyhow::Error::from(error)),
+        };
+        if let Err(error) = ack_result {
+            log::warn!(
+                "Stream #{} for '{}' failed before JOINOK on profile '{}' from {}: {}",
+                stream_index,
+                crate::util::log_identity(&session.username),
+                profile.name,
+                addr,
+                error
+            );
+            #[cfg(feature = "experimental-roaming")]
+            if let StreamAttach::Resume { reservation } = stream_attach {
+                profile.tcp_roaming_metrics.note_failure();
+                session.remove_stream(stream_id);
+                if let Some(roaming) = &session.tcp_roaming {
+                    roaming.abort_resume(reservation);
+                }
+                return;
+            }
+            detach_stream(&profile, &session, stream_id, addr).await;
+            return;
+        }
+
+        #[cfg(feature = "experimental-roaming")]
+        if let StreamAttach::Resume { reservation } = stream_attach {
+            let client_commit = async {
+                let record = tokio::time::timeout(
+                    TCP_RESUME_COMMIT_TIMEOUT,
+                    read_record(&mut read_half, framing),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("client commit confirmation timed out"))??;
+                let plaintext = server_rx.decrypt_packet(&record)?;
+                if plaintext != crate::protocol::roaming::TCP_RESUME_COMMIT {
+                    anyhow::bail!("unexpected TCP resume commit confirmation");
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = client_commit {
+                profile.tcp_roaming_metrics.note_failure();
+                session.remove_stream(stream_id);
+                if let Some(roaming) = &session.tcp_roaming {
+                    roaming.abort_resume(reservation);
+                }
+                log::warn!(
+                    "TCP resume candidate for '{}' aborted before commit; old carrier remains active: {}",
+                    crate::util::log_identity(&session.username),
+                    error
+                );
+                return;
+            }
+
+            let Some(roaming) = &session.tcp_roaming else {
+                profile.tcp_roaming_metrics.note_failure();
+                session.remove_stream(stream_id);
+                return;
+            };
+            let outcome = match roaming.commit_resume(reservation, stream_id) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    profile.tcp_roaming_metrics.note_failure();
+                    session.remove_stream(stream_id);
+                    roaming.abort_resume(reservation);
+                    log::warn!(
+                        "Authenticated JOIN for '{}' lost its reservation before commit: {}",
+                        crate::util::log_identity(&session.username),
+                        error
+                    );
+                    return;
+                }
+            };
+            // This is the only point that retires the old carrier: the new socket completed its
+            // handshake, JOINOK reached the client, and COMMIT_PATH succeeded on the platform.
+            session.activate_resume_stream(stream_id, outcome);
+            let commit_ack = {
+                let mut codec = lock_or_recover(&server_tx, "handler::join_commit_ack");
+                codec.encrypt_packet(crate::protocol::roaming::TCP_RESUME_COMMIT_ACK, &[])
+            };
+            let commit_ack_result = match commit_ack {
+                Ok(bytes) => write_half
+                    .write_all(&bytes)
+                    .await
+                    .map_err(anyhow::Error::from),
+                Err(error) => Err(anyhow::Error::from(error)),
+            };
+            if let Err(error) = commit_ack_result {
+                profile.tcp_roaming_metrics.note_failure();
+                log::warn!(
+                    "TCP resume for '{}' committed but its final acknowledgement failed: {}",
+                    crate::util::log_identity(&session.username),
+                    error
+                );
+                detach_stream(&profile, &session, stream_id, addr).await;
+                return;
+            }
+            profile.tcp_roaming_metrics.note_commit();
+            log::info!(
+                "ROAMING transport=tcp event=commit profile='{}' user='{}' peer={}",
+                profile.name,
+                crate::util::log_identity(&session.username),
+                addr
+            );
+        }
+
+        log::info!(
+            "Stream #{} JOINed session for user '{}' (IP {}) on profile '{}' from {}",
+            stream_index,
+            crate::util::log_identity(&session.username),
+            session.client_ip,
+            profile.name,
+            addr
+        );
     }
 
     let base = tokio::time::Instant::now();
@@ -1101,8 +2442,8 @@ async fn run_stream<R, W>(
     let (dead_tx, mut dead_rx) = mpsc::channel::<()>(1);
 
     {
-        let mut server_rx = server_rx;
         let tun_tx = tun_tx.clone();
+        let profile_r = profile.clone();
         let bytes_recv = session.bytes_recv.clone();
         let session_r = session.clone();
         let last_act = last_act.clone();
@@ -1110,7 +2451,17 @@ async fn run_stream<R, W>(
         let addr_r = addr;
         let mut shutdown_rx = shutdown_rx;
         profile.tasks.spawn(async move {
-            loop {
+            let recordizer_runtime = session_r.recordizer.as_ref().map(|config| {
+                crate::protocol::recordizer::RuntimeConfig::from_config(
+                    config,
+                    crate::protocol::packet::MAX_TUNNEL_MTU,
+                    profile_r.config.tun.mtu.max(0) as usize + 64,
+                )
+                .expect("validated TCP recordizer configuration")
+            });
+            let mut mux_rx =
+                recordizer_runtime.map(crate::protocol::recordizer::Reassembler::new);
+            'reader: loop {
                 // Acquire before reading so queue depth and allocation count are one fixed
                 // budget. Race both the pool wait and the socket read against shutdown: a
                 // kicked client must not remain parked on either resource.
@@ -1122,6 +2473,12 @@ async fn run_stream<R, W>(
                         None => break,
                     },
                 };
+                // Cancellation-safety invariant: cancelling read_record_into may leave the
+                // framing reader between a header and its payload. That is safe here only
+                // because shutdown_rx is terminal for this stream: after this branch we break,
+                // drop read_half and never attempt another record read on it. Do not add a
+                // "soft" pause/reload branch to this select without moving the reader into an
+                // owning task or retaining its partial-record state across cancellation.
                 let record = tokio::select! {
                     biased;
                     _ = shutdown_rx.changed() => break,
@@ -1134,29 +2491,56 @@ async fn run_stream<R, W>(
                 match record {
                     Ok(()) => {
                         let now = base.elapsed().as_millis() as u64;
-                        last_act.store(now, Ordering::Relaxed);
                         match server_rx.decrypt_packet_in_place(plaintext.as_vec_mut()) {
                             Ok(()) => {
+                                // Outer framing alone is not activity: only a record that
+                                // passes the inner AEAD may retain the lease/client slot.
+                                last_act.store(now, Ordering::Relaxed);
                                 // rx-liveness advances ONLY on a successful decrypt:
                                 // undecryptable traffic must not keep a dead session
                                 // (and its pool IP) alive past the rx-dead reaper.
                                 last_rx.store(now, Ordering::Relaxed);
-                                // In-tunnel control frame, not a packet: authenticated by
-                                // the AEAD above and bound to THIS session, which is why the
-                                // MTU report rides here rather than as a bare datagram next
-                                // to the UDP probes (those are keyed only by source address,
-                                // so anyone able to guess a session's IP:port could shrink
-                                // its MTU). Handled before the packet path so it never
-                                // reaches the ACLs or the TUN. (Audit 2026-07-30, #13.)
-                                if crate::protocol::ctrl::is_ctrl(&plaintext) {
-                                    if let Some(mtu) =
-                                        crate::protocol::ctrl::parse_mtu_report(&plaintext)
-                                    {
-                                        session_r.note_path_mtu(mtu);
-                                    } else if let Some((v, p)) =
-                                        crate::protocol::ctrl::parse_client_info(&plaintext)
-                                    {
-                                        session_r.note_client_info(&v, &p);
+                                // Priority terminal controls bypass PACKET_MUX_V1. Recognize a
+                                // direct authenticated ACK/CLOSE before the recordizer; ordinary
+                                // recordized controls are still consumed by
+                                // forward_server_uplink_packet after mux decode.
+                                if let Some(keep_reading) =
+                                    handle_server_control(&plaintext, &session_r, addr_r)
+                                {
+                                    if keep_reading {
+                                        continue;
+                                    }
+                                    break 'reader;
+                                }
+                                if let Some(reassembler) = mux_rx.as_mut() {
+                                    if plaintext.is_empty() {
+                                        continue;
+                                    }
+                                    let packets = match reassembler.decode(&plaintext) {
+                                        Ok(packets) => packets,
+                                        Err(error) => {
+                                            log::debug!(
+                                                "recordizer decode error from {}: {}",
+                                                addr_r,
+                                                error
+                                            );
+                                            continue;
+                                        }
+                                    };
+                                    drop(plaintext);
+                                    for packet in packets {
+                                        if !forward_server_uplink_packet(
+                                            ServerTunPacket::Fragment(packet),
+                                            &profile_r,
+                                            &session_r,
+                                            &tun_tx,
+                                            &bytes_recv,
+                                            stream_id,
+                                        )
+                                        .await
+                                        {
+                                            break 'reader;
+                                        }
                                     }
                                     continue;
                                 }
@@ -1171,7 +2555,7 @@ async fn run_stream<R, W>(
                                     if !session_r.src_guard.allows_packet(&plaintext) {
                                         log::debug!(
                                             "dropped packet from '{}' — disallowed inner source {} (expected {} or a routed subnet)",
-                                            session_r.username,
+                                            crate::util::log_identity(&session_r.username),
                                             crate::server::acl::packet_source(&plaintext)
                                                 .map(|source| source.to_string())
                                                 .unwrap_or_else(|| "<malformed>".to_string()),
@@ -1184,7 +2568,7 @@ async fn run_stream<R, W>(
                                     {
                                         log::debug!(
                                             "ACL: dropped packet from '{}' — destination not in allowed_networks",
-                                            session_r.username
+                                            crate::util::log_identity(&session_r.username)
                                         );
                                         continue;
                                     }
@@ -1208,8 +2592,12 @@ async fn run_stream<R, W>(
                                         stream_id,
                                     );
                                     if tun_tx
-                                        .sender
-                                        .send(ServerTunPacket::Pooled(plaintext))
+                                        .send_client_packet(
+                                            &profile_r,
+                                            session_r.session_id,
+                                            session_r.exit_access,
+                                            ServerTunPacket::Pooled(plaintext),
+                                        )
                                         .await
                                         .is_err()
                                     {
@@ -1242,12 +2630,9 @@ async fn run_stream<R, W>(
         });
     }
 
-    let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
-    heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut idle_check = tokio::time::interval(Duration::from_secs(5));
     idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let idle_ms = idle_timeout.as_millis() as u64;
-    let hb_ms = heartbeat_interval.as_millis() as u64;
     let mut last_tx_ms: u64 = base.elapsed().as_millis() as u64;
 
     // Flow-shaping (Phase 1, DPI-AUDIT 6.1/6.2): when enabled, idle cover traffic
@@ -1258,9 +2643,15 @@ async fn run_stream<R, W>(
     let mut shaper = crate::protocol::Shaper::new(
         pcfg.obfuscation.traffic_shaping.to_shaping(),
         std::time::Instant::now(),
-    );
+    )
+    .with_shared_budget(session.cover_budget.clone());
     let shaping_on = shaper.enabled();
     let heartbeat_enabled = heartbeat_enabled && !shaping_on;
+    let mut heartbeat_deadline = tokio::time::Instant::now()
+        + crate::protocol::randomized_heartbeat_delay(
+            heartbeat_interval,
+            Duration::from_millis(hb_config.jitter_ms),
+        );
     let rx_dead_ms = crate::protocol::liveness_deadline(
         heartbeat_enabled,
         heartbeat_interval,
@@ -1274,10 +2665,71 @@ async fn run_stream<R, W>(
     let mut cover_deadline = tokio::time::Instant::now() + shaper.next_gap(&mut rand::rng());
     let mut padding = Vec::with_capacity(crate::protocol::packet::MAX_RECORD_SIZE);
     let mut cover_record = Vec::with_capacity(session.wire_pool.buffer_capacity());
+    let mut wire_record = Vec::with_capacity(
+        crate::protocol::packet::TLS_RECORD_HEADER + crate::protocol::packet::MAX_RECORD_SIZE,
+    );
+    let recordizer_runtime = session.recordizer.as_ref().map(|config| {
+        crate::protocol::recordizer::RuntimeConfig::from_config(
+            config,
+            crate::protocol::packet::MAX_TUNNEL_MTU,
+            pcfg.tun.mtu.max(0) as usize + 64,
+        )
+        .expect("validated TCP recordizer configuration")
+    });
+    let mut recordizer = recordizer_runtime.map(crate::protocol::recordizer::Recordizer::new);
 
-    loop {
+    'writer: loop {
+        let mux_deadline = recordizer
+            .as_ref()
+            .and_then(|mux| mux.deadline())
+            .map(tokio::time::Instant::from_std)
+            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
+        #[cfg(feature = "experimental-roaming")]
+        let terminal_management = terminal_management_rx.recv();
+        #[cfg(not(feature = "experimental-roaming"))]
+        let terminal_management = std::future::pending::<()>();
+        tokio::pin!(terminal_management);
         tokio::select! {
             biased;
+
+            _terminal_event = &mut terminal_management => {
+                #[cfg(feature = "experimental-roaming")]
+                {
+                let Some(terminal) = _terminal_event else { break };
+                let mut delivered = true;
+                'terminal: for _ in 0..terminal.repetitions {
+                    for frame in &terminal.frames {
+                        if !encrypt_server_stream_payload(
+                            &server_tx,
+                            frame,
+                            crate::protocol::packet::MAX_TUNNEL_MTU,
+                            pcfg,
+                            &mut wire_record,
+                            &mut padding,
+                        ) || write_half.write_all(&wire_record).await.is_err()
+                        {
+                            delivered = false;
+                            break 'terminal;
+                        }
+                        session
+                            .bytes_sent
+                            .fetch_add(frame.len() as u64, Ordering::Relaxed);
+                        last_tx_ms = base.elapsed().as_millis() as u64;
+                        heartbeat_deadline = tokio::time::Instant::now()
+                            + crate::protocol::randomized_heartbeat_delay(
+                                heartbeat_interval,
+                                Duration::from_millis(hb_config.jitter_ms),
+                            );
+                    }
+                }
+                let _ = terminal.sent.send(delivered);
+                if !delivered {
+                    break 'writer;
+                }
+                }
+                #[cfg(not(feature = "experimental-roaming"))]
+                unreachable!("disabled terminal-management future is pending");
+            }
 
             _ = kick_rx.recv() => { break; }
             _ = dead_rx.recv() => { break; }
@@ -1292,6 +2744,8 @@ async fn run_stream<R, W>(
                 // independent bucket, allowing the configured rate in both directions.
                 // Stealth mode caps the data plane to the (lower) stealth rate so the
                 // flow stops looking like a line-rate bulk download.
+                let priority_control =
+                    crate::protocol::control_v2::is_control_v2(packet.as_ref());
                 let bw = session.bandwidth_limit_mbps.load(Ordering::Relaxed);
                 let limit = if shaping_on && shaper.stealth() {
                     let sr = shaper.stealth_rate_mbps();
@@ -1299,10 +2753,14 @@ async fn run_stream<R, W>(
                 } else {
                     bw
                 };
-                let delay = session
-                    .rates
-                    .download
-                    .consume(packet.len() as u64 * 8, limit);
+                let delay = if priority_control {
+                    Duration::ZERO
+                } else {
+                    session
+                        .rates
+                        .download
+                        .consume(packet.len() as u64 * 8, limit)
+                };
                 if shaping_on && shaper.stealth() && !delay.is_zero() {
                     // STEALTH: instead of one smooth sleep (which evens the spacing
                     // into a metronome — a WORSE tell), fill the rate-cap gap with
@@ -1337,31 +2795,103 @@ async fn run_stream<R, W>(
                 } else if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
-                session.bytes_sent.fetch_add(packet.len() as u64, Ordering::Relaxed);
-                last_tx_ms = base.elapsed().as_millis() as u64;
-                if write_half.write_all(&packet).await.is_err() {
-                    break;
+                let packet_len = packet.len();
+                session.bytes_sent.fetch_add(packet_len as u64, Ordering::Relaxed);
+                if let Some(mux) = recordizer.as_mut() {
+                    let ready = mux.push(packet.as_ref(), std::time::Instant::now());
+                    drop(packet);
+                    let mut payloads = match ready {
+                        Ok(payloads) => payloads,
+                        Err(error) => {
+                            log::debug!("server TCP recordizer dropped a packet: {error}");
+                            continue;
+                        }
+                    };
+                    if priority_control {
+                        if let Some(payload) = mux.flush() {
+                            payloads.push(payload);
+                        }
+                    }
+                    for payload in payloads {
+                        if !encrypt_server_stream_payload(
+                            &server_tx,
+                            &payload,
+                            crate::protocol::packet::MAX_TUNNEL_MTU,
+                            pcfg,
+                            &mut wire_record,
+                            &mut padding,
+                        ) {
+                            continue;
+                        }
+                        if write_half.write_all(&wire_record).await.is_err() {
+                            break 'writer;
+                        }
+                        last_tx_ms = base.elapsed().as_millis() as u64;
+                        heartbeat_deadline = tokio::time::Instant::now()
+                            + crate::protocol::randomized_heartbeat_delay(
+                                heartbeat_interval,
+                                Duration::from_millis(hb_config.jitter_ms),
+                            );
+                    }
+                } else {
+                    let packet_budget = crate::protocol::ip::parse_ip_packet(packet.as_ref())
+                        .ok()
+                        .and_then(|meta| session.downlink_mtu(pcfg.tun.mtu, meta.version))
+                        .map(usize::from)
+                        .unwrap_or_else(|| pcfg.tun.mtu.max(0) as usize)
+                        .max(packet_len)
+                        .min(crate::protocol::packet::MAX_TUNNEL_MTU);
+                    let encrypted = encrypt_server_stream_payload(
+                        &server_tx,
+                        packet.as_ref(),
+                        packet_budget,
+                        pcfg,
+                        &mut wire_record,
+                        &mut padding,
+                    );
+                    drop(packet);
+                    if encrypted {
+                        if write_half.write_all(&wire_record).await.is_err() {
+                            break;
+                        }
+                        last_tx_ms = base.elapsed().as_millis() as u64;
+                        heartbeat_deadline = tokio::time::Instant::now()
+                            + crate::protocol::randomized_heartbeat_delay(
+                                heartbeat_interval,
+                                Duration::from_millis(hb_config.jitter_ms),
+                            );
+                    }
                 }
             }
 
-            _ = heartbeat_tick.tick(), if heartbeat_enabled => {
-                let since = base.elapsed().as_millis() as u64 - last_tx_ms;
-                if since < hb_ms {
-                    continue;
+            _ = tokio::time::sleep_until(mux_deadline),
+                if recordizer.as_ref().is_some_and(|mux| mux.is_pending()) =>
+            {
+                if let Some(payload) = recordizer
+                    .as_mut()
+                    .and_then(|mux| mux.flush_due(std::time::Instant::now()))
+                {
+                    let encrypted = encrypt_server_stream_payload(
+                        &server_tx,
+                        &payload,
+                        crate::protocol::packet::MAX_TUNNEL_MTU,
+                        pcfg,
+                        &mut wire_record,
+                        &mut padding,
+                    );
+                    if encrypted && write_half.write_all(&wire_record).await.is_err() {
+                        break;
+                    }
+                    last_tx_ms = base.elapsed().as_millis() as u64;
+                    heartbeat_deadline = tokio::time::Instant::now()
+                        + crate::protocol::randomized_heartbeat_delay(
+                            heartbeat_interval,
+                            Duration::from_millis(hb_config.jitter_ms),
+                        );
                 }
-                // The beat fires on a fixed-interval tick and this sleep is ADDED to it, so a
-                // symmetric ±jitter is impossible by construction. The old shape (draw from
-                // [0, 2*jitter), then saturating_sub jitter) put >50% of the mass at exactly
-                // 0 — mean ≈ jitter/4, i.e. far weaker aperiodicity than intended — and
-                // `jitter * 2` could overflow into an empty RNG range. Draw it directly.
-                let jitter = if hb_config.jitter_ms > 0 {
-                    let mut rng = rand::rng();
-                    Duration::from_millis(rng.random_range(0..=hb_config.jitter_ms))
-                } else {
-                    Duration::ZERO
-                };
-                tokio::time::sleep(jitter).await;
+            }
 
+            _ = tokio::time::sleep_until(heartbeat_deadline), if heartbeat_enabled => {
                 let heartbeat_ready = {
                     let mut obf = Obfuscator::new();
                     obf.generate_padding_into(
@@ -1380,8 +2910,12 @@ async fn run_stream<R, W>(
                 let now_ms = base.elapsed().as_millis() as u64;
                 last_act.store(now_ms, Ordering::Relaxed);
                 last_tx_ms = now_ms;
+                heartbeat_deadline = tokio::time::Instant::now()
+                    + crate::protocol::randomized_heartbeat_delay(
+                        heartbeat_interval,
+                        Duration::from_millis(hb_config.jitter_ms),
+                    );
             }
-
             _ = tokio::time::sleep_until(cover_deadline), if shaping_on => {
                 let now_ms = base.elapsed().as_millis() as u64;
                 // Normally fill only GENUINE idle (save budget when traffic flows).
@@ -1435,7 +2969,7 @@ async fn run_stream<R, W>(
                 if let Some(rx_dead) = rx_dead_ms {
                     if now.saturating_sub(last_rx.load(Ordering::Relaxed)) > rx_dead {
                         log::info!("Stream {} ({}) reaped: no inbound for >{}s on profile '{}'",
-                            addr, session.username, rx_dead / 1000, profile.name);
+                            addr, crate::util::log_identity(&session.username), rx_dead / 1000, profile.name);
                         break;
                     }
                 }
@@ -1449,14 +2983,65 @@ async fn run_stream<R, W>(
     // that died on a timeout could leave a reader forwarding uploads indefinitely.
     let _ = shutdown_tx.send(true);
 
-    // Detach this stream; tear down the session when it was the last one.
+    detach_stream(&profile, &session, stream_id, addr).await;
+}
+
+/// Detach one bonded stream and perform the fire-once session teardown when it was the last.
+/// Kept in one helper so failures before the pump starts (notably JOINOK write failure) cannot
+/// leave a token, pool lease or client route orphaned.
+async fn detach_stream(
+    profile: &Arc<ProfileRuntime>,
+    session: &Arc<SessionShared>,
+    stream_id: u64,
+    addr: SocketAddr,
+) {
     let was_last = session.remove_stream(stream_id);
+    #[cfg(feature = "experimental-roaming")]
+    if let Some(roaming) = &session.tcp_roaming {
+        let reason = if session.is_revoked() {
+            DetachReason::Revoked
+        } else if session.is_closing() {
+            DetachReason::CleanClose
+        } else {
+            DetachReason::Unexpected
+        };
+        match roaming.detach(stream_id, reason, Instant::now()) {
+            Ok(DetachOutcome::StreamRemains) => return,
+            Ok(DetachOutcome::Orphaned(ticket)) => {
+                log::info!(
+                    "Client {} ({}) lost its last TCP path on profile '{}'; retaining session for authenticated resume",
+                    addr,
+                    crate::util::log_identity(&session.username),
+                    profile.name
+                );
+                schedule_tcp_orphan_reaper(profile.clone(), session.clone(), ticket, addr);
+                return;
+            }
+            Ok(DetachOutcome::Closing | DetachOutcome::Revoked) => {}
+            Err(error) => {
+                profile.tcp_roaming_metrics.note_failure();
+                // Cap exhaustion and terminal races fail closed. A concurrent authoritative
+                // removal makes the legacy guarded cleanup below a no-op.
+                log::warn!(
+                    "TCP roaming detach for '{}' closed the session: {}",
+                    crate::util::log_identity(&session.username),
+                    error
+                );
+            }
+        }
+    }
     if was_last {
+        // Serialize the authoritative session removal and pool release with every new
+        // authentication for this profile. Without the admission guard, a reconnect of the
+        // same device_key could observe no live session, idempotently reclaim its old lease,
+        // and then have that live lease freed by this older teardown before the new session
+        // was inserted. Keep the guard through release; the sessions lock itself is still
+        // dropped before taking the pool lock, preserving the established lock order.
+        let _admission_guard = profile.admission.lock().await;
         let mut sessions = profile.sessions.write().await;
         if sessions.by_ip.get(&session.client_ip).map(|s| s.session_id) == Some(session.session_id)
         {
-            sessions.by_ip.remove(&session.client_ip);
-            sessions.by_token.remove(&session.token);
+            sessions.remove(session.client_ip);
             // #13 iroute: drop this client's inbound routes; delete their kernel routes
             // after the lock is released.
             let iroutes: Vec<String> = sessions
@@ -1470,13 +3055,13 @@ async fn run_stream<R, W>(
                 .retain(|r| r.client_ip != session.client_ip);
             drop(sessions);
             for cidr in &iroutes {
-                program_client_subnet_route(false, cidr, &profile.config.tun.name).await;
+                let _ = program_client_subnet_route(false, cidr, &profile.config.tun.name).await;
             }
             profile.pool.lock().await.release(&session.device_key);
             log::info!(
                 "Client {} ({}) disconnected from profile '{}'",
                 addr,
-                session.username,
+                crate::util::log_identity(&session.username),
                 profile.name
             );
             // Notify (opt-in) — this guarded block is the fire-once per-session TCP
@@ -1484,6 +3069,100 @@ async fn run_stream<R, W>(
             crate::server::notify::fire_disconnect(&session.username, &profile.name, addr);
         }
     }
+}
+
+#[cfg(feature = "experimental-roaming")]
+fn schedule_tcp_orphan_reaper(
+    profile: Arc<ProfileRuntime>,
+    session: Arc<SessionShared>,
+    ticket: ReapTicket,
+    addr: SocketAddr,
+) {
+    let tasks = profile.tasks.clone();
+    tasks.spawn(async move {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(ticket.deadline())).await;
+        let should_reap = session
+            .tcp_roaming
+            .as_ref()
+            .is_some_and(|roaming| roaming.reap(ticket, Instant::now()));
+        if should_reap {
+            profile.tcp_roaming_metrics.note_grace_expired();
+            finalize_orphaned_tcp_session(&profile, &session, addr).await;
+        }
+    });
+}
+
+#[cfg(feature = "experimental-roaming")]
+async fn finalize_orphaned_tcp_session(
+    profile: &Arc<ProfileRuntime>,
+    session: &Arc<SessionShared>,
+    addr: SocketAddr,
+) {
+    let _admission_guard = profile.admission.lock().await;
+    let mut sessions = profile.sessions.write().await;
+    if sessions.by_ip.get(&session.client_ip).map(|s| s.session_id) != Some(session.session_id) {
+        return;
+    }
+    sessions.remove(session.client_ip);
+    let iroutes = sessions.take_client_routes(session.client_ip);
+    drop(sessions);
+    for cidr in &iroutes {
+        let _ = program_client_subnet_route(false, cidr, &profile.config.tun.name).await;
+    }
+    profile.pool.lock().await.release(&session.device_key);
+    log::info!(
+        "Client {} ({}) disconnected from profile '{}' (roaming grace expired)",
+        addr,
+        crate::util::log_identity(&session.username),
+        profile.name
+    );
+    crate::server::notify::fire_disconnect(&session.username, &profile.name, addr);
+}
+
+/// Interpret effective pushed `/0` routes as permissions to use an internal exit node.
+/// The route JSON is already the exact per-user-or-profile set sent in AuthOK, so personal
+/// route override semantics and negotiated-family filtering stay identical in both places.
+pub(crate) fn exit_access_from_routes_json(routes_json: &str) -> ExitAccess {
+    let Ok(routes) = serde_json::from_str::<Vec<serde_json::Value>>(routes_json) else {
+        return ExitAccess::default();
+    };
+    let mut access = ExitAccess::default();
+    for route in routes {
+        let Some(cidr) = route.get("cidr").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some((address, prefix)) = cidr.trim().split_once('/') else {
+            continue;
+        };
+        if prefix.trim() != "0" {
+            continue;
+        }
+        match address.trim().parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(_)) => access.ipv4 = true,
+            Ok(std::net::IpAddr::V6(_)) => access.ipv6 = true,
+            Err(_) => {}
+        }
+    }
+    access
+}
+
+/// Remove server-internal exit authorization markers from AuthOK. Qeli deliberately does
+/// not let a server force a client into full tunnel with a pushed `/0`; the consumer opts in
+/// locally with `gateway = true`. More-specific advertised routes are unchanged.
+pub(crate) fn routes_without_exit_defaults(routes_json: &str) -> String {
+    let Ok(mut routes) = serde_json::from_str::<Vec<serde_json::Value>>(routes_json) else {
+        return "[]".to_string();
+    };
+    routes.retain(|route| {
+        let Some(cidr) = route.get("cidr").and_then(serde_json::Value::as_str) else {
+            return true;
+        };
+        let Some((address, prefix)) = cidr.trim().split_once('/') else {
+            return true;
+        };
+        !(prefix.trim() == "0" && address.trim().parse::<std::net::IpAddr>().is_ok())
+    });
+    serde_json::Value::Array(routes).to_string()
 }
 
 async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
@@ -1667,7 +3346,25 @@ pub fn build_server_auth_msg(
     transcript_hash: &[u8; 32],
     hide_identity: bool,
 ) -> Vec<u8> {
-    if hide_identity {
+    build_server_auth_msg_with_capabilities(
+        static_kp,
+        client_pub,
+        ephemeral_shared,
+        transcript_hash,
+        hide_identity,
+        crate::protocol::capabilities::implemented_server_capabilities(),
+    )
+}
+
+pub fn build_server_auth_msg_with_capabilities(
+    static_kp: &crate::crypto::StaticKeypair,
+    client_pub: &crate::crypto::PublicKey,
+    ephemeral_shared: &[u8; 32],
+    transcript_hash: &[u8; 32],
+    hide_identity: bool,
+    capabilities: crate::protocol::capabilities::ServerCapabilities,
+) -> Vec<u8> {
+    let mut message = if hide_identity {
         crate::crypto::build_server_proof_only(
             static_kp,
             client_pub,
@@ -1677,30 +3374,83 @@ pub fn build_server_auth_msg(
         .to_vec()
     } else {
         build_server_auth_message(static_kp, client_pub, ephemeral_shared, transcript_hash)
-    }
+    };
+    crate::protocol::capabilities::append_server_capabilities(&mut message, capabilities);
+    message
 }
 
 /// A cached, valid Argon2id PHC hash of a throwaway password. Verifying a
-/// candidate password against it costs the same memory-hard work as a real
-/// user's hash, so the "user not found" path can spend that work too and not
-/// betray (by being fast) which usernames exist. Built once on first use with
+/// candidate password against it gives an empty-database fallback for the "user not found"
+/// path. When users exist, [`dummy_password_hash_for`] selects one of their real PHC cost
+/// profiles instead, so legacy/manual costs cannot become a username oracle. Built once with
 /// the crate's default params; the hashed value itself is irrelevant.
 fn dummy_password_hash() -> &'static str {
     use std::sync::OnceLock;
     static H: OnceLock<String> = OnceLock::new();
     H.get_or_init(|| {
-        use argon2::password_hash::{PasswordHasher, SaltString};
-        let salt = SaltString::encode_b64(b"qeli-dummy-salt!").expect("valid dummy salt");
+        use argon2::PasswordHasher;
         // Must use the SAME profile as real password hashing: this hash exists so an
         // unknown username costs the attacker exactly what a known one does. If the two
         // ever diverge — say the real cost is raised here but the dummy keeps the crate
         // default — the work gap becomes a username oracle again, which is the whole
         // thing this dummy prevents. (Audit 2026-07-27, H2.)
-        crate::crypto::password_hasher()
-            .hash_password(b"qeli-nonexistent-user", &salt)
-            .expect("hash dummy password")
-            .to_string()
+        let hash: argon2::PasswordHash = crate::crypto::password_hasher()
+            .hash_password_with_salt(b"qeli-nonexistent-user", b"qeli-dummy-salt!")
+            .expect("hash dummy password");
+        hash.to_string()
     })
+}
+
+/// Select a stable, process-secret representative verifier for an unknown/disabled username.
+///
+/// A single current-profile dummy (`m=19456,t=2`) made unknown users measurably different from
+/// valid legacy (`m=16384,t=2`) and manually-created (`m=32768,t=3`) accounts. Selecting from
+/// the configured hashes makes an unknown name follow the same observed cost distribution as
+/// real accounts, while keeping exactly one Argon2 job per attempt. `RandomState` seeds the
+/// mapping per process, so a remote party cannot predict which profile an absent name should
+/// have and compare it with the measured result.
+pub(crate) fn dummy_password_hash_candidates(db: &crate::config::users::UsersDb) -> Vec<String> {
+    let candidates: Vec<String> = db
+        .users
+        .iter()
+        .map(|user| user.password_hash.as_str())
+        .filter(|hash| hash.starts_with("$argon2id$") && argon2::PasswordHash::new(hash).is_ok())
+        .map(str::to_owned)
+        .collect();
+    if candidates.is_empty() {
+        vec![dummy_password_hash().to_string()]
+    } else {
+        candidates
+    }
+}
+
+fn dummy_password_hash_for(candidates: &[String], username: &str) -> String {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    use std::sync::OnceLock;
+
+    static SELECTOR: OnceLock<std::collections::hash_map::RandomState> = OnceLock::new();
+    let selector = SELECTOR.get_or_init(std::collections::hash_map::RandomState::new);
+    let mut hasher = selector.build_hasher();
+    b"qeli-argon2-anti-enumeration-v2".hash(&mut hasher);
+    username.hash(&mut hasher);
+    candidates[(hasher.finish() as usize) % candidates.len()].clone()
+}
+
+#[cfg(test)]
+#[test]
+fn dummy_selector_is_stable_and_uses_configured_costs() {
+    let user = crate::config::users::UserEntry {
+        password_hash: "$argon2id$v=19$m=16384,t=2,p=1$cWVsaVNhbHRWYWw$CCYuTv8pvqQrvhrBQW3KjPpEN0MZaFfTKv3HOcGqB8w".into(),
+        ..Default::default()
+    };
+    let db = crate::config::users::UsersDb {
+        users: vec![user],
+        ..Default::default()
+    };
+    let candidates = dummy_password_hash_candidates(&db);
+    let first = dummy_password_hash_for(&candidates, "absent");
+    assert_eq!(first, dummy_password_hash_for(&candidates, "absent"));
+    assert!(first.contains("m=16384,t=2,p=1"));
 }
 
 /// Verify a client's authentication (after the parsed `[key_proof][user:pass]`).
@@ -1735,7 +3485,7 @@ pub async fn verify_client_auth(
                 "AUTH DENIED {} {}: user={} — server key not pinned (require_client_key_proof)",
                 proto,
                 addr,
-                crate::util::log_sanitize(username)
+                crate::util::log_identity(username)
             );
             // Count against the source IP only: a probe that fails the
             // server-key proof never proved interest in this username, so it
@@ -1761,7 +3511,7 @@ pub async fn verify_client_auth(
                 "AUTH BLOCKED {} {}: user={} — {}",
                 proto,
                 addr,
-                crate::util::log_sanitize(username),
+                crate::util::log_identity(username),
                 msg
             );
             return Err(anyhow::anyhow!("authentication blocked: {}", msg));
@@ -1790,9 +3540,13 @@ pub async fn verify_client_auth(
                     "AUTH FAIL {} {}: user={} — not found or disabled",
                     proto,
                     addr,
-                    crate::util::log_sanitize(username)
+                    crate::util::log_identity(username)
                 );
                 drop(db);
+                let selected_dummy = {
+                    let candidates = server_state.dummy_password_hashes.read().await;
+                    dummy_password_hash_for(&candidates, username)
+                };
                 // Spend the same Argon2 work as the wrong-password path below, so an
                 // unknown username is not distinguishable from a known one by how
                 // fast the server rejects it (anti-enumeration). Result discarded.
@@ -1808,7 +3562,7 @@ pub async fn verify_client_auth(
                     let _permit = crate::server::argon2_gate().acquire().await;
                     let _ = tokio::task::spawn_blocking(move || {
                         use argon2::PasswordVerifier;
-                        if let Ok(ph) = argon2::PasswordHash::new(dummy_password_hash()) {
+                        if let Ok(ph) = argon2::PasswordHash::new(&selected_dummy) {
                             let _ = argon2::Argon2::default().verify_password(&pw_bytes, &ph);
                         }
                     })
@@ -1825,14 +3579,17 @@ pub async fn verify_client_auth(
                         3600,
                         crate::server::notify::Event::AuthLockout,
                         &format!(
-                            "{} locked after repeated wrong VPN credentials (last user: '{}')",
+                            "{} locked after repeated wrong VPN credentials (last user: {})",
                             addr.ip(),
-                            username
+                            crate::util::log_identity(username)
                         ),
                     )
                     .await;
                 }
-                return Err(anyhow::anyhow!("user not found or disabled: {}", username));
+                return Err(anyhow::anyhow!(
+                    "user not found or disabled: {}",
+                    crate::util::log_identity(username)
+                ));
             }
         }
     };
@@ -1850,7 +3607,12 @@ pub async fn verify_client_auth(
         use argon2::PasswordVerifier;
         argon2::Argon2::default()
             .verify_password(&pw_bytes, &ph)
-            .map_err(|_| anyhow::anyhow!("invalid password for user: {}", uname))
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid password for user: {}",
+                    crate::util::log_identity(&uname)
+                )
+            })
     })
     .await?;
 
@@ -1859,7 +3621,7 @@ pub async fn verify_client_auth(
             "AUTH FAIL {} {}: user={} — wrong password",
             proto,
             addr,
-            crate::util::log_sanitize(username)
+            crate::util::log_identity(username)
         );
         let locked = server_state
             .failed_auth
@@ -1872,9 +3634,9 @@ pub async fn verify_client_auth(
                 3600,
                 crate::server::notify::Event::AuthLockout,
                 &format!(
-                    "{} locked after repeated wrong VPN credentials (last user: '{}')",
+                    "{} locked after repeated wrong VPN credentials (last user: {})",
                     addr.ip(),
-                    username
+                    crate::util::log_identity(username)
                 ),
             )
             .await;
@@ -1894,12 +3656,12 @@ pub async fn verify_client_auth(
             "AUTH DENIED {} {}: user={} not permitted on profile '{}'",
             proto,
             addr,
-            crate::util::log_sanitize(username),
+            crate::util::log_identity(username),
             profile.name
         );
         return Err(anyhow::anyhow!(
             "user '{}' not authorised for profile '{}'",
-            username,
+            crate::util::log_identity(username),
             profile.name
         ));
     }
@@ -1912,7 +3674,7 @@ pub async fn verify_client_auth(
                 "AUTH DENIED {} {}: user={} — account expired",
                 proto,
                 addr,
-                crate::util::log_sanitize(username)
+                crate::util::log_identity(username)
             );
             return Err(anyhow::anyhow!("account expired"));
         }
@@ -1925,7 +3687,7 @@ pub async fn verify_client_auth(
                 "AUTH DENIED {} {}: user={} — download quota exhausted ({} / {} GB down)",
                 proto,
                 addr,
-                crate::util::log_sanitize(username),
+                crate::util::log_identity(username),
                 used / 1_000_000_000,
                 data_limit_gb
             );
@@ -1937,7 +3699,7 @@ pub async fn verify_client_auth(
         "AUTH OK {} {}: user={} on profile '{}'",
         proto,
         addr,
-        crate::util::log_sanitize(username),
+        crate::util::log_identity(username),
         profile.name
     );
     Ok(())
@@ -1947,49 +3709,95 @@ pub fn build_routes_json_pub(
     pcfg: &crate::config::server::ProfileConfig,
     users_db: &crate::config::users::UsersDb,
     username: &str,
+    assigned: crate::server::pool::AssignedAddresses,
 ) -> String {
-    build_routes_json_for_user(pcfg, users_db, username)
+    build_routes_json_for_user(pcfg, users_db, username, assigned)
 }
 
 /// Resolve a user's FIXED tunnel address for this profile (variant-b static IP): the
-/// per-user `static_ip`, else a profile-level `pool.reservation.<user>`. Returns the
-/// parsed address if configured; the pool's `allocate_fixed` then validates it against the
-/// pool range/exclusions, and the caller falls back to dynamic allocation on a `None`.
+/// per-user `static_ip`, else a profile-level `pool.reservation.<user>`. A configured value
+/// that cannot be parsed is an admission error; only an actually absent value becomes `None`.
 /// Read from the LIVE users_db at auth time, so a panel edit + SIGHUP takes effect at once.
 pub fn resolve_static_ip(
     users_db: &crate::config::users::UsersDb,
     pcfg: &crate::config::server::ProfileConfig,
     username: &str,
-) -> Option<std::net::Ipv4Addr> {
-    let configured = users_db
+) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
+    let Some(configured) = users_db
         .find_user(username)
         .and_then(|u| u.static_ip.clone())
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| pcfg.pool.static_reservations.get(username).cloned())?;
-    match configured.trim().parse::<std::net::Ipv4Addr>() {
-        Ok(ip) => Some(ip),
-        Err(_) => {
-            // Previously `.ok()` swallowed this, making a malformed address
-            // indistinguishable from "no static IP" — the user silently got a dynamic
-            // one with NOTHING in the log. The out-of-pool case already warns in the
-            // caller; this covers the typo case. (The panel now rejects it at
-            // authoring time too, but a hand-edited file still reaches here.)
-            log::warn!(
-                "static IP {:?} for user '{}' on profile '{}' is not a valid IPv4 address — \
-                 using a dynamic address",
+        .or_else(|| pcfg.pool.static_reservations.get(username).cloned())
+    else {
+        return Ok(None);
+    };
+    configured
+        .trim()
+        .parse::<std::net::Ipv4Addr>()
+        .map(Some)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "static_ip '{}' for user '{}' on profile '{}' is invalid: {error}",
                 configured,
-                crate::util::log_sanitize(username),
-                profile_name_of(pcfg)
-            );
-            None
-        }
-    }
+                crate::util::log_identity(username),
+                pcfg.name
+            )
+        })
 }
 
-/// Profile name for a log line (the config carries it; kept tiny so `resolve_static_ip`
-/// stays a pure lookup).
-fn profile_name_of(pcfg: &crate::config::server::ProfileConfig) -> &str {
-    &pcfg.name
+/// Resolve a user's fixed IPv6 tunnel address from the live user database, falling back
+/// to the profile-level IPv6 reservation. Pool membership and exclusions are enforced by
+/// the allocator under the same lock as the IPv4 side of a dual allocation.
+pub fn resolve_static_ipv6(
+    users_db: &crate::config::users::UsersDb,
+    pcfg: &crate::config::server::ProfileConfig,
+    username: &str,
+) -> anyhow::Result<Option<std::net::Ipv6Addr>> {
+    let Some(configured) = users_db
+        .find_user(username)
+        .and_then(|user| user.static_ipv6.clone())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| pcfg.pool.ipv6.static_reservations.get(username).cloned())
+    else {
+        return Ok(None);
+    };
+    configured
+        .trim()
+        .parse::<std::net::Ipv6Addr>()
+        .map(Some)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "static_ipv6 '{}' for user '{}' on profile '{}' is invalid: {error}",
+                configured,
+                crate::util::log_identity(username),
+                pcfg.name
+            )
+        })
+}
+
+pub fn resolve_static_addresses(
+    users_db: &crate::config::users::UsersDb,
+    pcfg: &crate::config::server::ProfileConfig,
+    username: &str,
+    mode: crate::config::server::IpMode,
+) -> anyhow::Result<(Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>)> {
+    let ipv4 = if matches!(
+        mode,
+        crate::config::server::IpMode::Ipv4 | crate::config::server::IpMode::Dual
+    ) {
+        resolve_static_ip(users_db, pcfg, username)?
+    } else {
+        None
+    };
+    let ipv6 = if matches!(
+        mode,
+        crate::config::server::IpMode::Ipv6 | crate::config::server::IpMode::Dual
+    ) {
+        resolve_static_ipv6(users_db, pcfg, username)?
+    } else {
+        None
+    };
+    Ok((ipv4, ipv6))
 }
 
 /// Build the auth-OK payload sent to the client after a successful login.
@@ -2006,12 +3814,73 @@ pub fn build_auth_ok(
     routes_json: &str,
     token: &[u8; JOIN_TOKEN_LEN],
     max_streams: u32,
+    client_capabilities: Option<crate::protocol::capabilities::ClientCapabilities>,
 ) -> String {
+    let ipv4 = client_ip.parse::<std::net::Ipv4Addr>().ok();
+    build_auth_ok_for_addresses(
+        crate::server::pool::AssignedAddresses { ipv4, ipv6: None },
+        pcfg,
+        routes_json,
+        token,
+        max_streams,
+        client_capabilities,
+    )
+}
+
+pub(crate) fn build_auth_error(reason: &str) -> String {
+    format!("ERR:{reason}")
+}
+
+pub fn build_auth_ok_for_addresses(
+    assigned: crate::server::pool::AssignedAddresses,
+    pcfg: &crate::config::server::ProfileConfig,
+    routes_json: &str,
+    token: &[u8; JOIN_TOKEN_LEN],
+    max_streams: u32,
+    client_capabilities: Option<crate::protocol::capabilities::ClientCapabilities>,
+) -> String {
+    build_auth_ok_for_addresses_with_udp_roaming(
+        assigned,
+        pcfg,
+        routes_json,
+        token,
+        max_streams,
+        client_capabilities,
+        None,
+    )
+}
+
+/// UDP-only AuthOK extension. The session id is encrypted inside PacketCodec and emitted only
+/// after UDP_ROAM_V1 negotiation; legacy TCP/UDP callers stay byte-compatible through the wrapper.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_auth_ok_for_addresses_with_udp_roaming(
+    assigned: crate::server::pool::AssignedAddresses,
+    pcfg: &crate::config::server::ProfileConfig,
+    routes_json: &str,
+    token: &[u8; JOIN_TOKEN_LEN],
+    max_streams: u32,
+    client_capabilities: Option<crate::protocol::capabilities::ClientCapabilities>,
+    udp_roaming_session_id: Option<u64>,
+) -> String {
+    let primary_address = assigned
+        .ipv4
+        .map(std::net::IpAddr::V4)
+        .or_else(|| assigned.ipv6.map(std::net::IpAddr::V6));
+    let client_ip = primary_address
+        .map(|address| address.to_string())
+        .unwrap_or_default();
     let obf = crate::config::PushedObf {
         padding: pcfg.obfuscation.padding.clone(),
         heartbeat: pcfg.obfuscation.heartbeat.clone(),
         traffic_normalization: pcfg.obfuscation.traffic_normalization.clone(),
         traffic_shaping: pcfg.obfuscation.traffic_shaping.clone(),
+        recordizer: if !pcfg.obfuscation.recordizer.is_off()
+            && crate::protocol::capabilities::packet_mux_supported(client_capabilities)
+        {
+            Some(pcfg.obfuscation.recordizer.clone())
+        } else {
+            None
+        },
     };
     let routes: serde_json::Value =
         serde_json::from_str(routes_json).unwrap_or_else(|_| serde_json::json!([]));
@@ -2020,14 +3889,37 @@ pub fn build_auth_ok(
     // AdGuard / NextDNS box) directly. Otherwise push the proxy's listen IP only when
     // the proxy runs (its default 10.9.0.1 resolves nowhere — pushing it would black-
     // hole client name resolution). Empty => the client keeps its own resolvers. The
-    // client strict-IP-validates the pushed value before applying platform DNS.
-    let pushed_dns = if let Some(ip) = pcfg.dns.push_servers.first() {
-        ip.as_str()
-    } else if pcfg.dns.enabled {
-        pcfg.dns.listen.as_str()
-    } else {
-        ""
+    // client strict-IP-validates the pushed value before touching resolv.conf.
+    let family_is_active = |address: std::net::IpAddr| {
+        (address.is_ipv4() && assigned.ipv4.is_some())
+            || (address.is_ipv6() && assigned.ipv6.is_some())
     };
+    let mut pushed_dns_servers: Vec<&str> = if !pcfg.dns.push_servers.is_empty() {
+        pcfg.dns
+            .push_servers
+            .iter()
+            .filter_map(|value| {
+                value
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+                    .filter(|address| family_is_active(*address))
+                    .map(|_| value.as_str())
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if pushed_dns_servers.is_empty() && pcfg.dns.enabled {
+        if assigned.ipv4.is_some() {
+            pushed_dns_servers.push(pcfg.dns.listen.as_str());
+        }
+        if assigned.ipv6.is_some() {
+            if let Some(address) = pcfg.dns.listen_ipv6.as_deref() {
+                pushed_dns_servers.push(address);
+            }
+        }
+    }
+    let pushed_dns = pushed_dns_servers.first().copied().unwrap_or("");
     // Push the VPN subnet prefix length so the client sets the correct on-link
     // prefix instead of assuming /24. Derived from the canonical pool CIDR parser;
     // falls back to 24 if it cannot be parsed (a non-/24 pool would otherwise break
@@ -2036,10 +3928,23 @@ pub fn build_auth_ok(
     let prefix: u8 = crate::config::server::pool_subnet(&pcfg.pool.cidr)
         .map(|subnet| subnet.prefix)
         .unwrap_or(24);
-    let body = serde_json::json!({
+    let ipv6_prefix = crate::config::server::ipv6_pool_subnet(&pcfg.pool.ipv6.cidr)
+        .map(|subnet| subnet.prefix)
+        .unwrap_or(64);
+    let legacy_prefix = if assigned.ipv4.is_some() {
+        prefix
+    } else {
+        ipv6_prefix
+    };
+    let legacy_gateway = if assigned.ipv4.is_some() {
+        pcfg.tun.address.as_str()
+    } else {
+        pcfg.tun.ipv6_address.as_deref().unwrap_or("")
+    };
+    let mut body = serde_json::json!({
         "client_ip": client_ip,
-        "server_ip": pcfg.tun.address,
-        "prefix": prefix,
+        "server_ip": legacy_gateway,
+        "prefix": legacy_prefix,
         // Push the server profile's TUN MTU. A client with mtu=0 (auto — the
         // default) adopts this value; a client that set its own mtu keeps it.
         // Additive: older clients ignore the field and use their own default.
@@ -2063,12 +3968,120 @@ pub fn build_auth_ok(
         // opens exactly max_streams. Only meaningful when bonding is active.
         "multipath_adaptive": max_streams > 1 && pcfg.obfuscation.multipath.adaptive,
     });
+    if let Some(session_id) = udp_roaming_session_id {
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                "udp_roaming_session".into(),
+                serde_json::json!(format!("{session_id:016x}")),
+            );
+        }
+    }
+    let plan_v2 = client_capabilities.is_some_and(|capabilities| {
+        capabilities.core_bits & crate::protocol::capabilities::client_capability::NETWORK_PLAN_V2
+            != 0
+    });
+    if plan_v2 {
+        // An L3 TUN is point-to-point: assigning the pool prefix (especially an IPv6 /64)
+        // would make the client kernel treat every peer as on-link and start ARP/NDP on an
+        // interface that carries IP packets, not Ethernet frames.  Keep the pool prefix in
+        // `on_link_prefix_len` for ACL/routing calculations, but assign a host prefix to the
+        // TUN. TAP is a real L2 segment, so it deliberately receives the pool prefix. The
+        // current shared client core normalizes this projection once more against its own
+        // local device type because TUN/TAP need not match across the L3 qeli wire; keeping
+        // this server-side projection preserves compatibility with older v2 clients.
+        let is_tap = pcfg.tun.device_type.eq_ignore_ascii_case("tap");
+        let ipv4_address_prefix = if is_tap { prefix } else { 32 };
+        let ipv6_address_prefix = if is_tap { ipv6_prefix } else { 128 };
+        let mut addresses = Vec::with_capacity(2);
+        if let Some(address) = assigned.ipv4 {
+            addresses.push(serde_json::json!({
+                "family": "ipv4",
+                "address": address,
+                "prefix_len": ipv4_address_prefix,
+                "on_link_prefix_len": prefix,
+                "gateway": pcfg.tun.address,
+            }));
+        }
+        if let Some(address) = assigned.ipv6 {
+            addresses.push(serde_json::json!({
+                "family": "ipv6",
+                "address": address,
+                "prefix_len": ipv6_address_prefix,
+                "on_link_prefix_len": ipv6_prefix,
+                "gateway": pcfg.tun.ipv6_address,
+            }));
+        }
+        let family_mode = match (assigned.ipv4.is_some(), assigned.ipv6.is_some()) {
+            (true, false) => "ipv4",
+            (true, true) => "dual",
+            (false, true) => "ipv6",
+            (false, false) => "ipv4",
+        };
+        let dns_servers: Vec<serde_json::Value> = pushed_dns_servers
+            .iter()
+            .map(|address| serde_json::json!({"address": address, "port": 53}))
+            .collect();
+        if let Some(object) = body.as_object_mut() {
+            object.insert("family_mode".into(), serde_json::json!(family_mode));
+            object.insert("addresses".into(), serde_json::json!(addresses));
+            object.insert("dns_servers".into(), serde_json::json!(dns_servers));
+        }
+    }
     format!("OK:{}", serde_json::to_string(&body).unwrap_or_default())
 }
 
 #[cfg(test)]
 mod auth_ok_prefix_tests {
-    use super::{build_auth_ok, JOIN_TOKEN_LEN};
+    use super::{
+        build_auth_error, build_auth_ok, build_auth_ok_for_addresses,
+        build_auth_ok_for_addresses_with_udp_roaming, build_routes_json_for_user,
+        resolve_static_addresses, JOIN_TOKEN_LEN,
+    };
+
+    #[test]
+    fn inactive_static_address_family_is_not_parsed() {
+        use crate::config::server::{IpMode, ProfileConfig};
+        use crate::config::users::{UserEntry, UsersDb};
+
+        let profile = ProfileConfig::baseline();
+        let ipv4_db = UsersDb {
+            users: vec![UserEntry {
+                username: "alice".into(),
+                enabled: true,
+                static_ip: Some("10.8.0.7".into()),
+                static_ipv6: Some("not-an-ipv6-address".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_static_addresses(&ipv4_db, &profile, "alice", IpMode::Ipv4).unwrap(),
+            (Some("10.8.0.7".parse().unwrap()), None)
+        );
+
+        let ipv6_db = UsersDb {
+            users: vec![UserEntry {
+                username: "alice".into(),
+                enabled: true,
+                static_ip: Some("not-an-ipv4-address".into()),
+                static_ipv6: Some("fd71:e1::7".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_static_addresses(&ipv6_db, &profile, "alice", IpMode::Ipv6).unwrap(),
+            (None, Some("fd71:e1::7".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn authenticated_negotiation_error_has_client_visible_wire_marker() {
+        assert_eq!(
+            build_auth_error("profile requires IPv6 capability"),
+            "ERR:profile requires IPv6 capability"
+        );
+    }
 
     #[test]
     fn pool_cidr_prefix_is_pushed_without_a_24_fallback() {
@@ -2076,7 +4089,7 @@ mod auth_ok_prefix_tests {
         profile.pool.cidr = "10.20.0.0/16".into();
         profile.tun.address = "10.20.0.1".into();
 
-        let message = build_auth_ok("10.20.0.2", &profile, "[]", &[0; JOIN_TOKEN_LEN], 1);
+        let message = build_auth_ok("10.20.0.2", &profile, "[]", &[0; JOIN_TOKEN_LEN], 1, None);
         let body: serde_json::Value = serde_json::from_str(
             message
                 .strip_prefix("OK:")
@@ -2087,34 +4100,212 @@ mod auth_ok_prefix_tests {
         assert_eq!(body["prefix"], 16);
         assert_eq!(body["server_ip"], "10.20.0.1");
     }
-}
 
-/// Program (add on connect / delete on disconnect) a kernel route that sends `cidr` into
-/// the profile's TUN, so the server's own stack delivers packets destined for a client's
-/// behind-subnet (iroute, #13) to qeli's TUN reader instead of the default route. Linux
-/// only, best-effort (a failure is logged, not fatal). `replace` is idempotent on connect.
-/// Best-effort teardown of a client's inbound kernel iroutes (#13) after its session
-/// left the map — see [`crate::server::SessionMap::take_client_routes`]. Spawned so a
-/// caller still holding the sessions write lock never blocks on `ip route del` (an `ip`
-/// command must not run under the lock). No-op when the client had no iroutes.
-pub(crate) fn spawn_client_route_teardown(
-    tasks: &crate::server::ProfileTasks,
-    cidrs: Vec<String>,
-    tun: String,
-) {
-    if cidrs.is_empty() {
-        return;
+    #[test]
+    fn recordizer_is_pushed_only_to_a_packet_mux_capable_client() {
+        let mut profile = crate::config::server::ProfileConfig::baseline();
+        profile.obfuscation.recordizer.policy = "prefer".into();
+        profile.obfuscation.recordizer.batch.max_packets = 7;
+
+        let legacy = build_auth_ok("10.20.0.2", &profile, "[]", &[0; JOIN_TOKEN_LEN], 1, None);
+        let legacy: serde_json::Value = serde_json::from_str(
+            legacy
+                .strip_prefix("OK:")
+                .expect("auth response must carry the OK marker"),
+        )
+        .unwrap();
+        assert!(legacy["obfuscation"].get("recordizer").is_none());
+
+        let capabilities = crate::protocol::capabilities::ClientCapabilities {
+            core_bits: crate::protocol::capabilities::client_capability::PACKET_MUX_V1,
+            ..Default::default()
+        };
+        let current = build_auth_ok(
+            "10.20.0.2",
+            &profile,
+            "[]",
+            &[0; JOIN_TOKEN_LEN],
+            1,
+            Some(capabilities),
+        );
+        let current: serde_json::Value = serde_json::from_str(
+            current
+                .strip_prefix("OK:")
+                .expect("auth response must carry the OK marker"),
+        )
+        .unwrap();
+        assert_eq!(current["obfuscation"]["recordizer"]["policy"], "prefer");
+        assert_eq!(
+            current["obfuscation"]["recordizer"]["batch"]["max_packets"],
+            7
+        );
     }
-    tasks.spawn(async move {
-        for cidr in &cidrs {
-            program_client_subnet_route(false, cidr, &tun).await;
-        }
-    });
+
+    #[test]
+    fn udp_roaming_bootstrap_is_additive_canonical_and_absent_from_legacy_auth_ok() {
+        let profile = crate::config::server::ProfileConfig::baseline();
+        let assigned = crate::server::pool::AssignedAddresses {
+            ipv4: Some("10.9.0.2".parse().unwrap()),
+            ipv6: None,
+        };
+        let legacy =
+            build_auth_ok_for_addresses(assigned, &profile, "[]", &[0; JOIN_TOKEN_LEN], 1, None);
+        let legacy: serde_json::Value =
+            serde_json::from_str(legacy.strip_prefix("OK:").unwrap()).unwrap();
+        assert!(legacy.get("udp_roaming_session").is_none());
+
+        let roaming = build_auth_ok_for_addresses_with_udp_roaming(
+            assigned,
+            &profile,
+            "[]",
+            &[0; JOIN_TOKEN_LEN],
+            1,
+            Some(crate::protocol::capabilities::ClientCapabilities {
+                core_bits: crate::protocol::capabilities::client_capability::CONTROL_V2
+                    | crate::protocol::capabilities::client_capability::UDP_ROAM_V1
+                    | crate::protocol::capabilities::client_capability::UDP_DATA_FRAG_V1,
+                ..Default::default()
+            }),
+            Some(0x0102_0304_0506_0708),
+        );
+        let roaming: serde_json::Value =
+            serde_json::from_str(roaming.strip_prefix("OK:").unwrap()).unwrap();
+        assert_eq!(
+            roaming["udp_roaming_session"],
+            serde_json::json!("0102030405060708")
+        );
+    }
+
+    #[test]
+    fn network_plan_v2_is_additive_and_keeps_legacy_projection() {
+        let mut profile = crate::config::server::ProfileConfig::baseline();
+        profile.pool.cidr = "10.30.0.0/20".into();
+        profile.tun.address = "10.30.0.1".into();
+        let capabilities = crate::protocol::capabilities::ClientCapabilities {
+            core_bits: crate::protocol::capabilities::client_capability::NETWORK_PLAN_V2,
+            ..Default::default()
+        };
+        let message = build_auth_ok(
+            "10.30.0.2",
+            &profile,
+            "[]",
+            &[0; JOIN_TOKEN_LEN],
+            1,
+            Some(capabilities),
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(message.strip_prefix("OK:").unwrap()).unwrap();
+        assert_eq!(body["client_ip"], "10.30.0.2");
+        assert_eq!(body["family_mode"], "ipv4");
+        assert_eq!(body["addresses"][0]["prefix_len"], 32);
+        assert_eq!(body["addresses"][0]["on_link_prefix_len"], 20);
+        assert_eq!(body["addresses"][0]["gateway"], "10.30.0.1");
+    }
+
+    #[test]
+    fn ipv6_tun_uses_host_prefix_without_losing_pool_prefix() {
+        let mut profile = crate::config::server::ProfileConfig::baseline();
+        profile.tun.device_type = "tun".into();
+        profile.tun.ipv6_address = Some("fd71:e1::1".into());
+        profile.pool.ipv6.cidr = "fd71:e1::/64".into();
+        let capabilities = crate::protocol::capabilities::ClientCapabilities {
+            core_bits: crate::protocol::capabilities::client_capability::NETWORK_PLAN_V2,
+            ..Default::default()
+        };
+        let message = build_auth_ok_for_addresses(
+            crate::server::pool::AssignedAddresses {
+                ipv4: None,
+                ipv6: Some("fd71:e1::2".parse().unwrap()),
+            },
+            &profile,
+            "[]",
+            &[0; JOIN_TOKEN_LEN],
+            1,
+            Some(capabilities),
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(message.strip_prefix("OK:").unwrap()).unwrap();
+        assert_eq!(body["addresses"][0]["prefix_len"], 128);
+        assert_eq!(body["addresses"][0]["on_link_prefix_len"], 64);
+        assert_eq!(body["addresses"][0]["gateway"], "fd71:e1::1");
+    }
+
+    #[test]
+    fn tap_keeps_pool_prefix_for_layer_two_neighbor_discovery() {
+        let mut profile = crate::config::server::ProfileConfig::baseline();
+        profile.tun.device_type = "tap".into();
+        profile.tun.ipv6_address = Some("fd71:e1::1".into());
+        profile.pool.ipv6.cidr = "fd71:e1::/64".into();
+        let capabilities = crate::protocol::capabilities::ClientCapabilities {
+            core_bits: crate::protocol::capabilities::client_capability::NETWORK_PLAN_V2,
+            ..Default::default()
+        };
+        let message = build_auth_ok_for_addresses(
+            crate::server::pool::AssignedAddresses {
+                ipv4: None,
+                ipv6: Some("fd71:e1::2".parse().unwrap()),
+            },
+            &profile,
+            "[]",
+            &[0; JOIN_TOKEN_LEN],
+            1,
+            Some(capabilities),
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(message.strip_prefix("OK:").unwrap()).unwrap();
+        assert_eq!(body["addresses"][0]["prefix_len"], 64);
+        assert_eq!(body["addresses"][0]["on_link_prefix_len"], 64);
+    }
+
+    #[test]
+    fn route_defaults_and_filtering_follow_the_assigned_families() {
+        let mut profile = crate::config::server::ProfileConfig::baseline();
+        profile.tun.ipv6_address = Some("fd71:e1::1".into());
+        profile.routing.advertised_routes = vec![
+            crate::config::server::PushedRoute {
+                cidr: "10.20.0.0/16".into(),
+                ..Default::default()
+            },
+            crate::config::server::PushedRoute {
+                cidr: "2001:db8:20::/64".into(),
+                ..Default::default()
+            },
+        ];
+        let users = crate::config::users::UsersDb::default();
+
+        let ipv4 = build_routes_json_for_user(
+            &profile,
+            &users,
+            "alice",
+            crate::server::pool::AssignedAddresses {
+                ipv4: Some("10.9.0.2".parse().unwrap()),
+                ipv6: None,
+            },
+        );
+        let ipv4: serde_json::Value = serde_json::from_str(&ipv4).unwrap();
+        assert_eq!(ipv4.as_array().unwrap().len(), 1);
+        assert_eq!(ipv4[0]["gateway"], "10.9.0.1");
+
+        let ipv6 = build_routes_json_for_user(
+            &profile,
+            &users,
+            "alice",
+            crate::server::pool::AssignedAddresses {
+                ipv4: None,
+                ipv6: Some("fd71:e1::2".parse().unwrap()),
+            },
+        );
+        let ipv6: serde_json::Value = serde_json::from_str(&ipv6).unwrap();
+        assert_eq!(ipv6.as_array().unwrap().len(), 1);
+        assert_eq!(ipv6[0]["gateway"], "fd71:e1::1");
+    }
 }
 
 /// Register a client's inbound iroute subnets (#13) into the sessions map under the write
-/// lock, returning the CIDRs whose kernel `ip route` must be programmed after the lock
-/// drops. Refuses a default route or one covering the server's tunnel IP, and skips a
+/// lock, returning the non-default CIDRs whose kernel `ip route` must be programmed after
+/// the lock drops. A default route is kept only in qeli's internal longest-prefix table
+/// (exit-node); installing it in the host table would capture the server's own WAN. Refuses
+/// a non-default route covering the server's tunnel IP, and skips a
 /// subnet already claimed by a DIFFERENT client (first-registered wins). Admin-configured
 /// (per-user `client_subnets`) — a footgun guard, not an untrusted-input gate. Shared by
 /// the TCP (handler) and UDP (udp_handler) auth paths so both transports route to a
@@ -2122,76 +4313,467 @@ pub(crate) fn spawn_client_route_teardown(
 pub(crate) fn register_client_subnets(
     sessions: &mut crate::server::SessionMap,
     client_subnets: &[String],
-    client_ip: std::net::Ipv4Addr,
+    client_ip: std::net::IpAddr,
     session: &std::sync::Arc<SessionShared>,
-    server_tun: Option<std::net::Ipv4Addr>,
+    server_tun_addresses: &[std::net::IpAddr],
     username: &str,
     profile_name: &str,
 ) -> Vec<String> {
     let mut programmed = Vec::new();
     for cidr in client_subnets {
+        if !client_subnet_family_active(
+            cidr,
+            session.client_ipv4.is_some(),
+            session.client_ipv6.is_some(),
+        ) {
+            log::warn!(
+                "iroute: skipping client_subnet '{cidr}' for user '{}' because its address family was not negotiated for this session",
+                crate::util::log_identity(username)
+            );
+            continue;
+        }
         let r = match crate::server::ClientRoute::parse(cidr, client_ip, session.clone()) {
             Some(r) => r,
             None => {
                 log::warn!(
-                    "iroute: skipping malformed client_subnet '{cidr}' for user '{username}'"
+                    "iroute: skipping malformed client_subnet '{cidr}' for user '{}'",
+                    crate::util::log_identity(username)
                 );
                 continue;
             }
         };
-        if r.prefix() == 0 || server_tun.map(|t| r.contains(t)).unwrap_or(false) {
-            log::warn!(
-                "iroute: refusing client_subnet '{cidr}' (user '{username}') — it would capture the default route or the tunnel gateway"
-            );
-            continue;
-        }
-        if sessions
-            .client_routes
-            .iter()
-            .any(|e| e.cidr == r.cidr && e.client_ip != client_ip)
+        let is_default = r.prefix() == 0;
+        if !is_default
+            && server_tun_addresses
+                .iter()
+                .any(|address| r.contains(*address))
         {
             log::warn!(
-                "iroute: '{cidr}' (user '{}') is already claimed by another client — skipping",
-                crate::util::log_sanitize(username)
-            );
+                "iroute: refusing client_subnet '{cidr}' (user '{}') — it would capture the tunnel gateway",
+                crate::util::log_identity(username)
+                );
             continue;
         }
-        // Sanitize the username on the way to the log like every other user-derived value —
-        // a CR/LF in it could otherwise forge log records (CWE-117). These two were the last
-        // raw `{username}` sites left in server/. (H-8)
+        if let Some(existing) = sessions
+            .client_routes
+            .iter()
+            .find(|existing| existing.same_network(&r))
+        {
+            if existing.client_ip != client_ip {
+                log::warn!(
+                    "iroute: '{cidr}' (user '{}') is already claimed by another client — skipping",
+                    crate::util::log_identity(username)
+                );
+            } else {
+                log::debug!(
+                    "iroute: duplicate client_subnet '{cidr}' for user '{}' — keeping one canonical route",
+                    crate::util::log_identity(username)
+                );
+            }
+            continue;
+        }
         log::info!(
             "iroute: {cidr} -> client {} ({client_ip}) on profile '{profile_name}'",
-            crate::util::log_sanitize(username)
+            crate::util::log_identity(username)
         );
-        programmed.push(r.cidr.clone());
+        // `/0` is an internal session-to-session next hop. Never turn it into the Linux
+        // host default route: the qeli server's own listener/WAN packets would be captured
+        // by its TUN and the profile would disconnect itself. Non-default iroutes still need
+        // a kernel route so traffic originating outside another qeli client reaches the TUN.
+        if !is_default {
+            programmed.push(r.cidr.clone());
+        }
         sessions.client_routes.push(r);
     }
     programmed
 }
 
-pub(crate) async fn program_client_subnet_route(add: bool, cidr: &str, tun: &str) {
-    let action = if add { "replace" } else { "del" };
-    match tokio::process::Command::new("ip")
-        .args(["route", action, cidr, "dev", tun])
-        .output()
-        .await
-    {
-        Ok(o) if o.status.success() => {
-            log::info!("iroute: ip route {} {} dev {}", action, cidr, tun)
+fn client_subnet_family_active(cidr: &str, has_ipv4: bool, has_ipv6: bool) -> bool {
+    let address = cidr
+        .trim()
+        .split_once('/')
+        .map_or(cidr.trim(), |(address, _)| address.trim());
+    match address.parse::<std::net::IpAddr>() {
+        Ok(address) if address.is_ipv4() => has_ipv4,
+        Ok(_) => has_ipv6,
+        // Leave malformed diagnostics to ClientRoute::parse below.
+        Err(_) => true,
+    }
+}
+
+pub(crate) fn configured_tun_addresses(
+    profile: &crate::config::server::ProfileConfig,
+) -> Vec<std::net::IpAddr> {
+    let mut addresses = Vec::with_capacity(2);
+    if profile.tun.ip_mode != crate::config::server::IpMode::Ipv6 {
+        if let Ok(address) = profile.tun.address.parse::<std::net::Ipv4Addr>() {
+            addresses.push(std::net::IpAddr::V4(address));
         }
-        Ok(o) => log::warn!(
-            "iroute: `ip route {} {} dev {}` failed: {}",
+    }
+    if profile.tun.ip_mode != crate::config::server::IpMode::Ipv4 {
+        if let Some(address) = profile
+            .tun
+            .ipv6_address
+            .as_deref()
+            .and_then(|address| address.parse::<std::net::Ipv6Addr>().ok())
+        {
+            addresses.push(std::net::IpAddr::V6(address));
+        }
+    }
+    addresses
+}
+
+/// Program (add on connect / delete on disconnect) a kernel route that sends `cidr` into
+/// the profile's TUN. Connect is fail-closed: an existing exact route is never replaced.
+/// It is adopted only when both the TUN and qeli's ownership metric match, allowing safe
+/// recovery of a route left by an earlier qeli process without deleting admin-owned state.
+/// The caller decides whether an error is fatal (authentication) or best-effort (teardown).
+pub(crate) async fn program_client_subnet_route(
+    add: bool,
+    cidr: &str,
+    tun: &str,
+) -> anyhow::Result<()> {
+    let result = program_client_subnet_route_inner(add, cidr, tun).await;
+    if let Err(error) = &result {
+        log::warn!("iroute: {error}");
+    }
+    result
+}
+
+async fn program_client_subnet_route_inner(add: bool, cidr: &str, tun: &str) -> anyhow::Result<()> {
+    // Defence in depth: exit-node defaults live only in SessionMap. Even if a future caller
+    // accidentally includes one in its programmed/teardown list, never add *or delete* the
+    // Linux host default route here.
+    if client_subnet_is_default(cidr) {
+        log::debug!("iroute: keeping internal default '{cidr}' out of the host route table");
+        return Ok(());
+    }
+
+    if add {
+        let existing = query_client_subnet_routes(cidr).await?;
+        if !existing.is_empty() {
+            if route_lines_are_owned_by_qeli(&existing, tun) {
+                log::info!(
+                    "iroute: adopting existing qeli-owned route for {cidr} on {}",
+                    crate::util::log_sanitize(tun)
+                );
+                return Ok(());
+            }
+            anyhow::bail!(
+                "refusing to replace or adopt unowned host route for {cidr}: {}",
+                crate::util::log_sanitize(&existing.join(" | "))
+            );
+        }
+    }
+
+    let action = if add { "add" } else { "del" };
+    let args = client_subnet_route_args(action, cidr, tun);
+    run_client_subnet_ip(&args, true).await?;
+
+    if add {
+        // Re-read after the atomic RTM_NEWROUTE operation. This catches an administrator or
+        // another network manager racing our preflight with a different exact route. Delete
+        // only our device-qualified route before refusing the admission.
+        let verified = match query_client_subnet_routes(cidr).await {
+            Ok(routes) => routes,
+            Err(verify_error) => {
+                // `route add` has already succeeded. A failed ownership query must not
+                // leave that route behind after admission is rejected and its session/IP
+                // allocation is rolled back by the caller.
+                let cleanup = client_subnet_route_args("del", cidr, tun);
+                let cleanup_error = run_client_subnet_ip(&cleanup, true).await.err();
+                if let Some(cleanup_error) = cleanup_error {
+                    anyhow::bail!(
+                        "could not verify newly added host route for {cidr}: {verify_error}; rollback also failed: {cleanup_error}"
+                    );
+                }
+                anyhow::bail!(
+                    "could not verify newly added host route for {cidr}: {verify_error}; route was rolled back"
+                );
+            }
+        };
+        if verified.is_empty() || !route_lines_are_owned_by_qeli(&verified, tun) {
+            let cleanup = client_subnet_route_args("del", cidr, tun);
+            let cleanup_error = run_client_subnet_ip(&cleanup, true).await.err();
+            if let Some(cleanup_error) = cleanup_error {
+                anyhow::bail!(
+                    "host route ownership changed while adding {cidr}; observed: {}; rollback also failed: {cleanup_error}",
+                    crate::util::log_sanitize(&verified.join(" | "))
+                );
+            }
+            anyhow::bail!(
+                "host route ownership changed while adding {cidr}; observed: {}; route was rolled back",
+                crate::util::log_sanitize(&verified.join(" | "))
+            );
+        }
+    }
+    Ok(())
+}
+
+const CLIENT_SUBNET_ROUTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+async fn run_client_subnet_ip(
+    args: &[String],
+    log_success: bool,
+) -> anyhow::Result<std::process::Output> {
+    let display_command = format!("ip {}", args.join(" "));
+    let mut process = tokio::process::Command::new("ip");
+    process.args(args).kill_on_drop(true);
+    let output = tokio::time::timeout(CLIENT_SUBNET_ROUTE_TIMEOUT, process.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("`{display_command}` timed out after 1 second"))?
+        .map_err(|error| anyhow::anyhow!("could not run `{display_command}`: {error}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`{display_command}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    if log_success {
+        log::info!("iroute: {display_command}");
+    }
+    Ok(output)
+}
+
+async fn query_client_subnet_routes(cidr: &str) -> anyhow::Result<Vec<String>> {
+    let args = client_subnet_route_show_args(cidr);
+    let output = run_client_subnet_ip(&args, false).await?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn route_lines_are_owned_by_qeli(lines: &[String], tun: &str) -> bool {
+    !lines.is_empty()
+        && lines.iter().all(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let devices = fields
+                .windows(2)
+                .filter(|pair| pair[0] == "dev")
+                .map(|pair| pair[1])
+                .collect::<Vec<_>>();
+            let metrics = fields
+                .windows(2)
+                .filter(|pair| pair[0] == "metric")
+                .map(|pair| pair[1])
+                .collect::<Vec<_>>();
+            devices == [tun]
+                && metrics == [CLIENT_SUBNET_ROUTE_METRIC]
+                && !fields.contains(&"via")
+                && !fields.contains(&"nexthop")
+        })
+}
+
+fn client_subnet_is_default(cidr: &str) -> bool {
+    let Some((address, prefix)) = cidr.trim().split_once('/') else {
+        return false;
+    };
+    prefix.trim() == "0" && address.trim().parse::<std::net::IpAddr>().is_ok()
+}
+
+// A non-default metric is an ownership marker, not a routing preference: admission rejects
+// every competing exact prefix before add. Including it in both add and del means a later
+// admin/network-manager replacement on the same TUN cannot be mistaken for qeli's route.
+const CLIENT_SUBNET_ROUTE_METRIC: &str = "42760";
+
+fn client_subnet_route_args(action: &str, cidr: &str, tun: &str) -> Vec<String> {
+    let ipv6 = cidr
+        .trim()
+        .split_once('/')
+        .map(|(address, _)| address.trim())
+        .and_then(|address| address.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|address| address.is_ipv6());
+    let mut args = Vec::with_capacity(if ipv6 { 8 } else { 7 });
+    if ipv6 {
+        args.push("-6".to_string());
+    }
+    args.extend(
+        [
+            "route",
             action,
             cidr,
+            "dev",
             tun,
-            String::from_utf8_lossy(&o.stderr).trim()
-        ),
-        Err(e) => log::warn!(
-            "iroute: could not run `ip route {} {}`: {}",
-            action,
-            cidr,
-            e
-        ),
+            "metric",
+            CLIENT_SUBNET_ROUTE_METRIC,
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    args
+}
+
+fn client_subnet_route_show_args(cidr: &str) -> Vec<String> {
+    let ipv6 = cidr
+        .trim()
+        .split_once('/')
+        .map(|(address, _)| address.trim())
+        .and_then(|address| address.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|address| address.is_ipv6());
+    let mut args = Vec::with_capacity(if ipv6 { 8 } else { 7 });
+    if ipv6 {
+        args.push("-6".to_string());
+    }
+    args.extend(
+        ["route", "show", "table", "main", "exact", cidr]
+            .into_iter()
+            .map(str::to_string),
+    );
+    args
+}
+
+#[cfg(test)]
+mod iroute_family_tests {
+    use super::{
+        client_subnet_family_active, client_subnet_is_default, client_subnet_route_args,
+        client_subnet_route_show_args, configured_tun_addresses, exit_access_from_routes_json,
+        route_lines_are_owned_by_qeli, routes_without_exit_defaults,
+    };
+
+    #[test]
+    fn routed_subnets_are_limited_to_the_negotiated_families() {
+        assert!(client_subnet_family_active("10.20.0.0/16", true, false));
+        assert!(!client_subnet_family_active(
+            "2001:db8:20::/64",
+            true,
+            false
+        ));
+        assert!(client_subnet_family_active("2001:db8:20::/64", false, true));
+        assert!(!client_subnet_family_active("10.20.0.0/16", false, true));
+    }
+
+    #[test]
+    fn ipv6_kernel_iroutes_select_the_ipv6_route_table() {
+        assert_eq!(
+            client_subnet_route_args("add", "2001:db8:20::/64", "qeli0"),
+            [
+                "-6",
+                "route",
+                "add",
+                "2001:db8:20::/64",
+                "dev",
+                "qeli0",
+                "metric",
+                "42760"
+            ]
+        );
+        assert_eq!(
+            client_subnet_route_args("del", "10.20.0.0/16", "qeli0"),
+            [
+                "route",
+                "del",
+                "10.20.0.0/16",
+                "dev",
+                "qeli0",
+                "metric",
+                "42760"
+            ]
+        );
+        assert_eq!(
+            client_subnet_route_show_args("2001:db8:20::/64"),
+            [
+                "-6",
+                "route",
+                "show",
+                "table",
+                "main",
+                "exact",
+                "2001:db8:20::/64"
+            ]
+        );
+    }
+
+    #[test]
+    fn post_add_ownership_requires_our_tun_and_metric_on_every_exact_route() {
+        assert!(route_lines_are_owned_by_qeli(
+            &["192.168.50.0/24 dev vpn0 scope link metric 42760".into()],
+            "vpn0"
+        ));
+        assert!(!route_lines_are_owned_by_qeli(
+            &["192.168.50.0/24 dev vpn0 scope link".into()],
+            "vpn0"
+        ));
+        assert!(!route_lines_are_owned_by_qeli(
+            &["192.168.50.0/24 dev vpn0 scope link metric 10".into()],
+            "vpn0"
+        ));
+        assert!(!route_lines_are_owned_by_qeli(
+            &["192.168.50.0/24 via 10.9.0.2 dev vpn0 metric 42760".into()],
+            "vpn0"
+        ));
+        assert!(!route_lines_are_owned_by_qeli(
+            &[
+                "192.168.50.0/24 metric 42760 nexthop dev vpn0 weight 1 nexthop dev eth0 weight 1"
+                    .into(),
+            ],
+            "vpn0"
+        ));
+        assert!(!route_lines_are_owned_by_qeli(
+            &[
+                "192.168.50.0/24 dev vpn0 scope link metric 42760".into(),
+                "192.168.50.0/24 via 192.0.2.1 dev eth0 metric 10".into(),
+            ],
+            "vpn0"
+        ));
+        assert!(!route_lines_are_owned_by_qeli(&[], "vpn0"));
+    }
+
+    #[test]
+    fn exit_defaults_never_reach_kernel_route_commands() {
+        assert!(client_subnet_is_default("0.0.0.0/0"));
+        assert!(client_subnet_is_default("::/0"));
+        assert!(!client_subnet_is_default("0.0.0.0/1"));
+        assert!(!client_subnet_is_default("not-an-ip/0"));
+    }
+
+    #[test]
+    fn effective_default_routes_authorize_only_their_own_family() {
+        let access = exit_access_from_routes_json(
+            r#"[
+                {"cidr":"0.0.0.0/0"},
+                {"cidr":"2001:db8:20::/64"}
+            ]"#,
+        );
+        assert!(access.ipv4);
+        assert!(!access.ipv6);
+
+        let both =
+            exit_access_from_routes_json(r#"[{"cidr":"203.0.113.7/0"},{"cidr":"2001:db8::7/0"}]"#);
+        assert!(both.ipv4 && both.ipv6);
+        assert_eq!(
+            exit_access_from_routes_json("not-json"),
+            crate::server::ExitAccess::default()
+        );
+
+        let client_routes = routes_without_exit_defaults(
+            r#"[
+                {"cidr":"0.0.0.0/0"},
+                {"cidr":"::/0"},
+                {"cidr":"10.20.0.0/16","metric":42}
+            ]"#,
+        );
+        let client_routes: serde_json::Value = serde_json::from_str(&client_routes).unwrap();
+        assert_eq!(client_routes.as_array().unwrap().len(), 1);
+        assert_eq!(client_routes[0]["cidr"], "10.20.0.0/16");
+    }
+
+    #[test]
+    fn inactive_profile_address_fields_are_not_treated_as_live_gateways() {
+        let mut profile = crate::config::server::ProfileConfig::baseline();
+        profile.tun.ipv6_address = Some("fd71:e1::1".into());
+        assert_eq!(
+            configured_tun_addresses(&profile),
+            vec!["10.9.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+
+        profile.tun.ip_mode = crate::config::server::IpMode::Ipv6;
+        assert_eq!(
+            configured_tun_addresses(&profile),
+            vec!["fd71:e1::1".parse::<std::net::IpAddr>().unwrap()]
+        );
     }
 }
 
@@ -2199,13 +4781,12 @@ fn build_routes_json_for_user(
     pcfg: &crate::config::server::ProfileConfig,
     users_db: &crate::config::users::UsersDb,
     username: &str,
+    assigned: crate::server::pool::AssignedAddresses,
 ) -> String {
     let user_routes = users_db
         .find_user(username)
         .filter(|u| !u.routes.is_empty())
         .map(|u| u.routes.as_slice());
-
-    let gw_default = &pcfg.tun.address;
 
     // Build the JSON via serde_json so any value (cidr/gateway from config) is
     // properly escaped — a stray quote can't break the array (C-3). cidr/gateway
@@ -2214,12 +4795,8 @@ fn build_routes_json_for_user(
     if let Some(routes) = user_routes {
         let arr: Vec<serde_json::Value> = routes
             .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "cidr": r.cidr,
-                    "gateway": r.gateway.as_deref().unwrap_or(gw_default),
-                    "metric": r.metric.unwrap_or(100),
-                })
+            .filter_map(|r| {
+                active_route_json(pcfg, assigned, &r.cidr, r.gateway.as_deref(), r.metric)
             })
             .collect();
         serde_json::Value::Array(arr).to_string()
@@ -2228,16 +4805,53 @@ fn build_routes_json_for_user(
             .routing
             .advertised_routes
             .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "cidr": r.cidr,
-                    "gateway": r.gateway.as_deref().unwrap_or(gw_default),
-                    "metric": r.metric.unwrap_or(100),
-                })
+            .filter_map(|r| {
+                active_route_json(pcfg, assigned, &r.cidr, r.gateway.as_deref(), r.metric)
             })
             .collect();
         serde_json::Value::Array(arr).to_string()
     }
+}
+
+fn active_route_json(
+    pcfg: &crate::config::server::ProfileConfig,
+    assigned: crate::server::pool::AssignedAddresses,
+    cidr: &str,
+    configured_gateway: Option<&str>,
+    metric: Option<u32>,
+) -> Option<serde_json::Value> {
+    let route_address = cidr
+        .split_once('/')
+        .and_then(|(address, _)| address.parse::<std::net::IpAddr>().ok())?;
+    let family_is_active = if route_address.is_ipv4() {
+        assigned.ipv4.is_some()
+    } else {
+        assigned.ipv6.is_some()
+    };
+    if !family_is_active {
+        return None;
+    }
+    let default_gateway = if route_address.is_ipv4() {
+        Some(pcfg.tun.address.as_str())
+    } else {
+        pcfg.tun.ipv6_address.as_deref()
+    }?;
+    let gateway = configured_gateway.unwrap_or(default_gateway);
+    let gateway_address = gateway.parse::<std::net::IpAddr>().ok()?;
+    if route_address.is_ipv4() != gateway_address.is_ipv4() {
+        log::warn!(
+            "Profile '{}': route '{}' and gateway '{}' use different address families; route not pushed",
+            pcfg.name,
+            cidr,
+            gateway
+        );
+        return None;
+    }
+    Some(serde_json::json!({
+        "cidr": cidr,
+        "gateway": gateway,
+        "metric": metric.unwrap_or(100),
+    }))
 }
 
 #[cfg(test)]
@@ -2360,7 +4974,8 @@ mod server_wire_pool_tests {
 
 #[cfg(test)]
 mod downlink_mtu_tests {
-    use super::downlink_mtu_for;
+    use super::{downlink_mtu_for, downlink_mtu_for_packet};
+    use crate::protocol::ip::IpVersion;
 
     /// The whole point of returning `None`: a client that never reported must leave the
     /// forwarder's behaviour bit-for-bit as it was before #13.
@@ -2399,5 +5014,22 @@ mod downlink_mtu_tests {
         assert_eq!(downlink_mtu_for(70_000, 0), None);
         // 65_536 truncates to 0 in 16 bits — exactly the value that would look like "unset".
         assert_eq!(downlink_mtu_for(65_536, 0), None);
+    }
+
+    #[test]
+    fn ipv6_never_inherits_the_ipv4_report_floor() {
+        assert_eq!(downlink_mtu_for_packet(576, 1500, IpVersion::V4), Some(576));
+        assert_eq!(
+            downlink_mtu_for_packet(576, 1500, IpVersion::V6),
+            Some(1280)
+        );
+        assert_eq!(
+            downlink_mtu_for_packet(1279, 1500, IpVersion::V6),
+            Some(1280)
+        );
+        assert_eq!(
+            downlink_mtu_for_packet(1280, 1500, IpVersion::V6),
+            Some(1280)
+        );
     }
 }

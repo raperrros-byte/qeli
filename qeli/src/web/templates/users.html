@@ -1,4 +1,4 @@
-<div x-data="usersPage()" x-init="init()">
+<div x-data="usersPage">
 
   <div x-show="expiringSoon.length" class="card p-3 mb-4">
     <div class="flex items-center gap-x-3 gap-y-1 flex-wrap text-xs">
@@ -13,7 +13,7 @@
     <div class="flex items-center gap-2">
       <div x-show="loading" class="w-4 h-4 rounded-full border-2 border-blue-500 border-t-transparent animate-spin"></div>
       <span class="text-sm text-slate-500"
-            x-text="`${filteredUsers.length} shown · ${users.length} total · ${onlineCount} online`"></span>
+            x-text="userSummary"></span>
     </div>
     <button class="btn btn-primary" @click="openCreate()">
       <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-width="2" stroke-linecap="round" d="M12 5v14M5 12h14"/></svg>
@@ -24,17 +24,17 @@
   <div class="flex flex-wrap items-center gap-2 mb-3">
     <input class="inp text-xs py-1.5 px-2 h-8" style="width:14rem" type="search"
            placeholder="Search users…" x-model="search"
-           @input.debounce.200ms="page = 1; refreshUserView()">
-    <select class="inp text-xs py-1.5 px-2 h-8" style="width:9.5rem"
-            x-model="statusFilter" @change="page = 1; refreshUserView()">
+           @input.debounce.200ms="[page = 1, refreshUserView()]">
+    <select class="inp inp-compact inp-fit"
+            x-model="statusFilter" @change="[page = 1, refreshUserView()]">
       <option value="">All statuses</option>
       <option value="online">Online</option>
       <option value="offline">Offline</option>
       <option value="enabled">Enabled</option>
       <option value="disabled">Disabled</option>
     </select>
-    <select class="inp text-xs py-1.5 px-2 h-8" style="width:11rem"
-            x-model="sortMode" @change="page = 1; refreshUserView()">
+    <select class="inp inp-compact inp-fit"
+            x-model="sortMode" @change="[page = 1, refreshUserView()]">
       <option value="online_desc">Online first</option>
       <option value="username_asc">Username A–Z</option>
       <option value="username_desc">Username Z–A</option>
@@ -42,7 +42,7 @@
       <option value="lastseen_desc">Recently seen</option>
       <option value="group_asc">Group A–Z</option>
     </select>
-    <select class="inp text-xs py-1.5 px-2 h-8" style="width:6rem"
+    <select class="inp inp-compact inp-fit"
             x-model.number="pageSize" @change="page = 1">
       <option value="25">25 rows</option>
       <option value="50">50 rows</option>
@@ -73,7 +73,7 @@
           <th class="tbl-th" style="width:2rem"><input type="checkbox" :checked="allSel" @change="toggleAll()"></th>
           <th class="tbl-th">Username</th>
           <th class="tbl-th">Status</th>
-          <th class="tbl-th">Static IP</th>
+          <th class="tbl-th">Tunnel addresses</th>
           <th class="tbl-th">Bandwidth</th>
           <th class="tbl-th">Data usage</th>
           <th class="tbl-th">Group</th>
@@ -97,7 +97,16 @@
                       x-text="u.enabled ? 'Enabled' : 'Disabled'"></span>
               </div>
             </td>
-            <td class="tbl-td font-mono text-slate-300 text-xs" x-text="u.static_ip || '—'"></td>
+            <td class="tbl-td font-mono text-slate-300 text-xs">
+              <template x-for="entry in addressRows(u)" :key="entry.address">
+                <div class="flex items-center gap-1.5 mb-1 last:mb-0">
+                  <span x-text="entry.address"></span>
+                  <span x-show="entry.active" class="badge badge-on text-[9px]" x-text="qeliT('Active')"></span>
+                  <span x-show="entry.fixed" class="badge badge-off text-[9px]" x-text="qeliT('Fixed')"></span>
+                </div>
+              </template>
+              <div x-show="addressRows(u).length === 0">—</div>
+            </td>
             <td class="tbl-td text-xs">
               <span class="text-slate-500" x-show="!u.bandwidth || (!u.bandwidth.limit_mbps && !u.bandwidth.burst_mbps)">Unlimited</span>
               <span class="text-slate-300" x-show="u.bandwidth && u.bandwidth.limit_mbps > 0">
@@ -166,10 +175,10 @@
 
     <div x-show="filteredUsers.length > 0" class="flex flex-col gap-2 px-5 py-3 border-t border-[#21314e] sm:flex-row sm:items-center sm:justify-between">
       <span class="text-xs" style="color:var(--txt-dim)"
-            x-text="`Showing ${pageFrom}–${pageTo} of ${filteredUsers.length} users`"></span>
+            x-text="pageRangeLabel"></span>
       <div class="flex items-center gap-2">
         <button class="btn btn-ghost btn-sm" @click="setPage(page - 1)" :disabled="safePage <= 1">Previous</button>
-        <span class="text-xs font-mono" style="color:var(--txt-mut)" x-text="`Page ${safePage} of ${pageCount}`"></span>
+        <span class="text-xs font-mono" style="color:var(--txt-mut)" x-text="pageLabel"></span>
         <button class="btn btn-ghost btn-sm" @click="setPage(page + 1)" :disabled="safePage >= pageCount">Next</button>
       </div>
     </div>
@@ -258,10 +267,14 @@
             <input class="inp" type="number" min="0" x-model.number="form.bandwidth_burst" placeholder="0 = same as limit">
           </div>
         </div>
-        <div class="grid grid-cols-2 gap-3">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
           <div>
             <label class="block text-xs font-medium text-slate-400 mb-1.5">Static IP <span class="text-slate-600">(optional)</span></label>
             <input class="inp font-mono" type="text" x-model="form.static_ip" placeholder="10.8.0.X">
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-slate-400 mb-1.5">Static IPv6 <span class="text-slate-600">(optional)</span></label>
+            <input class="inp font-mono" type="text" x-model="form.static_ipv6" placeholder="fd71:e1:1234:1::2">
           </div>
           <div>
             <label class="block text-xs font-medium text-slate-400 mb-1.5">Group <span class="text-slate-600">(optional)</span></label>
@@ -317,7 +330,7 @@
                 <input class="inp font-mono w-36" type="text" :value="r.gateway" placeholder="gateway (opt)"
                   @input="form.routes[i].gateway = $event.target.value">
                 <input class="inp w-20" type="number" :value="r.metric" placeholder="metric"
-                  @input="form.routes[i].metric = ($event.target.value===''?null:parseInt($event.target.value))">
+                  @input="form.routes[i].metric = ($event.target.value===''?null:toInteger($event.target.value))">
                 <button class="btn btn-danger btn-sm px-2.5" @click="form.routes.splice(i,1)">×</button>
               </div>
             </template>
@@ -328,11 +341,11 @@
 
         <!-- Client subnets behind this client (iroute — INBOUND routing) -->
         <div>
-          <label class="block text-xs font-medium text-slate-400 mb-1.5">Client subnets <span class="text-slate-600">(iroute — subnets/addresses BEHIND this client; the server routes INBOUND traffic to them into this client's tunnel)</span></label>
+          <label class="block text-xs font-medium text-slate-400 mb-1.5">Client subnets <span class="text-slate-600">(iroute — subnets/addresses BEHIND this client; with profile NDP proxy they also become live upstream IPv6 ownership)</span></label>
           <div class="space-y-2">
             <template x-for="(s, i) in (form.client_subnets || [])" :key="i">
               <div class="flex gap-2 items-center">
-                <input class="inp font-mono flex-1" type="text" :value="s" placeholder="192.168.50.0/24 or 10.20.0.7"
+                <input class="inp font-mono flex-1" type="text" :value="s" placeholder="192.168.50.0/24 or 2001:db8:50::/64"
                   @input="form.client_subnets[i] = $event.target.value">
                 <button class="btn btn-danger btn-sm px-2.5" @click="form.client_subnets.splice(i,1)">×</button>
               </div>
@@ -619,17 +632,36 @@ function usersPage() {
     selected: [],
     usage: [],
     usageByUser: {},
+    activeAddressesByUser: {},
     search: '',
     statusFilter: '',
     sortMode: 'online_desc',
     page: 1,
     pageSize: 50,
     usageForm: { username: '', data_limit_gb: 0, expire_days: 0, mode: 'limit' },
+    fmt(value) { return window.fmt ? window.fmt(value) : String(value); },
+    qeliT(value) { return window.qeliT ? window.qeliT(value) : value; },
+    toInteger(value) { return Number.parseInt(value, 10); },
     // Thin shim over the shared dialog in layout.html, kept so the call sites below read
     // the same as before. New code can call qeliConfirm() directly.
     confirmDialog(title, message, opts = {}) { return qeliConfirm(title, message, opts); },
 
     get onlineCount() { return this.usage.filter(u => u.online).length; },
+    get userSummary() { return this.filteredUsers.length + ' shown · ' + this.users.length + ' total · ' + this.onlineCount + ' online'; },
+    addressRows(user) {
+      const rows = new Map();
+      const add = (address, kind) => {
+        const value = String(address || '').trim();
+        if (!value) return;
+        const row = rows.get(value) || { address: value, active: false, fixed: false };
+        row[kind] = true;
+        rows.set(value, row);
+      };
+      for (const address of this.activeAddressesByUser[user.username] || []) add(address, 'active');
+      add(user.static_ip, 'fixed');
+      add(user.static_ipv6, 'fixed');
+      return [...rows.values()];
+    },
     refreshUserView() {
       const q = this.search.trim().toLowerCase();
       const rows = this.users.filter(u => {
@@ -639,7 +671,8 @@ function usersPage() {
         if (this.statusFilter === 'enabled' && !u.enabled) return false;
         if (this.statusFilter === 'disabled' && u.enabled) return false;
         if (!q) return true;
-        return [u.username, u.static_ip, u.group, ...(u.profiles || [])]
+        return [u.username, u.static_ip, u.static_ipv6, u.group, ...(u.profiles || []),
+                ...this.addressRows(u).map(row => row.address)]
           .some(v => String(v || '').toLowerCase().includes(q));
       });
       const [key, dir] = this.sortMode.split('_');
@@ -667,6 +700,8 @@ function usersPage() {
     },
     get pageFrom() { return this.filteredUsers.length ? (this.safePage - 1) * this.pageSize + 1 : 0; },
     get pageTo() { return Math.min(this.safePage * this.pageSize, this.filteredUsers.length); },
+    get pageRangeLabel() { return 'Showing ' + this.pageFrom + '–' + this.pageTo + ' of ' + this.filteredUsers.length + ' users'; },
+    get pageLabel() { return 'Page ' + this.safePage + ' of ' + this.pageCount; },
     setPage(next) { this.page = Math.min(Math.max(1, next), this.pageCount); },
 
     get allSel() { return this.pageUsers.length > 0 && this.pageUsers.every(u => this.selected.includes(u.username)); },
@@ -699,16 +734,35 @@ function usersPage() {
       await this.load();
     },
 
-    // Per-user data usage (merged into the users table).
+    // Per-user data usage plus live tunnel addresses (merged into the users table).
     async loadUsage() {
       try {
         const u = await apiFetch('api/usage');
         if (u.ok) {
           this.usage = u.usage || [];
           this.usageByUser = Object.fromEntries(this.usage.map(row => [row.username, row]));
-          this.refreshUserView();
         }
       } catch { /* non-fatal: configured users are still manageable */ }
+      const active = {};
+      try {
+        const live = await apiFetch('api/clients');
+        if (live.ok) {
+          for (const session of live.clients || []) {
+            const username = String(session.username || '').trim();
+            if (!username) continue;
+            const addresses = Array.isArray(session.addresses) && session.addresses.length
+              ? session.addresses : [session.ip];
+            for (const rawAddress of addresses) {
+              const address = String(rawAddress || '').trim();
+              if (!address) continue;
+              active[username] ||= [];
+              if (!active[username].includes(address)) active[username].push(address);
+            }
+          }
+        }
+      } catch { /* fail closed: never retain stale addresses after a failed refresh */ }
+      this.activeAddressesByUser = active;
+      this.refreshUserView();
     },
     usageFor(name) { return this.usageByUser[name] || {}; },
     usagePct(u) { return u.data_limit_gb ? Math.min(100, ((u.used_down || 0) / (u.data_limit_gb * 1e9)) * 100) : 0; },
@@ -977,7 +1031,7 @@ function usersPage() {
       this.form = {
         username: '', plainPassword: '',
         bandwidth_limit: 0, bandwidth_burst: 0,
-        static_ip: '', group: '', max_sessions: 0,
+        static_ip: '', static_ipv6: '', group: '', max_sessions: 0,
         profiles: [], allowed_networks: [], routes: [], client_subnets: [],
       };
       this.modalError = '';
@@ -992,6 +1046,7 @@ function usersPage() {
         bandwidth_limit: u.bandwidth?.limit_mbps || 0,
         bandwidth_burst: u.bandwidth?.burst_mbps || 0,
         static_ip: u.static_ip || '',
+        static_ipv6: u.static_ipv6 || '',
         group: u.group || '',
         max_sessions: u.max_sessions || 0,
         profiles: Array.isArray(u.profiles) ? [...u.profiles] : [],
@@ -1027,6 +1082,7 @@ function usersPage() {
             password: this.form.plainPassword,
             enabled: true,
             static_ip: this.form.static_ip.trim() || null,
+            static_ipv6: this.form.static_ipv6.trim() || null,
             group: this.form.group.trim() || null,
             max_sessions: this.form.max_sessions || 0,
             bandwidth: { limit_mbps: this.form.bandwidth_limit || 0, burst_mbps: this.form.bandwidth_burst || 0 },
@@ -1056,6 +1112,7 @@ function usersPage() {
       try {
         const body = {
           static_ip: this.form.static_ip.trim() || null,
+          static_ipv6: this.form.static_ipv6.trim() || null,
           group: this.form.group.trim() || null,
           max_sessions: this.form.max_sessions || 0,
           bandwidth: { limit_mbps: this.form.bandwidth_limit || 0, burst_mbps: this.form.bandwidth_burst || 0 },
@@ -1192,4 +1249,5 @@ function usersPage() {
     },
   };
 }
+document.addEventListener('alpine:init', () => Alpine.data('usersPage', usersPage));
 </script>

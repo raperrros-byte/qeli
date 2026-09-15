@@ -45,6 +45,9 @@ REMOTE_BUILD_ROOT = "/tmp/qeli-native-repro"
 NDK = f"/root/android-sdk/ndk/{DEFAULT_ANDROID_NDK}"
 HOST = ("10.66.116.11", os.environ.get("QELI_LAB_USER", "root"))
 ABIS = ("arm64-v8a", "x86_64")
+EXPECTED_REALITY_EXPORTS = "6"
+EXPECTED_CLIENT_EXPORTS = "22"
+EXPECTED_JNI_EXPORTS = "21"
 
 ARTIFACTS = {
     f"native-libs/android/{abi}/libqeli.so": {
@@ -142,6 +145,13 @@ def build_pass(
     print(f"[android/{pass_name}] rc={return_code}")
     if return_code != 0:
         raise RuntimeError(f"Android build pass {pass_name} failed")
+    for abi in ABIS:
+        built = f"{output_dir(pass_name)}/{abi}/libqeli_core.so"
+        public = artifact_path(pass_name, abi)
+        client.checked(
+            f"mv -f {shlex.quote(built)} {shlex.quote(public)}",
+            f"publish stable libqeli.so ABI filename for {abi} pass {pass_name}",
+        )
     client.checked(
         f"rm -rf {shlex.quote(target_dir)}",
         f"release Android pass {pass_name} cache",
@@ -169,7 +179,11 @@ def verify_exports(client: LabConnection) -> None:
             f"[{abi}] libqeli.so={size} bytes, qeli_realtls exports={reality}, "
             f"qeli_client exports={core}, TransportCore JNI exports={jni}"
         )
-        if reality.strip() != "6" or core.strip() != "20" or jni.strip() != "19":
+        if (
+            reality.strip() != EXPECTED_REALITY_EXPORTS
+            or core.strip() != EXPECTED_CLIENT_EXPORTS
+            or jni.strip() != EXPECTED_JNI_EXPORTS
+        ):
             raise RuntimeError(f"{abi} artifact has an incomplete native export surface")
 
 
@@ -184,7 +198,7 @@ def main() -> int:
         sftp = client.open_sftp()
         try:
             count = sync_qeli_source(client, sftp, LOCAL_QELI, REMOTE_SOURCE)
-            print(f"[sync] {count} .rs files + Cargo.toml/.lock -> {HOST[0]}:{REMOTE_SOURCE}")
+            print(f"[sync] {count} source/assets files + Cargo.toml/.lock -> {HOST[0]}:{REMOTE_SOURCE}")
             pass_hashes = collect_reproducible_hashes(
                 ARTIFACTS,
                 lambda pass_name: build_pass(

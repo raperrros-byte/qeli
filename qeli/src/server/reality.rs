@@ -65,6 +65,45 @@ impl DecoyGate {
     }
 }
 
+async fn handle_authenticated_tls<S>(
+    server_state: Arc<ServerState>,
+    profile: Arc<ProfileRuntime>,
+    mut stream: S,
+    addr: std::net::SocketAddr,
+    tun_tx: TunIngress,
+    pre_auth_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    handshake_timeout: Duration,
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+
+    // New clients begin with the RFC 9113 connection preface. Legacy clients
+    // begin with their inner fake-TLS ClientHello. Replay the bytes in either
+    // branch so neither parser loses data while the server is upgraded first.
+    let mut prefix = [0u8; crate::protocol::h2_carrier::CLIENT_PREFACE.len()];
+    tokio::time::timeout(handshake_timeout, stream.read_exact(&mut prefix))
+        .await
+        .map_err(|_| anyhow::anyhow!("REALITY carrier selection timed out for {addr}"))?
+        .map_err(|error| anyhow::anyhow!("REALITY carrier selection failed for {addr}: {error}"))?;
+    let stream = crate::protocol::realtls::server::PrefixedStream::new(prefix.to_vec(), stream);
+
+    if prefix.as_slice() == crate::protocol::h2_carrier::CLIENT_PREFACE {
+        let h2 = tokio::time::timeout(
+            handshake_timeout,
+            crate::protocol::h2_carrier::accept(stream),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("REALITY HTTP/2 carrier timed out for {addr}"))?
+        .map_err(|error| anyhow::anyhow!("REALITY HTTP/2 carrier failed for {addr}: {error}"))?;
+        log::debug!("REALITY: genuine HTTP/2 carrier established with {addr}");
+        handler::handle_h2_client(server_state, profile, h2, addr, tun_tx, pre_auth_permit).await
+    } else {
+        log::debug!("REALITY: legacy inner carrier selected for {addr}");
+        handler::handle_client(server_state, profile, stream, addr, tun_tx, pre_auth_permit).await
+    }
+}
 pub(crate) async fn handle_connection(
     server_state: Arc<ServerState>,
     profile: Arc<ProfileRuntime>,
@@ -232,8 +271,16 @@ pub(crate) async fn handle_connection(
                     "REALITY: hand-rolled TLS established with {} — tunnel inside",
                     addr
                 );
-                handler::handle_client(server_state, profile, tls, addr, tun_tx, pre_auth_permit)
-                    .await
+                handle_authenticated_tls(
+                    server_state,
+                    profile,
+                    tls,
+                    addr,
+                    tun_tx,
+                    pre_auth_permit,
+                    handshake_timeout,
+                )
+                .await
             } else {
                 // Terminate a genuine TLS 1.3 session (rustls) and run the tunnel
                 // inside it. The rustls config (incl. the cert) is built once at
@@ -266,8 +313,16 @@ pub(crate) async fn handle_connection(
                     "REALITY: real TLS established with {} — tunnel inside",
                     addr
                 );
-                handler::handle_client(server_state, profile, tls, addr, tun_tx, pre_auth_permit)
-                    .await
+                handle_authenticated_tls(
+                    server_state,
+                    profile,
+                    tls,
+                    addr,
+                    tun_tx,
+                    pre_auth_permit,
+                    handshake_timeout,
+                )
+                .await
             }
         } else {
             handler::handle_client(server_state, profile, stream, addr, tun_tx, pre_auth_permit)
@@ -342,7 +397,11 @@ where
     let mut buf = vec![0u8; 16 * 1024];
     loop {
         let n = match tokio::time::timeout(idle, r.read(&mut buf)).await {
-            Ok(Ok(0)) => return Ok(()), // clean EOF
+            Ok(Ok(0)) => {
+                // Propagate this direction's FIN while leaving the reverse direction alive.
+                w.shutdown().await?;
+                return Ok(());
+            }
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -385,12 +444,10 @@ async fn bridge_to_target(inbound: TcpStream, target: &str) -> anyhow::Result<()
     let fwd = copy_until_idle(ri, wo, BRIDGE_IDLE_TIMEOUT);
     let rev = copy_until_idle(ro, wi, BRIDGE_IDLE_TIMEOUT);
 
-    let bridged = async {
-        tokio::select! {
-            r = fwd => r,
-            r = rev => r,
-        }
-    };
+    // Wait for both directions. The first clean EOF now half-closes its destination rather
+    // than cancelling the reverse copy, so protocols that send a request, FIN, then read a
+    // response are bridged correctly. Errors still cancel the sibling through try_join.
+    let bridged = async { tokio::try_join!(fwd, rev).map(|_| ()) };
 
     // Absolute cap on top of the idle timeout: a peer that dribbles one byte per
     // minute stays under the idle bound indefinitely otherwise.
@@ -484,7 +541,7 @@ async fn recv_peek(stream: &TcpStream, len: usize, budget_ms: u64) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     /// `has_alpn_extension` walks attacker-controlled length fields and decides whether a peer
@@ -607,5 +664,25 @@ mod tests {
         let got = recv_peek(&server, payload.len(), 1500).await.unwrap();
         assert_eq!(got, payload, "recv_peek must reassemble every segment");
         writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_until_idle_propagates_half_close() {
+        let (mut source_peer, source) = tokio::io::duplex(1024);
+        let (sink, mut sink_peer) = tokio::io::duplex(1024);
+        let copy =
+            tokio::spawn(
+                async move { copy_until_idle(source, sink, Duration::from_secs(1)).await },
+            );
+
+        source_peer.write_all(b"request").await.unwrap();
+        source_peer.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), sink_peer.read_to_end(&mut received))
+            .await
+            .expect("destination must observe propagated EOF")
+            .unwrap();
+        assert_eq!(received, b"request");
+        copy.await.unwrap().unwrap();
     }
 }

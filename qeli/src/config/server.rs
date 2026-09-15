@@ -36,6 +36,51 @@ fn default_dhcp_domain() -> String {
     "vpn".into()
 }
 
+pub const ROAMING_MIN_GRACE_SECS: u64 = 1;
+pub const ROAMING_MAX_GRACE_SECS: u64 = 3_600;
+pub const ROAMING_MIN_ORPHANED: usize = 1;
+pub const ROAMING_MAX_ORPHANED: usize = 65_536;
+pub const ROAMING_MIN_ORPHAN_BYTES: usize = 4 * 1024 * 1024;
+pub const ROAMING_MAX_ORPHAN_BYTES: usize = 1024 * 1024 * 1024;
+
+fn default_roaming_grace_secs() -> u64 {
+    30
+}
+fn default_roaming_max_orphaned() -> usize {
+    256
+}
+fn default_roaming_max_orphan_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+/// Profile-scoped server policy for authenticated session roaming.
+///
+/// A missing key remains false for upgrade compatibility: installing a new binary must not
+/// silently opt an existing sparse config into a new wire capability. New profiles and every
+/// shipped server template explicitly set it to true through [`ProfileConfig::new_profile`].
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RoamingConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    #[serde(default = "default_roaming_grace_secs")]
+    pub grace_secs: u64,
+    #[serde(default = "default_roaming_max_orphaned")]
+    pub max_orphaned: usize,
+    #[serde(default = "default_roaming_max_orphan_bytes")]
+    pub max_orphan_bytes: usize,
+}
+
+impl Default for RoamingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            grace_secs: default_roaming_grace_secs(),
+            max_orphaned: default_roaming_max_orphaned(),
+            max_orphan_bytes: default_roaming_max_orphan_bytes(),
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct ServerConfig {
     #[serde(default)]
@@ -82,6 +127,8 @@ pub struct ProfileConfig {
     pub obfuscation: ServerObfuscationConfig,
     #[serde(default)]
     pub performance: ServerPerformanceConfig,
+    #[serde(default)]
+    pub roaming: RoamingConfig,
 }
 
 impl Default for ProfileConfig {
@@ -96,6 +143,7 @@ impl Default for ProfileConfig {
             dhcp: DhcpConfig::default(),
             obfuscation: ServerObfuscationConfig::default(),
             performance: ServerPerformanceConfig::default(),
+            roaming: RoamingConfig::default(),
             identity_key: None,
             enabled: true,
         }
@@ -103,24 +151,51 @@ impl Default for ProfileConfig {
 }
 
 impl ProfileConfig {
-    /// A profile with every per-field serde default applied — the canonical
-    /// "new profile" template. The nested objects are spelled out so serde runs
+    /// A profile with every per-field serde default applied — the canonical sparse-config
+    /// parser baseline. The nested objects are spelled out so serde runs
     /// the `default_*` functions rather than the derived `Default` (which would
-    /// give "" / 0 / false for sub-tables). The web UI fetches this via
-    /// `GET /api/config/defaults` so the form never hard-codes (and drifts from)
-    /// the schema. Keep the skeleton in sync with the struct's sub-tables.
+    /// give "" / 0 / false for sub-tables). Keep the skeleton in sync with the
+    /// struct's sub-tables. Use [`Self::new_profile`] for an operator-created profile.
     pub fn baseline() -> Self {
         const SKELETON: &str = r#"{
-            "bind":{},"tun":{},"pool":{},
-            "routing":{"nat":{}},
+            "bind":{},"tun":{},"pool":{"ipv6":{}},
+            "routing":{"nat":{},"ipv6":{}},
             "dns":{},"dhcp":{},
             "obfuscation":{"padding":{},"fragmentation":{},"heartbeat":{},
                 "tls":{"reality_proxy":{}},
                 "traffic_normalization":{},"traffic_shaping":{},"anti_fingerprinting":{},"quic":{},
                 "multipath":{},"awg":{}},
-            "performance":{"tcp":{},"tun":{},"connection":{}}
+            "performance":{"tcp":{},"tun":{},"connection":{}},
+            "roaming":{}
         }"#;
         serde_json::from_str(SKELETON).expect("baseline profile skeleton is valid")
+    }
+
+    /// Defaults for a newly installed or operator-created profile. This is intentionally
+    /// separate from [`Self::baseline`]: old configs that omit roaming/recordizer settings
+    /// retain their legacy behaviour, while every new profile opts into negotiated roaming
+    /// and PACKET_MUX_V1 with a safe legacy-client fallback.
+    pub fn new_profile() -> Self {
+        let mut profile = Self::baseline();
+        profile.roaming.enabled = true;
+        profile.obfuscation.recordizer.policy = "prefer".into();
+        profile
+    }
+}
+
+#[cfg(test)]
+mod profile_default_tests {
+    use super::ProfileConfig;
+
+    #[test]
+    fn new_profiles_enable_roaming_and_prefer_recordizer_without_changing_legacy_baseline() {
+        let baseline = ProfileConfig::baseline();
+        assert!(!baseline.roaming.enabled);
+        assert_eq!(baseline.obfuscation.recordizer.policy, "off");
+
+        let created = ProfileConfig::new_profile();
+        assert!(created.roaming.enabled);
+        assert_eq!(created.obfuscation.recordizer.policy, "prefer");
     }
 }
 
@@ -161,12 +236,54 @@ impl BindConfig {
     }
 }
 
+/// Address families carried inside a profile's tunnel.
+///
+/// This is deliberately distinct from `bind.address`: an IPv6 outer carrier may carry an
+/// IPv4-only tunnel, and an IPv4 carrier may carry a dual-stack or IPv6-only tunnel.
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IpMode {
+    #[default]
+    Ipv4,
+    Dual,
+    Ipv6,
+}
+
+impl std::fmt::Display for IpMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Ipv4 => "ipv4",
+            Self::Dual => "dual",
+            Self::Ipv6 => "ipv6",
+        })
+    }
+}
+
+impl std::str::FromStr for IpMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ipv4" => Ok(Self::Ipv4),
+            "dual" => Ok(Self::Dual),
+            "ipv6" => Ok(Self::Ipv6),
+            _ => Err(format!("expected one of ipv4, dual, ipv6; got '{value}'")),
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct TunConfig {
+    /// Inner address-family mode. Missing in old configs means IPv4 exactly as before.
+    #[serde(default)]
+    pub ip_mode: IpMode,
     #[serde(default = "default_tun_name")]
     pub name: String,
     #[serde(default = "default_tun_addr")]
     pub address: String,
+    /// Server-side IPv6 tunnel address. Required by `dual` and `ipv6`, absent in `ipv4`.
+    #[serde(default)]
+    pub ipv6_address: Option<String>,
     #[serde(default = "default_mtu")]
     pub mtu: i32,
     #[serde(default = "default_tx_queue")]
@@ -204,7 +321,7 @@ pub struct AuthConfig {
     #[serde(default)]
     pub brute_force: BruteForceConfig,
     /// Users defined inline in the server config (with Argon2 password hashes).
-    /// If non-empty, these are used instead of `users_file`.
+    /// Runtime merges them with `users_file`; the external file wins duplicate names.
     #[serde(default)]
     pub users: Vec<crate::config::users::UserEntry>,
     /// Optional group templates for inline users.
@@ -264,9 +381,10 @@ impl Default for BruteForceConfig {
 /// anything past that the PEER REJECTS. So the largest inner packet is that budget minus the
 /// per-record overhead, and going higher is a wire error rather than a matter of taste.
 ///
-/// Note the units: this is the TUNNEL (inner) MTU. The link still adds IP + UDP/TCP + the
-/// record and any obfs/QUIC framing on top — about 76 bytes worst case — so on a 16348-byte
-/// link the largest inner MTU that avoids outer fragmentation is nearer 16270.
+/// Note the units: this is the TUNNEL (inner) MTU. A legacy UDP peer still adds IP + UDP +
+/// record + obfs/QUIC framing to one datagram, so on a 16348-byte link its largest no-fragment
+/// inner MTU is nearer 16270. Negotiated DATA_FRAG instead splits the encrypted record to an
+/// independently measured outer budget; the codec ceiling above still applies before splitting.
 /// (Audit 2026-07-27, C4; ceiling derived 2026-07-31.)
 pub const MTU_MIN: u32 = 576;
 pub const MTU_MAX: u32 = crate::protocol::packet::MAX_TUNNEL_MTU as u32;
@@ -282,6 +400,232 @@ pub struct PoolSubnet {
     pub prefix: u8,
     pub netmask: std::net::Ipv4Addr,
     pub broadcast: std::net::Ipv4Addr,
+}
+
+/// Canonical IPv6 allocation prefix derived from `pool.ipv6.cidr`.
+///
+/// Unlike IPv4 there is no broadcast address. The all-zero host value is nevertheless kept
+/// out of allocation because it is the subnet-router anycast address for ordinary prefixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv6PoolSubnet {
+    pub network: std::net::Ipv6Addr,
+    pub prefix: u8,
+}
+
+impl Ipv6PoolSubnet {
+    pub fn contains(self, address: std::net::Ipv6Addr) -> bool {
+        let mask = ipv6_prefix_mask(self.prefix);
+        (u128::from(address) & mask) == u128::from(self.network)
+    }
+
+    pub fn contains_assignable(self, address: std::net::Ipv6Addr) -> bool {
+        self.contains(address) && address != self.network
+    }
+}
+
+fn ipv6_prefix_mask(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    }
+}
+
+/// Reject IPv6 address classes that cannot represent a tunnel host or next hop.
+pub fn validate_tunnel_ipv6_address(
+    field: &str,
+    address: std::net::Ipv6Addr,
+) -> Result<(), String> {
+    let first = address.segments()[0];
+    let link_local = first & 0xffc0 == 0xfe80;
+    if address.is_unspecified() {
+        return Err(format!(
+            "{field} must not be the unspecified IPv6 address ::"
+        ));
+    }
+    if address.is_loopback() {
+        return Err(format!("{field} must not be the IPv6 loopback address ::1"));
+    }
+    if address.is_multicast() {
+        return Err(format!("{field} must not be an IPv6 multicast address"));
+    }
+    if link_local {
+        return Err(format!(
+            "{field} must not be link-local — tunnel addresses need profile-wide scope"
+        ));
+    }
+    if address.to_ipv4_mapped().is_some() {
+        return Err(format!(
+            "{field} must not be an IPv4-mapped IPv6 address; configure the real family"
+        ));
+    }
+    Ok(())
+}
+
+pub fn ipv6_pool_subnet(cidr: &str) -> Result<Ipv6PoolSubnet, String> {
+    use std::net::Ipv6Addr;
+
+    let Some((address, prefix)) = cidr.trim().split_once('/') else {
+        return Err(format!(
+            "invalid pool.ipv6.cidr '{cidr}': expected IPv6 CIDR (e.g. fd71:e1:1234:1::/64)"
+        ));
+    };
+    if prefix.contains('/') {
+        return Err(format!(
+            "invalid pool.ipv6.cidr '{cidr}': expected exactly one '/' separator"
+        ));
+    }
+    let address = address
+        .trim()
+        .parse::<Ipv6Addr>()
+        .map_err(|e| format!("invalid pool.ipv6.cidr '{cidr}': invalid IPv6 address: {e}"))?;
+    let prefix = prefix
+        .trim()
+        .parse::<u8>()
+        .map_err(|e| format!("invalid pool.ipv6.cidr '{cidr}': invalid prefix: {e}"))?;
+    // /127 and /128 do not have enough distinct addresses for subnet-router anycast,
+    // the server address and at least one client address. /0 is not a meaningful private
+    // allocation pool and would also normalize to the unspecified address.
+    if !(1..=126).contains(&prefix) {
+        return Err(format!(
+            "invalid pool.ipv6.cidr '{cidr}': prefix must be between 1 and 126"
+        ));
+    }
+    let network = Ipv6Addr::from(u128::from(address) & ipv6_prefix_mask(prefix));
+    validate_tunnel_ipv6_address("pool.ipv6.cidr network", network)?;
+    Ok(Ipv6PoolSubnet { network, prefix })
+}
+
+/// Validate all IPv6 addressing fields of one profile without allocating or enumerating its
+/// prefix. This is shared by check-config, panel saves and the worker startup gate.
+pub fn validate_ipv6_profile(profile: &ProfileConfig) -> Result<Option<Ipv6PoolSubnet>, String> {
+    use std::collections::{HashMap, HashSet};
+    use std::net::Ipv6Addr;
+
+    let carries_ipv6 = profile.tun.ip_mode != IpMode::Ipv4;
+    let has_any_ipv6_addressing = profile
+        .tun
+        .ipv6_address
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || !profile.pool.ipv6.cidr.trim().is_empty()
+        || !profile.pool.ipv6.exclude.is_empty()
+        || !profile.pool.ipv6.static_reservations.is_empty();
+
+    if !carries_ipv6
+        && (profile.routing.ipv6.mode != Ipv6RoutingMode::Off
+            || profile.routing.ipv6.ndp_proxy != Ipv6NdpProxyMode::Off)
+    {
+        return Err(format!(
+            "IPv6 routing/NDP proxy requires tun.ip_mode = dual or ipv6 (routing.ipv6.mode = {}, routing.ipv6.ndp_proxy = {})",
+            profile.routing.ipv6.mode, profile.routing.ipv6.ndp_proxy
+        ));
+    }
+    if profile.routing.ipv6.ndp_proxy != Ipv6NdpProxyMode::Off
+        && profile.routing.ipv6.mode != Ipv6RoutingMode::Route
+    {
+        return Err(format!(
+            "routing.ipv6.ndp_proxy = {} requires routing.ipv6.mode = route; NDP proxy publishes source-preserving IPv6 addresses and must not be combined with off or NAT66",
+            profile.routing.ipv6.ndp_proxy
+        ));
+    }
+
+    if !carries_ipv6 && !has_any_ipv6_addressing {
+        return Ok(None);
+    }
+
+    let address_text = profile
+        .tun
+        .ipv6_address
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "tun.ipv6_address is required when IPv6 addressing is configured".to_string()
+        })?;
+    let address = address_text
+        .parse::<Ipv6Addr>()
+        .map_err(|error| format!("invalid tun.ipv6_address '{address_text}': {error}"))?;
+    validate_tunnel_ipv6_address("tun.ipv6_address", address)?;
+
+    if profile.pool.ipv6.cidr.trim().is_empty() {
+        return Err("pool.ipv6.cidr is required when IPv6 addressing is configured".to_string());
+    }
+    let subnet = ipv6_pool_subnet(&profile.pool.ipv6.cidr)?;
+    if !subnet.contains_assignable(address) {
+        return Err(format!(
+            "tun.ipv6_address {address} is not an assignable host inside pool.ipv6.cidr {} \
+             (network {} is reserved as subnet-router anycast)",
+            profile.pool.ipv6.cidr, subnet.network
+        ));
+    }
+
+    let mut excluded = HashSet::new();
+    for raw in &profile.pool.ipv6.exclude {
+        let value = raw.trim();
+        let ip = value.parse::<Ipv6Addr>().map_err(|error| {
+            format!("pool.ipv6.exclude entry '{value}' is not a bare IPv6 address: {error}")
+        })?;
+        validate_tunnel_ipv6_address("pool.ipv6.exclude", ip)?;
+        if !subnet.contains_assignable(ip) {
+            return Err(format!(
+                "pool.ipv6.exclude address {ip} is outside pool.ipv6.cidr {}",
+                profile.pool.ipv6.cidr
+            ));
+        }
+        if ip == address {
+            return Err(format!(
+                "pool.ipv6.exclude contains tun.ipv6_address {address}"
+            ));
+        }
+        if !excluded.insert(ip) {
+            return Err(format!("pool.ipv6.exclude contains duplicate address {ip}"));
+        }
+    }
+
+    let mut reservations: HashMap<Ipv6Addr, &str> = HashMap::new();
+    for (username, raw) in &profile.pool.ipv6.static_reservations {
+        if username.trim().is_empty() {
+            return Err("pool.ipv6.reservation has an empty username".to_string());
+        }
+        let value = raw.trim();
+        let ip = value.parse::<Ipv6Addr>().map_err(|error| {
+            format!(
+                "pool.ipv6.reservation.{username} = '{value}' is not a bare IPv6 address: {error}"
+            )
+        })?;
+        validate_tunnel_ipv6_address(&format!("pool.ipv6.reservation.{username}"), ip)?;
+        if !subnet.contains_assignable(ip) {
+            return Err(format!(
+                "pool.ipv6.reservation.{username} = {ip} is outside pool.ipv6.cidr {}",
+                profile.pool.ipv6.cidr
+            ));
+        }
+        if ip == address || excluded.contains(&ip) {
+            return Err(format!(
+                "pool.ipv6.reservation.{username} = {ip} collides with the server address or pool.ipv6.exclude"
+            ));
+        }
+        if let Some(other) = reservations.insert(ip, username) {
+            return Err(format!(
+                "pool.ipv6 reservations for '{other}' and '{username}' both use {ip}"
+            ));
+        }
+    }
+
+    if carries_ipv6 && profile.tun.mtu < 1280 {
+        return Err(format!(
+            "tun.mtu {} is below the IPv6 minimum 1280 for tun.ip_mode = {}",
+            profile.tun.mtu, profile.tun.ip_mode
+        ));
+    }
+    if profile.tun.ip_mode == IpMode::Ipv6 && profile.dhcp.enabled {
+        return Err(
+            "dhcp.enabled is DHCPv4 and cannot be enabled in an IPv6-only profile".to_string(),
+        );
+    }
+
+    Ok(Some(subnet))
 }
 
 impl PoolSubnet {
@@ -435,6 +779,100 @@ pub fn dhcp_pool_bounds(
 /// three ranges drifted apart in the first place. Callers pass `x as i64`.
 pub fn mtu_in_range(mtu: i64) -> bool {
     (MTU_MIN as i64..=MTU_MAX as i64).contains(&mtu)
+}
+
+#[cfg(test)]
+mod ipv6_config_tests {
+    use super::*;
+
+    fn dual_profile() -> ProfileConfig {
+        let mut profile = ProfileConfig::baseline();
+        profile.tun.ip_mode = IpMode::Dual;
+        profile.tun.ipv6_address = Some("fd71:e1:1234:1::1".into());
+        profile.pool.ipv6.cidr = "fd71:e1:1234:1::/64".into();
+        profile
+    }
+
+    #[test]
+    fn legacy_profile_defaults_to_ipv4_without_ipv6_fields() {
+        let profile = ProfileConfig::baseline();
+        assert_eq!(profile.tun.ip_mode, IpMode::Ipv4);
+        assert!(profile.tun.ipv6_address.is_none());
+        assert!(profile.pool.ipv6.cidr.is_empty());
+        assert_eq!(validate_ipv6_profile(&profile).unwrap(), None);
+    }
+
+    #[test]
+    fn ipv6_pool_is_normalized_without_enumerating_it() {
+        let subnet = ipv6_pool_subnet("fd71:e1:1234:1::abcd/64").unwrap();
+        assert_eq!(
+            subnet.network,
+            "fd71:e1:1234:1::".parse::<std::net::Ipv6Addr>().unwrap()
+        );
+        assert_eq!(subnet.prefix, 64);
+        assert!(subnet.contains("fd71:e1:1234:1::ffff".parse().unwrap()));
+        assert!(!subnet.contains("fd71:e1:1234:2::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn dual_profile_validates_addresses_reservations_and_mtu() {
+        let mut profile = dual_profile();
+        profile.pool.ipv6.exclude.push("fd71:e1:1234:1::10".into());
+        profile
+            .pool
+            .ipv6
+            .static_reservations
+            .insert("alice".into(), "fd71:e1:1234:1::50".into());
+        let subnet = validate_ipv6_profile(&profile).unwrap().unwrap();
+        assert_eq!(subnet.prefix, 64);
+
+        profile.tun.mtu = 1279;
+        assert!(validate_ipv6_profile(&profile)
+            .unwrap_err()
+            .contains("minimum 1280"));
+    }
+
+    #[test]
+    fn ipv6_profile_rejects_ambiguous_or_conflicting_values() {
+        let mut profile = dual_profile();
+        profile.pool.ipv6.exclude.push("fd71:e1:1234:1::1".into());
+        assert!(validate_ipv6_profile(&profile)
+            .unwrap_err()
+            .contains("tun.ipv6_address"));
+
+        profile.pool.ipv6.exclude.clear();
+        profile.tun.ipv6_address = Some("fe80::1".into());
+        assert!(validate_ipv6_profile(&profile)
+            .unwrap_err()
+            .contains("link-local"));
+
+        profile.tun.ipv6_address = Some("fd71:e1:1234:1::1".into());
+        profile.pool.ipv6.cidr = "fd71:e1:1234:1::/127".into();
+        assert!(validate_ipv6_profile(&profile)
+            .unwrap_err()
+            .contains("between 1 and 126"));
+    }
+
+    #[test]
+    fn ipv4_mode_cannot_activate_ipv6_routing() {
+        let mut profile = ProfileConfig::baseline();
+        profile.routing.ipv6.mode = Ipv6RoutingMode::Nat66;
+        assert!(validate_ipv6_profile(&profile)
+            .unwrap_err()
+            .contains("requires tun.ip_mode"));
+    }
+
+    #[test]
+    fn ndp_proxy_requires_source_preserving_ipv6_route_mode() {
+        let mut profile = dual_profile();
+        profile.routing.ipv6.ndp_proxy = Ipv6NdpProxyMode::Required;
+        assert!(validate_ipv6_profile(&profile)
+            .unwrap_err()
+            .contains("requires routing.ipv6.mode = route"));
+
+        profile.routing.ipv6.mode = Ipv6RoutingMode::Route;
+        assert!(validate_ipv6_profile(&profile).is_ok());
+    }
 }
 
 #[cfg(test)]
@@ -630,6 +1068,19 @@ pub struct PoolConfig {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub static_reservations: HashMap<String, String>,
+    #[serde(default)]
+    pub ipv6: Ipv6PoolConfig,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct Ipv6PoolConfig {
+    /// IPv6 client allocation prefix. Empty is valid only while `tun.ip_mode = ipv4`.
+    #[serde(default)]
+    pub cidr: String,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    #[serde(default)]
+    pub static_reservations: HashMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
@@ -662,6 +1113,8 @@ pub struct RoutingConfig {
     pub post_down: String,
     #[serde(default)]
     pub nat: NatConfig,
+    #[serde(default)]
+    pub ipv6: Ipv6RoutingConfig,
     #[serde(default, alias = "push_routes")]
     pub advertised_routes: Vec<PushedRoute>,
 }
@@ -674,12 +1127,137 @@ pub struct NatConfig {
     pub interface: String,
 }
 
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Ipv6RoutingMode {
+    #[default]
+    Off,
+    Route,
+    Nat66,
+}
+
+impl std::fmt::Display for Ipv6RoutingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Route => "route",
+            Self::Nat66 => "nat66",
+        })
+    }
+}
+
+impl std::str::FromStr for Ipv6RoutingMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "route" => Ok(Self::Route),
+            "nat66" => Ok(Self::Nat66),
+            _ => Err(format!("expected one of off, route, nat66; got '{value}'")),
+        }
+    }
+}
+
+/// Whether the server answers upstream Neighbor Solicitations for active tunnel addresses.
+///
+/// This is deliberately independent from forwarding: route mode works without it when the
+/// provider routes the prefix to the server's own address. NDP proxy is needed only when the
+/// upstream treats the delegated prefix as on-link and therefore asks for every client via NDP.
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Ipv6NdpProxyMode {
+    #[default]
+    Off,
+    /// Try to attach to the selected uplink; log and continue if the host cannot support it.
+    Auto,
+    /// Refuse to start the profile unless the responder is active.
+    Required,
+}
+
+impl std::fmt::Display for Ipv6NdpProxyMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+            Self::Required => "required",
+        })
+    }
+}
+
+impl std::str::FromStr for Ipv6NdpProxyMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "auto" => Ok(Self::Auto),
+            "required" => Ok(Self::Required),
+            _ => Err(format!(
+                "expected one of off, auto, required; got '{value}'"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct Ipv6RoutingConfig {
+    #[serde(default)]
+    pub mode: Ipv6RoutingMode,
+    /// Empty means auto-detect the IPv6 uplink when the selected mode needs one.
+    #[serde(default)]
+    pub interface: String,
+    /// Session-aware NDP response policy for an upstream on-link delegated prefix.
+    #[serde(default)]
+    pub ndp_proxy: Ipv6NdpProxyMode,
+    /// Empty means use the resolved `routing.ipv6.interface` / IPv6 default-route uplink.
+    #[serde(default)]
+    pub ndp_proxy_interface: String,
+}
+
+/// DNS proxy resource bounds. Validation rejects larger file/panel values and the runtime
+/// clamps defensively so a direct programmatic caller cannot create unbounded failover or cache
+/// state.
+pub const DNS_MAX_UPSTREAMS: usize = 16;
+pub const DNS_MAX_CACHE_ENTRIES: usize = 10_000;
+pub const DNS_MAX_TIMEOUT_SECS: u64 = 300;
+pub const DNS_MAX_BLOCKLIST_ENTRIES: usize = 10_000;
+
+/// Canonical textual DNS owner name accepted by the blocklist.
+///
+/// The matcher implements exact-name and subdomain matching, not wildcard syntax. IDNs must be
+/// supplied in their on-wire ASCII (punycode) form, which also keeps byte length and DNS label
+/// limits unambiguous.
+pub fn normalize_blocklist_domain(raw: &str) -> Option<String> {
+    let name = raw.trim().trim_end_matches('.');
+    if name.is_empty() || name.len() > 253 || !name.is_ascii() {
+        return None;
+    }
+    for label in name.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            || label.starts_with('-')
+            || label.ends_with('-')
+        {
+            return None;
+        }
+    }
+    Some(name.to_ascii_lowercase())
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct DnsConfig {
     #[serde(default = "default_false")]
     pub enabled: bool,
     #[serde(default = "default_dns_listen")]
     pub listen: String,
+    /// Optional IPv6 listener pushed to IPv6-capable clients. Required for an enabled DNS
+    /// proxy in an IPv6-only profile.
+    #[serde(default)]
+    pub listen_ipv6: Option<String>,
     #[serde(default = "default_dns_port")]
     pub port: u16,
     #[serde(default = "default_upstream")]
@@ -730,6 +1308,9 @@ pub struct ServerObfuscationConfig {
     /// Flow-shaping cover traffic (idle browsing-like cover; DPI-AUDIT 6.1/6.2).
     #[serde(default)]
     pub traffic_shaping: crate::config::TrafficShapingConfig,
+    /// Negotiated packet/record boundary masking shared by every transport.
+    #[serde(default)]
+    pub recordizer: crate::config::RecordizerConfig,
     #[serde(default)]
     pub anti_fingerprinting: AntiFingerprintingConfig,
     #[serde(default)]
@@ -784,11 +1365,8 @@ fn default_max_streams() -> u32 {
 pub struct TlsConfig {
     #[serde(default = "default_server_name")]
     pub server_name: String,
-    /// Pool of decoy SNI hostnames for camouflage. Defaults to a built-in set of
-    /// high-traffic domains (the same list as `protocol::tls::DEFAULT_SNI_POOL`),
-    /// surfaced here so operators can override it per profile in the config
-    /// instead of it being hard-coded. (Client-side SNI rotation that consumes
-    /// this list is a follow-up; today the field is config-surfaced and parsed.)
+    /// REALITY proxy/target settings. The client uses the configured target as a
+    /// stable explicit SNI; it never rotates unrelated public domains for a bare IP.
     #[serde(default)]
     pub reality_proxy: RealityProxyConfig,
 }
@@ -940,12 +1518,12 @@ pub struct WebConfig {
     /// a dismissible "update available" banner. OFF by default. The check is performed
     /// BY THE OPERATOR'S BROWSER (like the marketing site does) — no server-side beacon,
     /// no telemetry, no identifying data; the panel only runs it when this is true.
-    /// See docs/CONFIG.md.
+    /// See docs/*/manuals/CONFIG.md.
     #[serde(default = "default_false")]
     pub update_check: bool,
     /// Base path when the panel is served behind a reverse proxy under a sub-path
     /// (e.g. "/qeli"). Empty = served at the web root. A request's
-    /// `X-Forwarded-Prefix` header overrides this per-request. See docs/CONFIG.md.
+    /// `X-Forwarded-Prefix` header overrides this per-request. See docs/*/manuals/CONFIG.md.
     #[serde(default)]
     pub base_path: String,
     /// CSRF same-origin protection for mutating panel requests. **Keep `true`.**
@@ -953,7 +1531,7 @@ pub struct WebConfig {
     /// loopback-only bind reached via an SSH forward, NEVER on a public/LAN bind (any
     /// site you open in the same browser could then drive your logged-in panel).
     /// Loopback origins are already trusted on any port, so a normal SSH forward works
-    /// WITHOUT disabling this. See docs/CONFIG.md.
+    /// WITHOUT disabling this. See docs/*/manuals/CONFIG.md.
     #[serde(default = "default_true")]
     pub csrf: bool,
     /// Panel login-session lifetime in seconds — governs BOTH the session cookie's
@@ -965,7 +1543,7 @@ pub struct WebConfig {
     /// Brute-force lockout policy for **web-panel admin login** — independent of the
     /// VPN-auth policy in `[auth] brute_force`. Own attempt count, window and lockout
     /// so the panel and the tunnel can be tuned separately; set `enabled = false` to
-    /// turn panel-login rate-limiting off entirely. See docs/CONFIG.md.
+    /// turn panel-login rate-limiting off entirely. See docs/*/manuals/CONFIG.md.
     #[serde(default)]
     pub brute_force: BruteForceConfig,
 }
@@ -1060,4 +1638,40 @@ fn default_reality_target_port() -> u16 {
 }
 fn default_device_type() -> String {
     "tun".into()
+}
+
+#[cfg(test)]
+mod dns_blocklist_tests {
+    use super::normalize_blocklist_domain;
+
+    #[test]
+    fn blocklist_domains_are_canonical_and_strict() {
+        assert_eq!(
+            normalize_blocklist_domain(" Ads.Example.COM. "),
+            Some("ads.example.com".into())
+        );
+        assert_eq!(
+            normalize_blocklist_domain("_service.example.com"),
+            Some("_service.example.com".into())
+        );
+        for invalid in [
+            "",
+            ".",
+            ".example.com",
+            "example..com",
+            "-bad.example",
+            "bad-.example",
+            "*.example.com",
+            "not a domain",
+            "пример.рф",
+        ] {
+            assert_eq!(
+                normalize_blocklist_domain(invalid),
+                None,
+                "{invalid:?} must be rejected"
+            );
+        }
+        let long_label = format!("{}.example", "a".repeat(64));
+        assert_eq!(normalize_blocklist_domain(&long_label), None);
+    }
 }

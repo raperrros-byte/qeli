@@ -3,7 +3,8 @@
 
 Guards the documentation structure so it cannot silently rot:
 
-  1. links     — every relative Markdown link resolves to a real file
+  1. links     — every relative Markdown link resolves to a real file; release-note
+                 repository links are absolute and pinned to their release tag
   2. index     — every document under docs/<lang>/ is reachable from that
                  language's index.md (no orphaned pages)
   3. parity    — docs/ru and docs/eng contain the SAME set of files
@@ -13,12 +14,17 @@ Guards the documentation structure so it cannot silently rot:
                  (client.rs::from_ini) is mentioned in CONFIG.md, in BOTH
                  languages. Runtime-built keys (`pool.reservation.<user>`) are
                  checked by their literal prefix
-  5. source    — every source file a doc names in backticks still exists
+  5. source    — tracked docs only name source files tracked by Git
                  (frozen records — archive/, CHANGELOG — are out of scope)
   6. placeholder — no GitHub URL left with `<owner>` unfilled; these hide in
                  fenced code blocks where check 1 never looks
-  7. version   — CHANGELOG.md has a section for the version being developed.
-                 Every other version string is owned by scripts/sync_version.py
+  7. version   — CHANGELOG.md names the next public release and it is not older
+                 than the development build. Every other version string is owned
+                 by scripts/sync_version.py
+  8. anchors   — active docs do not pin source links to refactor-fragile #L numbers
+  9. sync      — safety-sensitive RU/EN pairs carry the same normative revision
+
+Every semantic check fails closed when its extractor or marker drifts.
 
 Exit code 0 = all good, 1 = something to fix. Intended for CI and pre-release.
 """
@@ -75,6 +81,7 @@ def tracked_markdown() -> list[Path]:
 
 
 LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+RELEASE_NOTES_FILE_RE = re.compile(r"RELEASE_NOTES_(\d+\.\d+\.\d+)\.md")
 
 
 # Fenced blocks and inline code spans, in that order. Link syntax inside either is
@@ -98,9 +105,34 @@ def check_links(files: list[Path]) -> None:
             fail("links", f"cannot read {f.relative_to(ROOT)}: {e}")
             continue
         text = strip_code(text)
+        release_match = (
+            RELEASE_NOTES_FILE_RE.fullmatch(f.name)
+            if f.parent == ROOT / "release"
+            else None
+        )
         for target in LINK_RE.findall(text):
             t = target.strip()
             if t.startswith(("http://", "https://", "mailto:", "#")):
+                if release_match and t.startswith(
+                    "https://github.com/litvinovtd/qeli/blob/"
+                ):
+                    expected = (
+                        "https://github.com/litvinovtd/qeli/blob/"
+                        f"v{release_match.group(1)}/"
+                    )
+                    if not t.startswith(expected):
+                        fail(
+                            "links",
+                            f"{f.relative_to(ROOT)} -> {t} is not pinned to "
+                            f"v{release_match.group(1)}",
+                        )
+                continue
+            if release_match:
+                fail(
+                    "links",
+                    f"{f.relative_to(ROOT)} -> {t}: GitHub Release bodies require "
+                    "an absolute repository URL pinned to the release tag",
+                )
                 continue
             path = (f.parent / t.split("#", 1)[0]).resolve()
             if not path.exists():
@@ -108,31 +140,43 @@ def check_links(files: list[Path]) -> None:
 
 
 def check_index_coverage() -> None:
+    allowed_roots = {"manuals", "reference", "plans", "reports", "archive"}
     for lang in LANGS:
         d = ROOT / "docs" / lang
         index = d / "index.md"
         if not index.exists():
             fail("index", f"docs/{lang}/index.md is missing")
             continue
-        body = index.read_text(encoding="utf-8", errors="replace")
-        for doc in sorted(d.glob("*.md")):
-            if doc.name == "index.md":
+        body = strip_code(index.read_text(encoding="utf-8", errors="replace"))
+        linked: set[str] = set()
+        for raw_target in LINK_RE.findall(body):
+            target = raw_target.strip()
+            if target.startswith(("http://", "https://", "mailto:", "#")):
                 continue
-            if f"({doc.name})" not in body:
-                fail("index", f"docs/{lang}/{doc.name} is not linked from index.md")
-        archive = d / "archive"
-        if archive.is_dir():
-            arch_readme = archive / "README.md"
-            arch_body = (
-                arch_readme.read_text(encoding="utf-8", errors="replace")
-                if arch_readme.exists()
-                else ""
-            )
-            for doc in sorted(archive.glob("*.md")):
-                if doc.name == "README.md":
-                    continue
-                if f"({doc.name})" not in arch_body and f"(archive/{doc.name})" not in body:
-                    fail("index", f"docs/{lang}/archive/{doc.name} is not linked anywhere")
+            target = target.split("#", 1)[0]
+            if not target:
+                continue
+            resolved = (index.parent / target).resolve()
+            try:
+                linked.add(resolved.relative_to(d.resolve()).as_posix())
+            except ValueError:
+                continue
+
+        for doc in sorted(d.rglob("*.md")):
+            rel = doc.relative_to(d)
+            rel_posix = rel.as_posix()
+            if rel_posix == "index.md":
+                continue
+            if len(rel.parts) == 1 and rel_posix != "README.md":
+                fail(
+                    "index",
+                    f"docs/{lang}/{rel_posix} is uncategorized; move it under "
+                    "manuals/, reference/, plans/, reports/ or archive/",
+                )
+            elif len(rel.parts) > 1 and rel.parts[0] not in allowed_roots:
+                fail("index", f"docs/{lang}/{rel_posix} uses an unknown document category")
+            if rel_posix not in linked:
+                fail("index", f"docs/{lang}/{rel_posix} is not linked from index.md")
 
 
 def check_parity() -> None:
@@ -232,18 +276,18 @@ def check_config_keys() -> None:
     client_keys = _client_keys()
 
     for lang in LANGS:
-        cfg = ROOT / "docs" / lang / "CONFIG.md"
+        cfg = ROOT / "docs" / lang / "manuals" / "CONFIG.md"
         if not cfg.exists():
-            fail("config", f"docs/{lang}/CONFIG.md is missing")
+            fail("config", f"docs/{lang}/manuals/CONFIG.md is missing")
             continue
         body = cfg.read_text(encoding="utf-8", errors="replace")
         for k in sorted(k for k in keys if not _documented(body, k)):
-            fail("config", f"key '{k}' is emitted by the server but absent from docs/{lang}/CONFIG.md")
+            fail("config", f"key '{k}' is emitted by the server but absent from docs/{lang}/manuals/CONFIG.md")
         for p in sorted(p for p in prefixes if f"{p}." not in body):
             fail(
                 "config",
                 f"dynamic key prefix '{p}.<…>' is emitted by the server but absent "
-                f"from docs/{lang}/CONFIG.md",
+                f"from docs/{lang}/manuals/CONFIG.md",
             )
         # Client keys are short, generic words (`key`, `mode`, `dev`, `user`) that a bare
         # substring search would find anywhere in a 1300-line reference, making the check
@@ -253,7 +297,7 @@ def check_config_keys() -> None:
             fail(
                 "config",
                 f"client key '[qeli] {k}' is read by client.rs but absent "
-                f"from docs/{lang}/CONFIG.md",
+                f"from docs/{lang}/manuals/CONFIG.md",
             )
 
 
@@ -287,6 +331,22 @@ SRC_REF_SKIP = ("archive/", "CHANGELOG.md", "AUDIT-FIXES-")
 
 
 def check_source_refs(files: list[Path]) -> None:
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=False
+        )
+    except OSError as e:
+        raise SystemExit(
+            f"cannot run git ({e}) — refusing to validate source references against "
+            "an unknown committed tree"
+        )
+    if proc.returncode != 0:
+        raise SystemExit(
+            "git ls-files failed while validating source references "
+            f"(exit {proc.returncode}): {proc.stderr.strip() or 'no stderr'}"
+        )
+    tracked = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
     for f in files:
         rel = f.relative_to(ROOT).as_posix()
         if any(s in rel for s in SRC_REF_SKIP):
@@ -295,18 +355,72 @@ def check_source_refs(files: list[Path]) -> None:
             # `qeli-android/.../QeliService.kt` — deliberate elision, not a real path.
             if "/.../" in ref:
                 continue
-            if not (ROOT / ref).exists():
-                fail("source", f"{rel} points at `{ref}`, which does not exist")
+            source_exists = (ROOT / ref).exists()
+            if ref not in tracked and (rel in tracked or not source_exists):
+                state = (
+                    "missing from the tracked Git tree"
+                    if rel in tracked
+                    else "does not exist"
+                )
+                fail("source", f"{rel} points at `{ref}`, which {state}")
+
+
+SOURCE_LINE_ANCHOR_RE = re.compile(
+    r"(?:"
+    r"\]\([^)]*\.(?:rs|cs|kt|swift)#L\d+(?:-L\d+)?\)"
+    r"|"
+    r"\[(?:[^\]\r\n]*\.(?:rs|cs|kt|swift):\d+(?:-\d+)?|:\d+(?:-\d+)?)\]"
+    r"\([^)]*\.(?:rs|cs|kt|swift)\)"
+    r")"
+)
+
+
+def check_source_line_anchors(files: list[Path]) -> None:
+    """Active docs link to symbols/files, never to refactor-fragile line numbers."""
+    for f in files:
+        rel = f.relative_to(ROOT).as_posix()
+        if any(s in rel for s in SRC_REF_SKIP):
+            continue
+        body = f.read_text(encoding="utf-8", errors="replace")
+        if SOURCE_LINE_ANCHOR_RE.search(body):
+            fail("anchors", f"{rel} contains a refactor-fragile source line anchor")
+
+
+NORMATIVE_SYNC_DOCS = (
+    "plans/ROAMING.md",
+    "reports/AUDIT.md",
+    "reference/THREAT-MODEL.md",
+)
+NORMATIVE_SYNC_RE = re.compile(r"<!--\s*normative-sync:\s*([a-z0-9._-]+)\s*-->")
+
+
+def check_normative_sync() -> None:
+    """Safety-sensitive RU/EN pairs must declare the same review revision."""
+    for name in NORMATIVE_SYNC_DOCS:
+        revisions: dict[str, str] = {}
+        for lang in LANGS:
+            path = ROOT / "docs" / lang / name
+            if not path.exists():
+                continue
+            matches = NORMATIVE_SYNC_RE.findall(path.read_text(encoding="utf-8"))
+            if len(matches) != 1:
+                fail("sync", f"docs/{lang}/{name} must contain exactly one normative-sync marker")
+                continue
+            revisions[lang] = matches[0]
+        if len(revisions) == len(LANGS) and len(set(revisions.values())) != 1:
+            fail("sync", f"{name} RU/EN revisions differ: {revisions}")
 
 
 CARGO_VERSION_RE = re.compile(r'^version\s*=\s*"([^"]+)"', re.M)
 
 
 def check_version() -> None:
-    """The CHANGELOG must have a section for the version being developed.
+    """The CHANGELOG must identify the next public release.
 
-    Only that: every other version string in the repo (build files, the overview
-    READMEs, the "these docs describe X" banners) is owned by
+    A development build number need not become a public release number: the
+    0.7.17 development tree is intentionally scheduled as 0.8.0. Every other
+    version string in the repo (build files, overview READMEs, documentation
+    status banners) is owned by
     `scripts/sync_version.py`, which can also stamp them. Checking them here too
     would be a second, weaker implementation of the same rule."""
     cargo = ROOT / "qeli" / "Cargo.toml"
@@ -320,10 +434,29 @@ def check_version() -> None:
     version = m.group(1)
 
     changelog = ROOT / "CHANGELOG.md"
-    if changelog.exists() and f"[{version}]" not in changelog.read_text(
-        encoding="utf-8", errors="replace"
-    ):
-        fail("version", f"CHANGELOG.md has no section for {version}")
+    if not changelog.exists():
+        fail("version", "CHANGELOG.md not found")
+        return
+    body = changelog.read_text(encoding="utf-8", errors="replace")
+    planned_match = re.search(
+        r"^## \[([0-9]+\.[0-9]+\.[0-9]+)\]\s+[—-]\s+не выпущен\s*$",
+        body,
+        re.M | re.I,
+    )
+    if not planned_match:
+        fail("version", "CHANGELOG.md has no numeric unreleased release heading")
+        return
+    planned = planned_match.group(1)
+    try:
+        dev_tuple = tuple(int(part) for part in version.split("."))
+        planned_tuple = tuple(int(part) for part in planned.split("."))
+    except ValueError:
+        fail("version", f"development/planned version is not numeric SemVer: {version}/{planned}")
+        return
+    if len(dev_tuple) != 3 or len(planned_tuple) != 3:
+        fail("version", f"development/planned version is not three-part SemVer: {version}/{planned}")
+    elif planned_tuple < dev_tuple:
+        fail("version", f"planned release {planned} is older than development build {version}")
 
 
 def main() -> int:
@@ -335,12 +468,14 @@ def main() -> int:
     check_config_keys()
     check_source_refs(files)
     check_placeholder_urls(files)
+    check_source_line_anchors(files)
+    check_normative_sync()
     check_version()
 
     if not failures:
         print(
-            "OK — all 7 checks pass (links, index, parity, config keys "
-            "[server + client + prefixes], sources, placeholders, version)."
+            "OK — all 9 checks pass (links, index, parity, config keys "
+            "[server + client + prefixes], sources, placeholders, anchors, sync, version)."
         )
         return 0
     by_check: dict[str, int] = {}

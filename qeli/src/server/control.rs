@@ -27,6 +27,25 @@ pub fn control_socket_path() -> String {
         .unwrap_or_else(|| CONTROL_SOCKET.to_string())
 }
 
+/// Return a mutable external entry, materializing an inline user as a file override when
+/// a runtime control command needs to persist a change.
+fn external_or_inline_user<'a>(
+    db: &'a mut UsersDb,
+    config: &crate::config::server::ServerConfig,
+    username: &str,
+) -> Option<&'a mut crate::config::users::UserEntry> {
+    if db.users.iter().all(|user| user.username != username) {
+        let inline = config
+            .auth
+            .users
+            .iter()
+            .find(|user| user.username == username)
+            .cloned()?;
+        db.users.push(inline);
+    }
+    db.users.iter_mut().find(|user| user.username == username)
+}
+
 #[derive(Deserialize)]
 struct Request {
     cmd: String,
@@ -69,7 +88,11 @@ pub struct BlockedInfo {
 pub struct ClientInfo {
     pub profile: String,
     pub username: String,
+    /// Stable primary address retained for older clients of the control API.
     pub ip: String,
+    /// Every address assigned to this session, in deterministic IPv4/IPv6 order.
+    #[serde(default)]
+    pub addresses: Vec<String>,
     /// Client's public source address (ip:port).
     pub peer: String,
     pub connected_secs: u64,
@@ -214,9 +237,13 @@ async fn handle_control(
 /// stays connected and can't reconnect". The stuck task's own later cleanup is a
 /// no-op (its `by_ip` guard no longer matches). Returns the number kicked.
 async fn kick_user_on_profile(profile: &Arc<ProfileRuntime>, username: &str) -> usize {
+    // Kicking is an authoritative session/lease transition, just like authentication.
+    // Hold admission until every removed session has released its device lease so a
+    // same-device reconnect cannot reclaim the lease in the removal->release gap.
+    let _admission_guard = profile.admission.lock().await;
     let (kicked, iroutes) = {
         let mut sessions = profile.sessions.write().await;
-        let ips: Vec<std::net::Ipv4Addr> = sessions
+        let ips: Vec<std::net::IpAddr> = sessions
             .by_ip
             .iter()
             .filter(|(_, s)| s.username == username)
@@ -225,20 +252,34 @@ async fn kick_user_on_profile(profile: &Arc<ProfileRuntime>, username: &str) -> 
         let mut out = Vec::with_capacity(ips.len());
         let mut iroutes: Vec<String> = Vec::new();
         for ip in ips {
-            if let Some(s) = sessions.by_ip.remove(&ip) {
-                sessions.by_token.remove(&s.token);
+            if let Some(s) = sessions.remove(ip) {
                 iroutes.extend(sessions.take_client_routes(ip));
                 out.push(s);
             }
         }
         (out, iroutes)
     };
-    // Tear down the kicked sessions' inbound iroutes now the sessions lock is gone.
-    crate::server::handler::spawn_client_route_teardown(
-        &profile.tasks,
-        iroutes,
-        profile.config.tun.name.clone(),
-    );
+    // Tear down the kicked sessions' inbound iroutes now the sessions lock is gone, but
+    // before admission is released. A detached delete can otherwise run after a reconnect
+    // has installed the same CIDR and remove the new session's route.
+    for cidr in &iroutes {
+        let _ = crate::server::handler::program_client_subnet_route(
+            false,
+            cidr,
+            &profile.config.tun.name,
+        )
+        .await;
+    }
+    #[cfg(feature = "experimental-roaming")]
+    for session in &kicked {
+        let event =
+            crate::protocol::control_v2::ManagementEvent::Kick(crate::protocol::control_v2::Kick {
+                reason: crate::protocol::control_v2::KickReason::Administrative,
+                message: "Disconnected by the server administrator".to_string(),
+                reconnect_allowed: false,
+            });
+        let _ = session.send_management(&event).await;
+    }
     for s in &kicked {
         s.kick_all();
         profile.pool.lock().await.release(&s.device_key);
@@ -249,14 +290,106 @@ async fn kick_user_on_profile(profile: &Arc<ProfileRuntime>, username: &str) -> 
     kicked.len()
 }
 
+/// Snapshot worker-lifetime roaming outcomes without exposing session locators, CIDs or proofs.
+async fn roaming_status(state: &Arc<ServerState>) -> serde_json::Value {
+    let profiles = state.profiles.read().await;
+    let mut ordered = profiles.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|(name, _)| *name);
+    let mut out = Vec::with_capacity(ordered.len());
+
+    for (name, profile) in ordered {
+        let tcp = profile.tcp_roaming_metrics.snapshot();
+        #[cfg(feature = "experimental-roaming")]
+        let (
+            tcp_sessions,
+            orphaned_sessions,
+            orphaned_bytes,
+            udp_attempts,
+            udp_commits,
+            udp_failures,
+            udp_sessions,
+            udp_candidates,
+            udp_cid_aliases,
+        ) = {
+            let tcp_sessions = profile
+                .sessions
+                .read()
+                .await
+                .by_ip
+                .values()
+                .filter(|session| session.tcp_roaming.is_some())
+                .count();
+            let (orphaned_sessions, orphaned_bytes) = {
+                let limiter = crate::server::lock_or_recover(
+                    &profile.tcp_orphans,
+                    "control::roaming_tcp_orphans",
+                );
+                (limiter.sessions(), limiter.bytes())
+            };
+            let udp = profile.udp_roaming_registry.stats();
+            (
+                tcp_sessions,
+                orphaned_sessions,
+                orphaned_bytes,
+                udp.attempts_total,
+                udp.commits_total,
+                udp.failures_total,
+                udp.active_sessions,
+                udp.active_candidates,
+                udp.cid_aliases,
+            )
+        };
+        #[cfg(not(feature = "experimental-roaming"))]
+        let (
+            tcp_sessions,
+            orphaned_sessions,
+            orphaned_bytes,
+            udp_attempts,
+            udp_commits,
+            udp_failures,
+            udp_sessions,
+            udp_candidates,
+            udp_cid_aliases,
+        ) = (
+            0usize, 0usize, 0usize, 0u64, 0u64, 0u64, 0usize, 0usize, 0usize,
+        );
+
+        out.push(serde_json::json!({
+            "name": name,
+            "enabled": profile.config.roaming.enabled,
+            "feature_compiled": cfg!(feature = "experimental-roaming"),
+            "transport": profile.config.bind.transport,
+            "worker_lifetime": true,
+            "tcp": {
+                "attempts_total": tcp.attempts_total,
+                "commits_total": tcp.commits_total,
+                "failures_total": tcp.failures_total,
+                "grace_expired_total": tcp.grace_expired_total,
+                "active_sessions": tcp_sessions,
+                "orphaned_sessions": orphaned_sessions,
+                "orphaned_bytes": orphaned_bytes,
+            },
+            "udp": {
+                "attempts_total": udp_attempts,
+                "commits_total": udp_commits,
+                "failures_total": udp_failures,
+                "active_sessions": udp_sessions,
+                "active_candidates": udp_candidates,
+                "cid_aliases": udp_cid_aliases,
+            },
+        }));
+    }
+
+    serde_json::json!({ "profiles": out })
+}
 async fn dispatch(req: Request, state: &Arc<ServerState>) -> Response {
     // Audit-log every administrative (state-changing) control command. list-clients
     // is read-only and may be polled, so it is excluded to avoid log spam.
-    if req.cmd != "list-clients" && req.cmd != "list-blocked" {
+    if req.cmd != "list-clients" && req.cmd != "list-blocked" && req.cmd != "roaming-stats" {
         log::info!(
             "CONTROL action='{}' user='{}' profile='{}' mbps={} ip='{}'",
             crate::util::log_sanitize(&req.cmd),
-            crate::util::log_sanitize(&req.username),
+            crate::util::log_identity(&req.username),
             crate::util::log_sanitize(&req.profile),
             req.mbps,
             crate::util::log_sanitize(&req.ip)
@@ -274,6 +407,10 @@ async fn dispatch(req: Request, state: &Arc<ServerState>) -> Response {
                         profile: pname.clone(),
                         username: s.username.clone(),
                         ip: s.client_ip.to_string(),
+                        addresses: s
+                            .assigned_addresses()
+                            .map(|address| address.to_string())
+                            .collect(),
                         peer: s.peer.to_string(),
                         connected_secs: s.connected_at.elapsed().as_secs(),
                         bytes_sent: s.bytes_sent.load(std::sync::atomic::Ordering::Relaxed),
@@ -296,6 +433,12 @@ async fn dispatch(req: Request, state: &Arc<ServerState>) -> Response {
             }
         }
 
+        "roaming-stats" => Response {
+            ok: true,
+            error: None,
+            clients: None,
+            message: Some(roaming_status(state).await.to_string()),
+        },
         "kick" => {
             if req.username.is_empty() {
                 return Response {
@@ -363,17 +506,20 @@ async fn dispatch(req: Request, state: &Arc<ServerState>) -> Response {
             let (disabled, save_err) = {
                 let users_file = state.config.auth.users_file.clone();
                 let mut users = state.users_db.write().await;
-                match UsersDb::update_locked(&users_file, |db| {
-                    match db.users.iter_mut().find(|u| u.username == req.username) {
+                match UsersDb::update_locked_checked(&users_file, |db| {
+                    let found = match external_or_inline_user(db, &state.config, &req.username) {
                         Some(u) => {
                             u.enabled = false;
                             true
                         }
                         None => false,
-                    }
+                    };
+                    let effective =
+                        crate::server::effective_users_from_external(&state.config, db.clone())?;
+                    Ok((found, effective))
                 }) {
-                    Ok((fresh, found)) => {
-                        *users = fresh;
+                    Ok((_fresh, (found, effective))) => {
+                        *users = effective;
                         (found, None)
                     }
                     Err(e) => {
@@ -404,8 +550,8 @@ async fn dispatch(req: Request, state: &Arc<ServerState>) -> Response {
                 Some(e) => Response {
                     ok: false,
                     error: Some(format!(
-                        "user '{}' disabled in memory and {} session(s) kicked, but persisting \
-                         to the users file FAILED ({}) — the change will be lost on restart",
+                        "user '{}' was NOT disabled because the users file update failed; {} \
+                         current session(s) were kicked, but reconnect remains possible ({})",
                         req.username, total_kicked, e
                     )),
                     clients: None,
@@ -435,19 +581,22 @@ async fn dispatch(req: Request, state: &Arc<ServerState>) -> Response {
             let (found, save_err) = {
                 let users_file = state.config.auth.users_file.clone();
                 let mut users = state.users_db.write().await;
-                match UsersDb::update_locked(&users_file, |db| {
-                    match db.users.iter_mut().find(|u| u.username == req.username) {
+                match UsersDb::update_locked_checked(&users_file, |db| {
+                    let found = match external_or_inline_user(db, &state.config, &req.username) {
                         Some(u) => {
                             u.data_limit_gb = req.data_limit_gb;
                             u.expire_at = req.expire_at;
                             true
                         }
                         None => false,
-                    }
+                    };
+                    let effective =
+                        crate::server::effective_users_from_external(&state.config, db.clone())?;
+                    Ok((found, effective))
                 }) {
-                    Ok((fresh, ok)) => {
-                        *users = fresh;
-                        (ok, None)
+                    Ok((_fresh, (found, effective))) => {
+                        *users = effective;
+                        (found, None)
                     }
                     Err(e) => {
                         log::error!("Failed to save users file after set-limit: {}", e);
@@ -467,8 +616,7 @@ async fn dispatch(req: Request, state: &Arc<ServerState>) -> Response {
                 Some(e) => Response {
                     ok: false,
                     error: Some(format!(
-                        "limit set in memory but persisting to the users file FAILED ({}) — \
-                         it will be lost on restart",
+                        "limit was NOT changed because the users file update failed ({})",
                         e
                     )),
                     clients: None,
@@ -524,18 +672,21 @@ async fn dispatch(req: Request, state: &Arc<ServerState>) -> Response {
             }
             let users_file = state.config.auth.users_file.clone();
             let mut users = state.users_db.write().await;
-            let outcome = UsersDb::update_locked(&users_file, |db| {
-                match db.users.iter_mut().find(|u| u.username == req.username) {
+            let outcome = UsersDb::update_locked_checked(&users_file, |db| {
+                let found = match external_or_inline_user(db, &state.config, &req.username) {
                     Some(u) => {
                         u.enabled = true;
                         true
                     }
                     None => false,
-                }
+                };
+                let effective =
+                    crate::server::effective_users_from_external(&state.config, db.clone())?;
+                Ok((found, effective))
             });
             let found = match &outcome {
-                Ok((fresh, found)) => {
-                    *users = fresh.clone();
+                Ok((_fresh, (found, effective))) => {
+                    *users = effective.clone();
                     *found
                 }
                 Err(_) => true, // report the save failure, not "no such user"
@@ -553,8 +704,7 @@ async fn dispatch(req: Request, state: &Arc<ServerState>) -> Response {
                         Response {
                             ok: false,
                             error: Some(format!(
-                                "user '{}' enabled in memory, but persisting to the users file \
-                                 FAILED ({}) — the change will be lost on restart",
+                                "user '{}' was NOT enabled because the users file update failed ({})",
                                 req.username, e
                             )),
                             clients: None,
@@ -610,22 +760,41 @@ async fn dispatch(req: Request, state: &Arc<ServerState>) -> Response {
             }
             drop(profiles);
 
-            let save_err = {
+            let (found, save_err) = {
                 let users_file = state.config.auth.users_file.clone();
                 let mut users = state.users_db.write().await;
-                match UsersDb::update_locked(&users_file, |db| {
-                    db.set_bandwidth(&req.username, req.mbps)
+                match UsersDb::update_locked_checked(&users_file, |db| {
+                    let found = match external_or_inline_user(db, &state.config, &req.username) {
+                        Some(user) => {
+                            user.bandwidth.limit_mbps = req.mbps;
+                            user.bandwidth.burst_mbps = req.mbps.saturating_add(req.mbps / 4);
+                            true
+                        }
+                        None => false,
+                    };
+                    let effective =
+                        crate::server::effective_users_from_external(&state.config, db.clone())?;
+                    Ok((found, effective))
                 }) {
-                    Ok((fresh, _found)) => {
-                        *users = fresh;
-                        None
+                    Ok((_fresh, (found, effective))) => {
+                        *users = effective;
+                        (found, None)
                     }
                     Err(e) => {
                         log::error!("Failed to save users file after set-bandwidth: {}", e);
-                        Some(e.to_string())
+                        (true, Some(e.to_string()))
                     }
                 }
             };
+
+            if !found {
+                return Response {
+                    ok: false,
+                    error: Some(format!("user '{}' not found", req.username)),
+                    clients: None,
+                    message: None,
+                };
+            }
 
             match save_err {
                 Some(e) => Response {
@@ -827,6 +996,31 @@ mod tests {
     }
 
     #[test]
+    fn runtime_mutation_materializes_and_keeps_an_inline_user_override() {
+        let mut config = crate::config::server::ServerConfig::default();
+        config.auth.users.push(crate::config::users::UserEntry {
+            username: "inline-alice".to_string(),
+            password_hash: "hash".to_string(),
+            enabled: true,
+            ..Default::default()
+        });
+        let mut external = UsersDb::default();
+
+        let user = external_or_inline_user(&mut external, &config, "inline-alice")
+            .expect("inline user must be materialized as a file override");
+        user.enabled = false;
+        let effective = crate::server::effective_users_from_external(&config, external)
+            .expect("override union must remain valid");
+
+        assert_eq!(effective.users.len(), 1);
+        assert_eq!(effective.users[0].username, "inline-alice");
+        assert!(
+            !effective.users[0].enabled,
+            "external override must keep precedence over the inline entry"
+        );
+    }
+
+    #[test]
     fn full_command_parses_all_fields() {
         let r = parse(
             r#"{"cmd":"set-limit","username":"alice","profile":"tcp","mbps":50,
@@ -861,6 +1055,7 @@ mod tests {
         for cmd in [
             "list-clients",
             "list-blocked",
+            "roaming-stats",
             "kick",
             "disable-user",
             "set-limit",

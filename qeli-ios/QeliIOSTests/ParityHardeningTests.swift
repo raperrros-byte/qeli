@@ -6,6 +6,36 @@ import XCTest
 /// differently on one platform.
 final class ParityHardeningTests: XCTestCase {
 
+    func testIOSSigningDiagnosticsRequireEverySharedCapability() {
+        let valid = IOSSigningDiagnostics.Entitlements(
+            networkExtensions: ["packet-tunnel-provider"],
+            appGroups: ["group.ru.qeli.app"],
+            keychainGroups: ["TEAMID.ru.qeli.app.shared"]
+        )
+        XCTAssertEqual(
+            IOSSigningDiagnostics.missingRequirements(
+                in: valid,
+                expectedAppGroup: "group.ru.qeli.app",
+                expectedKeychainGroup: "TEAMID.ru.qeli.app.shared"
+            ),
+            []
+        )
+
+        let genericSideload = IOSSigningDiagnostics.Entitlements(
+            networkExtensions: [],
+            appGroups: [],
+            keychainGroups: ["TEAMID.*"]
+        )
+        XCTAssertEqual(
+            IOSSigningDiagnostics.missingRequirements(
+                in: genericSideload,
+                expectedAppGroup: "group.ru.qeli.app",
+                expectedKeychainGroup: "ru.qeli.app.shared"
+            ),
+            [.packetTunnel, .appGroup, .keychainGroup]
+        )
+    }
+
     private func minimalINI(_ extra: String = "") -> String {
         """
         [qeli]
@@ -106,7 +136,7 @@ final class ParityHardeningTests: XCTestCase {
         let base = try VPNConfig(parsing: minimalINI("key = " + String(repeating: "aa", count: 32)))
         XCTAssertTrue(ProtectionSummary(config: base).carriesEverything)
 
-        for narrowing in ["allow_lan = true", "allow_ipv6_leak = true",
+        for narrowing in ["allow_lan = true", "allow_ipv4_leak = true", "allow_ipv6_leak = true",
                           "exclude = 192.168.0.0/16", "gateway = false"] {
             let config = try VPNConfig(parsing: minimalINI(
                 "key = " + String(repeating: "aa", count: 32) + "\n" + narrowing))
@@ -135,6 +165,108 @@ final class ParityHardeningTests: XCTestCase {
         // ...and with it off a clean profile still claims everything — otherwise this would
         // pass against a summary that simply always warns.
         XCTAssertTrue(ProtectionSummary(config: config, globalAllowLAN: false).carriesEverything)
+    }
+
+    func testLANToggleDoesNotPretendToExcludeSplitTunnelRoutes() throws {
+        let config = try VPNConfig(parsing: minimalINI(
+            "gateway = false\ninclude = 10.20.0.0/16\nallow_lan = true"
+        ))
+        let summary = ProtectionSummary(config: config, globalAllowLAN: true)
+        XCTAssertEqual(summary.scope, .splitRoutes)
+        XCTAssertFalse(summary.warnings.contains(.lanOutside))
+    }
+
+    func testMissingFamilyWarningOutranksNarrowerBypasses() throws {
+        let config = try VPNConfig(parsing: minimalINI(
+            "allow_ipv4_leak = true\nallow_lan = true\nexclude = 192.168.0.0/16"
+        ))
+        XCTAssertEqual(ProtectionSummary(config: config).warnings.first, .ipv4Outside)
+    }
+
+    func testLegacyTunnelSnapshotDecodesWithoutGateway() throws {
+        let legacy = Data(#"""
+        {"phase":"connected","message":"ok","clientAddress":"fd71:e100::2",
+         "bytesUploaded":0,"bytesDownloaded":0,"uploadBytesPerSecond":0,
+         "downloadBytesPerSecond":0,"updatedAt":0,"maxStreams":1,"pushedRoutes":0}
+        """#.utf8)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        let snapshot = try decoder.decode(TunnelSnapshot.self, from: legacy)
+        XCTAssertEqual(snapshot.clientAddress, "fd71:e100::2")
+        XCTAssertNil(snapshot.tunnelGateway)
+        XCTAssertNil(snapshot.liveConnectionProperties)
+
+        var current = snapshot
+        current.tunnelGateway = "fd71:e100::1"
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        let roundTrip = try decoder.decode(
+            TunnelSnapshot.self,
+            from: encoder.encode(current)
+        )
+        XCTAssertEqual(roundTrip.tunnelGateway, "fd71:e100::1")
+    }
+
+    func testLiveConnectionPropertiesRoundTripWithoutCredentials() throws {
+        let config = try VPNConfig(parsing: minimalINI(
+            "key = " + String(repeating: "aa", count: 32)
+                + "\nallow_ipv6_leak = true\nmtu = 1312\nreconnect = false"
+        ))
+        let live = LiveConnectionProperties(config: config, globalAllowLAN: true)
+        XCTAssertEqual(live.serverAddress, config.serverAddress)
+        XCTAssertEqual(live.displayEndpoint, "\(config.serverAddress):\(config.port)")
+        XCTAssertEqual(live.configuredMTU, 1312)
+        XCTAssertFalse(live.reconnectEnabled)
+        XCTAssertTrue(live.warnings.contains(.ipv6Outside))
+        XCTAssertTrue(live.warnings.contains(.lanOutside))
+
+        var snapshot = TunnelSnapshot()
+        snapshot.liveConnectionProperties = live
+        let encoded = try JSONEncoder().encode(snapshot)
+        let text = String(decoding: encoded, as: UTF8.self)
+        XCTAssertFalse(text.contains("password"))
+        XCTAssertFalse(text.contains("sessionToken"))
+        let decoded = try JSONDecoder().decode(TunnelSnapshot.self, from: encoded)
+        XCTAssertEqual(decoded.liveConnectionProperties, live)
+        XCTAssertEqual(ProtectionSummary(live: live).warnings,
+                       ProtectionSummary(config: config, globalAllowLAN: true).warnings)
+
+        var negotiated = TunnelSnapshot()
+        negotiated.pushed = PushedFacts(
+            familyMode: "dual",
+            carrierAddress: "2001:db8::20",
+            recordizerMode: "packet_mux_v1",
+            recordizerPolicy: "prefer",
+            roamingMode: "udp_roam_v1",
+            roamingPolicy: "auto"
+        )
+        let negotiatedRoundTrip = try JSONDecoder().decode(
+            TunnelSnapshot.self, from: JSONEncoder().encode(negotiated))
+        XCTAssertEqual(negotiatedRoundTrip.pushed?.familyMode, "dual")
+        XCTAssertEqual(negotiatedRoundTrip.pushed?.carrierAddress, "2001:db8::20")
+        XCTAssertEqual(negotiatedRoundTrip.pushed?.recordizerMode, "packet_mux_v1")
+        XCTAssertEqual(negotiatedRoundTrip.pushed?.recordizerPolicy, "prefer")
+        XCTAssertEqual(negotiatedRoundTrip.pushed?.roamingMode, "udp_roam_v1")
+        XCTAssertEqual(negotiatedRoundTrip.pushed?.roamingPolicy, "auto")
+
+        let legacyFacts = Data(#"""
+        {"routes":[],"routeCount":0,"routesInstalled":0,
+         "multipathAdaptive":false,"paddingEnabled":false,"paddingMin":0,
+         "paddingMax":0,"heartbeatEnabled":false,
+         "heartbeatIntervalMilliseconds":0,"shapingEnabled":false}
+        """#.utf8)
+        let decodedLegacyFacts = try JSONDecoder().decode(PushedFacts.self, from: legacyFacts)
+        XCTAssertNil(decodedLegacyFacts.familyMode)
+        XCTAssertNil(decodedLegacyFacts.carrierAddress)
+        XCTAssertNil(decodedLegacyFacts.recordizerMode)
+        XCTAssertNil(decodedLegacyFacts.roamingMode)
+
+        var ipv6 = config
+        ipv6.serverAddress = "2001:db8::10"
+        XCTAssertEqual(
+            LiveConnectionProperties(config: ipv6, globalAllowLAN: false).displayEndpoint,
+            "[2001:db8::10]:\(config.port)"
+        )
     }
 
     /// `apps_mode` is REPORTED on iOS, never applied — `NEAppRule` needs an MDM-managed

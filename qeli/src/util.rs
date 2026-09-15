@@ -46,7 +46,8 @@ mod host_port_tests {
 }
 
 /// Validate a route CIDR (`10.20.0.0/16`). The address must parse as an `IpAddr`
-/// and the prefix must be a decimal length in range for the family. Also rejects
+/// and the prefix must be a decimal length in range for the family. Host bits must be
+/// zero so equivalent networks have one meaning across platform route APIs. Also rejects
 /// anything that could be read as an `ip` option (leading `-`).
 ///
 /// Shared by the config parser, the panel API and the client's route applier so a
@@ -65,8 +66,25 @@ pub fn is_valid_cidr(s: &str) -> bool {
     let Ok(len) = prefix.parse::<u8>() else {
         return false;
     };
-    let max = if ip.is_ipv4() { 32 } else { 128 };
-    len <= max
+    // A route is a network, not an interface address. Zero host bits make the value
+    // unambiguous across route APIs and prevent semantic duplicates under different strings.
+    match ip {
+        std::net::IpAddr::V4(address) if len <= 32 => {
+            let value = u32::from(address);
+            let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+            value & mask == value
+        }
+        std::net::IpAddr::V6(address) if len <= 128 => {
+            let value = u128::from(address);
+            let mask = if len == 0 {
+                0
+            } else {
+                u128::MAX << (128 - len)
+            };
+            value & mask == value
+        }
+        _ => false,
+    }
 }
 
 /// Validate a route gateway: a bare `IpAddr` (NOT a CIDR/subnet), and not
@@ -106,6 +124,8 @@ mod route_validate_tests {
         assert!(is_valid_cidr("172.16.20.0/24"));
         assert!(is_valid_cidr("10.0.0.0/8"));
         assert!(is_valid_cidr("::/0"));
+        assert!(is_valid_cidr("172.16.20.7/32"));
+        assert!(is_valid_cidr("2001:db8::7/128"));
     }
 
     #[test]
@@ -115,6 +135,8 @@ mod route_validate_tests {
         assert!(!is_valid_cidr("172.16.20.0/33")); // prefix out of range
         assert!(!is_valid_cidr("nonsense/24"));
         assert!(!is_valid_cidr("-hostile/24"));
+        assert!(!is_valid_cidr("172.16.20.7/24"));
+        assert!(!is_valid_cidr("2001:db8::7/64"));
     }
 
     #[test]
@@ -177,6 +199,59 @@ pub fn log_sanitize(s: &str) -> String {
         }
     }
     out
+}
+
+/// Return a stable pseudonym suitable for logs instead of a plaintext account name.
+///
+/// The first 96 bits of SHA-256 are enough to correlate one account's events while
+/// keeping usernames, email addresses and control characters out of local or shipped
+/// logs. This is pseudonymisation, not authentication and not an API identifier.
+pub fn log_identity(username: &str) -> String {
+    log_fingerprint("user#", username)
+}
+
+/// Return a stable pseudonym for a session/device key that may embed a username.
+pub fn log_device_identity(device_key: &str) -> String {
+    log_fingerprint("device#", device_key)
+}
+
+fn log_fingerprint(prefix: &str, value: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    const DIGEST_BYTES: usize = 12;
+
+    let digest = Sha256::digest(value.as_bytes());
+    let mut out = String::with_capacity(prefix.len() + DIGEST_BYTES * 2);
+    out.push_str(prefix);
+    for &byte in &digest[..DIGEST_BYTES] {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+#[cfg(test)]
+mod log_identity_tests {
+    use super::log_identity;
+
+    #[test]
+    fn identity_is_stable_distinct_and_contains_no_plaintext() {
+        let alice = log_identity("alice@example.com");
+        assert_eq!(alice, log_identity("alice@example.com"));
+        assert_ne!(alice, log_identity("bob@example.com"));
+        assert!(alice.starts_with("user#"));
+        assert_eq!(alice.len(), 29);
+        assert!(!alice.contains("alice"));
+        assert!(!alice.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn hostile_identity_cannot_forge_a_log_line() {
+        let id = log_identity("alice\nAUTH OK: root");
+        assert!(!id.contains('\n'));
+        assert!(!id.contains("AUTH"));
+    }
 }
 
 /// Write `bytes` to `path` **atomically**: a uniquely-named temp file in the same
@@ -358,7 +433,18 @@ impl FileLock {
         // later users-file change from the panel or the control socket would fail with
         // EACCES. Best effort: only root can chown, and a mismatch is not fatal on a
         // single-user setup.
-        if let Ok(target) = std::fs::metadata(path.as_ref()) {
+        let ownership = std::fs::metadata(path.as_ref()).or_else(|_| {
+            // A first writer has no target to inherit from. The directory owns the future
+            // state file, so use its uid/gid; otherwise a root CLI can create a root-only
+            // sidecar that the packaged User=qeli service can never reopen.
+            let parent = path
+                .as_ref()
+                .parent()
+                .filter(|value| !value.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            std::fs::metadata(parent)
+        });
+        if let Ok(target) = ownership {
             use std::os::unix::fs::MetadataExt;
             if let Ok(lock_meta) = f.metadata() {
                 if lock_meta.uid() != target.uid() || lock_meta.gid() != target.gid() {
@@ -463,7 +549,8 @@ fn write_atomic_inner(path: impl AsRef<Path>, bytes: &[u8], private: bool) -> an
                 {
                     use std::os::unix::fs::MetadataExt;
                     use std::os::unix::io::AsRawFd;
-                    if let Ok(target) = std::fs::metadata(path) {
+                    let ownership = std::fs::metadata(path).or_else(|_| std::fs::metadata(dir));
+                    if let Ok(target) = ownership {
                         if let Ok(cur) = f.metadata() {
                             if cur.uid() != target.uid() || cur.gid() != target.gid() {
                                 unsafe { libc::fchown(f.as_raw_fd(), target.uid(), target.gid()) };

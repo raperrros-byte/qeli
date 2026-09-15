@@ -1,7 +1,9 @@
 using System.Collections.ObjectModel;
+using System.Collections.Generic;
 using System.IO;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text.Json;
 using Avalonia;
 using Avalonia.Controls;
@@ -154,7 +156,8 @@ public partial class MainWindow : Window
         RenderStatus(_status, _lastExtra); // localized initial status
     }
 
-    /// <summary>Seed sample profiles for an offscreen UI screenshot (uishot verb only).</summary>
+#if QELI_BUILD_TOOLS
+    /// <summary>Seed sample profiles for an offscreen UI screenshot.</summary>
     internal void ShotSeed(params VpnConfig[] ps)
     {
         foreach (var p in ps) { p.Reachability = ProfileReachability.Reachable; p.LatencyMs = 38; _profiles.Add(p); }
@@ -163,6 +166,7 @@ public partial class MainWindow : Window
         UpdateEmptyHint();
         OnProfileSelected(this, null);
     }
+#endif
 
     private VpnConfig? Selected => ProfilesList.SelectedItem as VpnConfig;
 
@@ -426,7 +430,8 @@ public partial class MainWindow : Window
         );
         try
         {
-            var json = JsonSerializer.Serialize(p);
+            byte[] profileBytes = System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(p));
+            string profileDigest = Convert.ToHexString(SHA256.HashData(profileBytes));
             // The temp file carries the server password — create it 0600 BEFORE the bytes land,
             // rather than writing at the default umask and narrowing afterwards: a crash/read in
             // that window would otherwise expose the plaintext password. Mirrors
@@ -435,17 +440,17 @@ public partial class MainWindow : Window
             {
                 using var fs = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write);
                 try { File.SetUnixFileMode(tmp, UnixFileMode.UserRead | UnixFileMode.UserWrite); } catch { }
-                var bytes = System.Text.Encoding.UTF8.GetBytes(json);
-                fs.Write(bytes, 0, bytes.Length);
+                fs.Write(profileBytes, 0, profileBytes.Length);
             }
             else
             {
                 using var fs = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write);
                 using var writer = new StreamWriter(fs);
-                writer.Write(json);
+                writer.Write(System.Text.Encoding.UTF8.GetString(profileBytes));
             }
 
-            var (ok, msg, canceled) = await Task.Run(() => ServiceManager.RunSelfElevated("daemon-install", tmp));
+            var (ok, msg, canceled) = await Task.Run(() =>
+                ServiceManager.RunSelfElevated("daemon-install", tmp, profileDigest));
             if (!ok)
             {
                 if (!canceled)
@@ -635,6 +640,8 @@ public partial class MainWindow : Window
     private void RenderStatus(VpnStatus status, string? extra)
     {
         _status = status;
+        if (status is VpnStatus.Connected or VpnStatus.Connecting)
+            _profileReachabilityGeneration.Clear();
         _lastExtra = extra;
         _tray?.Update(status, extra);
 
@@ -1042,6 +1049,8 @@ public partial class MainWindow : Window
     private DateTime _lastReachAll = DateTime.MinValue;
     private bool _reachPending;
     private DispatcherTimer? _probeTimer;
+    private long _nextReachabilityGeneration;
+    private readonly Dictionary<VpnConfig, long> _profileReachabilityGeneration = new();
 
     /// <summary>(Re)configure the auto-poll timer from settings. Auto off → no timer
     /// (reachability is then updated only by the manual "check" button / dot click).</summary>
@@ -1103,6 +1112,9 @@ public partial class MainWindow : Window
     {
         // Auto-poll off: leave the dot as-is (default Unknown / last manual result), don't wipe it.
         if (!manual && !QeliMac.Model.AppSettings.Current.ProbeReachability) return;
+        if (_status is VpnStatus.Connected or VpnStatus.Connecting) return;
+        var generation = ++_nextReachabilityGeneration;
+        _profileReachabilityGeneration[p] = generation;
         p.Reachability = ProfileReachability.Checking;
         _ = Task.Run(async () =>
         {
@@ -1124,6 +1136,12 @@ public partial class MainWindow : Window
             }
             Dispatcher.UIThread.Post(() =>
             {
+                if (_status is VpnStatus.Connected or VpnStatus.Connecting
+                    || !_profileReachabilityGeneration.TryGetValue(p, out var current)
+                    || current != generation)
+                    return;
+                _profileReachabilityGeneration.Remove(p);
+                if (!_profiles.Contains(p)) return;
                 p.LatencyMs = ok ? ms : null;
                 p.Reachability = ok ? ProfileReachability.Reachable : ProfileReachability.Unreachable;
             });

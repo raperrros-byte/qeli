@@ -1,9 +1,10 @@
 import Foundation
 
-/// What the SERVER pushed for this session, as the client applied it.
+/// Negotiated, display-safe runtime facts for the active session.
 ///
 /// Mirror of the Android `PushedFacts`. Only knowable after the handshake, so it travels on
-/// `TunnelSnapshot` rather than being derived from the profile. Two deliberate limits:
+/// `TunnelSnapshot` rather than being derived from the profile. It includes both server-pushed
+/// settings and capability-negotiated transport modes. Two deliberate limits:
 ///
 /// * `routes` is CAPPED at ``routeSample`` entries with `routeCount` carrying the real total.
 ///   A server may advertise an arbitrarily long list — an operator pushing a country-sized
@@ -45,4 +46,10 @@ struct PushedFacts: Codable, Equatable, Sendable {
     var heartbeatEnabled = false
     var heartbeatIntervalMilliseconds = 0
     var shapingEnabled = false
+    var familyMode: String?
+    var carrierAddress: String?
+    var recordizerMode: String?
+    var recordizerPolicy: String?
+    var roamingMode: String?
+    var roamingPolicy: String?
 }

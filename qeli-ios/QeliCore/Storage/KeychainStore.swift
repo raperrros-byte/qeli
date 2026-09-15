@@ -58,6 +58,22 @@ final class KeychainStore: @unchecked Sendable {
         guard add == errSecSuccess else { throw KeychainError.status(add) }
     }
 
+    /// Probes an access group without creating or changing a keychain item.
+    /// A permitted group returns either an existing item or `errSecItemNotFound`;
+    /// a re-signed build without the entitlement returns `errSecMissingEntitlement`.
+    static func canAccess(group: String) -> Bool {
+        guard !group.isEmpty, !group.contains("$(") else { return false }
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: "ru.qeli.app.signing-diagnostics",
+            kSecAttrAccount: "entitlement-probe",
+            kSecAttrAccessGroup: group,
+            kSecMatchLimit: kSecMatchLimitOne
+        ]
+        let status = SecItemCopyMatching(query as CFDictionary, nil)
+        return status == errSecSuccess || status == errSecItemNotFound
+    }
+
     private func baseQuery(account: String) -> [CFString: Any] {
         var query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
@@ -71,6 +87,11 @@ final class KeychainStore: @unchecked Sendable {
 
 enum KeychainError: LocalizedError {
     case status(OSStatus)
+
+    var isMissingEntitlement: Bool {
+        guard case .status(let status) = self else { return false }
+        return status == errSecMissingEntitlement
+    }
 
     var errorDescription: String? {
         switch self {

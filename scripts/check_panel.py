@@ -23,6 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES = ROOT / "qeli" / "src" / "web" / "templates"
 I18N = ROOT / "qeli" / "src" / "web" / "assets" / "i18n.js"
+SELECT_CSS = ROOT / "qeli" / "web-assets" / "input.css"
 
 failures: list[str] = []
 
@@ -62,6 +63,10 @@ def technical_label(value: str) -> bool:
     # Symbols and protocol/config values are intentionally language-neutral.
     if not any(character.isalpha() for character in stripped):
         return True
+    if "{{" in stripped or "{%" in stripped:
+        return True
+    if stripped == "qeli show-identity" or re.fullmatch(r"jc\s+\([^)]*\)", stripped):
+        return True
     return bool(re.fullmatch(r"[A-Za-z0-9_.:/+×-]+", stripped))
 
 
@@ -69,6 +74,12 @@ def technical_placeholder(value: str) -> bool:
     # Single tokens and examples containing config/network punctuation should not be translated.
     # Human instructions such as "Search profiles" or "auto from the link" must be.
     return " " not in value or bool(re.search(r"[/:=\[\]{}<>$0-9]", value))
+VOID_TAGS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr",
+}
+NON_VISIBLE_TAGS = {"script", "style", "textarea"}
+
 
 
 class TemplateAudit(HTMLParser):
@@ -76,7 +87,7 @@ class TemplateAudit(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.path = path
         self.source = source
-        self.control_stack: list[tuple[str, dict[str, str | None], int]] = []
+        self.element_stack: list[tuple[str, dict[str, str | None], int]] = []
 
     @property
     def line(self) -> int:
@@ -84,11 +95,40 @@ class TemplateAudit(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         data = dict(attrs)
+        if tag not in VOID_TAGS:
+            self.element_stack.append((tag, data, self.line))
         classes = set((data.get("class") or "").split())
         input_type = (data.get("type") or "text").lower()
 
+        for name, value in attrs:
+            if not value:
+                continue
+            if name.startswith(("@", "x-on:")):
+                expression = value.strip()
+                if ";" in expression.rstrip(";"):
+                    fail(self.path, self.line, "CSP Alpine event handlers must contain one expression")
+            forbidden_csp_syntax = ("Object.entries(", "parseInt(", "randHex(", ".replace(/")
+            if name.startswith(("@", ":", "x-")) and any(
+                token in value for token in forbidden_csp_syntax
+            ):
+                fail(self.path, self.line, "Alpine expression uses syntax/global unavailable in the CSP build")
+
         # login.html is a standalone, fully styled page with its own scoped input/select CSS.
         bespoke_login = self.path.name == "login.html"
+        if tag == "select":
+            inline_style = data.get("style") or ""
+            if re.search(r"(?:^|;)\s*(?:inline-size|width)\s*:", inline_style, re.IGNORECASE):
+                fail(
+                    self.path,
+                    self.line,
+                    "select width must be content-fitted or inherited, never fixed inline",
+                )
+            fixed_width_classes = sorted(
+                item for item in classes
+                if item.startswith("w-") and item not in {"w-auto", "w-full"}
+            )
+            if fixed_width_classes:
+                fail(self.path, self.line, f"select uses fixed width classes: {fixed_width_classes}")
         if not bespoke_login:
             if tag == "select" and "inp" not in classes:
                 fail(self.path, self.line, "select must use the shared .inp control")
@@ -117,26 +157,32 @@ class TemplateAudit(HTMLParser):
             if not allowed:
                 fail(self.path, self.line, "clickable div must be a shared toggle, modal, or keyboard-operable role")
 
-        if tag in {"button", "option"}:
-            self.control_stack.append((tag, data, self.line))
-
     def handle_data(self, data: str) -> None:
-        if not self.control_stack:
+        if not self.element_stack:
             return
-        tag, attrs, start_line = self.control_stack[-1]
+        if any(tag in NON_VISIBLE_TAGS for tag, _, _ in self.element_stack):
+            return
+        if any(
+            attrs.get("data-i18n-skip") is not None or attrs.get("x-text") is not None
+            for _, attrs, _ in self.element_stack
+        ):
+            return
+        tag, attrs, start_line = self.element_stack[-1]
         text = " ".join(data.split())
-        if not text or attrs.get("data-i18n-skip") is not None or attrs.get("x-text") is not None:
+        if not text:
             return
         # An option without value submits its visible text as the configuration value. The
         # runtime translator intentionally leaves those protocol enum tokens untouched.
         if tag == "option" and "value" not in attrs:
             return
         if text not in dictionary and not technical_label(text):
-            fail(self.path, start_line, f"{tag} text has no RU translation: {text!r}")
+            fail(self.path, start_line, f"visible text has no RU translation: {text!r}")
 
     def handle_endtag(self, tag: str) -> None:
-        if self.control_stack and self.control_stack[-1][0] == tag:
-            self.control_stack.pop()
+        for index in range(len(self.element_stack) - 1, -1, -1):
+            if self.element_stack[index][0] == tag:
+                del self.element_stack[index:]
+                return
 
 
 template_paths = sorted(TEMPLATES.glob("*.html"))
@@ -155,6 +201,46 @@ for path in template_paths:
     except Exception as error:  # fail closed on malformed input/parser surprises
         fail(path, parser.line, f"HTML audit failed: {error}")
 
+# Selects must remain locale-independent: the shared CSS keeps native values left-aligned,
+# reserves space for the custom arrow, and JavaScript fits compact controls to the longest
+# translated/dynamic option.
+select_css = SELECT_CSS.read_text(encoding="utf-8")
+select_block_match = re.search(r"select\.inp\s*\{(?P<body>[^}]*)\}", select_css, re.DOTALL)
+if not select_block_match:
+    fail(SELECT_CSS, 1, "shared select.inp styling block is missing")
+    select_block = ""
+else:
+    select_block = select_block_match.group("body")
+for marker in (
+    "padding:0 2.25rem 0 .75rem",
+    "text-align:left",
+    "text-align-last:left",
+):
+    if marker not in select_block:
+        fail(SELECT_CSS, 1, f"shared select.inp styling is missing {marker!r}")
+for marker in ("text-align:center", "text-align-last:center"):
+    if marker in select_block:
+        fail(SELECT_CSS, 1, f"shared select.inp styling must not contain {marker!r}")
+for marker in ("select.inp.inp-fit", "--qeli-select-fit-width"):
+    if marker not in select_css:
+        fail(SELECT_CSS, 1, f"localized select auto-fitting is missing {marker!r}")
+for marker in ("select.inp-fit, select[data-select-fit]", "--qeli-select-fit-width"):
+    if marker not in i18n_text:
+        fail(I18N, 1, f"localized select auto-fitting is missing {marker!r}")
+
+# Placeholders are examples, not saved values. Keep a dedicated token for both themes and
+# apply it to every input/textarea; a class-only rule previously left some fields too dark.
+placeholder_block = re.search(
+    r"input::placeholder\s*,\s*textarea::placeholder\s*\{(?P<body>[^}]*)\}",
+    select_css,
+)
+if not placeholder_block or "color:var(--txt-placeholder)" not in placeholder_block.group("body"):
+    fail(SELECT_CSS, 1, "global input/textarea placeholder colour token is missing")
+if not placeholder_block or "opacity:1" not in placeholder_block.group("body"):
+    fail(SELECT_CSS, 1, "placeholder opacity must be normalized across browsers")
+if select_css.count("--txt-placeholder:") < 2:
+    fail(SELECT_CSS, 1, "placeholder token must be defined for dark and light themes")
+
 # Alpine evaluates x-text/x-title expressions as soon as its deferred script runs. qeliT must
 # already exist at that point or dynamic labels render empty until an unrelated state change.
 layout_path = TEMPLATES / "layout.html"
@@ -163,6 +249,16 @@ i18n_pos = layout_source.find('src="assets/i18n.js')
 alpine_pos = layout_source.find('src="assets/alpine.js')
 if i18n_pos < 0 or alpine_pos < 0 or i18n_pos > alpine_pos:
     fail(layout_path, 1, "i18n.js must load before Alpine initializes translated expressions")
+
+# The CSP Alpine evaluator does not resolve arbitrary window globals from x-text. Dashboard
+# uptime used to call the shared global dur() directly, which left every cell empty after the
+# switch to @alpinejs/csp. Keep the expression backed by a component method.
+dashboard_path = TEMPLATES / "dashboard.html"
+dashboard_source = dashboard_path.read_text(encoding="utf-8")
+if 'x-text="dur(c.connected_secs)"' not in dashboard_source:
+    fail(dashboard_path, 1, "dashboard must render the server-provided connected_secs value")
+if not re.search(r"\bdur\(value\)\s*\{[^}]*window\.dur", dashboard_source):
+    fail(dashboard_path, 1, "dashboard duration formatter must be exposed through Alpine component data")
 
 # Profile diagnostics belong in the fixed drawer. An inline x-show inside each grid card makes
 # every sibling in that CSS-grid row grow to the expanded card's height.
@@ -173,6 +269,54 @@ if "transport-drawer-backdrop" not in transport_source or "selectedProfile" not 
 if 'x-show="expanded===profile.name"' in transport_source:
     fail(transport_path, line_at(transport_source, transport_source.index('x-show="expanded===profile.name"')),
          "transport details must not expand inside a profile grid card")
+
+# The global counter is the number of live inbound sessions returned by /api/status, not the
+# number of configured users or outbound profiles. Keep the label and Alpine field honest.
+if "Inbound sessions:" not in layout_source or "activeInboundSessions" not in layout_source:
+    fail(layout_path, 1, "global status counter must be labelled as inbound sessions")
+if "Total clients:" in layout_source:
+    fail(layout_path, line_at(layout_source, layout_source.index("Total clients:")),
+         "ambiguous total-client label must not return")
+
+# A running client's multiline log belongs in structured diagnostics. The table may retain a
+# one-line error summary for an old process without a status sidecar, but must never expand an
+# otherwise healthy row with the raw tail.
+client_path = TEMPLATES / "client.html"
+client_source = client_path.read_text(encoding="utf-8")
+if 'p.connected && p.log_tail' in client_source or 'x-text="p.log_tail"' in client_source:
+    fail(client_path, 1, "outbound profile rows must not render the raw multiline log tail")
+if "lastLine(p.log_tail)" not in client_source:
+    fail(client_path, 1, "legacy client errors need a bounded one-line log fallback")
+
+# IPv6 route policy is common enough to be first-class in the outbound profile form. Keep the
+# Field editor, its lossless parser and the Rust serializer in sync; otherwise a newly-created
+# profile can use these keys only through Raw INI, or a later Field save can drop them.
+client_api_path = ROOT / "qeli" / "src" / "web" / "api" / "client.rs"
+client_api_source = client_api_path.read_text(encoding="utf-8")
+for key in ("include", "exclude", "lan_subnet_ipv6"):
+    if f'x-model="form.{key}"' not in client_source:
+        fail(client_path, 1, f"outbound profile form must expose {key}")
+    if f"{key}:'{key}'" not in client_source:
+        fail(client_path, 1, f"Field/Raw parser must round-trip {key}")
+    if f'"{key}"' not in client_api_source:
+        fail(client_api_path, 1, f"profile API must serialize {key}")
+
+# The Users table promises tunnel addresses, so it must merge active session IPs from the same
+# /api/clients source as the dashboard instead of displaying configured static values alone.
+users_path = TEMPLATES / "users.html"
+users_source = users_path.read_text(encoding="utf-8")
+if "apiFetch('api/clients')" not in users_source or "addressRows(u)" not in users_source:
+    fail(users_path, 1, "users table must merge live and fixed tunnel addresses")
+if "session.addresses" not in users_source or "[session.ip]" not in users_source:
+    fail(users_path, 1, "users table must support dual-stack addresses and the legacy primary IP")
+
+control_path = ROOT / "qeli" / "src" / "server" / "control.rs"
+control_source = control_path.read_text(encoding="utf-8")
+if "pub addresses: Vec<String>" not in control_source or ".assigned_addresses()" not in control_source:
+    fail(
+        control_path, 1,
+        "list-clients must expose every assigned dual-stack address alongside the legacy primary IP",
+    )
 
 if failures:
     print("panel checks FAILED:")

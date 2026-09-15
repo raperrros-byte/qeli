@@ -7,17 +7,17 @@
 //! qeli://<user>:<pass>@<host>:<port>?proto=tcp&mode=fake-tls&key=<hex>&sni=<host>&obfs=<key>#<label>
 //! ```
 //!
-//! Everything in [`ClientLink`] is exactly the set of fields the client cannot
-//! derive or receive from the server at handshake time — credentials, where to
-//! connect, the pinned server key, and the wire mode that must match the
-//! server's profile. Routes, DNS, MTU and the obfuscation *parameters* are
-//! pushed by the server after auth, so they deliberately do not appear here.
+//! Everything in [`ClientLink`] is the connection descriptor needed before the
+//! authenticated server push: credentials, endpoint, pinned key and the wire/framing
+//! settings that must already match. NetworkPlan supplies tunnel addresses, routes, DNS
+//! and the automatic inner MTU after auth; an explicit client MTU may appear here as an
+//! override. Device-local policy such as per-app routing deliberately stays in flat INI.
 //!
 //! Pure `std` (manual percent-encoding, no `url` crate), so it builds and is
 //! tested on every platform.
 
-/// The minimal, QR-encodable client connection descriptor. Maps 1:1 onto the
-/// `[qeli]` section of a client config and onto a `qeli://` URI.
+/// The minimal, QR-encodable client connection descriptor. It is the portable
+/// connection-bearing subset of the larger flat-INI `[qeli]` section.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ClientLink {
     pub host: String,
@@ -60,41 +60,87 @@ pub struct ClientLink {
     /// client adopts the MTU the server pushes at auth. Only present in the link
     /// when set to a non-zero override.
     pub mtu: i32,
+    /// Client session-migration policy (`off`, `auto`, or `required`). `auto` is
+    /// the default and is omitted from compact links; non-default policy must
+    /// survive sharing between clients.
+    pub roaming: String,
     /// Human label shown in the client UI (URI fragment).
     pub label: Option<String>,
 }
 
-/// Parse an operator-supplied public endpoint and reject address families the current client
-/// data plane cannot use. Keeping this at the common link boundary prevents the installer,
-/// CLI and panel from successfully issuing a polished but unusable IPv6 configuration.
+/// Parse an operator-supplied public endpoint. IPv6 literals use the URI-compatible
+/// `[address]:port` form when a port is present; a bare literal inherits `default_port`.
+fn supported_dns_host(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 || !host.is_ascii() {
+        return false;
+    }
+    let without_root_dot = host.strip_suffix('.').unwrap_or(host);
+    if without_root_dot.is_empty() {
+        return false;
+    }
+    without_root_dot.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    })
+}
+
 pub fn supported_public_endpoint(input: &str, default_port: u16) -> Result<(String, u16), String> {
     let value = input.trim();
     if value.is_empty() {
         return Err("public endpoint is empty".into());
     }
-    if value.starts_with('[')
-        || value.parse::<std::net::Ipv6Addr>().is_ok()
-        || value.matches(':').count() > 1
-    {
+    let (host, port) = if let Some(bracketed) = value.strip_prefix('[') {
+        let (host, suffix) = bracketed.split_once(']').ok_or_else(|| {
+            format!("invalid public endpoint '{value}' (missing closing IPv6 bracket)")
+        })?;
+        host.parse::<std::net::Ipv6Addr>()
+            .map_err(|_| format!("invalid IPv6 public endpoint address in '{value}'"))?;
+        let port = if suffix.is_empty() {
+            default_port
+        } else {
+            suffix
+                .strip_prefix(':')
+                .filter(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+                .ok_or_else(|| format!("invalid public endpoint '{value}' (expected [IPv6]:port)"))?
+                .parse::<u16>()
+                .map_err(|_| format!("invalid public endpoint port in '{value}'"))?
+        };
+        (host.to_string(), port)
+    } else if value.parse::<std::net::Ipv6Addr>().is_ok() {
+        (value.to_string(), default_port)
+    } else if value.matches(':').count() > 1 {
         return Err(format!(
-            "IPv6 server endpoint '{value}' is not supported yet; use an IPv4 address or a hostname with an A record"
+            "invalid public endpoint '{value}' (IPv6 literals with a port must use [address]:port)"
+        ));
+    } else {
+        match value.rsplit_once(':') {
+            Some((host, port)) => {
+                if host.is_empty()
+                    || port.is_empty()
+                    || !port.bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    return Err(format!(
+                        "invalid public endpoint '{value}' (expected host or host:port)"
+                    ));
+                }
+                let port = port
+                    .parse::<u16>()
+                    .map_err(|_| format!("invalid public endpoint port in '{value}'"))?;
+                (host.to_string(), port)
+            }
+            None => (value.to_string(), default_port),
+        }
+    };
+    if host.parse::<std::net::IpAddr>().is_err() && !supported_dns_host(&host) {
+        return Err(format!(
+            "invalid public endpoint host '{host}' (expected an IP address or DNS hostname)"
         ));
     }
-    let (host, port) = match value.rsplit_once(':') {
-        Some((host, port)) => {
-            if host.is_empty() || port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit())
-            {
-                return Err(format!(
-                    "invalid public endpoint '{value}' (expected host or host:port)"
-                ));
-            }
-            let port = port
-                .parse::<u16>()
-                .map_err(|_| format!("invalid public endpoint port in '{value}'"))?;
-            (host.to_string(), port)
-        }
-        None => (value.to_string(), default_port),
-    };
     if port == 0 {
         return Err("public endpoint port must be 1..65535".into());
     }
@@ -173,6 +219,7 @@ impl ClientLink {
             // mtu=0 (auto): the client adopts the server-pushed TUN MTU. Omitted from the
             // URI; set a non-zero value only to force a client-side override.
             mtu: 0,
+            roaming: "auto".into(),
             label,
             // AmneziaWG-style junk masking. Junk is emitted only where the handshake
             // actually sends it: on TCP the obfs wire mode (protocol::obfs), and on UDP
@@ -245,6 +292,9 @@ impl ClientLink {
         if self.mtu > 0 {
             query.push(("mtu".into(), self.mtu.to_string()));
         }
+        if !self.roaming.is_empty() && self.roaming != "auto" {
+            query.push(("roaming".into(), self.roaming.clone()));
+        }
         if !query.is_empty() {
             uri.push('?');
             let parts: Vec<String> = query
@@ -288,11 +338,17 @@ impl ClientLink {
             let (h, p) = rest
                 .split_once("]:")
                 .ok_or(LinkError("malformed IPv6 [host]:port"))?;
+            h.parse::<std::net::Ipv6Addr>()
+                .map_err(|_| LinkError("invalid IPv6 address"))?;
             (h, p)
         } else {
-            hostport
+            let (h, p) = hostport
                 .rsplit_once(':')
-                .ok_or(LinkError("authority missing :port"))?
+                .ok_or(LinkError("authority missing :port"))?;
+            if h.contains(':') || h.contains('[') || h.contains(']') {
+                return Err(LinkError("IPv6 authority must be [address]:port"));
+            }
+            (h, p)
         };
         if host.is_empty() {
             return Err(LinkError("empty host"));
@@ -332,6 +388,7 @@ impl ClientLink {
             jmin: 0,
             jmax: 0,
             mtu: 0,
+            roaming: "auto".into(),
             label: fragment,
         };
 
@@ -353,6 +410,12 @@ impl ClientLink {
                     "jmin" => link.jmin = v.parse().unwrap_or(0),
                     "jmax" => link.jmax = v.parse().unwrap_or(0),
                     "mtu" => link.mtu = v.parse().unwrap_or(0),
+                    "roaming" => match v.trim().to_ascii_lowercase().as_str() {
+                        "off" | "auto" | "required" => link.roaming = v.trim().to_ascii_lowercase(),
+                        _ => {
+                            return Err(LinkError("roaming must be off, auto or required"));
+                        }
+                    },
                     _ => {} // forward-compatible: ignore unknown params
                 }
             }
@@ -393,11 +456,36 @@ mod endpoint_tests {
             supported_public_endpoint("198.51.100.8:9443", 443).unwrap(),
             ("198.51.100.8".into(), 9443)
         );
+        assert_eq!(
+            supported_public_endpoint("2001:db8::1", 443).unwrap(),
+            ("2001:db8::1".into(), 443)
+        );
+        assert_eq!(
+            supported_public_endpoint("[2001:db8::1]:8443", 443).unwrap(),
+            ("2001:db8::1".into(), 8443)
+        );
     }
 
     #[test]
-    fn rejects_ipv6_and_invalid_ports_until_the_data_plane_supports_them() {
-        for endpoint in ["2001:db8::1", "[2001:db8::1]:443", "host:0", "host:nope"] {
+    fn rejects_malformed_endpoints_and_invalid_ports() {
+        for endpoint in [
+            "[2001:db8::1",
+            "[2001:db8::1]:nope",
+            "2001:db8::1:443:garbage",
+            "host:0",
+            "host:nope",
+            "evil@attacker.example",
+            "host/path",
+            "host?query",
+            "host#fragment",
+            "host name",
+            "host%40name",
+            ".example.com",
+            "example..com",
+            "-example.com",
+            "example-.com",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example",
+        ] {
             assert!(
                 supported_public_endpoint(endpoint, 443).is_err(),
                 "{endpoint} must be refused"
@@ -598,6 +686,7 @@ mod tests {
             jmin: 0,
             jmax: 0,
             mtu: 0,
+            roaming: "auto".into(),
             label: Some("My VPN".into()),
         }
     }
@@ -639,6 +728,7 @@ mod tests {
             jmin: 0,
             jmax: 0,
             mtu: 1280,
+            roaming: "required".into(),
             label: None,
         };
         let back = ClientLink::from_uri(&link.to_uri()).unwrap();
@@ -647,6 +737,8 @@ mod tests {
         assert_eq!(back.fronting.as_deref(), Some("none"));
         assert!(back.quic);
         assert_eq!(back.server_key, "");
+        assert_eq!(back.mtu, 1280);
+        assert_eq!(back.roaming, "required");
         assert_eq!(back.label, None);
     }
 
@@ -685,6 +777,9 @@ mod tests {
         assert!(ClientLink::from_uri("qeli://hostonly").is_err());
         assert!(ClientLink::from_uri("qeli://h:notaport").is_err());
         assert!(ClientLink::from_uri("qeli://u:p@[2001:db8::1]").is_err()); // bracket, no port
+        assert!(ClientLink::from_uri("qeli://u:p@2001:db8::443").is_err()); // bare IPv6
+        assert!(ClientLink::from_uri("qeli://u:p@[2001:db8:::1]:443").is_err());
+        assert!(ClientLink::from_uri("qeli://u:p@[vpn.example.com]:443").is_err());
     }
 
     #[test]
@@ -826,6 +921,9 @@ mod conformance {
             if let Some(v) = e.get("mtu").and_then(Value::as_i64) {
                 assert_eq!(link.mtu, v as i32, "case '{name}': mtu");
             }
+            if let Some(v) = e.get("roaming").and_then(Value::as_str) {
+                assert_eq!(link.roaming, v, "case '{name}': roaming");
+            }
             if let Some(v) = e.get("quic").and_then(Value::as_bool) {
                 assert_eq!(link.quic, v, "case '{name}': quic");
             }
@@ -927,6 +1025,10 @@ mod conformance {
             assert_eq!(
                 link.obfs_key, again.obfs_key,
                 "case '{name}': obfs round-trip"
+            );
+            assert_eq!(
+                link.roaming, again.roaming,
+                "case '{name}': roaming round-trip"
             );
             assert_eq!(link.quic, again.quic, "case '{name}': quic round-trip");
             assert_eq!(link.awg, again.awg, "case '{name}': awg round-trip");

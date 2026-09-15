@@ -12,7 +12,8 @@
 #      itself (add QELI_SRC=<repo checkout> for a fully offline / build-from-source run),
 #   3. asks for the profile (reality-tls | fake-tls | udp-quic) + listen port and writes
 #      /etc/qeli/server.conf with ONLY that profile (taken from the packaged
-#      multi-profile example) on the chosen port, full-tunnel NAT on,
+#      multi-profile example) on the chosen port, full-tunnel NAT44 on,
+#      and dual-stack NAT66 when the host has a public IPv6 WAN,
 #   4. generates the server identity key,
 #   5. creates 5 users and saves their ready-to-use qeli:// connection strings
 #      under /etc/qeli/client-links/,
@@ -32,15 +33,8 @@
 #     PUBLIC_HOST   Address clients connect to (IP or hostname). If omitted, the
 #                   public IP is auto-detected — pass it explicitly if your box has
 #                   separate inbound/outbound IPs or you use a domain.
-#     QELI_PROFILE  Optional. Single-profile install (legacy). If unset, ALL profiles
-#                   from server-multiprofile.conf.example are enabled (default).
-#     QELI_SINGLE_PROFILE=1
-#                   Force single-profile mode without setting QELI_PROFILE.
-#     QELI_PANEL_DOMAIN=<hostname>
-#                   Panel behind an external TLS terminator (nginx). Sets loopback
-#                   bind, tls=false, secure_cookie=true, allowed_origins=<hostname>.
-#                   With all profiles, reality-tls listens on 127.0.0.1:4430 for nginx
-#                   SNI passthrough on public :443.
+#     QELI_PROFILE  Optional. Pick the profile non-interactively (skips the prompt):
+#                   QELI_PROFILE=reality-tls | fake-tls | udp-quic. For curl|bash / automation.
 #     QELI_PORT     Optional. Pick the listen port non-interactively (default 443;
 #                   1-65535, and not 8080 which the web panel uses). udp-quic listens on UDP.
 #     QELI_BIN      Optional. Path to a prebuilt qeli binary — install from it and
@@ -91,13 +85,8 @@ cleanup_tmp() {
 trap cleanup_tmp EXIT INT TERM
 
 REPO="litvinovtd/qeli"
-PROFILE=""            # single-profile mode only; default is all profiles
-PORT=443
-SINGLE_PROFILE=0
-if [ -n "${QELI_PROFILE:-}" ] || [ "${QELI_SINGLE_PROFILE:-0}" = "1" ]; then
-  SINGLE_PROFILE=1
-fi
-REALITY_BACKEND_PORT="${QELI_REALITY_BACKEND_PORT:-4430}"
+PROFILE=""            # chosen interactively below (or non-interactively via QELI_PROFILE)
+PORT=443             # default listen port; overridable via QELI_PORT / the prompt below
 PANEL_PORT=8080      # web admin panel — reserved (the VPN port cannot reuse it)
 NUM_USERS=5
 USER_PREFIX="phone"
@@ -111,6 +100,37 @@ die(){ printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 warn(){ printf '\033[1;33mWARNING: %s\033[0m\n' "$*" >&2; }
 # true iff $1 is a decimal port in 1..65535
 _valid_port(){ case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+
+# Discover the interface and source address the kernel would use for public IPv6.
+# A ULA or link-local address is deliberately insufficient: NAT66 is enabled only
+# for a 2000::/3 GUA on an interface that also owns an IPv6 default route. Exclude
+# documentation, transition and benchmarking ranges that also sit inside 2000::/3.
+_native_public_ipv6_egress(){
+  local route_line route_dev route_src
+  command -v ip6tables >/dev/null 2>&1 || return 1
+  ip6tables -t nat -S >/dev/null 2>&1 || return 1
+  route_line="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | head -n 1)" || return 1
+  route_dev="$(printf '%s\n' "$route_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  route_src="$(printf '%s\n' "$route_line" | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' | tr '[:upper:]' '[:lower:]')"
+  [ -n "$route_dev" ] && [ -n "$route_src" ] || return 1
+  ip -6 route show default dev "$route_dev" 2>/dev/null | grep -q '^default' || return 1
+  case "$route_src" in
+    2*|3*) ;;
+    *) return 1 ;;
+  esac
+  case "$route_src" in
+    2001:db8:*|2001::*|2001:0:*|2001:2:*|2001:10:*|2001:20:*|2002:*|3fff:*) return 1 ;;
+  esac
+  IPV6_WAN_IF="$route_dev"
+  IPV6_WAN_ADDR="$route_src"
+}
+
+# Print the digest for a bare asset name from a GNU sha256sum-format file.  Strip a
+# possible CR left by a Windows-authored CRLF file: otherwise awk treats it as part
+# of field 2 and a correctly listed package looks absent on Linux.
+_checksum_for(){
+  awk -v n="$2" '{ sub(/\r$/, "", $2); if ($2 == n) { print $1; exit } }' "$1"
+}
 
 # ── obtaining the packaged unit / config examples for the QELI_BIN path ───────
 # These files used to be pulled with a bare `curl https://raw.githubusercontent.com/
@@ -155,7 +175,7 @@ _ensure_pkg_payload(){
   if ! curl -fL --retry 3 -o "$tmp_deb" "$deb_url" || ! curl -fL --retry 3 -o "$tmp_sha" "$sha_url"; then
     rm -f "$tmp_deb" "$tmp_sha"; warn "download from release ${ref} failed."; return 1
   fi
-  want="$(awk -v n="$(basename "$deb_url")" '$2==n{print $1}' "$tmp_sha" | head -n1)"
+  want="$(_checksum_for "$tmp_sha" "$(basename "$deb_url")")"
   got="$(sha256sum "$tmp_deb" | awk '{print $1}')"
   rm -f "$tmp_sha"
   if [ -z "$want" ] || [ "$want" != "$got" ]; then
@@ -236,9 +256,9 @@ from_source_install(){
   fi
   # 3) directories.
   mkdir -p /etc/qeli /var/log/qeli /var/lib/qeli
-  # 4) example configs — the same five the .deb ships.
+  # 4) example configs — the same complete set the .deb ships.
   local name
-  for name in server server-multiprofile users client client-reality; do
+  for name in server server-multiprofile server-ipv6 server-maxobf users client client-reality client-maxobf; do
     _pkg_file "qeli/config/${name}.conf" "etc/qeli/${name}.conf.example" "/etc/qeli/${name}.conf.example" \
       || die "could not obtain a VERIFIED ${name}.conf example (pass QELI_SRC=<repo checkout> for an offline install, or QELI_REF=<release tag>)."
   done
@@ -340,7 +360,7 @@ choose_profile() {
     {
       printf '\n\033[1;36m== Which server profile to install?\033[0m\n'
       printf '  1) reality-tls  — real TLS to a front site, strongest disguise   [default]\n'
-      printf '  2) fake-tls     — TLS-1.3-mimicking handshake, lighter, no front (default port 8444)\n'
+      printf '  2) fake-tls     — TLS-1.3-mimicking handshake, lighter, no front\n'
       printf '  3) udp-quic     — QUIC/HTTP3-shaped UDP (no TCP-over-TCP; good on lossy/mobile)\n'
       printf 'Choose [1/2/3] (default 1): '
     } > /dev/tty
@@ -360,18 +380,12 @@ choose_profile() {
   fi
   echo "Selected profile: ${PROFILE}"
 }
+choose_profile
 
-# Per-profile default listen port — matches server-multiprofile.conf.example layout
-# (reality-tls :443, fake-tls :8444, udp-quic :8449). QELI_PORT overrides.
-default_port_for_profile() {
-  case "$PROFILE" in
-    reality-tls) PORT=443 ;;
-    fake-tls)    PORT=8444 ;;
-    udp-quic)    PORT=8449 ;;
-    *)           PORT=443 ;;
-  esac
-}
-
+# ── 0b. choose the listen port (default 443) ────────────────────────────────
+# 443 mimics HTTPS and is the recommended choice; some networks prefer 8443/993/etc.
+# Priority mirrors the profile: $QELI_PORT (non-interactive) → terminal prompt →
+# default 443. The panel port (8080) is reserved and refused here.
 choose_port() {
   local sel="${QELI_PORT:-}"
   if [ -n "$sel" ]; then
@@ -384,7 +398,7 @@ choose_port() {
     while :; do
       printf 'Listen port [1-65535] (default %s): ' "$PORT" > /dev/tty
       read -r ans < /dev/tty || ans=""
-      [ -z "$ans" ] && break
+      [ -z "$ans" ] && break                              # empty → keep the default
       if ! _valid_port "$ans"; then
         printf 'Not a valid port (1-65535) — try again.\n' > /dev/tty; continue
       fi
@@ -398,16 +412,7 @@ choose_port() {
   fi
   echo "Selected port: ${PORT}"
 }
-
-if [ "$SINGLE_PROFILE" = "1" ]; then
-  choose_profile
-  default_port_for_profile
-  choose_port
-else
-  PROFILE="reality-tls"
-  PORT=443
-  echo "Profile mode: all profiles enabled (single-profile: set QELI_PROFILE or QELI_SINGLE_PROFILE=1)"
-fi
+choose_port
 
 # Transport of the chosen profile — udp-* profiles listen on UDP, the rest on TCP.
 # Drives the (TCP-only) outer MSS clamp below and the firewall hint at the end.
@@ -420,7 +425,14 @@ TRANSPORT_UC="$(printf '%s' "$TRANSPORT" | tr '[:lower:]' '[:upper:]')"
 # ── 1. dependencies ─────────────────────────────────────────────────────────
 log "Installing dependencies"
 apt-get update -y
+# Debian/Ubuntu ship both iptables and ip6tables in this one package. ip6tables
+# is checked explicitly below so a broken alternatives/minimal image cannot leave
+# an IPv6 tunnel without the NAT66 firewall tool.
 apt-get install -y curl ca-certificates jq iptables iproute2 openssl
+command -v iptables >/dev/null 2>&1 || die "the iptables package was installed but the iptables command is unavailable."
+if ! command -v ip6tables >/dev/null 2>&1; then
+  warn "the iptables package did not provide ip6tables; this install will use IPv4 only."
+fi
 
 # ── 2. obtain + install qeli ────────────────────────────────────────────────
 # Two ways to get qeli onto the box, both ending in the SAME .deb layout:
@@ -468,7 +480,7 @@ else
     QELI_TMP_PATHS+=("$TMP_SHA")
     curl -fL --retry 3 -o "$TMP_SHA" "$SHA_URL"
     DEB_NAME="$(basename "$DEB_URL")"
-    WANT="$(awk -v n="$DEB_NAME" '$2==n{print $1}' "$TMP_SHA" | head -n1)"
+    WANT="$(_checksum_for "$TMP_SHA" "$DEB_NAME")"
     GOT="$(sha256sum "$TMP_DEB" | awk '{print $1}')"
     rm -f "$TMP_SHA"
     if [ -z "$WANT" ]; then
@@ -517,12 +529,8 @@ fi   # end obtain+install (from-binary vs .deb)
 command -v qeli >/dev/null || die "qeli is not on PATH after install."
 [ -f "$EXAMPLE" ] || die "$EXAMPLE missing — package too old (need >= 0.7.2)."
 
-# ── 4. build server.conf from the multiprofile example ───────────────────────
-if [ "$SINGLE_PROFILE" = "1" ]; then
-  log "Configuring the ${PROFILE} profile on :${PORT}"
-else
-  log "Configuring all profiles from multiprofile example"
-fi
+# ── 4. build server.conf: the selected profile only, from the example ───────
+log "Configuring the ${PROFILE} profile on :${PORT}"
 # Only reachable with QELI_FORCE_RECONFIG=1 (see the guard at the top). Keep the
 # previous config: it is the only copy of the identity pinning, the panel
 # password_hash and any hand-written profile this run is about to throw away.
@@ -532,54 +540,49 @@ if [ -e "$CONF" ]; then
   cp -a "$CONF" "$CONF_BAK"
   echo "  previous config backed up → ${CONF_BAK}"
 fi
-if [ "$SINGLE_PROFILE" = "1" ]; then
-  {
-    awk '/^\[profile:/{exit} {print}' "$EXAMPLE"
-    awk -v p="[profile:${PROFILE}]" '$0==p{f=1;print;next} /^\[profile:/{f=0} f{print}' "$EXAMPLE"
-  } > "$CONF"
-  sed -i "s|^bind.port = .*|bind.port = ${PORT}|" "$CONF"
-  if grep -q '^obf.tls.reality_proxy.short_ids' "$CONF"; then
-    SID="$(openssl rand -hex 8)"
-    sed -i "s|^obf.tls.reality_proxy.short_ids = .*|obf.tls.reality_proxy.short_ids = ${SID}|" "$CONF"
-    echo "  generated REALITY short_id: ${SID}"
-  fi
-else
-  cp "$EXAMPLE" "$CONF"
-  sed -i 's/^enabled = false/enabled = true/' "$CONF"
-  if [ -n "${QELI_PANEL_DOMAIN:-}" ]; then
-    awk -v rp="$REALITY_BACKEND_PORT" '
-      /^\[profile:reality-tls\]/ { in_rt=1 }
-      /^\[profile:/ && !/^\[profile:reality-tls\]/ { in_rt=0 }
-      in_rt && /^bind\.address/ { print "bind.address = 127.0.0.1"; next }
-      in_rt && /^bind\.port = 443/ { print "bind.port = " rp; print "bind.public_port = 443"; next }
-      { print }
-    ' "$CONF" > "${CONF}.new"
-    mv "${CONF}.new" "$CONF"
-    echo "  reality-tls → 127.0.0.1:${REALITY_BACKEND_PORT} (nginx SNI passthrough on :443)"
-  fi
-  RT_SID="$(openssl rand -hex 8)"
-  tmp="$(mktemp)"
-  awk -v keep_sid="$RT_SID" '
-    /^\[profile:reality-tls\]/ { in_rt=1 }
-    /^\[profile:/ { if ($0 != "[profile:reality-tls]") in_rt=0 }
-    /^obf\.tls\.reality_proxy\.short_ids/ {
-      if (in_rt) { print "obf.tls.reality_proxy.short_ids = " keep_sid; next }
-      print "obf.tls.reality_proxy.short_ids = PLACEHOLDER"; next
-    }
-    { print }
-  ' "$CONF" > "$tmp"
-  mv "$tmp" "$CONF"
-  while grep -q PLACEHOLDER "$CONF"; do
-    sid="$(openssl rand -hex 8)"
-    sed -i "0,/PLACEHOLDER/s//${sid}/" "$CONF"
-  done
-  echo "  generated REALITY short_id (reality-tls): ${RT_SID}"
-  while grep -q CHANGEME "$CONF"; do
-    key="$(openssl rand -hex 16)"
-    sed -i "0,/CHANGEME/s//${key}/" "$CONF"
-  done
+{
+  # global sections ([auth]/[logging]/[web]) — everything before the first profile
+  awk '/^\[profile:/{exit} {print}' "$EXAMPLE"
+  # only the selected profile block (header until the next [profile:)
+  awk -v p="[profile:${PROFILE}]" '$0==p{f=1;print;next} /^\[profile:/{f=0} f{print}' "$EXAMPLE"
+} > "$CONF"
+# Force the listener onto :$PORT regardless of the example's per-profile port
+# (reality-tls already ships on 443; fake-tls ships on 8444 in the example).
+sed -i "s|^bind.port = .*|bind.port = ${PORT}|" "$CONF"
+# reality-tls carries a REALITY short_id — give THIS deployment its own random one
+# (not the example sample). fake-tls has no reality_proxy, so there is nothing to do.
+if grep -q '^obf.tls.reality_proxy.short_ids' "$CONF"; then
+  SID="$(openssl rand -hex 8)"
+  sed -i "s|^obf.tls.reality_proxy.short_ids = .*|obf.tls.reality_proxy.short_ids = ${SID}|" "$CONF"
+  echo "  generated REALITY short_id: ${SID}"
 fi
+# Leave IPv4 NAT auto-detection portable. For IPv6, keep dual-stack only when the
+# selected default-route interface has a real public GUA and ip6tables NAT support.
 sed -i "/^routing.nat.interface/d" "$CONF"
+IPV6_WAN_IF=""
+IPV6_WAN_ADDR=""
+if _native_public_ipv6_egress; then
+  # RFC4193 locally assigned ULA: fd + 40 random Global-ID bits = one unique /48.
+  # The final /64 subnet ID is different for each shipped profile and is retained.
+  ULA_HEX="$(openssl rand -hex 5)"
+  ULA_SITE="fd${ULA_HEX:0:2}:${ULA_HEX:2:4}:${ULA_HEX:6:4}"
+  sed -i "s|fd71:e1:8000|${ULA_SITE}|g" "$CONF"
+  sed -i "s|^routing.ipv6.interface =.*|routing.ipv6.interface = ${IPV6_WAN_IF}|" "$CONF"
+  echo "  IPv6 WAN: ${IPV6_WAN_ADDR} on ${IPV6_WAN_IF}"
+  echo "  tunnel ULA site prefix: ${ULA_SITE}::/48 (NAT66 enabled)"
+else
+  # Do not leave a nominally dual config that cannot egress or program a fail-closed
+  # IPv6 boundary. IPv4 remains fully configured and NAT44 stays enabled.
+  sed -i \
+    -e 's/^tun.ip_mode = dual$/tun.ip_mode = ipv4/' \
+    -e '/^tun.ipv6_address =/d' \
+    -e '/^pool.ipv6.cidr =/d' \
+    -e 's/^routing.ipv6.mode = nat66$/routing.ipv6.mode = off/' \
+    -e '/^routing.ipv6.interface =/d' \
+    -e '/^dns.listen_ipv6 =/d' \
+    "$CONF"
+  warn "no usable public IPv6 default-route + ip6tables NAT path; installed an IPv4-only active profile."
+fi
 
 # ── 5. server identity key (created + printed; pinned automatically in the link)
 log "Generating the server identity key"
@@ -618,9 +621,41 @@ case "$PUBLIC_HOST" in
     die "PUBLIC_HOST '${PUBLIC_HOST}' starts with '-' — that is not an address." ;;
 esac
 [ "${#PUBLIC_HOST}" -le 253 ] || die "PUBLIC_HOST is ${#PUBLIC_HOST} characters long — no hostname is (max 253)."
+# Host:port authorities must bracket IPv6 literals (RFC 3986). Keep public_host itself bare:
+# qeli's config/share codec owns authority parsing and adds brackets where required.
+PUBLIC_AUTHORITY_HOST="$PUBLIC_HOST"
+PUBLIC_PANEL_BIND="0.0.0.0"
+ENABLE_IPV6_LISTENER=0
 case "$PUBLIC_HOST" in
-  *:*) die "PUBLIC_HOST '${PUBLIC_HOST}' is an IPv6 literal, but current qeli clients support IPv4 server endpoints only. Pass an IPv4 address or a hostname with an A record." ;;
+  *:*)
+    PUBLIC_AUTHORITY_HOST="[${PUBLIC_HOST}]"
+    PUBLIC_PANEL_BIND="::"
+    ENABLE_IPV6_LISTENER=1
+    ;;
 esac
+
+# A hostname can gain/use an AAAA record without changing the installed config. When this
+# kernel has IPv6 enabled, make Quick Start dual-carrier-ready even if PUBLIC_HOST itself is
+# a DNS name (or today's auto-detected address happened to be IPv4). The second socket is
+# V6ONLY, so it neither steals nor duplicates the primary IPv4 listener. An explicit IPv6
+# literal still requests this listener even on a misconfigured IPv6-disabled host, making the
+# final service start fail honestly instead of printing an unusable connection link.
+if [ -s /proc/net/if_inet6 ]; then
+  ENABLE_IPV6_LISTENER=1
+fi
+
+# The packaged multiprofile example uses an IPv4 primary listener. An IPv6 literal in the
+# generated link is useful only if the selected profile also owns an IPv6 socket; qeli makes
+# that socket V6ONLY deliberately, so 0.0.0.0 cannot accept it. Keep the IPv4 listener for
+# dual-carrier reachability and add/update the independent wildcard IPv6 listener. Do not add
+# a duplicate if a future packaged example already uses :: as its primary bind.
+if [ "$ENABLE_IPV6_LISTENER" = "1" ] && ! grep -Eq '^bind\.address = (::|\[::\])$' "$CONF"; then
+  if grep -q '^listen = \[::\]:' "$CONF"; then
+    sed -i "s|^listen = \[::\]:.*|listen = [::]:${PORT}|" "$CONF"
+  else
+    sed -i "/^bind.port = /a listen = [::]:${PORT}" "$CONF"
+  fi
+fi
 
 # ── 7. create users + save ready qeli:// connection strings ─────────────────
 log "Creating ${NUM_USERS} users + connection strings"
@@ -659,7 +694,7 @@ for i in $(seq 1 "$NUM_USERS"); do
   # account polling /proc, and put it into auditd execve records besides.
   # (Audit 2026-08-04.)
   if ! ADD_OUT="$(printf '%s' "$P" | qeli add-client "$U" --password-stdin --link \
-           --host "${PUBLIC_HOST}:${PORT}" --link-profile "$PROFILE" \
+           --host "${PUBLIC_AUTHORITY_HOST}:${PORT}" --link-profile "$PROFILE" \
            --config "$CONF" 2>&1)"; then
     printf '%s\n' "$ADD_OUT" >&2
     die "add-client failed for ${U} (output above)."
@@ -687,7 +722,16 @@ log "Applying OS tuning (outer MSS clamp + sysctl) for mobile/LTE"
 # LTE/CGMAT for the TCP wire modes. A udp-quic profile has no outer TCP handshake to
 # clamp (QUIC handles its own PMTU over UDP), so skip it there.
 MSS_RULE=""
+MSS_INPUT_RULE=""
+MSS6_RULE=""
+MSS6_INPUT_RULE=""
 MSS_APPLIED=0
+MSS6_APPLIED=0
+MSS_ADDED=0
+MSS6_ADDED=0
+MSS_SUMMARY=""
+MSS_REVERT=""
+MSS_LAST_ADDED=0
 # The clamp is a PERFORMANCE tweak, never a reason to abandon a half-finished install.
 # `iptables -t mangle -A OUTPUT $MSS_RULE && echo …` used to run bare under `set -e`, so
 # on a host without the mangle table (LXC/OpenVZ) or with an nft backend that rejects the
@@ -695,57 +739,158 @@ MSS_APPLIED=0
 # Both the rule and its persistence are best-effort now, and a failure only warns.
 # (Audit 2026-07-27, O5)
 apply_mss_clamp(){
-  local sport="$1"
-  MSS_RULE="-p tcp --sport ${sport} --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1340"
-  # shellcheck disable=SC2086
-  if iptables -t mangle -C OUTPUT $MSS_RULE 2>/dev/null; then
-    echo "  MSS clamp already present on :${sport}"; return 0
+  local table_cmd="$1" chain="$2" rule="$3" family="$4" direction="$5" mss="$6"
+  MSS_LAST_ADDED=0
+  command -v "$table_cmd" >/dev/null 2>&1 || return 1
+  # shellcheck disable=SC2086  # $rule is a deliberate multi-word argument list
+  if "$table_cmd" -t mangle -C "$chain" $rule 2>/dev/null; then
+    echo "  ${family} ${direction} MSS clamp already present on :${PORT}"; return 0
   fi
-  # shellcheck disable=SC2086
-  if iptables -t mangle -A OUTPUT $MSS_RULE 2>/dev/null; then
-    echo "  + MSS clamp 1340 on :${sport}"; return 0
+  # shellcheck disable=SC2086  # same
+  if "$table_cmd" -t mangle -A "$chain" $rule 2>/dev/null; then
+    MSS_LAST_ADDED=1
+    echo "  + ${family} ${direction} MSS clamp ${mss} on :${PORT}"; return 0
   fi
   return 1
 }
-persist_iptables(){
-  # NEVER clobber an existing persisted ruleset. `iptables-save > /etc/iptables/rules.v4`
+record_mss_clamp(){
+  local summary="$1" revert="$2" added="$3"
+  if [ -n "$MSS_SUMMARY" ]; then
+    MSS_SUMMARY="${MSS_SUMMARY} + ${summary}"
+  else
+    MSS_SUMMARY="$summary"
+  fi
+  # Do not claim ownership of a rule that predated this install. Removing an operator's
+  # existing clamp from the printed Revert command is more destructive than leaving ours.
+  if [ "$added" = "1" ]; then
+    if [ -n "$MSS_REVERT" ]; then
+      MSS_REVERT="${MSS_REVERT} ; ${revert}"
+    else
+      MSS_REVERT="$revert"
+    fi
+  fi
+}
+persist_new_ruleset(){
+  local save_cmd="$1" restore_cmd="$2" destination="$3" family="$4" tmp
+  # Write beside the destination, validate non-empty output, then publish with a hard link.
+  # `ln` is an atomic no-clobber create: even if another firewall manager creates the file
+  # after our caller's -e check, qeli cannot replace it. A failed *-save leaves only a private
+  # temporary file, which is removed instead of becoming the next boot's ruleset.
+  tmp="$(mktemp "${destination}.qeli.XXXXXX")" || {
+    echo "  (could not create a temporary ${family} ruleset — clamp is live only)"
+    return 1
+  }
+  if ! "$save_cmd" >"$tmp" 2>/dev/null || [ ! -s "$tmp" ] \
+     || ! command -v "$restore_cmd" >/dev/null 2>&1 \
+     || ! "$restore_cmd" --test <"$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    echo "  (could not generate a complete ${family} ruleset — clamp is live only)"
+    return 1
+  fi
+  if ! chmod 600 "$tmp" || ! ln "$tmp" "$destination" 2>/dev/null; then
+    rm -f "$tmp"
+    echo "  (could not publish ${destination} without overwriting an existing file — clamp is live only)"
+    return 1
+  fi
+  rm -f "$tmp"
+  return 0
+}
+persist_mss_clamps(){
+  # NEVER clobber an existing persisted ruleset. `*-save > /etc/iptables/rules.v*`
   # overwrites whatever iptables-persistent manages with the CURRENT live state, which
   # silently drops every rule that file loads but the running kernel does not have.
   # (Audit 2026-07-27, O5)
-  if command -v netfilter-persistent >/dev/null 2>&1; then
-    netfilter-persistent save >/dev/null 2>&1 \
-      || echo "  (netfilter-persistent save failed — the clamp will not survive a reboot)"
-  elif [ ! -e /etc/iptables/rules.v4 ]; then
-    mkdir -p /etc/iptables 2>/dev/null || true
-    iptables-save > /etc/iptables/rules.v4 2>/dev/null \
-      || echo "  (could not persist the clamp — it will not survive a reboot)"
-  else
-    echo "  (/etc/iptables/rules.v4 exists and is managed elsewhere — NOT overwriting it;"
-    echo "   add the clamp there yourself if it should survive a reboot)"
+  # Do not call `netfilter-persistent save` here: it overwrites existing rules.v4/rules.v6
+  # with the current live state and can erase administrator rules that are persisted but
+  # temporarily not loaded. A newly created conventional snapshot will be consumed by
+  # iptables-persistent when installed; an existing file stays under its current owner.
+  mkdir -p /etc/iptables 2>/dev/null || true
+  if [ "$MSS_ADDED" = "1" ]; then
+    if [ ! -e /etc/iptables/rules.v4 ]; then
+      persist_new_ruleset iptables-save iptables-restore /etc/iptables/rules.v4 IPv4 || true
+    else
+      echo "  (/etc/iptables/rules.v4 exists and is managed elsewhere — NOT overwriting it;"
+      echo "   add the IPv4 clamp there yourself if it should survive a reboot)"
+    fi
+  fi
+  if [ "$MSS6_ADDED" = "1" ]; then
+    if [ ! -e /etc/iptables/rules.v6 ]; then
+      if command -v ip6tables-save >/dev/null 2>&1; then
+        persist_new_ruleset ip6tables-save ip6tables-restore /etc/iptables/rules.v6 IPv6 || true
+      else
+        echo "  (ip6tables-save is unavailable — the IPv6 clamp will not survive a reboot)"
+      fi
+    else
+      echo "  (/etc/iptables/rules.v6 exists and is managed elsewhere — NOT overwriting it;"
+      echo "   add the IPv6 clamp there yourself if it should survive a reboot)"
+    fi
+  fi
+  if ! command -v netfilter-persistent >/dev/null 2>&1; then
+    echo "  (netfilter-persistent is unavailable — rules.v4/rules.v6 will not be"
+    echo "   restored automatically; install iptables-persistent or use your firewall manager)"
   fi
 }
-MSS_APPLIED=0
-if [ "$SINGLE_PROFILE" = "0" ]; then
-  MSS_PORTS="$(awk '
-    /^\[profile:/ { in_p=1; tcp=0; next }
-    /^\[/ && !/^\[profile:/ { in_p=0 }
-    in_p && /^bind\.transport = tcp/ { tcp=1 }
-    in_p && tcp && /^bind\.port = / { print $3 }
-  ' "$CONF" | sort -u)"
-else
-  MSS_PORTS="$PORT"
-fi
-for clamp_port in $MSS_PORTS; do
-  if apply_mss_clamp "$clamp_port"; then
+if [ "$TRANSPORT" = "tcp" ]; then
+  # IPv4 has no protocol-level 1280-byte minimum, but 1280 is the conservative baseline
+  # qeli documents and certifies for mobile/CGNAT paths. 1240 = 1280 - IPv4(20) - TCP(20).
+  # Clamp the MSS from the client's incoming SYN before the local TCP stack consumes it;
+  # this bounds server->client ServerHello segments as well as later application records.
+  MSS_INPUT_RULE="-p tcp --dport ${PORT} --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240"
+  if apply_mss_clamp iptables PREROUTING "$MSS_INPUT_RULE" IPv4 server-to-client 1240; then
     MSS_APPLIED=1
+    if [ "$MSS_LAST_ADDED" = "1" ]; then MSS_ADDED=1; fi
+    record_mss_clamp "IPv4 server-to-client MSS 1240" \
+      "iptables -t mangle -D PREROUTING ${MSS_INPUT_RULE}" "$MSS_LAST_ADDED"
   else
-    warn "could not install MSS clamp on :${clamp_port} — continuing"
+    warn "could not install the outer IPv4 server-to-client MSS clamp. The install
+         CONTINUES, but a large post-quantum ServerHello may black-hole. Retry by hand:
+           iptables -t mangle -A PREROUTING ${MSS_INPUT_RULE}"
   fi
-done
-[ "$MSS_APPLIED" = "1" ] && persist_iptables
-if [ -z "$MSS_PORTS" ]; then
-  echo "  no TCP listen ports — skipping MSS clamp."
-elif [ "$SINGLE_PROFILE" = "1" ] && [ "$TRANSPORT" != "tcp" ]; then
+
+  # Clamp the server's outgoing SYN-ACK MSS; this bounds the client's PQ ClientHello.
+  MSS_RULE="-p tcp --sport ${PORT} --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240"
+  if apply_mss_clamp iptables OUTPUT "$MSS_RULE" IPv4 client-to-server 1240; then
+    MSS_APPLIED=1
+    if [ "$MSS_LAST_ADDED" = "1" ]; then MSS_ADDED=1; fi
+    record_mss_clamp "IPv4 client-to-server MSS 1240" \
+      "iptables -t mangle -D OUTPUT ${MSS_RULE}" "$MSS_LAST_ADDED"
+  else
+    warn "could not install the outer IPv4 client-to-server MSS clamp (no mangle table on this host, or an nft
+         backend refused the rule). The install CONTINUES — this only means large
+         post-quantum ClientHellos may black-hole on LTE/CGNAT paths. Retry by hand:
+           iptables -t mangle -A OUTPUT ${MSS_RULE}"
+  fi
+  if [ "$ENABLE_IPV6_LISTENER" = "1" ]; then
+    # IPv6's minimum link MTU is 1280; subtract its 40-byte IP and 20-byte TCP headers.
+    MSS6_INPUT_RULE="-p tcp --dport ${PORT} --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1220"
+    if apply_mss_clamp ip6tables PREROUTING "$MSS6_INPUT_RULE" IPv6 server-to-client 1220; then
+      MSS6_APPLIED=1
+      if [ "$MSS_LAST_ADDED" = "1" ]; then MSS6_ADDED=1; fi
+      record_mss_clamp "IPv6 server-to-client MSS 1220" \
+        "ip6tables -t mangle -D PREROUTING ${MSS6_INPUT_RULE}" "$MSS_LAST_ADDED"
+    else
+      warn "could not install the outer IPv6 server-to-client MSS clamp. IPv4 installation
+           continues, but a large post-quantum ServerHello may black-hole. Retry by hand:
+             ip6tables -t mangle -A PREROUTING ${MSS6_INPUT_RULE}"
+    fi
+
+    MSS6_RULE="-p tcp --sport ${PORT} --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1220"
+    if apply_mss_clamp ip6tables OUTPUT "$MSS6_RULE" IPv6 client-to-server 1220; then
+      MSS6_APPLIED=1
+      if [ "$MSS_LAST_ADDED" = "1" ]; then MSS6_ADDED=1; fi
+      record_mss_clamp "IPv6 client-to-server MSS 1220" \
+        "ip6tables -t mangle -D OUTPUT ${MSS6_RULE}" "$MSS_LAST_ADDED"
+    else
+      warn "could not install the outer IPv6 client-to-server MSS clamp although an IPv6 listener is enabled.
+           IPv4 installation continues, but large post-quantum ClientHellos may black-hole
+           on minimum-MTU IPv6 paths. Retry by hand:
+             ip6tables -t mangle -A OUTPUT ${MSS6_RULE}"
+    fi
+  fi
+  if [ "$MSS_ADDED" = "1" ] || [ "$MSS6_ADDED" = "1" ]; then
+    persist_mss_clamps
+  fi
+else
   echo "  udp-quic: UDP transport has no outer TCP handshake — skipping MSS clamp."
 fi
 # /etc/sysctl.d and /etc/modules-load.d may be absent on a minimal base (no procps/
@@ -790,7 +935,7 @@ log "Enabling the web admin panel (HTTPS, generated password)"
 PANEL_PUBLIC=0
 PANEL_ALLOWED="${QELI_PANEL_ALLOWED_IPS:-}"
 if [ "${QELI_PANEL_PUBLIC:-0}" = "1" ]; then
-  [ -n "$PANEL_ALLOWED" ] || die "QELI_PANEL_PUBLIC=1 needs QELI_PANEL_ALLOWED_IPS=<ip[,ip…]> — publishing the admin panel on 0.0.0.0 with no source allowlist is refused. Use your own address, or drop QELI_PANEL_PUBLIC and reach the panel through an SSH tunnel:  ssh -L ${PANEL_PORT}:127.0.0.1:${PANEL_PORT} root@${PUBLIC_HOST}"
+  [ -n "$PANEL_ALLOWED" ] || die "QELI_PANEL_PUBLIC=1 needs QELI_PANEL_ALLOWED_IPS=<ip[,ip…]> — publishing the admin panel on a wildcard bind with no source allowlist is refused. Use your own address, or drop QELI_PANEL_PUBLIC and reach the panel through an SSH tunnel:  ssh -L ${PANEL_PORT}:127.0.0.1:${PANEL_PORT} root@${PUBLIC_HOST}"
   # Same reasoning as PUBLIC_HOST: this value lands in the config, so it is data only.
   # Comma-separated, no spaces (e.g. QELI_PANEL_ALLOWED_IPS=203.0.113.4,198.51.100.0/24).
   case "$PANEL_ALLOWED" in
@@ -805,26 +950,15 @@ if [ -n "$PANEL_PW" ] && printf '%s' "$PANEL_PW" \
   # set-web-password enabled the panel + wrote username/password_hash. TLS on either
   # way: even on loopback the password should not cross an unencrypted socket that
   # any local user could read.
-  if [ -n "${QELI_PANEL_DOMAIN:-}" ]; then
-    _conf_web_set bind 127.0.0.1
-    _conf_web_set tls false
-    _conf_web_set secure_cookie true
-    _conf_web_set public_host "$QELI_PANEL_DOMAIN"
-    _conf_web_set allowed_origins "$QELI_PANEL_DOMAIN"
-    _conf_web_set trusted_proxies "127.0.0.1"
-    PANEL_URL="https://${QELI_PANEL_DOMAIN}/  (terminate TLS in nginx; qeli listens on loopback :${PANEL_PORT})"
+  _conf_web_set tls true
+  _conf_web_set public_host "$PUBLIC_HOST"     # default host for share links/QR
+  if [ "$PANEL_PUBLIC" = "1" ]; then
+    _conf_web_set bind "$PUBLIC_PANEL_BIND"
+    _conf_web_set allowed_ips "$PANEL_ALLOWED"
+    PANEL_URL="https://${PUBLIC_AUTHORITY_HOST}:${PANEL_PORT}"
   else
-    _conf_web_set tls true
-    if [ "$PANEL_PUBLIC" = "1" ]; then
-      _conf_web_set bind 0.0.0.0
-      _conf_web_set allowed_ips "$PANEL_ALLOWED"
-      _conf_web_set public_host "$PUBLIC_HOST"
-      PANEL_URL="https://${PUBLIC_HOST}:${PANEL_PORT}"
-    else
-      _conf_web_set bind 127.0.0.1
-      _conf_web_set public_host "$PUBLIC_HOST"
-      PANEL_URL="https://127.0.0.1:${PANEL_PORT}  (loopback only — tunnel in: ssh -L ${PANEL_PORT}:127.0.0.1:${PANEL_PORT} root@${PUBLIC_HOST})"
-    fi
+    _conf_web_set bind 127.0.0.1
+    PANEL_URL="https://127.0.0.1:${PANEL_PORT}  (loopback only — tunnel in: ssh -L ${PANEL_PORT}:127.0.0.1:${PANEL_PORT} root@${PUBLIC_HOST})"
   fi
   chown qeli:qeli "$CONF" 2>/dev/null || true
 else
@@ -868,13 +1002,21 @@ systemctl is-active --quiet qeli || die "qeli failed to start — see: journalct
 # host (which is no longer fatal — see O5 above), or the profile is UDP and never
 # wanted one. Reporting a revert command for a rule that was never installed would
 # send the operator chasing a rule that is not there.
-if [ "$MSS_APPLIED" = "1" ]; then
-  PERF_NOTE="Mobile/LTE:    MSS clamp 1340 on :${PORT} + BBR/PMTU probing.
-               Revert: iptables -t mangle -D OUTPUT ${MSS_RULE} ; rm /etc/sysctl.d/99-qeli-perf.conf /etc/modules-load.d/qeli-bbr.conf && sysctl --system"
+if [ "$MSS_APPLIED" = "1" ] || [ "$MSS6_APPLIED" = "1" ]; then
+  if [ -n "$MSS_REVERT" ]; then
+    PERF_NOTE="Mobile/LTE:    ${MSS_SUMMARY} + BBR/PMTU probing.
+               Revert installer-added rules: ${MSS_REVERT}
+               Revert tuning: rm /etc/sysctl.d/99-qeli-perf.conf /etc/modules-load.d/qeli-bbr.conf && sysctl --system"
+  else
+    PERF_NOTE="Mobile/LTE:    ${MSS_SUMMARY} already existed; BBR/PMTU probing applied.
+               MSS ownership: no firewall rule was added, so none is removed by this installer.
+               Revert tuning: rm /etc/sysctl.d/99-qeli-perf.conf /etc/modules-load.d/qeli-bbr.conf && sysctl --system"
+  fi
 elif [ "$TRANSPORT" = "tcp" ]; then
-  PERF_NOTE="Mobile/LTE:    BBR/PMTU sysctl applied; the outer MSS clamp could NOT be installed
+  PERF_NOTE="Mobile/LTE:    BBR/PMTU sysctl applied; the outer IPv4 MSS clamps could NOT be installed
                on this host (see the warning above) — large post-quantum ClientHellos may
-               black-hole on LTE/CGNAT. Add it once iptables works:
+               black-hole on LTE/CGNAT. Add both directions once iptables works:
+                 iptables -t mangle -A PREROUTING ${MSS_INPUT_RULE}
                  iptables -t mangle -A OUTPUT ${MSS_RULE}
                Revert: rm /etc/sysctl.d/99-qeli-perf.conf /etc/modules-load.d/qeli-bbr.conf && sysctl --system"
 else
@@ -884,7 +1026,7 @@ fi
 
 log "Done"
 cat <<EOF
-Server:        ${PROFILE} (${TRANSPORT_UC}) on ${PUBLIC_HOST}:${PORT}   (full-tunnel NAT enabled)
+Server:        ${PROFILE} (${TRANSPORT_UC}) on ${PUBLIC_AUTHORITY_HOST}:${PORT}   (full-tunnel NAT enabled)
 Identity key:  ${PUBKEY:-<run: qeli show-identity --config $CONF>}
 Users:         ${NUM_USERS}  (${USER_PREFIX}1 … ${USER_PREFIX}${NUM_USERS})
 Web panel:     $([ -n "$PANEL_PW" ] && echo "${PANEL_URL}  →  login: admin  /  ${PANEL_PW}" || echo "disabled (set: qeli set-web-password)")
@@ -899,6 +1041,6 @@ NEXT STEPS:
   • Open inbound ${TRANSPORT_UC} ${PORT}$([ "$PANEL_PUBLIC" = "1" ] && printf ' and TCP %s (panel)' "$PANEL_PORT") in your cloud firewall / security group.
   • Add a connection string to the app — that's all. To print one:
       cat ${LINKS_DIR}/${USER_PREFIX}1.qeli
-$([ "$PANEL_PUBLIC" = "1" ] && printf '  \342\200\242 The panel is PUBLIC on 0.0.0.0:%s, restricted to allowed_ips = %s.\n    Widen or narrow it in the [web] section of %s.\n' "$PANEL_PORT" "$PANEL_ALLOWED" "$CONF")
+$([ "$PANEL_PUBLIC" = "1" ] && printf '  \342\200\242 The panel is PUBLIC at %s, restricted to allowed_ips = %s.\n    Widen or narrow it in the [web] section of %s.\n' "$PANEL_URL" "$PANEL_ALLOWED" "$CONF")
 $([ "$PANEL_PUBLIC" = "0" ] && [ -n "$PANEL_PW" ] && printf '  \342\200\242 The panel listens on LOOPBACK only. Reach it with an SSH tunnel:\n      ssh -L %s:127.0.0.1:%s root@%s   then open https://127.0.0.1:%s\n    To publish it instead, set web.bind = 0.0.0.0 AND web.allowed_ips in %s.\n' "$PANEL_PORT" "$PANEL_PORT" "$PUBLIC_HOST" "$PANEL_PORT" "$CONF")
 EOF

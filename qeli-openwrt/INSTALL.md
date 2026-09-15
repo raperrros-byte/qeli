@@ -1,8 +1,9 @@
 # Installing the qeli client on OpenWrt
 
-> **Experimental — published in v0.7.5 as a preview.** Not yet tested on real OpenWrt
-> hardware; the integration paths are by-design and pending a real-device run. Use at
-> your own risk.
+> **Tested integration.** The full-IPv6 line uses public version 0.8.0; there is no
+> public 0.7.17 release. The client has been verified on real OpenWrt hardware and works.
+> Install an artifact from the exact release tag and verify the target architecture,
+> TUN support and firewall/interface names for your router.
 
 Two ways to install: **A) prebuilt binary** (fastest — hand-install + opkg deps) or
 **B) from source** (proper feed package + `.ipk`). Both end with the same UCI/LuCI
@@ -107,12 +108,13 @@ qeli add-client router1 --link --host vpn.example.com   # prints a qeli:// link
 qeli show-identity                                       # prints the public key to pin
 ```
 
-Set it via **UCI** (or LuCI → Services → qeli VPN):
+Set non-secret options via **UCI** (or LuCI → Services → qeli VPN). Credentials are
+write-only per-boot tmpfs secrets and are deliberately never committed to UCI/flash:
 
 ```sh
 uci set qeli.main.server='vpn.example.com:443'
 uci set qeli.main.user='router1'
-uci set qeli.main.pass='<password>'
+printf '%s\n' '<password>' | /etc/init.d/qeli set_secret pass
 uci set qeli.main.key='<64-hex server identity>'   # zero/empty = TOFU
 uci set qeli.main.bind_static='1'                  # keep on with a real key (drop to 0 for TOFU)
 uci set qeli.main.mode='fake-tls'

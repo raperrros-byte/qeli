@@ -1,12 +1,15 @@
 [package]
 name = "qeli"
-version = "0.7.16"
+version = "0.8.1"
 edition = "2021"
 description = "Quick Easy Link IP"
 authors = ["qeli"]
 
 [lib]
-name = "qeli"
+# Keep the Rust library target distinct from the `qeli` executable: MSVC emits one PDB per
+# target name, so identical names collide at qeli.pdb. Release recipes rename only the final
+# native cdylib back to the stable public qeli.dll/libqeli.{so,dylib} ABI filenames.
+name = "qeli_core"
 path = "src/lib.rs"
 # rlib for the binary/tests; cdylib/staticlib for the realtls FFI on Android/Windows.
 crate-type = ["rlib", "cdylib", "staticlib"]
@@ -20,7 +23,7 @@ required-features = ["server", "client"]
 
 # Standalone client binary for routers (Keenetic / Entware). Built ONLY under the
 # off-by-default `client-bin` feature, so normal builds never compile it — keeping
-# server/CI/FFI builds byte-identical to before. See docs/KEENETIC-PORT.md.
+# server/CI/FFI builds byte-identical to before. See docs/*/reference/KEENETIC-PORT.md.
 # NB: lives at src/client_main.rs (NOT src/bin/) because .gitignore's `**/bin/`
 # would otherwise exclude it from git/CI.
 [[bin]]
@@ -48,9 +51,12 @@ default = ["server", "client"]
 # Server side pulls the only MIPS-incompatible deps (rustls/ring via rcgen) plus
 # the web stack. A client-only build (`--no-default-features --features client-bin`)
 # excludes all of these and cross-compiles to mipsel/aarch64.
-server = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:rcgen", "dep:axum", "dep:axum-server", "dep:tower", "dep:qrcode", "dep:rustls-pemfile", "dep:ipnet"]
+# Every server build includes session roaming: shipped profiles and Quick Start enable it.
+server = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:rcgen", "dep:axum", "dep:axum-server", "dep:tower", "dep:qrcode", "dep:rustls-pemfile", "experimental-roaming"]
 client = []
-client-bin = ["client"]
+# Standard standalone and FFI clients carry the same roaming state machine. Runtime
+# capability negotiation still falls back safely on unsupported platforms and peers.
+client-bin = ["client", "experimental-roaming"]
 # Swap the server binary's global allocator to jemalloc. Opt-in + OFF by default:
 # only the Linux server/deb release build enables it (`--features jemalloc`). The
 # cross-platform FFI cdylib (Win/Mac/Android) and the MIPS/musl router client never
@@ -76,7 +82,11 @@ ffi-cdylib = []
 # Experimental whole-client control-plane ABI. It deliberately implies the existing
 # ffi-cdylib panic contract: every exported entry point catches unwinds, so a release
 # build with panic=abort must fail at compile time instead of making those guards inert.
-transport-core-ffi = ["ffi-cdylib", "client"]
+transport-core-ffi = ["ffi-cdylib", "client", "experimental-roaming"]
+# Internal compile-time gate retained for minimal/core experiments. All supported server,
+# standalone-client and FFI build entry points above include it. Handover is authenticated and
+# still requires the platform adapter and peer to negotiate the complete ROAMING_PATH contract.
+experimental-roaming = []
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "signal", "sync", "macros", "process"] }
@@ -103,7 +113,7 @@ ml-kem = { version = "0.3", features = ["getrandom"] }
 sha2 = "0.11"
 hkdf = "0.13"
 hmac = "0.13"
-argon2 = "0.5"
+argon2 = "0.6"
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
 log = "0.4"
@@ -111,6 +121,8 @@ env_logger = "0.11"
 anyhow = "1"
 thiserror = "2"
 bytes = "1"
+h2 = "0.4"
+http = "1"
 libc = "0.2"
 # Drop-in AtomicU64 etc. that work on 32-bit targets without native 64-bit atomics
 # (mipsel Keenetic routers). Maps to native instructions on aarch64/x86_64 — zero
@@ -137,9 +149,10 @@ axum-server = { version = "0.8", features = ["tls-rustls-no-provider"], optional
 tower = { version = "0.5", optional = true }
 # Load PEM cert/key (operator-provided or persisted self-signed) for the panel TLS.
 rustls-pemfile = { version = "2", optional = true }
-# Source-IP allowlist for the panel (CIDR contains-check).
-ipnet = { version = "2", optional = true }
-base64 = "0.22"
+# CIDR parsing is part of the base config validation surface: even no-feature parser/fuzz
+# builds validate client LAN CIDRs, while server builds also use it for panel allowlists.
+ipnet = "2"
+base64 = "0.23"
 # Pure-Rust QR generation for the web UI share/QR feature (SVG output, no JS/CDN).
 qrcode = { version = "0.14", default-features = false, features = ["svg"], optional = true }
 

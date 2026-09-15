@@ -1,4 +1,4 @@
-<div x-data="notificationsPage()" x-init="init()" class="max-w-2xl">
+<div x-data="notificationsPage" class="max-w-2xl">
 
   <!-- Intro -->
   <div class="card p-5 mb-5" style="background:linear-gradient(180deg,rgba(74,158,255,.05),transparent),var(--bg-card)">
@@ -126,7 +126,8 @@
 
   <!-- Save -->
   <div class="flex justify-end mb-8">
-    <button class="btn btn-primary" @click="save()" :disabled="busy">
+    <span x-show="loadFailed" class="text-xs mr-3 self-center" style="color:var(--red)">Reload this page before saving.</span>
+    <button class="btn btn-primary" @click="save()" :disabled="busy || loadFailed">
       <div x-show="busy" class="w-3.5 h-3.5 rounded-full border-2 border-white border-t-transparent animate-spin"></div>
       Save changes
     </button>
@@ -146,6 +147,7 @@ function notificationsPage() {
     },
     tokenSet: false,
     tokenHint: '',
+    loadFailed: false,
     busy: false,
     testingTg: false,
     testingWh: false,
@@ -164,24 +166,27 @@ function notificationsPage() {
     async init() {
       try {
         const d = await apiFetch('api/notify');
-        if (d.ok) {
-          const c = d.config;
-          this.cfg.server_name = c.server_name || '';
-          this.cfg.telegram_enabled = c.telegram_enabled;
-          this.cfg.telegram_chat_id = c.telegram_chat_id || '';
-          this.cfg.telegram_events = Object.assign(this.cfg.telegram_events, c.telegram_events || {});
-          this.cfg.webhook_enabled = c.webhook_enabled;
-          this.cfg.webhook_url = c.webhook_url || '';
-          this.cfg.webhook_events = Object.assign(this.cfg.webhook_events, c.webhook_events || {});
-          this.tokenSet = c.telegram_token_set;
-          this.tokenHint = c.telegram_token_hint || '';
-          this.cfg.telegram_token = '';
-        }
-      } catch {}
+        if (!d.ok) throw new Error(d.error || 'Load failed');
+        const c = d.config;
+        this.cfg.server_name = c.server_name || '';
+        this.cfg.telegram_enabled = c.telegram_enabled;
+        this.cfg.telegram_chat_id = c.telegram_chat_id || '';
+        this.cfg.telegram_events = Object.assign(this.cfg.telegram_events, c.telegram_events || {});
+        this.cfg.webhook_enabled = c.webhook_enabled;
+        this.cfg.webhook_url = c.webhook_url || '';
+        this.cfg.webhook_events = Object.assign(this.cfg.webhook_events, c.webhook_events || {});
+        this.tokenSet = c.telegram_token_set;
+        this.tokenHint = c.telegram_token_hint || '';
+        this.cfg.telegram_token = '';
+        this.loadFailed = false;
+      } catch (e) {
+        this.loadFailed = true;
+        this.$dispatch('notify', { msg: qeliT('Notification settings were not loaded: ') + e.message, type: 'error' });
+      }
     },
 
     async save() {
-      if (this.busy) return;
+      if (this.busy || this.loadFailed) return;
       this.busy = true;
       try {
         const d = await apiFetch('api/notify', {
@@ -189,12 +194,11 @@ function notificationsPage() {
           body: JSON.stringify(this.cfg),
         });
         if (d.ok) {
+          const saved = d.config || {};
           this.$dispatch('notify', { msg: 'Notification settings saved', type: 'success' });
-          if (this.cfg.telegram_token) {
-            this.tokenSet = true;
-            this.tokenHint = '…' + this.cfg.telegram_token.slice(-4);
-            this.cfg.telegram_token = '';
-          }
+          this.tokenSet = !!saved.telegram_token_set;
+          this.tokenHint = saved.telegram_token_hint || '';
+          this.cfg.telegram_token = '';
         } else {
           this.$dispatch('notify', { msg: d.error || 'Save failed', type: 'error' });
         }
@@ -242,4 +246,5 @@ function notificationsPage() {
     },
   };
 }
+document.addEventListener('alpine:init', () => Alpine.data('notificationsPage', notificationsPage));
 </script>

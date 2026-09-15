@@ -13,31 +13,58 @@ namespace QeliWin.Vpn;
 /// </summary>
 internal sealed class ProcessAppMap : IDisposable
 {
-    private readonly object _gate = new();
     private readonly object _refreshGate = new();
-    private Dictionary<uint, string> _pidToPath = new();
     // TCP ownership includes the complete endpoint. Keying only by the local port lets two
     // simultaneous connections (or port reuse after close) inherit each other's process
     // decision. UDP's Windows table has no peer endpoint, so it uses the wildcard remote.
-    private Dictionary<(byte proto, string local, ushort localPort,
-        string remote, ushort remotePort), uint> _endpointToPid = new();
+    internal sealed class OwnershipSnapshot
+    {
+        internal static readonly OwnershipSnapshot Empty = new(
+            new Dictionary<(byte proto, string local, ushort localPort,
+                string remote, ushort remotePort), uint>(),
+            new Dictionary<uint, string>());
+
+        internal OwnershipSnapshot(
+            Dictionary<(byte proto, string local, ushort localPort,
+                string remote, ushort remotePort), uint> endpointToPid,
+            Dictionary<uint, string> pidToPath)
+        {
+            EndpointToPid = endpointToPid;
+            PidToPath = pidToPath;
+        }
+
+        internal Dictionary<(byte proto, string local, ushort localPort,
+            string remote, ushort remotePort), uint> EndpointToPid { get; }
+        internal Dictionary<uint, string> PidToPath { get; }
+    }
+
+    private OwnershipSnapshot _snapshot = OwnershipSnapshot.Empty;
+    private readonly Func<OwnershipSnapshot> _snapshotBuilder;
     private const uint AmbiguousPid = uint.MaxValue;
     private readonly HashSet<string> _selected;
     private readonly bool _includeMode; // true = only selected tunnel; false = selected bypass
     private DateTime _lastRefresh = DateTime.MinValue;
     private static readonly TimeSpan RefreshInterval = TimeSpan.FromSeconds(2);
-    private const int MissRefreshWaitMs = 75;
     private bool _refreshQueued;
     private readonly ManualResetEventSlim _refreshFinished = new(initialState: true);
     private readonly int _selfPid = Environment.ProcessId;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     public ProcessAppMap(IEnumerable<string> apps, bool includeMode)
+        : this(apps, includeMode, snapshotBuilder: null)
+    {
+    }
+
+    internal ProcessAppMap(
+        IEnumerable<string> apps,
+        bool includeMode,
+        Func<OwnershipSnapshot>? snapshotBuilder)
     {
         _includeMode = includeMode;
         _selected = new HashSet<string>(
             apps.Where(LooksLikeWindowsExecutable).Select(NormalizePath).Where(p => p.Length > 0),
             StringComparer.OrdinalIgnoreCase);
+        _snapshotBuilder = snapshotBuilder ?? BuildSnapshot;
         // Warm the ownership snapshot before WinDivert starts delivering packets. A socket
         // created in the remaining race window still triggers the bounded miss refresh below.
         ScheduleRefresh(force: true);
@@ -52,36 +79,37 @@ internal sealed class ProcessAppMap : IDisposable
         {
             ScheduleRefresh(force: false);
             _refreshFinished.Wait(250);
-            lock (_gate)
+            var snapshot = Volatile.Read(ref _snapshot);
+            foreach (uint pid in snapshot.EndpointToPid.Values.Distinct())
             {
-                foreach (uint pid in _endpointToPid.Values.Distinct())
-                {
-                    if (pid == AmbiguousPid) continue;
-                    if (!_pidToPath.TryGetValue(pid, out var path))
-                    {
-                        path = QueryImagePath(pid);
-                        if (path != null) _pidToPath[pid] = path;
-                    }
-                    if (path != null && _selected.Contains(path)) return true;
-                }
+                if (pid == AmbiguousPid) continue;
+                if (snapshot.PidToPath.TryGetValue(pid, out var path)
+                    && _selected.Contains(path)) return true;
             }
             return false;
         }
     }
 
-    /// <summary>Classify an outbound packet by owning process.</summary>
+    /// <summary>
+    /// Classify an outbound packet from the latest ownership snapshot. A miss schedules a
+    /// coalesced refresh and returns <see cref="PacketDisposition.Unknown"/> immediately:
+    /// the WinDivert capture thread must never wait on the system-wide endpoint scan.
+    /// The adapter holds the packet in its bounded retry queue and applies the refreshed
+    /// decision off the capture thread.
+    /// </summary>
     public PacketDisposition Classify(
         byte protocol, IPAddress localIp, ushort localPort,
         IPAddress remoteIp, ushort remotePort)
     {
         var result = ClassifySnapshot(protocol, localIp, localPort, remoteIp, remotePort);
-        if (result != PacketDisposition.Unknown) return result;
-
-        ScheduleRefresh(force: true);
-        if (!_refreshFinished.Wait(MissRefreshWaitMs)) return PacketDisposition.Drop;
-        result = ClassifySnapshot(protocol, localIp, localPort, remoteIp, remotePort);
-        return result == PacketDisposition.Unknown ? PacketDisposition.Drop : result;
+        if (result == PacketDisposition.Unknown) ScheduleRefresh(force: true);
+        return result;
     }
+
+    /// <summary>Wait for the refresh already requested by an Unknown classification.
+    /// Called only by the adapter's deferred-classification worker, never by capture.</summary>
+    public bool WaitForPendingRefresh(int timeoutMilliseconds) =>
+        _refreshFinished.Wait(timeoutMilliseconds);
 
     /// <summary>Check the latest kernel TCP-owner snapshot for a still-open socket.
     /// Flow-table GC calls this only after a grace period, so the normal two-second
@@ -90,15 +118,13 @@ internal sealed class ProcessAppMap : IDisposable
         IPAddress localIp, ushort localPort, IPAddress remoteIp, ushort remotePort)
     {
         ScheduleRefresh(force: false);
-        lock (_gate)
-        {
-            return _endpointToPid.ContainsKey((
-                6,
-                AddrKey(localIp),
-                localPort,
-                AddrKey(remoteIp),
-                remotePort));
-        }
+        var snapshot = Volatile.Read(ref _snapshot);
+        return snapshot.EndpointToPid.ContainsKey((
+            6,
+            AddrKey(localIp),
+            localPort,
+            AddrKey(remoteIp),
+            remotePort));
     }
 
     private PacketDisposition ClassifySnapshot(
@@ -110,77 +136,68 @@ internal sealed class ProcessAppMap : IDisposable
         if (protocol is not (6 or 17))
             return _includeMode ? PacketDisposition.Drop : PacketDisposition.Tunnel;
 
-        lock (_gate)
+        // Classification runs on the WinDivert capture thread. It reads one immutable
+        // snapshot and never waits for the system-wide endpoint/PID scan or process lookup.
+        ScheduleRefresh(force: false);
+        var snapshot = Volatile.Read(ref _snapshot);
+        string localKey = AddrKey(localIp);
+        string remoteKey = AddrKey(remoteIp);
+        string any = localIp.AddressFamily == AddressFamily.InterNetwork ? "0.0.0.0" : "::";
+        if (!snapshot.EndpointToPid.TryGetValue(
+                (protocol, localKey, localPort, remoteKey, remotePort), out uint pid)
+            && !snapshot.EndpointToPid.TryGetValue(
+                (protocol, localKey, localPort, any, 0), out pid))
         {
-            // Classification runs on the WinDivert capture thread. Never perform the
-            // system-wide endpoint/PID scan here; use the latest snapshot and refresh it
-            // on a coalesced worker when stale.
-            ScheduleRefresh(force: false);
-            string localKey = AddrKey(localIp);
-            string remoteKey = AddrKey(remoteIp);
-            string any = localIp.AddressFamily == AddressFamily.InterNetwork ? "0.0.0.0" : "::";
-            if (!_endpointToPid.TryGetValue(
-                    (protocol, localKey, localPort, remoteKey, remotePort), out uint pid)
-                && !_endpointToPid.TryGetValue(
-                    (protocol, localKey, localPort, any, 0), out pid))
+            // Also try wildcard 0.0.0.0 / :: bindings — UDP often binds any-local.
+            if (!snapshot.EndpointToPid.TryGetValue(
+                    (protocol, any, localPort, remoteKey, remotePort), out pid)
+                && !snapshot.EndpointToPid.TryGetValue(
+                    (protocol, any, localPort, any, 0), out pid))
             {
-                // Also try wildcard 0.0.0.0 / :: bindings — UDP often binds any-local.
-                if (!_endpointToPid.TryGetValue(
-                        (protocol, any, localPort, remoteKey, remotePort), out pid)
-                    && !_endpointToPid.TryGetValue(
-                        (protocol, any, localPort, any, 0), out pid))
-                {
-                    // Socket creation races are common, especially for UDP. Refreshing all
-                    // four kernel ownership tables synchronously for every missed packet
-                    // stalled the capture loop and amplified packet loss. Coalesce misses
-                    // into at most one background refresh per normal refresh interval; the
-                    // current packet keeps the privacy-safe unknown-owner disposition.
-                    ScheduleRefresh(force: true);
-                    return PacketDisposition.Unknown;
-                }
-            }
-
-            // SO_REUSEADDR can give the same UDP local endpoint to several processes.
-            // A single arbitrary PID would leak an included app or capture an excluded one.
-            if (pid == AmbiguousPid)
+                // Socket creation races are common, especially for UDP. Coalesce misses
+                // into a background refresh; keep the privacy-safe unknown disposition.
+                ScheduleRefresh(force: true);
                 return PacketDisposition.Unknown;
-
-            if (pid == (uint)_selfPid) return PacketDisposition.Bypass;
-
-            if (!_pidToPath.TryGetValue(pid, out var path))
-            {
-                path = QueryImagePath(pid);
-                if (path != null) _pidToPath[pid] = path;
             }
-
-            // Path unknown after lookup: same fail-closed rule as unknown port owner.
-            if (path == null)
-                return PacketDisposition.Unknown;
-
-            bool selected = _selected.Contains(path);
-            if (_includeMode)
-                return selected ? PacketDisposition.Tunnel : PacketDisposition.Bypass;
-            return selected ? PacketDisposition.Bypass : PacketDisposition.Tunnel;
         }
+
+        // SO_REUSEADDR can give the same UDP local endpoint to several processes.
+        // A single arbitrary PID would leak an included app or capture an excluded one.
+        if (pid == AmbiguousPid)
+            return PacketDisposition.Unknown;
+
+        if (pid == (uint)_selfPid) return PacketDisposition.Bypass;
+
+        // Path unknown in this complete snapshot: defer until a later refresh. Never call
+        // Process.MainModule / OpenProcess from the packet capture path.
+        if (!snapshot.PidToPath.TryGetValue(pid, out var path))
+            return PacketDisposition.Unknown;
+
+        bool selected = _selected.Contains(path);
+        if (_includeMode)
+            return selected ? PacketDisposition.Tunnel : PacketDisposition.Bypass;
+        return selected ? PacketDisposition.Bypass : PacketDisposition.Tunnel;
     }
 
     public void Dispose()
     {
-        _disposed = true;
-        _refreshFinished.Set();
+        lock (_refreshGate)
+        {
+            _disposed = true;
+            _refreshFinished.Set();
+        }
     }
 
-    private void ForceRefreshUnlocked()
+    private OwnershipSnapshot BuildSnapshot()
     {
-        _endpointToPid.Clear();
-        RefreshTcp(afInet: 2);
-        RefreshTcp(afInet: 23); // AF_INET6
-        RefreshUdp(afInet: 2);
-        RefreshUdp(afInet: 23);
-        var live = new HashSet<uint>(_endpointToPid.Values.Where(pid => pid != AmbiguousPid))
-            { (uint)_selfPid };
-        foreach (var pid in _pidToPath.Keys.Where(p => !live.Contains(p)).ToList())
-            _pidToPath.Remove(pid);
+        var endpointToPid = new Dictionary<(byte proto, string local, ushort localPort,
+            string remote, ushort remotePort), uint>();
+        RefreshTcp(endpointToPid, afInet: 2);
+        RefreshTcp(endpointToPid, afInet: 23); // AF_INET6
+        RefreshUdp(endpointToPid, afInet: 2);
+        RefreshUdp(endpointToPid, afInet: 23);
+        var live = new HashSet<uint>(endpointToPid.Values.Where(pid => pid != AmbiguousPid));
+        var pidToPath = new Dictionary<uint, string>();
         // A PID can be reused by a different executable. Keeping the old path merely because
         // the numeric PID is still present lets the replacement inherit the old app decision.
         // Revalidate every live owner on each endpoint refresh (the interval bounds the cost).
@@ -188,9 +205,9 @@ internal sealed class ProcessAppMap : IDisposable
         {
             if (pid == (uint)_selfPid) continue;
             string? path = QueryImagePath(pid);
-            if (path != null) _pidToPath[pid] = path;
-            else _pidToPath.Remove(pid);
+            if (path != null) pidToPath[pid] = path;
         }
+        return new OwnershipSnapshot(endpointToPid, pidToPath);
     }
 
     private void ScheduleRefresh(bool force)
@@ -204,15 +221,17 @@ internal sealed class ProcessAppMap : IDisposable
         }
         ThreadPool.QueueUserWorkItem(_ =>
         {
+            OwnershipSnapshot? replacement = null;
             try
             {
-                lock (_gate)
-                    if (!_disposed) ForceRefreshUnlocked();
+                if (!_disposed) replacement = _snapshotBuilder();
             }
             finally
             {
                 lock (_refreshGate)
                 {
+                    if (!_disposed && replacement != null)
+                        Volatile.Write(ref _snapshot, replacement);
                     _lastRefresh = DateTime.UtcNow;
                     _refreshQueued = false;
                     _refreshFinished.Set();
@@ -225,7 +244,10 @@ internal sealed class ProcessAppMap : IDisposable
         DateTime lastRefresh, DateTime now, bool pending, bool force = false) =>
         !pending && (force || now - lastRefresh >= RefreshInterval);
 
-    private void RefreshTcp(int afInet)
+    private static void RefreshTcp(
+        Dictionary<(byte proto, string local, ushort localPort,
+            string remote, ushort remotePort), uint> endpointToPid,
+        int afInet)
     {
         // TCP_TABLE_OWNER_PID_CONNECTIONS = 5
         uint size = 0;
@@ -250,7 +272,7 @@ internal sealed class ProcessAppMap : IDisposable
                     ushort remotePort = (ushort)IPAddress.NetworkToHostOrder((short)(remotePortNbo & 0xFFFF));
                     uint pid = unchecked((uint)Marshal.ReadInt32(row + 20));
                     if (port != 0)
-                        RememberOwner((6, V4Key(localAddr), port,
+                        RememberOwner(endpointToPid, (6, V4Key(localAddr), port,
                             remotePort == 0 ? "0.0.0.0" : V4Key(remoteAddr), remotePort), pid);
                     row += 24;
                 }
@@ -271,7 +293,7 @@ internal sealed class ProcessAppMap : IDisposable
                     ushort remotePort = (ushort)IPAddress.NetworkToHostOrder((short)(remotePortNbo & 0xFFFF));
                     uint pid = unchecked((uint)Marshal.ReadInt32(row + 52));
                     if (port != 0)
-                        RememberOwner((6, new IPAddress(localBytes).ToString(), port,
+                        RememberOwner(endpointToPid, (6, new IPAddress(localBytes).ToString(), port,
                             remotePort == 0 ? "::" : new IPAddress(remoteBytes).ToString(), remotePort), pid);
                     row += 56;
                 }
@@ -280,7 +302,10 @@ internal sealed class ProcessAppMap : IDisposable
         finally { Marshal.FreeHGlobal(buf); }
     }
 
-    private void RefreshUdp(int afInet)
+    private static void RefreshUdp(
+        Dictionary<(byte proto, string local, ushort localPort,
+            string remote, ushort remotePort), uint> endpointToPid,
+        int afInet)
     {
         // UDP_TABLE_OWNER_PID = 1
         uint size = 0;
@@ -302,7 +327,8 @@ internal sealed class ProcessAppMap : IDisposable
                     ushort port = (ushort)IPAddress.NetworkToHostOrder((short)(localPortNbo & 0xFFFF));
                     uint pid = unchecked((uint)Marshal.ReadInt32(row + 8));
                     if (port != 0)
-                        RememberOwner((17, V4Key(localAddr), port, "0.0.0.0", 0), pid);
+                        RememberOwner(endpointToPid,
+                            (17, V4Key(localAddr), port, "0.0.0.0", 0), pid);
                     row += 12;
                 }
             }
@@ -317,7 +343,8 @@ internal sealed class ProcessAppMap : IDisposable
                     ushort port = (ushort)IPAddress.NetworkToHostOrder((short)(localPortNbo & 0xFFFF));
                     uint pid = unchecked((uint)Marshal.ReadInt32(row + 24));
                     if (port != 0)
-                        RememberOwner((17, new IPAddress(localBytes).ToString(), port, "::", 0), pid);
+                        RememberOwner(endpointToPid,
+                            (17, new IPAddress(localBytes).ToString(), port, "::", 0), pid);
                     row += 28;
                 }
             }
@@ -333,14 +360,16 @@ internal sealed class ProcessAppMap : IDisposable
         return new IPAddress(b).ToString();
     }
 
-    private void RememberOwner(
+    private static void RememberOwner(
+        Dictionary<(byte proto, string local, ushort localPort,
+            string remote, ushort remotePort), uint> endpointToPid,
         (byte proto, string local, ushort localPort, string remote, ushort remotePort) endpoint,
         uint pid)
     {
-        if (!_endpointToPid.TryGetValue(endpoint, out uint existing))
-            _endpointToPid[endpoint] = pid;
+        if (!endpointToPid.TryGetValue(endpoint, out uint existing))
+            endpointToPid[endpoint] = pid;
         else
-            _endpointToPid[endpoint] = MergeOwnerForTest(existing, pid);
+            endpointToPid[endpoint] = MergeOwnerForTest(existing, pid);
     }
 
     internal static uint MergeOwnerForTest(uint existing, uint incoming) =>

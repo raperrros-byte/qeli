@@ -1,4 +1,4 @@
-<div x-data="quickstartPage()">
+<div x-data="quickstartPage">
 
   <!-- Intro / explanation -->
   <div class="card p-5 mb-6" style="background:linear-gradient(180deg,rgba(74,158,255,.05),transparent),var(--bg-card)">
@@ -7,7 +7,18 @@
       <h2 class="text-base font-semibold text-white">Quick start — launch any masking mode in one click</h2>
     </div>
     <p class="text-sm leading-relaxed mb-2" style="color:var(--txt-mut)">Each row is a complete masking mode. Click Launch and the panel builds a ready profile — TUN interface, NAT egress, in-tunnel DNS, an IP pool and the full obfuscation stack with the curated stealth posture (Poisson flow-shaping instead of a fixed heartbeat, MTU 1400, stream bonding on TCP) — then saves it and restarts the server.</p>
+    <p class="text-sm leading-relaxed mb-2" style="color:var(--green-2)">Every newly created Quick Start profile enables authenticated session roaming. Clients use auto by default and reconnect normally when a platform, network or legacy peer cannot migrate the live session.</p>
     <p class="text-sm leading-relaxed mb-2" style="color:var(--txt-mut)">Each mode gets its own interface, subnet and port, so they never collide — launch as many as you like and clients pick whichever port suits their network. After a server is up, add users and share a qeli:// link or QR; for full manual control over every option, open the config.</p>
+    <div class="flex flex-wrap items-center gap-3 mb-3">
+      <label for="quickstart-ip-mode" class="text-xs font-medium" style="color:var(--txt-mut)">Inner IP mode</label>
+      <select id="quickstart-ip-mode" class="inp inp-fit" x-model="ipMode">
+        <option value="auto">Auto (dual-stack when native IPv6 and its firewall are available)</option>
+        <option value="ipv4">IPv4 only</option>
+        <option value="dual">Dual-stack (IPv4 + IPv6)</option>
+        <option value="ipv6">IPv6 only</option>
+      </select>
+      <span class="text-xs" style="color:var(--txt-dim)">Auto is resolved once and stored; relaunching an existing profile preserves its current mode.</span>
+    </div>
     <div class="flex items-center gap-3 text-sm">
       <a href="users" class="text-white underline">Users</a>
       <span style="color:var(--txt-dim)">·</span>
@@ -53,15 +64,18 @@
   <div x-cloak x-show="qs.done" class="modal-bg" @click.self="qs.done=null">
     <div class="modal p-6" @click.stop style="max-width:540px">
       <div class="flex items-center gap-2.5 mb-1">
-        <div class="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0" style="background:rgba(0,230,118,.12);color:var(--green-2)">
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-width="2.4" stroke-linecap="round" d="M5 13l4 4L19 7"/></svg>
+        <div class="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0"
+             :style="doneValue('ok') ? 'background:rgba(0,230,118,.12);color:var(--green-2)' : 'background:rgba(245,158,11,.12);color:#f59e0b'">
+          <svg x-show="doneValue('ok')" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-width="2.4" stroke-linecap="round" d="M5 13l4 4L19 7"/></svg>
+          <svg x-show="!doneValue('ok')" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
         </div>
-        <h3 class="text-base font-semibold text-white"><span x-text="qs.done?.name"></span> server is live</h3>
+        <h3 class="text-base font-semibold text-white" x-text="doneValue('ok') ? qeliTf('{} server is live', doneValue('name')) : qeliTf('{} profile saved; restart unconfirmed', doneValue('name'))"></h3>
       </div>
-      <p class="text-sm mb-4" style="color:var(--txt-mut)">Profile <strong class="text-white" x-text="qs.done?.profile"></strong> is running on <strong class="text-white font-mono" x-text="qs.done?.endpoint"></strong>.</p>
+      <p x-show="doneValue('ok')" class="text-sm mb-4" style="color:var(--txt-mut)">Profile <strong class="text-white" x-text="doneValue('profile')"></strong> is running on <strong class="text-white font-mono" x-text="doneValue('endpoint')"></strong>.</p>
+      <p x-show="!doneValue('ok')" class="text-sm mb-4" style="color:#f59e0b" x-text="qeliT('The profile was saved, but the panel could not confirm that the restarted server came back. Check `systemctl status qeli` before sharing the endpoint.')"></p>
 
       <div class="space-y-2.5 mb-5">
-        <template x-if="qs.done?.sid">
+        <template x-if="doneValue('sid')">
           <div>
             <label class="block text-xs font-medium mb-1" style="color:var(--txt-mut)">REALITY short_id <span style="color:var(--txt-dim)">— set reality_sid to this on every client</span></label>
             <div class="flex gap-2">
@@ -70,7 +84,7 @@
             </div>
           </div>
         </template>
-        <template x-if="qs.done?.obfsKey">
+        <template x-if="doneValue('obfsKey')">
           <div>
             <label class="block text-xs font-medium mb-1" style="color:var(--txt-mut)">obfs pre-shared key <span style="color:var(--txt-dim)">— set obfs_key to this on every client</span></label>
             <div class="flex gap-2">
@@ -83,10 +97,10 @@
           <svg class="w-3.5 h-3.5 flex-shrink-0 mt-0.5" style="color:var(--blue-2)" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-width="2" stroke-linecap="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
           <span>Clients also need the server's pinned public key — run qeli show-identity on the server. Then add users below and share a QR/link from the Users page.</span>
         </div>
-        <template x-if="qs.done?.tcp">
+        <template x-if="doneValue('tcp')">
           <div class="flex items-start gap-2.5 p-3 rounded-lg text-xs" style="background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.28);color:var(--txt-mut)">
             <svg class="w-3.5 h-3.5 flex-shrink-0 mt-0.5" style="color:#f59e0b" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
-            <span>Mobile / LTE clients: the large handshake can black-hole behind a sub-1500 path MTU. On the server apply the OS tuning (outer-port MSS clamp + BBR/PMTU probing) — see docs/PANEL.md → "Mobile / LTE" or CONFIG.md → "sysctl + iptables". The install-qeli-server.sh installer does this automatically.</span>
+            <span>Mobile / LTE clients: the large handshake can black-hole behind a sub-1500 path MTU. On the server apply the OS tuning (outer-port MSS clamp + BBR/PMTU probing) — see docs/*/manuals/PANEL.md → "Mobile / LTE" or CONFIG.md → "sysctl + iptables". The install-qeli-server.sh installer does this automatically.</span>
           </div>
         </template>
       </div>
@@ -125,14 +139,15 @@
 function quickstartPage() {
   return {
     qs: { busy: null, step: '', done: null },
+    ipMode: 'auto',
     portClash: null,       // {port, profile} when Launch hits a port already in use
     // The full multiprofile set — each entry is launchable in one click. Fields
     // The Rust API builds and validates the actual profiles; these objects are display and
     // collision-check metadata only.
     modes: [
       { id: 'reality-tls', name: 'reality-tls', transport: 'tcp', port: 443, idx: 0, tag: 'TCP · 443', flag: true,
-        obfMode: 'fake-tls', realityEnabled: true, realTls: true, needsSid: true, padding: false, heartbeat: false, shaping: true, multipath: true,
-        desc: 'Genuine TLS 1.3 carries the tunnel — indistinguishable from a real HTTPS site, beats active probing. Best default.' },
+        obfMode: 'reality-tls', realityEnabled: true, realTls: true, needsSid: true, padding: false, heartbeat: false, shaping: true, multipath: true,
+        desc: 'REALITY TLS 1.3 with a genuine HTTP/2 streaming carrier and randomized batching. Server authentication uses qeli identity proof and the pinned key; no transport is literally indistinguishable. Best default.' },
       { id: 'reality', name: 'reality', transport: 'tcp', port: 8443, idx: 1, tag: 'TCP · 8443',
         obfMode: 'fake-tls', realityEnabled: true, realTls: false, needsSid: true, padding: true, heartbeat: false, shaping: true, multipath: true,
         desc: 'REALITY proxy: foreign / prober traffic is bridged to a real site; our clients are recognised by a short_id token (fake-TLS, no inner TLS).' },
@@ -153,7 +168,7 @@ function quickstartPage() {
         desc: 'fake-TLS handshake over UDP. Lower latency than TCP-carried modes.' },
       { id: 'udp-quic', name: 'udp-quic', transport: 'udp', port: 8449, idx: 7, tag: 'UDP · 8449',
         obfMode: 'fake-tls', quic: true, padding: true, heartbeat: false, shaping: true, multipath: false,
-        desc: 'fake-TLS + QUIC masking — looks like QUIC / HTTP3 traffic. Best for mobile.' },
+        desc: 'fake-TLS with shallow QUIC-shaped compatibility framing — not genuine QUIC or HTTP/3. Best for mobile.' },
       { id: 'udp-obfs', name: 'udp-obfs', transport: 'udp', port: 8450, idx: 8, tag: 'UDP · 8450',
         obfMode: 'obfs', needsKey: true, padding: false, heartbeat: false, shaping: true, multipath: false,
         desc: 'ChaCha20 stream obfuscation over UDP.' },
@@ -161,6 +176,21 @@ function quickstartPage() {
         obfMode: 'obfs', needsKey: true, fronting: 'none', awg: true, awgJc: 4, padding: true, heartbeat: false, shaping: true, multipath: true,
         desc: 'obfs + AmneziaWG-style junk preamble — prepends jc random junk packets before the handshake (the Amnezia analog). Both ends need the same jc.' },
     ],
+
+    doneValue(field) { return this.qs.done ? this.qs.done[field] : null; },
+    endpointFor(profile) {
+      const bind = profile?.bind || {};
+      let host = String(bind.address || '').trim();
+      if (!host || host === '0.0.0.0' || host === '::' || host === '[::]') {
+        const browserHost = String(window.location.hostname || '').trim();
+        host = ['localhost', '127.0.0.1', '::1'].includes(browserHost)
+          ? 'SERVER_ADDRESS'
+          : browserHost || 'SERVER_ADDRESS';
+      }
+      if (host.includes(':') && !host.startsWith('[')) host = `[${host}]`;
+      const transport = String(bind.transport || 'tcp').toUpperCase();
+      return `${host}:${bind.port} · ${transport}`;
+    },
 
     copy(text) {
       navigator.clipboard?.writeText(text).then(
@@ -198,6 +228,7 @@ function quickstartPage() {
       const existingProfile = (cfg.profiles || []).find(p => p.name === m.id);
       const effectivePort = existingProfile?.bind?.port ?? m.port;
       const effectiveTransport = existingProfile?.bind?.transport || m.transport;
+      const effectiveTag = `${String(effectiveTransport).toUpperCase()} \u00b7 ${effectivePort}`;
 
       // A DIFFERENT profile already bound to the effective port+transport must be changed
       // first (re-launching the SAME mode re-enables its own profile, so that's allowed).
@@ -213,10 +244,13 @@ function quickstartPage() {
 
       const existing = !!existingProfile;
       if (!await qeliConfirm('Set up and restart',
-            qeliTf('Set up the "{}" server ({}) and restart now?', m.id, m.tag) + '\n\n'
+            qeliTf('Set up the "{}" server ({}) and restart now?', m.id, effectiveTag) + '\n\n'
               + qeliT(existing
-                ? 'This profile already exists. Quick Start will keep its credentials and manual settings, enable it and restart the server.'
-                : 'This creates the profile with new credentials and brings the server up.'),
+                ? (this.ipMode === 'auto'
+                    ? 'This profile already exists. Quick Start will keep its credentials, IP mode and manual settings, enable it and restart the server.'
+                    : 'This profile already exists. Quick Start will keep its credentials and manual settings, explicitly switch its inner IP mode, enable it and restart the server.')
+                : 'This creates the profile with new credentials and brings the server up.')
+              + '\n' + qeliT('Inner IP mode: ') + this.ipMode,
             { label: 'Set up' })) {
         this.qs.busy = null; this.qs.step = '';
         return;
@@ -226,7 +260,7 @@ function quickstartPage() {
       try {
         const built = await apiFetch('api/config/quickstart/' + encodeURIComponent(m.id), {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ expected_revision: revision }),
+          body: JSON.stringify({ expected_revision: revision, ip_mode: this.ipMode }),
         });
         if (!built.ok) throw new Error(built.error || 'profile build failed');
         const profile = built.profile;
@@ -235,12 +269,13 @@ function quickstartPage() {
 
         this.qs.step = 'Restarting…';
         const ok = await restartServer();
+        const endpoint = this.endpointFor(profile);
         this.qs.done = {
-          id: m.id, name: m.name, profile: profile.name,
-          endpoint: `${profile.bind.address}:${profile.bind.port} · ${profile.bind.transport.toUpperCase()}`,
-          tcp: m.transport === 'tcp', sid, obfsKey,
+          id: m.id, name: m.name, profile: profile.name, ok,
+          endpoint,
+          tcp: (profile.bind?.transport || m.transport) === 'tcp', sid, obfsKey,
         };
-        this.$dispatch('notify', { msg: ok ? `${m.name} server is live` : 'Applied — server still coming up', type: ok ? 'success' : 'warn' });
+        this.$dispatch('notify', { msg: ok ? qeliTf('{} server is live', m.name) : qeliT('Applied — server still coming up'), type: ok ? 'success' : 'warn' });
       } catch (e) {
         this.$dispatch('notify', { msg: qeliT('Quick start failed: ') + qeliT(e.message), type: 'error' });
       } finally {
@@ -249,4 +284,5 @@ function quickstartPage() {
     },
   };
 }
+document.addEventListener('alpine:init', () => Alpine.data('quickstartPage', quickstartPage));
 </script>

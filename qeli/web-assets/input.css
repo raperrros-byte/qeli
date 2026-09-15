@@ -43,6 +43,7 @@
   --bg:#080b14; --bg-2:#0d1322; --bg-card:#111a2e; --bg-card-2:#16213e;
   --line:rgba(120,150,210,.14); --line-soft:rgba(120,150,210,.08);
   --txt:#e8edf7; --txt-mut:#93a2c0; --txt-dim:#6b7a9b;
+  --txt-placeholder:#53617f;
   --blue:#4a9eff; --blue-2:#6fb7ff; --teal:#16c8b6; --green:#00e676; --green-2:#4dffa0;
   --violet:#a78bfa; --amber:#ffb020; --red:#ff5d6c;
   --grad-3:linear-gradient(110deg,#4a9eff,#16c8b6 52%,#00e676);
@@ -103,7 +104,85 @@ code,pre,.mono,.font-mono{ font-family:'JetBrains Mono',ui-monospace,Menlo,monos
 @media (min-width:1536px){
   .profile-grid{ grid-template-columns:repeat(6,minmax(0,1fr)); }
 }
+/* Configuration profile navigation uses content-sized cards. Long names remain visible,
+   while complete cards wrap naturally without a nested scrollbar or fixed grid tracks. */
+.config-profile-nav{
+  margin-bottom:1.25rem; overflow:hidden; border:1px solid var(--line);
+  border-radius:var(--radius); background:var(--bg-card);
+}
+.config-profile-nav-head{
+  display:flex; align-items:center; justify-content:space-between; gap:.875rem;
+  padding:.875rem 1rem; border-bottom:1px solid var(--line-soft);
+}
+.config-profile-nav-heading{ display:flex; align-items:baseline; gap:.55rem; min-width:0; }
+.config-profile-nav-title{ color:var(--txt); font-size:.875rem; font-weight:600; }
+.config-profile-nav-count{ color:var(--txt-dim); font-size:.72rem; }
+.config-profile-nav-body{ padding:.75rem .875rem .875rem; }
+.config-profile-list{ display:flex; flex-wrap:wrap; align-items:stretch; gap:.5rem; }
+.config-profile-add{
+  display:inline-flex; align-items:center; gap:.4rem; flex:0 0 auto;
+  padding:.45rem .7rem; border:1px solid rgba(74,158,255,.28); border-radius:9px;
+  color:var(--blue-2); background:rgba(74,158,255,.08); font-size:.78rem; font-weight:600;
+  cursor:pointer; transition:color .16s,background .16s,border-color .16s;
+}
+.config-profile-add:hover{ color:var(--txt); background:rgba(74,158,255,.14); border-color:rgba(74,158,255,.42); }
+.config-profile-tab{
+  display:inline-flex; align-items:center; gap:.5rem; flex:0 0 auto; width:auto; max-width:100%; min-height:40px;
+  padding:.5rem .625rem; border:1px solid transparent; border-radius:9px;
+  color:var(--txt-mut); background:var(--bg-2); font-size:.78rem; font-weight:600;
+  cursor:pointer; transition:color .16s,background .16s,border-color .16s;
+}
+.config-profile-tab:hover{ color:var(--txt); background:rgba(255,255,255,.04); }
+.config-profile-tab.active{
+  color:var(--txt); background:rgba(74,158,255,.12); border-color:rgba(74,158,255,.32);
+}
+.config-profile-tab-name{ min-width:0; white-space:normal; overflow-wrap:anywhere; text-align:left; }
+.config-profile-global{ margin-bottom:.625rem; color:var(--txt-mut); background:transparent; }
+.transport-kind{
+  display:inline-flex; align-items:center; justify-content:center; flex:0 0 auto;
+  min-width:34px; padding:3px 5px; border-radius:6px; font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;
+  font-size:.58rem; font-weight:800; line-height:1; letter-spacing:.035em;
+}
+.transport-kind-tcp{ color:var(--blue-2); background:rgba(74,158,255,.14); border:1px solid rgba(74,158,255,.22); }
+.transport-kind-udp{ color:#ddd6fe; background:rgba(124,58,237,.2); border:1px solid rgba(167,139,250,.28); }
+@media (max-width:639px){
+  .config-profile-nav-head{ align-items:flex-start; }
+}
 
+/* Identity rows must accommodate a full bracketed IPv6 endpoint without hiding the
+   port. Details stack before either the endpoint or the pinned key becomes cramped. */
+.identity-card{
+  padding:.625rem; border:1px solid var(--line); border-radius:.5rem; background:var(--bg-2);
+}
+.identity-card-head{
+  display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-bottom:.5rem;
+}
+.identity-card-profile{
+  min-width:0; color:var(--txt); font-size:.875rem; font-weight:600; overflow-wrap:anywhere;
+}
+.identity-card-details{
+  display:grid; grid-template-columns:minmax(18rem,.8fr) minmax(24rem,1.2fr); gap:.625rem;
+}
+.identity-card-field{ min-width:0; }
+.identity-card-label{
+  margin:0 0 .25rem .125rem; color:var(--txt-dim); font-size:.65rem; font-weight:600;
+  line-height:1.2; text-transform:uppercase; letter-spacing:.045em;
+}
+.identity-card-value-row{ display:flex; align-items:stretch; gap:.5rem; min-width:0; }
+.identity-card-endpoint{
+  display:flex; align-items:center; flex:1 1 auto; min-width:0; min-height:2.5rem; padding:.55rem .75rem;
+  border:1px solid var(--line); border-radius:10px; background:var(--bg-card); color:var(--txt-mut);
+  font-size:.75rem; line-height:1.35; overflow-wrap:anywhere; word-break:break-word;
+}
+.identity-card-key{ min-width:0; }
+@media (max-width:1100px){
+  .identity-card-details{ grid-template-columns:minmax(0,1fr); }
+}
+@media (max-width:639px){
+  .identity-card-head{ align-items:flex-start; }
+  .identity-card-value-row{ flex-wrap:wrap; }
+  .identity-card-value-row>.btn{ margin-left:auto; }
+}
 /* ── buttons ── */
 .btn{ display:inline-flex; align-items:center; gap:7px; padding:8px 15px; border-radius:10px; font-size:.8125rem; font-weight:600; cursor:pointer; border:1px solid transparent; transition:all .2s var(--ease); line-height:1.4; white-space:nowrap; }
 .btn:disabled{ opacity:.5; cursor:not-allowed; }
@@ -131,18 +210,26 @@ code,pre,.mono,.font-mono{ font-family:'JetBrains Mono',ui-monospace,Menlo,monos
 .inp{ width:100%; background-color:var(--bg-2); border:1px solid var(--line); border-radius:10px; padding:9px 12px; font-size:.875rem; color:var(--txt); outline:none; transition:border-color .15s,box-shadow .15s,background-color .15s; }
 .inp:hover:not(:disabled){ border-color:rgba(120,150,210,.32); }
 .inp:focus{ border-color:rgba(74,158,255,.55); box-shadow:0 0 0 3px rgba(74,158,255,.12); }
-.inp::placeholder{ color:#4a5878; }
+/* A placeholder is guidance, never a value: keep it visibly quieter in every panel field. */
+input::placeholder,textarea::placeholder{ color:var(--txt-placeholder); opacity:1; }
 .inp:disabled{ cursor:not-allowed; opacity:.58; }
 /* Normalise platform-native dropdown/search controls. Without appearance:none,
    Chromium on Windows paints its own white arrow/button over the dark panel. */
 select.inp{
-  -webkit-appearance:none; appearance:none; cursor:pointer; padding-right:2.25rem;
+  -webkit-appearance:none; appearance:none; cursor:pointer; box-sizing:border-box;
+  height:2.5rem; min-height:2.5rem; padding:0 2.25rem 0 .75rem; line-height:1.25rem;
+  text-align:left; text-align-last:left;
   background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236b7a9b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m7 10 5 5 5-5'/%3E%3C/svg%3E");
   background-repeat:no-repeat; background-position:right .7rem center; background-size:1rem;
 }
 select.inp::-ms-expand{ display:none; }
 select.inp option{ background-color:var(--bg-card-2); color:var(--txt); }
-select.inp.inp-compact{ height:30px; padding-top:3px; padding-bottom:3px; font-size:.8rem; }
+select.inp.inp-compact{ height:2rem; min-height:2rem; padding-top:0; padding-bottom:0; font-size:.8rem; }
+/* Compact filters opt into content fitting. i18n.js measures the longest rendered
+   option after translation and after Alpine adds dynamic options, so a locale is
+   never forced into a width chosen for English. Full-width form controls retain
+   the normal .inp width. */
+select.inp.inp-fit{ width:var(--qeli-select-fit-width,auto); max-width:100%; flex:0 0 auto; }
 .inp[type=search]{
   -webkit-appearance:none; appearance:none; padding-left:2.1rem;
   background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236b7a9b' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='6'/%3E%3Cpath d='m20 20-4.2-4.2'/%3E%3C/svg%3E");
@@ -295,6 +382,7 @@ html[data-theme=light]{
   --bg:#f3f6fb;--bg-2:#eaeef6;--bg-card:#ffffff;--bg-card-2:#f5f8fc;
   --line:rgba(31,58,110,.16);--line-soft:rgba(31,58,110,.09);
   --txt:#101a2c;--txt-mut:#475569;--txt-dim:#64748b;
+  --txt-placeholder:#9aa8bc;
   --blue:#2f7fe6;--blue-2:#1d6fe0;--teal:#0e9488;--green:#059669;--green-2:#047857;
   --violet:#7c3aed;--amber:#b45309;--red:#dc2626;
   --chrome-bg:rgba(255,255,255,.72);--log-bg:#ffffff;
@@ -316,6 +404,8 @@ html[data-theme=light] .border-\[\#21314e\]{border-color:rgba(31,58,110,.16)}
 html[data-theme=light] .section-hdr{color:#0f1a2c;border-bottom-color:rgba(31,58,110,.16)}
 html[data-theme=light] .field-label{color:#475569}
 html[data-theme=light] .badge-udp{background:rgba(109,40,217,.12);color:#5b21b6;box-shadow:inset 0 0 0 1px rgba(91,33,182,.2)}
+html[data-theme=light] .config-profile-tab:hover{background:rgba(47,127,230,.06)}
+html[data-theme=light] .transport-kind-udp{color:#5b21b6;background:rgba(109,40,217,.1);border-color:rgba(91,33,182,.2)}
 html[data-theme=light] .server-host-badge{background:rgba(47,127,230,.08);border-color:rgba(47,127,230,.22);color:#334155}
 /* tinted info / error boxes */
 html[data-theme=light] .bg-red-900\/30{background-color:rgba(220,38,38,.08)}

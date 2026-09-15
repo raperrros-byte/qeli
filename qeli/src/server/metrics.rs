@@ -102,7 +102,7 @@ async fn sample_once(m: &MetricsState, tun_names: &[String]) {
     let pid = m.worker_pid.load(Ordering::Relaxed);
     let proc_now = proc_stat(pid); // (cpu_jiffies, rss_bytes)
     let (agg_sent, agg_recv, clients) = tunnel_aggregate().await.unwrap_or((0, 0, 0));
-    let (tcp, udp) = count_conns();
+    let (tcp, udp) = count_conns(pid);
     let cores = cpu_cores();
 
     let mut prev = m.prev.lock().await;
@@ -118,7 +118,10 @@ async fn sample_once(m: &MetricsState, tun_names: &[String]) {
     };
     let proc_pct = match (prev.proc_cpu, proc_now, prev.cpu, cpu_now) {
         (Some(pp), Some((c, _)), Some((_, pt)), Some((_, t))) if t > pt && c >= pp => {
-            (c - pp) as f64 / (t - pt) as f64 * 100.0
+            // /proc/stat is the aggregate of all CPUs. Convert that fraction to the
+            // conventional top(1) process scale where one saturated worker is 100%
+            // and a process using N full cores may report N * 100%.
+            (c - pp) as f64 / (t - pt) as f64 * cores as f64 * 100.0
         }
         _ => 0.0,
     };
@@ -345,26 +348,59 @@ fn proc_stat(pid: i32) -> Option<(u64, u64)> {
     Some((utime + stime, rss_pages * page))
 }
 
-/// (established TCP, total UDP) socket counts from /proc/net.
-fn count_conns() -> (u64, u64) {
-    let tcp_est = |path: &str| -> u64 {
-        std::fs::read_to_string(path)
-            .map(|s| {
-                s.lines()
-                    .skip(1)
-                    .filter(|l| l.split_whitespace().nth(3) == Some("01"))
-                    .count() as u64
-            })
-            .unwrap_or(0)
+/// Socket inode numbers owned by one process. `/proc/<pid>/net/*` is network-namespace
+/// wide, not process-local; joining it with the fd symlinks is what keeps unrelated host
+/// services out of the qeli dashboard.
+fn process_socket_inodes(pid: i32) -> std::collections::HashSet<u64> {
+    if pid <= 0 {
+        return std::collections::HashSet::new();
+    }
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return std::collections::HashSet::new();
     };
-    let udp_lines = |path: &str| -> u64 {
+    entries
+        .flatten()
+        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+        .filter_map(|target| {
+            let text = target.to_string_lossy();
+            text.strip_prefix("socket:[")
+                .and_then(|value| value.strip_suffix(']'))
+                .and_then(|value| value.parse().ok())
+        })
+        .collect()
+}
+
+fn count_socket_lines(
+    text: &str,
+    inodes: &std::collections::HashSet<u64>,
+    established_only: bool,
+) -> u64 {
+    text.lines()
+        .skip(1)
+        .filter(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if established_only && fields.get(3) != Some(&"01") {
+                return false;
+            }
+            fields
+                .get(9)
+                .and_then(|inode| inode.parse::<u64>().ok())
+                .is_some_and(|inode| inodes.contains(&inode))
+        })
+        .count() as u64
+}
+
+/// (established TCP, total UDP) sockets owned by the data-plane worker.
+fn count_conns(pid: i32) -> (u64, u64) {
+    let inodes = process_socket_inodes(pid);
+    let count = |path: &str, established_only: bool| -> u64 {
         std::fs::read_to_string(path)
-            .map(|s| s.lines().count().saturating_sub(1) as u64)
+            .map(|text| count_socket_lines(&text, &inodes, established_only))
             .unwrap_or(0)
     };
     (
-        tcp_est("/proc/net/tcp") + tcp_est("/proc/net/tcp6"),
-        udp_lines("/proc/net/udp") + udp_lines("/proc/net/udp6"),
+        count("/proc/net/tcp", true) + count("/proc/net/tcp6", true),
+        count("/proc/net/udp", false) + count("/proc/net/udp6", false),
     )
 }
 
@@ -393,4 +429,20 @@ fn round1(x: f64) -> f64 {
 }
 fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_count_is_process_scoped_and_tcp_state_aware() {
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+                     0: 00000000:01BB 00000000:0000 01 0:0 00:0 0 1000 0 111\n\
+                     1: 00000000:01BC 00000000:0000 0A 0:0 00:0 0 1000 0 222\n\
+                     2: 00000000:01BD 00000000:0000 01 0:0 00:0 0 1000 0 333\n";
+        let owned = [111_u64, 222].into_iter().collect();
+        assert_eq!(count_socket_lines(table, &owned, true), 1);
+        assert_eq!(count_socket_lines(table, &owned, false), 2);
+    }
 }

@@ -37,6 +37,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             do {
                 try Task.checkCancellation()
                 guard isCurrent(state.generation) else { throw CancellationError() }
+                guard PacketTunnelSigningDiagnostics.hasRequiredEntitlements() else {
+                    throw PacketTunnelProviderError.invalidSigning
+                }
                 let archive = try ProfileStore().load()
                 let optionID = (options?["profileID"] as? NSString)
                     .map { $0 as String }
@@ -198,6 +201,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         snapshot.phase = .error
         snapshot.error = error.localizedDescription
         snapshot.message = error.localizedDescription
+        snapshot.privateUpdatePath = nil
+        snapshot.liveConnectionProperties = nil
         snapshot.updatedAt = Date()
         sharedStore.save(snapshot)
         sharedStore.appendLog("ERROR: \(error.localizedDescription)")
@@ -219,8 +224,34 @@ private final class ProviderStartCompletion: @unchecked Sendable {
     }
 }
 
+private enum PacketTunnelSigningDiagnostics {
+    static func hasRequiredEntitlements() -> Bool {
+        #if targetEnvironment(simulator)
+        return true
+        #else
+        guard let expectedAppGroup = Bundle.main.object(
+                  forInfoDictionaryKey: "QeliAppGroup"
+              ) as? String,
+              !expectedAppGroup.isEmpty,
+              !expectedAppGroup.contains("$("),
+              let expectedKeychainGroup = Bundle.main.object(
+                  forInfoDictionaryKey: "QeliKeychainAccessGroup"
+              ) as? String,
+              !expectedKeychainGroup.isEmpty,
+              !expectedKeychainGroup.contains("$(") else { return false }
+        // Reaching this process proves that iOS accepted the packet-tunnel entitlement.
+        // Probe the remaining shared capabilities through public APIs so re-signed builds
+        // fail with a useful diagnostic instead of using the private SecTask API.
+        return FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: expectedAppGroup
+        ) != nil && KeychainStore.canAccess(group: expectedKeychainGroup)
+        #endif
+    }
+}
+
 enum PacketTunnelProviderError: LocalizedError {
     case profileNotFound
+    case invalidSigning
     /// The engine reached a terminal failure before `startTunnel` could report success.
     case startFailed(String)
 
@@ -228,6 +259,8 @@ enum PacketTunnelProviderError: LocalizedError {
         switch self {
         case .profileNotFound:
             return "The active encrypted Qeli profile was not found."
+        case .invalidSigning:
+            return "The Qeli Packet Tunnel extension is missing its VPN, App Group, or Keychain entitlement. Install a correctly signed build."
         case .startFailed(let reason):
             return reason.isEmpty ? "The Qeli tunnel failed to start." : reason
         }

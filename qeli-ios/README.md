@@ -4,17 +4,18 @@ Native iPhone client for the qeli protocol. The project mirrors the Android clie
 three primary surfaces (Connection, Profiles, Log) and uses a Packet Tunnel Provider
 extension for the VPN data plane.
 
-## Status: feature-complete, unverified
+## Status: feature-complete, simulator-built, device-unverified
 
 **Neither a preview nor a release.** Not a preview, because the client is not a sketch —
 it mirrors the Android client feature for feature, and that logic is proven in the field.
-Not a release, because **the iOS application/extension has not been exercised on a device**:
-the shared Rust core passes its lab and iOS-target checks, but no Xcode build has been tested
-on real hardware and nothing ships from this directory.
+Not a release, because **the iOS application/extension has not been exercised on a physical
+device**. CI builds the device/simulator XCFramework, compiles the generated Xcode project for
+the simulator and runs its unit tests, but no real-hardware result exists and nothing ships from
+this directory.
 
 Read the Apple-specific list below as *what is implemented*, not *what is verified*.
 The common Rust transport is exercised by the repository/lab matrix; the Swift adapter
-still needs an Xcode/device pass — install, connect on each wire mode,
+still needs a signed physical-device pass — install, connect on each wire mode,
 background/foreground, a Wi-Fi ↔ cellular switch, and On Demand behaviour — after which
 this section should say what was actually observed, not only what was built.
 
@@ -31,31 +32,35 @@ every other client, not because a build of it was released.
 - Android-compatible encrypted backups (`QELI-ENC-1`, PBKDF2-SHA256, AES-256-GCM).
 - Opt-in release checks that run only with a fail-closed full-tunnel route.
 - `NETunnelProviderManager` lifecycle, VPN On Demand and status/statistics bridge.
-- Device-local Trusted Wi-Fi rules use an exact SSID `NEOnDemandRuleDisconnect` followed by
-  a catch-all Connect rule. Explicit Disconnect removes the auto-resume intent; the UI uses a
-  neutral “waiting for network policy” state because iOS does not reveal which On Demand rule
-  matched the current network. A copied SSID can spoof this convenience policy.
-- `NEPacketTunnelProvider` target with a small ABI 1.10 platform adapter. Swift applies
+- `NEPacketTunnelProvider` target over the current ABI 1.15 core, with a compatible ABI 1.11
+  base, optional ABI 1.12-1.14 path transactions and ABI 1.15 management events. Swift applies
   authenticated `NetworkPlan` values, persists Keychain identity/trust and moves bounded
   packet batches between `NEPacketTunnelFlow` and Rust.
 - The common Rust whole-client core owns each plain/fake-TLS/obfs/REALITY TCP/UDP/QUIC
   generation, X25519+ML-KEM, authentication, packet crypto, heartbeat/shaping, MTU and
-  fixed/adaptive bonding. Swift owns only the lifecycle decision to start the next generation
-  under the shared reconnect policy; no Swift wire implementation is on the production path.
-- `NetworkPlan` application is fail-closed: unsupported DNS ports or routes that cannot be
-  installed by the IPv4 Packet Tunnel adapter are rejected before the core receives ACK.
+  fixed/adaptive bonding plus the shared roaming state machine. Swift owns Apple path
+  observation, path-scoped DNS/NAT64 resolution, socket/interface binding and the exact
+  excluded-route transaction requested by Rust; no Swift wire implementation is on the
+  production path.
+- `NetworkPlan` application is fail-closed for IPv4, IPv6 and dual-stack plans: unsupported
+  DNS ports, addresses or routes are rejected before the shared core receives ACK.
 - The status bridge reports server-pushed routes separately from client/local routes and
   uses effective post-push padding, heartbeat and shaping facts supplied by Rust.
-- Rust iOS XCFramework build script for the complete `transport-core-ffi` static library,
-  including the canonical ABI header and device/simulator slices.
+- Rust iOS XCFramework build script for the complete `transport-core-ffi experimental-roaming`
+  static library, including the canonical ABI header and device/simulator slices.
 - Home Screen status widget and authenticated connect/disconnect action; iOS 18 adds
   the same action as a Control Center, Lock Screen and Action button control.
 - MDM deployment templates, typed managed configuration, enforced profile/On-Demand
   precedence and an App-Group policy gate for managed WidgetKit controls.
 
-The production Packet Tunnel now uses the same ABI 1.10 Rust transport as Linux, Android,
-Windows and macOS. Swift applies `NetworkPlan`, persists trust/device identity and copies
-bounded IP batches to/from `NEPacketTunnelFlow`; it no longer implements a wire protocol.
+The production Packet Tunnel uses the same versioned Rust transport ABI as Linux, Android,
+Windows and macOS. The current core is ABI 1.15; ABI 1.11 remains the compatible base,
+ABI 1.12-1.14 activates the optional path-command/path-refresh contracts, and ABI 1.15 adds
+NOTICE/KICK management events. Ordinary TCP and every UDP camouflage mode
+use that one Rust roaming policy. Explicit `local`/non-zero `lport`, a default or older core,
+and an unsupported peer retain the previous full-reconnect fallback. Swift applies
+`NetworkPlan`, persists trust/device identity, executes Apple path operations and copies bounded
+IP batches to/from `NEPacketTunnelFlow`; it does not implement a wire protocol.
 CI builds the real device/simulator XCFramework, compiles the generated Xcode project for
 the simulator and runs the iOS unit tests. A physical-iPhone smoke test and the complete
 interoperability matrix still have to be performed before release. See `PARITY.md` for that
@@ -96,15 +101,43 @@ table is the entitlement files (`Config/*.entitlements`), not a recommendation:
 The shared identifiers are `group.ru.qeli.app` (App Group) and
 `$(AppIdentifierPrefix)ru.qeli.app.shared` (Keychain Group).
 
+### Installation and unsigned IPA files
+
+An unsigned IPA is a build intermediate, **not an installable Qeli VPN release**. A generic
+SideStore/AltStore re-sign with a free Apple Account can make the container UI launch while
+dropping or changing the capabilities required by the app and its extensions. The usual result
+is a Keychain “missing required entitlement” error followed by Network Extension “permission
+denied”; the Packet Tunnel Provider cannot work in that state.
+
+Use one of these installation paths:
+
+- TestFlight or App Store distribution signed by the Qeli Apple Developer team;
+- Development/Ad Hoc distribution whose three explicit App IDs and provisioning profiles carry
+  exactly the capabilities in the table above;
+- an Xcode device build made by an authorized Apple Developer team after updating
+  `Config/Signing.xcconfig` and registering the matching App Group and Keychain Group.
+
+Before distributing an IPA, verify it on macOS from the repository root:
+
+```sh
+python3 scripts/verify_ios_ipa.py /path/to/Qeli.ipa
+```
+
+The verifier rejects missing component signatures/provisioning profiles, inconsistent bundle or
+shared-group identifiers, and effective signatures without Packet Tunnel, App Group or Keychain
+entitlements. `--structural-only` is diagnostic and is not release evidence.
+
 The widget deliberately has **no** Keychain access: it renders status and requests a
 desired state, and must never be able to read profile secrets. Granting it Keychain
 Sharing to "make things consistent" would quietly widen the blast radius of a widget
 compromise — the two extensions are not interchangeable.
 
-The widget and iOS 18 control read status from the App Group. Their authenticated
-App Intents write a short-lived, one-time desired-state request and bring the main
-app forward to apply it through `NETunnelProviderManager`; the widget extension
-never starts a tunnel directly. The `qeli-control://status` URL is navigation-only.
+The widget and iOS 18 control read status from the App Group. Their authenticated App Intents
+write a short-lived desired-state request and open the container app. `AppModel` consumes the
+request and performs the same serialized `connectionDesired` / On-Demand preference transaction
+as a manual tap before it starts or stops the tunnel. The widget deliberately has neither
+Network Extension nor Keychain access: it cannot mutate `NETunnelProviderManager`, create a
+profile or read profile secrets. The `qeli-control://status` URL is navigation-only.
 Any future command URL must carry a fresh opaque token that already exists in the
 App Group, so an arbitrary custom URL cannot authorize connect or disconnect.
 WidgetKit controls timeline refresh frequency, so status can briefly lag when the
@@ -128,22 +161,31 @@ the reason, not a broken project file.
 the Rust crate three times — `aarch64-apple-ios` for the device,
 plus `aarch64-apple-ios-sim` and `x86_64-apple-ios` lipo'd into one simulator slice — and
 packages both with the headers from `QeliCore/Native/include` into the XCFramework. It
-builds `--no-default-features --features transport-core-ffi`: the iOS slice is the
-whole-client static library, with no server or CLI. `QELI_RUST_MANIFEST` and
-`QELI_CARGO_TARGET_DIR` override the paths for out-of-tree builds.
+builds `--no-default-features --features 'transport-core-ffi experimental-roaming'` by
+default: the iOS slice is the whole-client static library, with no server or CLI.
+`QELI_RUST_FEATURES` can override that exact feature set for compatibility checks;
+`QELI_RUST_MANIFEST` and `QELI_CARGO_TARGET_DIR` override the paths for out-of-tree builds.
 
 The Swift side talks through the versioned whole-client ABI in
 `QeliCore/Native/QeliFFI.swift`: `new/start/run/stop`, lifecycle events, server-identity and
-NetworkPlan ACKs, stats, `tun_push/pull`, plus the handle-free UDP diagnostic. Rust owns
+NetworkPlan ACKs, stats, `tun_push/pull`, the handle-free UDP diagnostic, and optional
+`PathUpdate`/`PathCommandResult` calls. `NWPathMonitor`, a path-scoped UDP `NWConnection`,
+Darwin `IP_BOUND_IF`/`IPV6_BOUND_IF`, and exact `/32`/`/128` `excludedRoutes` implement
+PREPARE/BIND/COMMIT/ABORT without replacing the packet tunnel. Rust owns
 record framing, handshakes, crypto, carriers and packet loops. Swift owns only Apple system
-APIs, profile storage and UI. The Packet Tunnel target excludes the old Swift
-`Crypto/`/`Protocol/` conformance code entirely.
+APIs, profile storage and UI. Both production targets exclude the old Swift `Protocol/`
+conformance code; `QeliIOSTests` compiles it explicitly for cross-language KATs. The Packet
+Tunnel additionally excludes the retained Swift `Crypto/` helpers.
 
 Two consequences worth stating plainly. The XCFramework is a **build artefact of a specific
 Rust revision**: change anything under `qeli/src/` that the FFI touches and you must re-run
 `build_native.sh`, or Xcode will keep linking the stale archive and the mismatch will surface
 as ABI negotiation failure. The build script always packages the canonical transport header,
 so a new Rust export cannot silently drift from the Swift module declaration.
+
+The genuine H2 carrier for `reality-tls` is part of that versioned Rust artefact. An installed
+iOS app receives it only after a new XCFramework is built, packaged, signed and installed;
+a server-side update cannot change the client wire implementation.
 
 The iOS packet bridge has an explicit memory budget: two Rust pools of 32 × 65,535 bytes
 (4,194,240 bytes total), 128-slot bounded queues, and three reused Swift caller buffers capped

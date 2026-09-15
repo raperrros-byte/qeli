@@ -9,6 +9,9 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.net.VpnService
 import android.os.Build
@@ -90,6 +93,7 @@ class MainActivity : AppCompatActivity() {
     // Invalidates reachability probes launched against a VPN generation being torn down.
     private var reachEpoch = 0L
     private var clientIp = ""
+    private var clientGateway = ""
     private var logLineCount = 0
     // Mirror of PREF_LOG_TIME_FORMAT, cached because appendLog reads it per line.
     // Refreshed in onCreate and whenever Settings is saved.
@@ -113,8 +117,8 @@ class MainActivity : AppCompatActivity() {
      *  obfs_key, so they must not sit in plaintext SharedPreferences. The master
      *  key lives in the Android Keystore (TEE/StrongBox where available). On first
      *  use this migrates any legacy plaintext profiles, then wipes the legacy copy
-     *  so secrets no longer linger unencrypted. (docs/RELEASE-FIXES.md E1) */
-    private val secureStore: SharedPreferences by lazy {
+     *  so secrets no longer linger unencrypted. (docs/ru/archive/plans/RELEASE-FIXES.md E1) */
+    private val secureStore: ProfileStore.SecureStore by lazy {
         // Same store the Quick Settings tile reads — see ProfileStore for the shared params.
         val store = ProfileStore.open(this)
         val legacy = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -133,7 +137,7 @@ class MainActivity : AppCompatActivity() {
     private data class Profile(var name: String, var text: String)
 
     companion object {
-        private const val MAX_LOG_LINES = 500
+        private const val MAX_LOG_LINES = DiagnosticLogStore.MAX_ENTRIES
         private const val PREFS_NAME = "vpn"
         private const val KEY_PROFILES = "profiles_json"
         /** Intent extra: the Quick Settings tile ([QeliTileService]) sets this to true to ask
@@ -146,6 +150,7 @@ class MainActivity : AppCompatActivity() {
         const val PREF_TRUSTED_WIFI_ENABLED = "trusted_wifi_enabled"
         const val PREF_TRUSTED_WIFI_SSIDS = "trusted_wifi_ssids"
         const val PREF_CONNECTION_DESIRED = "connection_desired"
+        const val PREF_DIAGNOSTIC_SESSION_ID = "diagnostic_session_id"
         // Global LAN-bypass toggle (read by QeliService at establish; OR'd with the
         // profile's own allow_lan). Lets Wi-Fi/LAN devices stay reachable on a full tunnel.
         const val PREF_ALLOW_LAN = "allow_lan"
@@ -168,6 +173,13 @@ class MainActivity : AppCompatActivity() {
         const val PREF_GEO_PRESET = "geo_route_preset"
         const val PREF_AUTO_PROBE = "auto_probe_profiles"
         const val PREF_PROBE_INTERVAL_SECS = "probe_interval_secs"
+        /** True only while this process has a started Activity. The VPN service uses this
+         * to add the location foreground-service type during a user-visible transition;
+         * Android 14 rejects adding that while-in-use type to a service created in the
+         * background, even when checkSelfPermission still reports GRANTED. */
+        @Volatile
+        internal var uiVisible = false
+            private set
         private const val PREF_LAST_AUTO_PROBE_MS = "last_auto_probe_ms"
         private const val MAX_IMPORTED_FILE_BYTES = 8 * 1024 * 1024
         // QELI-ENC-1 base64-expands an otherwise valid 8 MiB plaintext archive.
@@ -186,6 +198,9 @@ pass = changeme
 key =
 mode = fake-tls
 sni = www.microsoft.com
+ipv6 = auto
+# allow_ipv4_leak = false ; full-tunnel exception for an IPv6-only plan
+# allow_ipv6_leak = false ; full-tunnel exception for an IPv4-only plan
 # kill_switch = true       ; requires Android Always-on VPN + Block without VPN
 # route_local = false      ; route LAN/RFC1918 through the tunnel
 # dns_servers = 1.1.1.1, 8.8.8.8 ; resolvers reached via the tunnel
@@ -252,9 +267,23 @@ sni = www.microsoft.com
             val status = intent.getStringExtra(VpnServiceImpl.EXTRA_STATUS)
             val error = intent.getStringExtra(VpnServiceImpl.EXTRA_ERROR)
             val log = intent.getStringExtra(VpnServiceImpl.EXTRA_LOG)
+            val logTimeMs = intent.getLongExtra(
+                VpnServiceImpl.EXTRA_LOG_TIME_MS,
+                System.currentTimeMillis(),
+            )
+            val logSessionId = intent.getStringExtra(VpnServiceImpl.EXTRA_LOG_SESSION_ID).orEmpty()
+            val logLevel = intent.getStringExtra(VpnServiceImpl.EXTRA_LOG_LEVEL) ?: "info"
             runOnUiThread {
                 if (isFinishing || isDestroyed) return@runOnUiThread
-                log?.let { appendLog(it) }
+                log?.let {
+                    appendLog(
+                        msg = it,
+                        timestampMs = logTimeMs,
+                        persist = false,
+                        sessionId = logSessionId,
+                        level = logLevel,
+                    )
+                }
                 if (status == VpnServiceImpl.STATUS_STATS) {
                     updateSpeed(
                         intent.getLongExtra(VpnServiceImpl.EXTRA_UP, 0),
@@ -265,7 +294,10 @@ sni = www.microsoft.com
                         intent.getLongExtra(VpnServiceImpl.EXTRA_DOWN_TOTAL, VpnServiceImpl.liveBytesDown)
                     )
                 } else {
-                    if (status == VpnServiceImpl.STATUS_CONNECTED) clientIp = intent.getStringExtra(VpnServiceImpl.EXTRA_IP) ?: ""
+                    if (status == VpnServiceImpl.STATUS_CONNECTED) {
+                        clientIp = intent.getStringExtra(VpnServiceImpl.EXTRA_IP) ?: ""
+                        clientGateway = intent.getStringExtra(VpnServiceImpl.EXTRA_GATEWAY) ?: ""
+                    }
                     updateUi(status, error)
                 }
             }
@@ -275,6 +307,7 @@ sni = www.microsoft.com
     // Update check (opt-in; notification-only): checked once per app run, only while connected.
     private var updateChecked = false
     private var updateUrl: String? = null
+    private var updateJob: Job? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -312,6 +345,7 @@ sni = www.microsoft.com
         ContextCompat.registerReceiver(
             this, statusReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED
         )
+        restoreDiagnosticLog()
 
         binding.btnImport.setOnClickListener { showImportChooser() }
         binding.btnNewProfile.setOnClickListener { showEditor(-1) }
@@ -320,7 +354,12 @@ sni = www.microsoft.com
         binding.ringConnect.setOnClickListener { onConnectTap(it) }
 
         // Log tab toolbar
-        binding.btnLogClear.setOnClickListener { binding.tvLog.text = ""; logLineCount = 0 }
+        binding.btnLogClear.setOnClickListener {
+            runCatching { DiagnosticLogStore.clear(noBackupFilesDir) }
+                .onFailure { error -> Log.w("VpnMain", "Unable to clear diagnostic log", error) }
+            binding.tvLog.text = ""
+            logLineCount = 0
+        }
         binding.btnLogCopy.setOnClickListener {
             val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
             cm.setPrimaryClip(ClipData.newPlainText("qeli log", binding.tvLog.text))
@@ -364,10 +403,12 @@ sni = www.microsoft.com
 
     override fun onStart() {
         super.onStart()
+        uiVisible = true
         configureAutoProbeTimer(runImmediately = true)
     }
 
     override fun onStop() {
+        uiVisible = false
         autoProbeJob?.cancel()
         autoProbeJob = null
         cancelAutomaticProbeJobs()
@@ -409,17 +450,52 @@ sni = www.microsoft.com
         packageManager.getPackageInfo(packageName, 0).versionName ?: "0"
     } catch (_: Exception) { "0" }
 
-    /** Opt-in auto update check: once per session, only while the tunnel is up (so the
-     *  request travels inside the tunnel — hides the real IP + the "runs qeli" tell), fail-soft. */
+    /** Opt-in auto update check: once per session and only through a provably private tunnel. */
     private fun maybeCheckForUpdates() {
         if (!QeliApp.isCheckUpdates(this) || updateChecked) return
+        val vpnNetwork = privateUpdateNetwork() ?: return
         updateChecked = true
-        if (!isConnected) return
-        lifecycleScope.launch {
-            val info = UpdateChecker.check(rawVersionName()) ?: return@launch
-            if (info.isNewer) showUpdateAvailable(info)
+        updateJob?.cancel()
+        updateJob = lifecycleScope.launch {
+            try {
+                val info = UpdateChecker.check(rawVersionName(), vpnNetwork) ?: return@launch
+                if (info.isNewer) showUpdateAvailable(info)
+            } finally {
+                // A reconnect cancels the blocking request before the physical path can leak.
+                // The explicit Network may also fail before the status broadcast reaches us;
+                // either case must let the next private generation retry.
+                if (!isActive || privateUpdateNetwork() != vpnNetwork) updateChecked = false
+            }
         }
     }
+
+    private fun privateUpdateNetwork(): Network? {
+        // The selected profile remains editable while its old config is still running.
+        // Trust only the service-owned snapshot derived from that actual generation; parsing
+        // current() here could turn a harmless editor change into an update request outside
+        // the tunnel that is really active.
+        if (!isConnected ||
+            VpnServiceImpl.liveStatus != VpnServiceImpl.STATUS_CONNECTED ||
+            !VpnServiceImpl.liveUpdatePrivatePath
+        ) return null
+
+        val manager = getSystemService(ConnectivityManager::class.java) ?: return null
+        val vpnNetworks = runCatching {
+            manager.allNetworks.filter { network ->
+                manager.getNetworkCapabilities(network)?.let { capabilities ->
+                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                } == true
+            }
+        }.getOrDefault(emptyList())
+        // Prefer the process default when it is the VPN. Some Android versions expose the
+        // VpnService owner's carrier as its default even though an application socket can
+        // still be explicitly bound to the sole VPN network; accept that unambiguous case.
+        val active = runCatching { manager.activeNetwork }.getOrNull()
+        return active?.takeIf { it in vpnNetworks }
+            ?: vpnNetworks.singleOrNull()
+    }
+
 
     /** Reveal an available update in the footer + a toast; the footer opens the dialog. */
     private fun showUpdateAvailable(info: UpdateInfo) {
@@ -439,7 +515,17 @@ sni = www.microsoft.com
         val toggle = CheckBox(this).apply {
             text = getString(R.string.check_updates_auto)
             isChecked = QeliApp.isCheckUpdates(this@MainActivity)
-            setOnCheckedChangeListener { _, on -> QeliApp.setCheckUpdates(this@MainActivity, on) }
+            setOnCheckedChangeListener { _, on ->
+                QeliApp.setCheckUpdates(this@MainActivity, on)
+                if (on) {
+                    maybeCheckForUpdates()
+                } else {
+                    // Revoking the opt-in also revokes an already-running request.
+                    updateChecked = false
+                    updateJob?.cancel()
+                    updateJob = null
+                }
+            }
         }
         val status = TextView(this).apply {
             setPadding(0, pad, 0, 0)
@@ -456,10 +542,15 @@ sni = www.microsoft.com
             .create()
         dlg.show()
         dlg.getButton(android.app.AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
-            if (!isConnected) { status.text = getString(R.string.update_connect_first); return@setOnClickListener }
+            val vpnNetwork = privateUpdateNetwork()
+            if (vpnNetwork == null) {
+                status.text = getString(R.string.update_private_path_required)
+                return@setOnClickListener
+            }
             status.text = getString(R.string.update_checking)
-            lifecycleScope.launch {
-                val info = UpdateChecker.check(rawVersionName())
+            updateJob?.cancel()
+            updateJob = lifecycleScope.launch {
+                val info = UpdateChecker.check(rawVersionName(), vpnNetwork)
                 when {
                     info == null -> status.text = getString(R.string.update_check_failed)
                     info.isNewer -> {
@@ -481,7 +572,11 @@ sni = www.microsoft.com
      *  Activity is recreated by a theme switch or rotation). */
     private fun restoreServiceState() {
         when (VpnServiceImpl.liveStatus) {
-            VpnServiceImpl.STATUS_CONNECTED -> { clientIp = VpnServiceImpl.liveIp; setConnectedState() }
+            VpnServiceImpl.STATUS_CONNECTED -> {
+                clientIp = VpnServiceImpl.liveIp
+                clientGateway = VpnServiceImpl.liveGateway
+                setConnectedState()
+            }
             VpnServiceImpl.STATUS_CONNECTING -> setConnectingState()
             VpnServiceImpl.STATUS_DISCONNECTING -> setDisconnectingState()
             VpnServiceImpl.STATUS_WAITING_TRUSTED -> setTrustedWaitingState()
@@ -952,7 +1047,7 @@ sni = www.microsoft.com
         }
         val cbAutoProbe = android.widget.CheckBox(this).apply {
             text = getString(R.string.auto_probe_profiles)
-            isChecked = prefs.getBoolean(PREF_AUTO_PROBE, true)
+            isChecked = prefs.getBoolean(PREF_AUTO_PROBE, ProfileAutoProbePolicy.DEFAULT_ENABLED)
         }
         val probeIntervalInput = com.google.android.material.textfield.TextInputEditText(this).apply {
             inputType = InputType.TYPE_CLASS_NUMBER
@@ -1457,7 +1552,11 @@ sni = www.microsoft.com
         val dlgBinding = DialogConfigEditorBinding.inflate(LayoutInflater.from(this))
         val editing = profiles.getOrNull(index)
         dlgBinding.editName.setText(editing?.name ?: getString(R.string.new_profile_title))
-        dlgBinding.editJson.setText(editing?.text ?: TEMPLATE)
+        val initialConfigText = editing?.text ?: TEMPLATE
+        dlgBinding.editJson.setText(initialConfigText)
+        val roamingPolicies = listOf("auto", "required", "off")
+        val initialRoaming = runCatching { VpnConfig.parse(initialConfigText).roaming }.getOrDefault("auto")
+        dlgBinding.spinnerRoaming.setSelection(roamingPolicies.indexOf(initialRoaming).coerceAtLeast(0))
 
         val dialog = MaterialAlertDialogBuilder(this)
             .setTitle(getString(if (index < 0) R.string.new_profile_title else R.string.edit_profile_title))
@@ -1468,11 +1567,14 @@ sni = www.microsoft.com
         dialog.show()
         dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
             val cfgText = dlgBinding.editJson.text.toString().trim()
-            val cfg = try { VpnConfig.parse(cfgText).also { it.validate() } } catch (e: Exception) {
+            val roamingPolicy = roamingPolicies.getOrElse(dlgBinding.spinnerRoaming.selectedItemPosition) { "auto" }
+            val cfg = try {
+                VpnConfig.parse(cfgText).copy(roaming = roamingPolicy).also { it.validate() }
+            } catch (e: Exception) {
                 Toast.makeText(this, getString(R.string.invalid_config, e.message ?: ""), Toast.LENGTH_LONG).show(); return@setOnClickListener
             }
-            // Re-emit as canonical INI so the stored text stays tidy/consistent.
-            val iniText = if (cfgText.trimStart().startsWith("{")) cfg.toIni() else cfgText
+            // The form owns roaming; canonical INI keeps every modelled/carried portable key.
+            val iniText = cfg.toIni()
             var name = dlgBinding.editName.text.toString().trim()
             if (name.isBlank()) name = cfg.serverAddress.ifBlank { getString(R.string.profile_fallback_name) }
             val candidate = profiles.map { it.copy() }.toMutableList()
@@ -1614,24 +1716,41 @@ sni = www.microsoft.com
      * profile, and never scraped out of the log.
      */
     private fun showProtectionDetails() {
-        val profile = current() ?: return
-        val cfg = try { VpnConfig.parse(profile.text) } catch (_: Exception) {
-            Toast.makeText(this, getString(R.string.protection_invalid), Toast.LENGTH_SHORT).show()
-            return
-        }
-        val s = ProtectionSummary.of(cfg, globalAllowLan())
+        val properties = VpnServiceImpl.liveConnectionProperties ?: return
+        val s = properties.protection
         val live = isConnected
         val rows = mutableListOf<Pair<Int, String>>()
-        rows += R.string.detail_server to "${cfg.serverAddress}:${cfg.port}"
+        rows += R.string.detail_server to properties.displayEndpoint
         rows += R.string.detail_transport to
-            "${cfg.wireMode} / ${cfg.protocol.uppercase()}${if (cfg.quicEnabled) " + QUIC" else ""}"
+            "${properties.wireMode} / ${properties.protocol.uppercase()}" +
+                (if (properties.quicEnabled) " + QUIC" else "")
         rows += R.string.detail_crypto to
             getString(if (s.postQuantum) R.string.protection_pq else R.string.protection_classic)
         rows += R.string.detail_server_key to
             getString(if (s.keyPinned) R.string.protection_key_pinned else R.string.protection_key_tofu)
+        // The compact strip intentionally has room for one highest-priority warning. The
+        // detail sheet is the promised full picture, so list every independent carve-out
+        // instead of silently hiding the second and later warnings.
+        for (warning in s.warnings) {
+            rows += R.string.detail_warning to protectionWarningText(
+                warning, s.excludedRouteCount
+            )
+        }
         if (live) {
             val pushed = VpnServiceImpl.livePushed
-            rows += R.string.detail_tunnel_ip to VpnServiceImpl.liveIp
+            pushed.familyMode?.let { family ->
+                rows += R.string.detail_ip_family to getString(when (family) {
+                    "ipv4" -> R.string.detail_ipv4
+                    "ipv6" -> R.string.detail_ipv6
+                    else -> R.string.detail_dual_stack
+                })
+            }
+            pushed.carrierAddress?.let { address ->
+                val endpoint = if (address.contains(':')) "[$address]:${properties.port}"
+                else "$address:${properties.port}"
+                rows += R.string.detail_carrier to endpoint
+            }
+            rows += R.string.detail_tunnel_ip to VpnServiceImpl.liveAddresses.ifEmpty { VpnServiceImpl.liveIp }
             // `liveDns` is the resolver the tunnel ACTUALLY programmed, and empty is a real
             // answer: it means none was installed and the device keeps its own.
             //
@@ -1647,7 +1766,25 @@ sni = www.microsoft.com
             }
             if (VpnServiceImpl.liveMtu > 0) {
                 rows += R.string.detail_mtu to
-                    "${VpnServiceImpl.liveMtu}${if (cfg.mtu > 0) "" else " (auto)"}"
+                    "${VpnServiceImpl.liveMtu}${if (properties.configuredMtu > 0) "" else " (auto)"}"
+            }
+            pushed.recordizerMode?.let { mode ->
+                val displayMode = when (mode) {
+                    "packet_mux_v1" -> "PACKET_MUX_V1"
+                    else -> getString(R.string.detail_legacy_packet_record)
+                }
+                rows += R.string.detail_recordizer to negotiatedModeText(
+                    displayMode, pushed.recordizerPolicy)
+            }
+            pushed.roamingMode?.let { mode ->
+                val displayMode = when (mode) {
+                    "udp_roam_v1" -> "UDP_ROAM_V1"
+                    "tcp_resume_v2" -> "TCP_RESUME_V2"
+                    "tcp_handover_v2" -> "TCP_HANDOVER_V2 + TCP_RESUME_V2"
+                    else -> getString(R.string.detail_reconnect_fallback)
+                }
+                rows += R.string.detail_roaming to negotiatedModeText(
+                    displayMode, pushed.roamingPolicy)
             }
             if (VpnServiceImpl.liveStreams > 1) {
                 rows += R.string.detail_multipath to (
@@ -1697,7 +1834,7 @@ sni = www.microsoft.com
             ProtectionScope.SPLIT_ROUTES -> getString(R.string.protection_split)
         }
         rows += R.string.detail_reconnect to getString(
-            if (cfg.reconnectEnabled) R.string.detail_on else R.string.detail_off
+            if (properties.reconnectEnabled) R.string.detail_on else R.string.detail_off
         )
 
         val d = resources.displayMetrics.density
@@ -1757,17 +1894,22 @@ sni = www.microsoft.com
             .show()
     }
 
-    /**
-     * The app-wide LAN-bypass toggle, which the tunnel ORs with the profile's own `allow_lan`
-     * (see QeliService). The protection card has to read the same pair, or it reports on a
-     * tunnel different from the one being built. (Audit 2026-08-02, §6.)
-     */
-    private fun globalAllowLan(): Boolean =
-        getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
-            .getBoolean(PREF_ALLOW_LAN, false)
+    private fun protectionWarningText(warning: ProtectionWarning, excludedRouteCount: Int): String =
+        when (warning) {
+            ProtectionWarning.LAN_OUTSIDE -> getString(R.string.protection_warn_lan)
+            ProtectionWarning.IPV4_OUTSIDE -> getString(R.string.protection_warn_ipv4)
+            ProtectionWarning.IPV6_OUTSIDE -> getString(R.string.protection_warn_ipv6)
+            ProtectionWarning.EXCLUDED_ROUTES ->
+                getString(R.string.protection_warn_excluded, excludedRouteCount)
+            ProtectionWarning.NO_PINNED_KEY -> getString(R.string.protection_warn_no_key)
+        }
+
+    private fun negotiatedModeText(mode: String, policy: String?): String =
+        if (policy.isNullOrBlank()) mode
+        else getString(R.string.detail_mode_policy, mode, policy)
 
     /**
-     * Fill the one-line connection-info strip from the ACTIVE profile.
+     * Fill the one-line connection-info strip from the live generation snapshot.
      *
      * This deliberately does NOT render a verdict. The card it replaced led with a bold
      * "All traffic is protected", which is the strongest claim in the app and the easiest to
@@ -1776,33 +1918,26 @@ sni = www.microsoft.com
      *
      * When something narrows the tunnel, the whole strip turns amber and shows THAT instead
      * of the facts: a carve-out is what the user needs to see first, and there is only one
-     * line to say it in. [ProtectionSummary] still decides — including the app-wide LAN
-     * toggle, which the tunnel ORs with the profile's own.
+     * line to say it in. [ProtectionSummary] still decides; the service calculated it from
+     * the immutable connected config and the app-wide LAN toggle when the TUN was applied.
      */
     private fun renderConnectionInfo() {
-        val profile = current()
-        val cfg = profile?.let { try { VpnConfig.parse(it.text) } catch (_: Exception) { null } }
+        val properties = VpnServiceImpl.liveConnectionProperties
         val row = binding.connectionInfoRow
         val text = binding.tvConnectionInfo
         // Properties OF A CONNECTION — so there is nothing to state until there is one. This
         // also gives the idle screen the whole card's height back, which is where the tab was
         // tightest.
-        if (!isConnected || cfg == null) {
+        if (!isConnected || properties == null) {
             row.visibility = View.GONE
             return
         }
         row.visibility = View.VISIBLE
         row.isClickable = true
 
-        val s = ProtectionSummary.of(cfg, globalAllowLan())
+        val s = properties.protection
         val warning = s.warnings.firstOrNull()?.let {
-            when (it) {
-                ProtectionWarning.LAN_OUTSIDE -> getString(R.string.protection_warn_lan)
-                ProtectionWarning.IPV6_OUTSIDE -> getString(R.string.protection_warn_ipv6)
-                ProtectionWarning.EXCLUDED_ROUTES ->
-                    getString(R.string.protection_warn_excluded, s.excludedRouteCount)
-                ProtectionWarning.NO_PINNED_KEY -> getString(R.string.protection_warn_no_key)
-            }
+            protectionWarningText(it, s.excludedRouteCount)
         }
         if (warning != null) {
             text.text = warning
@@ -1811,8 +1946,8 @@ sni = www.microsoft.com
         }
         // `mode · TRANSPORT[/QUIC] · key exchange · how the peer is trusted`
         text.text = listOf(
-            cfg.wireMode,
-            cfg.protocol.uppercase() + if (cfg.quicEnabled) " / QUIC" else "",
+            properties.wireMode,
+            properties.protocol.uppercase() + if (properties.quicEnabled) " / QUIC" else "",
             getString(if (s.postQuantum) R.string.protection_pq_short else R.string.protection_classic_short),
             getString(if (s.keyPinned) R.string.protection_key_pinned else R.string.protection_key_tofu),
         ).joinToString(" · ")
@@ -2144,7 +2279,7 @@ sni = www.microsoft.com
         autoProbeJob = null
         cancelAutomaticProbeJobs()
         val prefs = getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
-        if (!prefs.getBoolean(PREF_AUTO_PROBE, true)) return
+        if (!prefs.getBoolean(PREF_AUTO_PROBE, ProfileAutoProbePolicy.DEFAULT_ENABLED)) return
 
         autoProbeJob = lifecycleScope.launch {
             if (runImmediately) pingAll(manual = false)
@@ -2188,7 +2323,7 @@ sni = www.microsoft.com
         if (isDisconnecting) return
         if (!manual) {
             val enabled = getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
-                .getBoolean(PREF_AUTO_PROBE, true)
+                .getBoolean(PREF_AUTO_PROBE, ProfileAutoProbePolicy.DEFAULT_ENABLED)
             if (!enabled || isConnected || isConnecting || isTrustedPaused) return
         }
         val p = current() ?: return
@@ -2200,13 +2335,11 @@ sni = www.microsoft.com
         launchReachabilityProbe(manual) {
             // While connected, probe the in-tunnel gateway for a clean tunnel RTT
             // (probing the public IP loops back through the server and ~doubles it).
-            val ms = withReachabilityProbeSlot {
-                if (isConnected && clientIp.isNotEmpty()) {
-                    val gw = gatewayOf(clientIp)
-                    if (cfg.isUdp) udpPing(cfg, gw) else tcpPing(gw, cfg.port)
-                } else {
-                    probe(p)
-                }
+            val ms = if (isConnected && clientGateway.isNotEmpty()) {
+                if (cfg.isUdp) udpPing(cfg, clientGateway)
+                else tcpPing(clientGateway, cfg.port)
+            } else {
+                probe(p)
             }
             if (epoch == reachEpoch && !isDisconnecting
                 && profiles.getOrNull(idx) === p) {
@@ -2222,7 +2355,7 @@ sni = www.microsoft.com
         val sweepAt = System.currentTimeMillis()
         if (!manual) {
             if (!ProfileAutoProbePolicy.canStartSweep(
-                    enabled = sweepPrefs.getBoolean(PREF_AUTO_PROBE, true),
+                    enabled = sweepPrefs.getBoolean(PREF_AUTO_PROBE, ProfileAutoProbePolicy.DEFAULT_ENABLED),
                     tunnelBusy = isConnected || isConnecting || isDisconnecting || isTrustedPaused,
                     nowMs = sweepAt,
                     lastSweepMs = lastAutoProbeAtMs,
@@ -2278,14 +2411,6 @@ sni = www.microsoft.com
     private suspend fun probe(p: Profile): Long {
         val cfg = try { VpnConfig.parse(p.text) } catch (_: Exception) { return -1L }
         return if (cfg.isUdp) udpPing(cfg, cfg.serverAddress) else tcpPing(cfg.serverAddress, cfg.port)
-    }
-
-    /** The server's in-tunnel gateway (`x.y.z.1` of the assigned tunnel IP). The
-     *  profile listens on 0.0.0.0:port, so it is reachable here through the tunnel
-     *  — probing it gives a clean one-way tunnel RTT. */
-    private fun gatewayOf(ip: String): String {
-        val o = ip.split(".")
-        return if (o.size == 4) "${o[0]}.${o[1]}.${o[2]}.1" else ip
     }
 
     /** Native UDP first-flight diagnostic. Rust uses the same hybrid PQ ClientHello,
@@ -2467,6 +2592,7 @@ sni = www.microsoft.com
     // ── UI state ──────────────────────────────────────────────────────────--
 
     private fun setConnectingState() {
+        updateJob?.cancel(); updateJob = null
         isConnected = false; isConnecting = true; isDisconnecting = false; isTrustedPaused = false
         binding.btnPing.isEnabled = true
         binding.btnCheckAll.isEnabled = true
@@ -2481,9 +2607,11 @@ sni = www.microsoft.com
     }
 
     private fun setDisconnectingState() {
+        updateJob?.cancel(); updateJob = null
         if (!isDisconnecting) reachEpoch++
         isConnected = false; isConnecting = false; isDisconnecting = true; isTrustedPaused = false
         clientIp = ""
+        clientGateway = ""
         binding.btnPing.isEnabled = false
         binding.btnCheckAll.isEnabled = false
         binding.statusIndicator.backgroundTintList = csl(R.color.status_connecting)
@@ -2498,7 +2626,9 @@ sni = www.microsoft.com
     }
 
     private fun setDisconnectedState() {
-        isConnected = false; isConnecting = false; isDisconnecting = false; isTrustedPaused = false; clientIp = ""
+        updateJob?.cancel(); updateJob = null
+        isConnected = false; isConnecting = false; isDisconnecting = false
+        clientIp = ""; clientGateway = ""
         binding.btnPing.isEnabled = true
         binding.btnCheckAll.isEnabled = true
         binding.statusIndicator.backgroundTintList = csl(R.color.status_disconnected)
@@ -2529,6 +2659,7 @@ sni = www.microsoft.com
     }
 
     private fun setTrustedWaitingState() {
+        updateJob?.cancel(); updateJob = null
         isConnected = false; isConnecting = false; isDisconnecting = false; isTrustedPaused = true
         clientIp = ""
         binding.btnPing.isEnabled = true
@@ -2548,7 +2679,9 @@ sni = www.microsoft.com
     }
 
     private fun setErrorState(error: String?) {
-        isConnected = false; isConnecting = false; isDisconnecting = false; isTrustedPaused = false; clientIp = ""
+        updateJob?.cancel(); updateJob = null
+        isConnected = false; isConnecting = false; isDisconnecting = false
+        clientIp = ""; clientGateway = ""
         binding.btnPing.isEnabled = true
         binding.btnCheckAll.isEnabled = true
         binding.statusIndicator.backgroundTintList = csl(R.color.status_error)
@@ -2645,12 +2778,12 @@ sni = www.microsoft.com
     /// `util::log_timestamp` (and the server's `[logging] time_format`) value for
     /// value, so phone and server logs line up; an unknown value degrades to the
     /// default instead of throwing.
-    private fun logStamp(): String {
+    private fun logStamp(timestampMs: Long = System.currentTimeMillis()): String {
         // Cached field, not a prefs read: appendLog runs per line and a reconnect
         // storm is exactly the path this screen was hardened against.
         val fmt = logTimeFormat
         if (fmt == "none" || fmt == "off") return ""
-        val now = System.currentTimeMillis()
+        val now = timestampMs
         if (fmt == "epoch" || fmt == "unix") {
             return "${now / 1000}.${(now % 1000).toString().padStart(3, '0')}"
         }
@@ -2667,14 +2800,60 @@ sni = www.microsoft.com
         return sdf.format(java.util.Date(now))
     }
 
-    private fun appendLog(msg: String) {
-        val ts = logStamp()
+    private fun currentDiagnosticSessionId(): String =
+        getSharedPreferences(PREFS_STATE, Context.MODE_PRIVATE)
+            .getString(PREF_DIAGNOSTIC_SESSION_ID, "")
+            .orEmpty()
+
+    private fun restoreDiagnosticLog() {
+        binding.tvLog.text = ""
+        logLineCount = 0
+        runCatching { DiagnosticLogStore.read(noBackupFilesDir) }
+            .onFailure { error -> Log.w("VpnMain", "Unable to restore diagnostic log", error) }
+            .getOrDefault(emptyList())
+            .forEach { entry ->
+                appendLog(
+                    msg = entry.message,
+                    timestampMs = entry.timestampMs,
+                    persist = false,
+                    sessionId = entry.sessionId,
+                    level = entry.level,
+                    updateConnectionStep = false,
+                )
+            }
+    }
+
+    private fun appendLog(
+        msg: String,
+        timestampMs: Long = System.currentTimeMillis(),
+        persist: Boolean = true,
+        sessionId: String = currentDiagnosticSessionId(),
+        level: String = "info",
+        updateConnectionStep: Boolean = true,
+    ) {
+        val entry = if (persist) {
+            runCatching {
+                DiagnosticLogStore.append(
+                    directory = noBackupFilesDir,
+                    message = msg,
+                    sessionId = sessionId,
+                    level = level,
+                    timestampMs = timestampMs,
+                )
+            }.getOrElse { error ->
+                Log.w("VpnMain", "Unable to persist diagnostic log", error)
+                DiagnosticLogEntry(timestampMs, sessionId, level, msg)
+            }
+        } else {
+            DiagnosticLogEntry(timestampMs, sessionId, level, msg)
+        }
+        val ts = logStamp(entry.timestampMs)
         val tv = binding.tvLog
         // append() upgrades the buffer to EDITABLE, so we can trim the oldest lines
         // IN PLACE below. The old split/join of the whole buffer ran on every line
         // (O(n) allocations); during a reconnect log storm that saturated the main
         // thread into an ANR. editableText.delete is O(chars removed) ≈ one line.
-        tv.append(if (ts.isEmpty()) "$msg\n" else "[$ts] $msg\n")
+        tv.append(if (ts.isEmpty()) "${entry.message}\n" else "[$ts] ${entry.message}\n")
         logLineCount++
         if (logLineCount > MAX_LOG_LINES) {
             (tv.text as? android.text.Editable)?.let { ed ->
@@ -2688,7 +2867,10 @@ sni = www.microsoft.com
                 if (cut > 0) { ed.delete(0, cut); logLineCount = MAX_LOG_LINES }
             }
         }
-        binding.tvConnectionStep.text = msg; binding.tvConnectionStep.visibility = View.VISIBLE
+        if (updateConnectionStep) {
+            binding.tvConnectionStep.text = entry.message
+            binding.tvConnectionStep.visibility = View.VISIBLE
+        }
         // Coalesce autoscroll: queue at most one fullScroll per frame. Posting one per
         // log line queued a full layout pass per line and amplified the storm.
         if (logAutoScroll && !pendingLogScroll) {

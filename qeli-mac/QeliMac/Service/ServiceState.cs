@@ -67,10 +67,8 @@ public static class ServiceState
 
     private const int O_RDONLY = 0x0000;
     private const int O_WRONLY = 0x0001;
-    private const int O_APPEND = 0x0008;
     private const int O_NOFOLLOW = 0x0100;
     private const int O_CREAT = 0x0200;
-    private const int O_TRUNC = 0x0400;
     private const int O_EXCL = 0x0800;
     private const int O_DIRECTORY = 0x100000;
     private const int O_CLOEXEC = 0x1000000;
@@ -267,10 +265,6 @@ public static class ServiceState
     // rest with AES-256-GCM (mirrors qeli-win's DPAPI-LocalMachine ServiceState, E1).
     // Both writer (GUI as root) and reader (daemon as root) live in the system domain,
     // so the key is a root-only 0600 file in the shared dir (not the per-user Keychain).
-    // On-disk layout: [nonce:12][tag:16][ciphertext]. Legacy plaintext is migrated.
-    private const int NonceLen = 12;
-    private const int TagLen = 16;
-    private static string KeyFile => Path.Combine(Dir, ".service.key");
 
     private static byte[] ServiceKey()
     {
@@ -295,15 +289,7 @@ public static class ServiceState
         EnsureDir();
         var pt = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(cfg));
         var key = ServiceKey();
-        var nonce = RandomNumberGenerator.GetBytes(NonceLen);
-        var ct = new byte[pt.Length];
-        var tag = new byte[TagLen];
-        using (var gcm = new AesGcm(key, TagLen))
-            gcm.Encrypt(nonce, pt, ct, tag);
-        var blob = new byte[NonceLen + TagLen + ct.Length];
-        Buffer.BlockCopy(nonce, 0, blob, 0, NonceLen);
-        Buffer.BlockCopy(tag, 0, blob, NonceLen, TagLen);
-        Buffer.BlockCopy(ct, 0, blob, NonceLen + TagLen, ct.Length);
+        var blob = EncryptedEnvelope.Seal(pt, key);
         AtomicWriteChild("service-profile.json", blob, 0x180); // 0600
     }
 
@@ -317,59 +303,12 @@ public static class ServiceState
                 maxBytes: 4 * 1024 * 1024
             );
             if (raw == null) return null;
-            string json;
-            bool wasLegacyPlaintext = false;
-
-            // Decide the FORMAT before trying to decrypt, and never fall back on a crypto
-            // failure.
-            //
-            // The old shape was `try { AesGcm.Decrypt } catch { treat the bytes as JSON }`,
-            // with no discrimination at all: a failed AUTHENTICATION TAG — i.e. a detected
-            // forgery — took the same branch as a genuine pre-E1 plaintext file. The tag
-            // therefore stopped being an authenticity boundary: to make the root daemon load
-            // any VpnConfig you liked (server address, credentials, routes, DNS) you did not
-            // need the key at all, you just wrote plain JSON. The migration then RE-ENCRYPTED
-            // the forgery under the real key, erasing the evidence.
-            //
-            // A legacy file is UTF-8 JSON and starts with '{' (optionally after whitespace or
-            // a BOM); a GCM blob starts with 12 random nonce bytes, which practically never
-            // do. So: sniff first, and once we have committed to the encrypted format a tag
-            // failure is fatal — the file is corrupt or forged, and either way must not be
-            // used. (Audit 2026-08-04.)
-            static bool LooksLikeLegacyJson(byte[] b)
-            {
-                int i = 0;
-                if (b.Length >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) i = 3; // BOM
-                while (i < b.Length && (b[i] == (byte)' ' || b[i] == (byte)'\t'
-                                        || b[i] == (byte)'\r' || b[i] == (byte)'\n')) i++;
-                return i < b.Length && b[i] == (byte)'{';
-            }
-
-            if (LooksLikeLegacyJson(raw))
-            {
-                json = Encoding.UTF8.GetString(raw);
-                wasLegacyPlaintext = true;
-            }
-            else
-            {
-                if (raw.Length < NonceLen + TagLen)
-                    throw new CryptographicException(
-                        "daemon profile is neither legacy JSON nor a complete encrypted blob");
-                var key = ServiceKey();
-                var nonce = raw.AsSpan(0, NonceLen);
-                var tag = raw.AsSpan(NonceLen, TagLen);
-                var ct = raw.AsSpan(NonceLen + TagLen);
-                var pt = new byte[ct.Length];
-                using var gcm = new AesGcm(key, TagLen);
-                // Throws on a tag mismatch — deliberately NOT caught here. Propagates to the
-                // outer catch, which returns null, and the daemon starts no tunnel rather
-                // than one an attacker described.
-                gcm.Decrypt(nonce, ct, tag, pt);
-                json = Encoding.UTF8.GetString(pt);
-            }
+            var plaintext = EncryptedEnvelope.Open(
+                raw, ServiceKey(), allowLegacyArray: false, out bool needsMigration);
+            string json = Encoding.UTF8.GetString(plaintext);
 
             var cfg = JsonSerializer.Deserialize<VpnConfig>(json);
-            if (wasLegacyPlaintext && cfg != null) SaveProfile(cfg);
+            if (needsMigration && cfg != null) SaveProfile(cfg);
             return cfg;
         }
         catch { return null; }

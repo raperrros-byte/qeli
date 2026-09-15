@@ -1,5 +1,6 @@
 import Foundation
 import Security
+@testable import Qeli
 
 enum UDPFragmentation {
     static let magic: [UInt8] = [0xf0, 0x9b, 0x71]
@@ -66,7 +67,7 @@ enum UDPFragmentation {
     ///
     /// There is no ambiguity against a real record, in either framing: TLS framing opens
     /// `0x17 0x03 0x03`, and raw framing opens with a UInt16 payload length bounded by
-    /// MAX_RECORD_SIZE (0x4124), so its high byte is at most 0x41 — `0xF0` is unreachable both
+    /// MAX_RECORD_SIZE (0x4100), so its high byte is at most 0x41 — `0xF0` is unreachable both
     /// ways. Same property ``isFragment(_:)`` already relies on to tell a fragmented
     /// ClientHello from a legacy single-datagram one.
     static let authOK: UInt8 = 6
@@ -157,7 +158,12 @@ enum UDPFragmentation {
             } else if messageID != incomingID || expectedCount != count {
                 throw UDPFragmentationError.inconsistentMessage
             }
-            if parts[index] == nil { parts[index] = data.dropFirst(UDPFragmentation.headerLength) }
+            let chunk = Data(data.dropFirst(UDPFragmentation.headerLength))
+            if let existing = parts[index] {
+                guard existing == chunk else { throw UDPFragmentationError.conflictingDuplicate }
+            } else {
+                parts[index] = chunk
+            }
             guard parts.allSatisfy({ $0 != nil }) else { return nil }
             return parts.compactMap { $0 }.reduce(into: Data()) { $0.append($1) }
         }
@@ -178,6 +184,7 @@ enum UDPFragmentation {
 
 enum UDPFragmentationError: Error {
     case notFragment, invalidCount, invalidIndex, chunkTooLarge, inconsistentMessage
+    case conflictingDuplicate
     case tooManyFragments(Int)
     case randomFailure(OSStatus)
 }

@@ -77,16 +77,29 @@ pub async fn asset(Path(path): Path<String>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{APP_CSS, I18N_JS};
+    use super::{ALPINE_JS, APP_CSS, I18N_JS};
+
+    #[test]
+    fn vendored_alpine_is_the_csp_build() {
+        assert!(ALPINE_JS.contains("3.15.12"));
+        assert!(!ALPINE_JS.contains("new Function"));
+        assert!(!ALPINE_JS.contains("eval("));
+    }
 
     #[test]
     fn panel_grid_controls_and_localized_options_are_embedded() {
         assert!(APP_CSS.contains(".profile-grid{display:grid"));
         assert!(APP_CSS.contains("repeat(6,minmax(0,1fr))"));
+        assert!(APP_CSS.contains(".config-profile-list{display:flex;flex-wrap:wrap"));
+        assert!(APP_CSS.contains(
+            ".config-profile-tab-name{min-width:0;white-space:normal;overflow-wrap:anywhere"
+        ));
+        assert!(APP_CSS.contains(".transport-kind-udp{"));
         assert!(APP_CSS.contains("select.inp{"));
         assert!(APP_CSS.contains(".inp[type=search]{"));
         assert!(APP_CSS.contains("html[data-theme=light] .badge-udp{"));
         assert!(APP_CSS.contains(".server-host-badge{"));
+        assert!(I18N_JS.contains("'PACKET_MUX recordizer':"));
         assert!(I18N_JS.contains("(tag === 'OPTION' && !p.hasAttribute('value'))"));
         assert!(I18N_JS.contains("[/^(\\d+) selected$/, 'Выбрано: $1']"));
     }

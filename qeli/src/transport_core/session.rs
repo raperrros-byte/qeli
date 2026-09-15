@@ -8,25 +8,50 @@ use crate::crypto::{
     derive_keys, derive_keys_bound, derive_keys_hybrid, derive_keys_hybrid_bound,
     handshake_transcript_hash, Keypair,
 };
-use crate::protocol::{
-    pick_random_sni, read_record, read_tls_record, FakeTlsHandshake, Framing, PacketCodec,
+#[cfg(feature = "experimental-roaming")]
+use crate::crypto::{
+    derive_session_material, derive_session_material_bound, derive_session_material_hybrid,
+    derive_session_material_hybrid_bound,
 };
+use crate::protocol::{read_record, read_tls_record, FakeTlsHandshake, Framing, PacketCodec};
 use std::future::Future;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug)]
 pub(crate) struct AuthOk {
+    pub family_mode: crate::transport_core::NetworkFamilyMode,
+    pub addresses: Vec<crate::transport_core::NetworkAddress>,
     pub client_ip: String,
     pub server_ip: String,
     pub prefix: u8,
     pub mtu: i32,
     pub dns_ip: String,
     pub dns_port: String,
+    pub dns_servers: Vec<crate::transport_core::NetworkDns>,
     pub routes_json: String,
     pub pushed_obf: Option<PushedObf>,
     pub session_token: String,
     pub max_streams: u32,
     pub adaptive: bool,
+    /// Present only after bidirectional UDP_ROAM_V1 negotiation. Hex avoids JSON's lossy
+    /// numeric representation in app-layer parsers while retaining the protocol's full u64.
+    pub udp_roaming_session_id: Option<u64>,
+}
+
+/// Complete result of the authenticated primary TCP handshake.
+///
+/// Roaming builds retain only the domain-separated resume secret from the original
+/// authentication KDF. It is never serialized, cloned into diagnostics, or reused as a
+/// data-plane key. Default builds do not carry the field at all.
+pub(crate) struct TcpAuthentication {
+    pub client_rx: PacketCodec,
+    pub client_tx: PacketCodec,
+    pub auth: AuthOk,
+    pub server_capabilities: Option<crate::protocol::capabilities::ServerCapabilities>,
+    #[cfg(feature = "experimental-roaming")]
+    pub client_capabilities: Option<crate::protocol::capabilities::ClientCapabilities>,
+    #[cfg(feature = "experimental-roaming")]
+    pub resume_secret: zeroize::Zeroizing<[u8; 32]>,
 }
 
 /// One hybrid UDP ClientHello flight shared by the live tunnel and native diagnostics.
@@ -52,11 +77,7 @@ pub(crate) fn build_udp_client_hello_flight(
         );
     }
     let client_keypair = Keypair::generate();
-    let server_name = match config.obfuscation.sni.as_deref() {
-        Some(name) if !name.is_empty() => name,
-        _ if config.server.address.parse::<std::net::IpAddr>().is_ok() => pick_random_sni(),
-        _ => &config.server.address,
-    };
+    let server_name = config.effective_fake_tls_sni();
     let (client_hello, mlkem_decapsulation_key) =
         FakeTlsHandshake::build_client_hello_pq(client_keypair.public(), server_name, 1200, None);
     let fragments = crate::protocol::udp_frag::fragment(
@@ -79,57 +100,240 @@ pub(crate) fn parse_auth_ok(response: &str) -> anyhow::Result<AuthOk> {
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|error| anyhow::anyhow!("malformed auth OK json: {error}"))?;
 
+    let has_family_mode = value.get("family_mode").is_some();
+    let has_addresses = value.get("addresses").is_some();
+    if has_family_mode != has_addresses {
+        anyhow::bail!("auth OK NetworkPlan v2 must contain both family_mode and addresses");
+    }
+    let v2 = has_family_mode;
+
     let client_ip = value["client_ip"].as_str().unwrap_or("").to_string();
     if client_ip.is_empty() {
         anyhow::bail!("auth OK missing client_ip");
     }
-    if client_ip.parse::<std::net::Ipv4Addr>().is_err() {
-        anyhow::bail!(
-            "auth OK client_ip {:?} is not a valid IPv4 address - refusing to configure the tunnel with it",
-            client_ip
-        );
-    }
     let server_ip = value["server_ip"].as_str().unwrap_or("").to_string();
-    if !server_ip.is_empty() && server_ip.parse::<std::net::Ipv4Addr>().is_err() {
-        anyhow::bail!(
-            "auth OK server_ip {:?} is not a valid IPv4 address - refusing to install routes through it",
-            server_ip
-        );
-    }
 
     let dns_port = match &value["dns_port"] {
         serde_json::Value::Number(number) => number.to_string(),
         serde_json::Value::String(text) => text.clone(),
         _ => "53".to_string(),
     };
-    let prefix = value["prefix"]
-        .as_u64()
-        .map(|number| number as u8)
-        .filter(|prefix| (1..=32).contains(prefix))
-        .unwrap_or(24);
+    let prefix_limit = if v2 { 128 } else { 32 };
+    let prefix = match value.get("prefix").and_then(serde_json::Value::as_u64) {
+        Some(number) if (1..=prefix_limit).contains(&number) => number as u8,
+        Some(_) | None if v2 => {
+            anyhow::bail!("auth OK NetworkPlan v2 contains an invalid legacy prefix projection")
+        }
+        // Older IPv4-only servers omitted this field, and legacy clients historically
+        // treated an invalid value as the old /24 default. Keep that compatibility only
+        // outside NetworkPlan v2; v2 is self-describing and must agree exactly with the
+        // selected address below.
+        Some(_) | None => 24,
+    };
     let mtu = value["mtu"]
         .as_i64()
         .filter(|mtu| crate::config::server::mtu_in_range(*mtu))
         .map(|mtu| mtu as i32)
         .unwrap_or(0);
 
+    let (family_mode, addresses, dns_servers) = if v2 {
+        let family_mode: crate::transport_core::NetworkFamilyMode =
+            serde_json::from_value(value["family_mode"].clone())
+                .map_err(|error| anyhow::anyhow!("invalid auth OK family_mode: {error}"))?;
+        let addresses: Vec<crate::transport_core::NetworkAddress> =
+            serde_json::from_value(value["addresses"].clone())
+                .map_err(|error| anyhow::anyhow!("invalid auth OK addresses: {error}"))?;
+        if addresses.is_empty() || addresses.len() > 2 {
+            anyhow::bail!("auth OK must contain one address per active IP family");
+        }
+        let mut has_ipv4 = false;
+        let mut has_ipv6 = false;
+        for assigned in &addresses {
+            let address: std::net::IpAddr = assigned.address.parse().map_err(|_| {
+                anyhow::anyhow!("invalid auth OK tunnel address '{}'", assigned.address)
+            })?;
+            let (expected_family, max_prefix) = if address.is_ipv4() {
+                if has_ipv4 {
+                    anyhow::bail!("auth OK contains duplicate IPv4 addresses");
+                }
+                has_ipv4 = true;
+                (crate::transport_core::NetworkAddressFamily::Ipv4, 32)
+            } else {
+                if has_ipv6 {
+                    anyhow::bail!("auth OK contains duplicate IPv6 addresses");
+                }
+                has_ipv6 = true;
+                (crate::transport_core::NetworkAddressFamily::Ipv6, 128)
+            };
+            if assigned.family != expected_family
+                || assigned.prefix_len == 0
+                || assigned.prefix_len > max_prefix
+                || assigned.on_link_prefix_len == 0
+                || assigned.on_link_prefix_len > assigned.prefix_len
+            {
+                anyhow::bail!(
+                    "invalid auth OK address metadata for '{}'",
+                    assigned.address
+                );
+            }
+            if let std::net::IpAddr::V6(address) = address {
+                crate::config::server::validate_tunnel_ipv6_address("auth OK address", address)
+                    .map_err(anyhow::Error::msg)?;
+            }
+            if let Some(gateway) = &assigned.gateway {
+                let gateway: std::net::IpAddr = gateway
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid auth OK tunnel gateway '{gateway}'"))?;
+                if gateway.is_ipv4() != address.is_ipv4() {
+                    anyhow::bail!(
+                        "auth OK address '{}' and gateway '{}' use different families",
+                        assigned.address,
+                        gateway
+                    );
+                }
+                if let std::net::IpAddr::V6(gateway) = gateway {
+                    crate::config::server::validate_tunnel_ipv6_address(
+                        "auth OK tunnel gateway",
+                        gateway,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                }
+            }
+        }
+        let expected_mode = match (has_ipv4, has_ipv6) {
+            (true, false) => crate::transport_core::NetworkFamilyMode::Ipv4,
+            (true, true) => crate::transport_core::NetworkFamilyMode::Dual,
+            (false, true) => crate::transport_core::NetworkFamilyMode::Ipv6,
+            (false, false) => unreachable!("empty address list rejected"),
+        };
+        if family_mode != expected_mode {
+            anyhow::bail!("auth OK family_mode does not match its address families");
+        }
+        if has_ipv6 && mtu < 1280 {
+            anyhow::bail!("auth OK IPv6 plan MTU {mtu} is below the IPv6 minimum 1280");
+        }
+        let projection = addresses
+            .iter()
+            .find(|address| address.family == crate::transport_core::NetworkAddressFamily::Ipv4)
+            .unwrap_or(&addresses[0]);
+        if client_ip != projection.address
+            || prefix != projection.on_link_prefix_len
+            || server_ip != projection.gateway.as_deref().unwrap_or("")
+        {
+            anyhow::bail!("auth OK legacy projection disagrees with NetworkPlan v2");
+        }
+        let dns_servers: Vec<crate::transport_core::NetworkDns> =
+            serde_json::from_value(value["dns_servers"].clone())
+                .map_err(|error| anyhow::anyhow!("invalid auth OK dns_servers: {error}"))?;
+        if dns_servers.len() > 8 {
+            anyhow::bail!("auth OK contains too many DNS servers");
+        }
+        for dns in &dns_servers {
+            let address: std::net::IpAddr = dns.address.parse().map_err(|_| {
+                anyhow::anyhow!("invalid auth OK DNS server '{}:{}'", dns.address, dns.port)
+            })?;
+            if dns.port == 0 {
+                anyhow::bail!("invalid auth OK DNS server '{}:0'", dns.address);
+            }
+            if (address.is_ipv4() && !has_ipv4) || (address.is_ipv6() && !has_ipv6) {
+                anyhow::bail!(
+                    "auth OK DNS server '{}' uses a family absent from the tunnel",
+                    dns.address
+                );
+            }
+            if let std::net::IpAddr::V6(address) = address {
+                crate::config::server::validate_tunnel_ipv6_address("auth OK DNS server", address)
+                    .map_err(anyhow::Error::msg)?;
+            }
+        }
+        (family_mode, addresses, dns_servers)
+    } else {
+        if client_ip.parse::<std::net::Ipv4Addr>().is_err() {
+            anyhow::bail!(
+                "auth OK client_ip {:?} is not a valid IPv4 address - refusing to configure the tunnel with it",
+                client_ip
+            );
+        }
+        if !server_ip.is_empty() && server_ip.parse::<std::net::Ipv4Addr>().is_err() {
+            anyhow::bail!(
+                "auth OK server_ip {:?} is not a valid IPv4 address - refusing to install routes through it",
+                server_ip
+            );
+        }
+        let addresses = vec![crate::transport_core::NetworkAddress {
+            family: crate::transport_core::NetworkAddressFamily::Ipv4,
+            address: client_ip.clone(),
+            prefix_len: prefix,
+            on_link_prefix_len: prefix,
+            gateway: (!server_ip.is_empty()).then(|| server_ip.clone()),
+        }];
+        let dns_servers = value["dns"]
+            .as_str()
+            .filter(|address| !address.is_empty())
+            .and_then(|address| address.parse::<std::net::Ipv4Addr>().ok())
+            .map(|address| {
+                vec![crate::transport_core::NetworkDns {
+                    address: address.to_string(),
+                    port: dns_port.parse::<u16>().unwrap_or(53),
+                }]
+            })
+            .unwrap_or_default();
+        (
+            crate::transport_core::NetworkFamilyMode::Ipv4,
+            addresses,
+            dns_servers,
+        )
+    };
+
+    let pushed_obf = value
+        .get("obfuscation")
+        .filter(|obfuscation| !obfuscation.is_null())
+        .map(|obfuscation| {
+            let pushed: PushedObf = serde_json::from_value(obfuscation.clone())
+                .map_err(|error| anyhow::anyhow!("invalid auth OK obfuscation: {error}"))?;
+            pushed.validate("auth OK obfuscation")?;
+            Ok::<PushedObf, anyhow::Error>(pushed)
+        })
+        .transpose()?;
+
+    let udp_roaming_session_id = match value.get("udp_roaming_session") {
+        None => None,
+        Some(serde_json::Value::String(encoded))
+            if encoded.len() == 16 && encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            let session_id = u64::from_str_radix(encoded, 16)
+                .map_err(|_| anyhow::anyhow!("invalid auth OK UDP roaming session id"))?;
+            if session_id == 0 {
+                anyhow::bail!("auth OK UDP roaming session id must be non-zero");
+            }
+            Some(session_id)
+        }
+        Some(_) => {
+            anyhow::bail!(
+                "auth OK UDP roaming session id must be exactly 16 hexadecimal characters"
+            )
+        }
+    };
+
     Ok(AuthOk {
+        family_mode,
+        addresses,
         client_ip,
         server_ip,
         prefix,
         mtu,
         dns_ip: value["dns"].as_str().unwrap_or("").to_string(),
         dns_port,
+        dns_servers,
         routes_json: value
             .get("routes")
             .map(ToString::to_string)
             .unwrap_or_else(|| "[]".into()),
-        pushed_obf: value
-            .get("obfuscation")
-            .and_then(|obfuscation| serde_json::from_value(obfuscation.clone()).ok()),
+        pushed_obf,
         session_token: value["session_token"].as_str().unwrap_or("").to_string(),
         max_streams: value["max_streams"].as_u64().unwrap_or(1).clamp(1, 16) as u32,
         adaptive: value["multipath_adaptive"].as_bool().unwrap_or(false),
+        udp_roaming_session_id,
     })
 }
 
@@ -143,8 +347,9 @@ pub(crate) async fn authenticate_tcp<S, V, F>(
     config: &crate::config::client::ClientConfig,
     password: &str,
     device_id: &[u8; crate::protocol::DEVICE_ID_LEN],
+    platform_capabilities: u64,
     mut verify_key: V,
-) -> anyhow::Result<(PacketCodec, PacketCodec, AuthOk)>
+) -> anyhow::Result<TcpAuthentication>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     V: FnMut([u8; 32]) -> F,
@@ -152,30 +357,47 @@ where
 {
     let client_kp = Keypair::generate();
 
-    if config.obfuscation.mode == "plain" {
+    if matches!(config.obfuscation.mode.as_str(), "plain" | "reality-tls") {
         stream.write_all(client_kp.public().as_bytes()).await?;
         let mut server_public = [0u8; 32];
         stream
             .read_exact(&mut server_public)
             .await
-            .map_err(|error| anyhow::anyhow!("failed to read server key (plain): {error}"))?;
+            .map_err(|error| anyhow::anyhow!("failed to read server key (raw inner): {error}"))?;
         let server_pub = crate::crypto::PublicKey::from_bytes(&server_public);
         let transcript_hash =
             handshake_transcript_hash(&[client_kp.public().as_bytes(), &server_public]);
         let shared = client_kp
             .derive_shared_checked(&server_pub)
             .ok_or_else(|| anyhow::anyhow!("rejected low-order server public key"))?;
-        let (server_to_client, client_to_server) = match static_es(config, &client_kp)? {
+        let static_shared = static_es(config, &client_kp)?;
+        let (server_to_client, client_to_server) = match static_shared {
             Some(static_shared) => derive_keys_bound(&shared.0, &static_shared),
             None => derive_keys(&shared.0),
+        };
+        #[cfg(feature = "experimental-roaming")]
+        let resume_secret = {
+            let material = match static_shared {
+                Some(static_shared) => derive_session_material_bound(&shared.0, &static_shared),
+                None => derive_session_material(&shared.0),
+            };
+            zeroize::Zeroizing::new(*material.resume_secret())
         };
         let mut client_rx = PacketCodec::new_raw(server_to_client);
         let mut client_tx = PacketCodec::new_raw(client_to_server);
 
         let auth_proof_record = read_record(stream, Framing::Raw)
             .await
-            .map_err(|error| anyhow::anyhow!("failed to read auth proof (plain): {error}"))?;
+            .map_err(|error| anyhow::anyhow!("failed to read auth proof (raw inner): {error}"))?;
         let auth_proof = client_rx.decrypt_packet(&auth_proof_record)?;
+        let (_, server_capabilities) =
+            crate::protocol::capabilities::split_server_capabilities(&auth_proof)?;
+        #[cfg(feature = "experimental-roaming")]
+        let client_capabilities = crate::protocol::capabilities::negotiate_client_capabilities(
+            config,
+            server_capabilities,
+            platform_capabilities,
+        )?;
         let server_static = verify_server_identity(
             &auth_proof,
             &client_kp,
@@ -184,7 +406,7 @@ where
             &config.auth.server_public_key,
         )?;
         verify_key(server_static).await?;
-        log::info!("Server identity verified (plain)");
+        log::info!("Server identity verified (raw inner)");
 
         let auth_plaintext = build_client_auth_plaintext(
             config,
@@ -193,24 +415,31 @@ where
             &transcript_hash,
             device_id,
             password,
-        );
+            server_capabilities,
+            platform_capabilities,
+        )?;
         let auth_packet = client_tx.encrypt_packet(&auth_plaintext, &[])?;
         stream.write_all(&auth_packet).await?;
 
-        let auth_response_record = read_record(stream, Framing::Raw)
-            .await
-            .map_err(|error| anyhow::anyhow!("failed to read auth response (plain): {error}"))?;
+        let auth_response_record = read_record(stream, Framing::Raw).await.map_err(|error| {
+            anyhow::anyhow!("failed to read auth response (raw inner): {error}")
+        })?;
         let auth_response = client_rx.decrypt_packet(&auth_response_record)?;
         let auth = parse_auth_ok(&String::from_utf8(auth_response)?)?;
-        log::info!("Auth OK (plain), assigned IP: {}", auth.client_ip);
-        return Ok((client_rx, client_tx, auth));
+        log::info!("Auth OK (raw inner), assigned IP: {}", auth.client_ip);
+        return Ok(TcpAuthentication {
+            client_rx,
+            client_tx,
+            auth,
+            server_capabilities,
+            #[cfg(feature = "experimental-roaming")]
+            client_capabilities,
+            #[cfg(feature = "experimental-roaming")]
+            resume_secret,
+        });
     }
 
-    let server_name = match config.obfuscation.sni.as_deref() {
-        Some(name) if !name.is_empty() => name,
-        _ if config.server.address.parse::<std::net::IpAddr>().is_ok() => pick_random_sni(),
-        _ => &config.server.address,
-    };
+    let server_name = config.effective_fake_tls_sni();
     let reality_session_id = match (
         config
             .obfuscation
@@ -275,9 +504,20 @@ where
         .as_slice()
         .try_into()
         .map_err(|_| anyhow::anyhow!("ML-KEM shared secret not 32 bytes"))?;
-    let (server_to_client, client_to_server) = match static_es(config, &client_kp)? {
+    let static_shared = static_es(config, &client_kp)?;
+    let (server_to_client, client_to_server) = match static_shared {
         Some(static_shared) => derive_keys_hybrid_bound(&shared.0, &mlkem_shared, &static_shared),
         None => derive_keys_hybrid(&shared.0, &mlkem_shared),
+    };
+    #[cfg(feature = "experimental-roaming")]
+    let resume_secret = {
+        let material = match static_shared {
+            Some(static_shared) => {
+                derive_session_material_hybrid_bound(&shared.0, &mlkem_shared, &static_shared)
+            }
+            None => derive_session_material_hybrid(&shared.0, &mlkem_shared),
+        };
+        zeroize::Zeroizing::new(*material.resume_secret())
     };
     let mut client_rx = PacketCodec::new(server_to_client);
     let mut client_tx = PacketCodec::new(client_to_server);
@@ -289,6 +529,14 @@ where
         .await
         .map_err(|error| anyhow::anyhow!("failed to read auth proof: {error}"))?;
     let auth_proof = client_rx.decrypt_packet(&auth_proof_record)?;
+    let (_, server_capabilities) =
+        crate::protocol::capabilities::split_server_capabilities(&auth_proof)?;
+    #[cfg(feature = "experimental-roaming")]
+    let client_capabilities = crate::protocol::capabilities::negotiate_client_capabilities(
+        config,
+        server_capabilities,
+        platform_capabilities,
+    )?;
     let server_static = verify_server_identity(
         &auth_proof,
         &client_kp,
@@ -306,7 +554,9 @@ where
         &transcript_hash,
         device_id,
         password,
-    );
+        server_capabilities,
+        platform_capabilities,
+    )?;
     let auth_packet = client_tx.encrypt_packet(&auth_plaintext, &[])?;
     stream.write_all(&auth_packet).await?;
     let auth_response_record = read_tls_record(stream)
@@ -324,7 +574,16 @@ where
             auth.routes_json.matches("cidr").count()
         );
     }
-    Ok((client_rx, client_tx, auth))
+    Ok(TcpAuthentication {
+        client_rx,
+        client_tx,
+        auth,
+        server_capabilities,
+        #[cfg(feature = "experimental-roaming")]
+        client_capabilities,
+        #[cfg(feature = "experimental-roaming")]
+        resume_secret,
+    })
 }
 
 pub(crate) fn effective_mtu(client_mtu: i32, pushed_mtu: i32) -> i32 {
@@ -344,6 +603,7 @@ pub(crate) fn verify_server_identity(
     transcript_hash: &[u8; 32],
     pinned: &Option<String>,
 ) -> anyhow::Result<[u8; 32]> {
+    let (auth_proof, _) = crate::protocol::capabilities::split_server_capabilities(auth_proof)?;
     if auth_proof.len() >= 64 {
         crate::crypto::verify_server_auth_message(
             auth_proof,
@@ -370,6 +630,7 @@ pub(crate) fn verify_server_identity(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_client_auth_plaintext(
     config: &crate::config::client::ClientConfig,
     client_keypair: &Keypair,
@@ -377,7 +638,9 @@ pub(crate) fn build_client_auth_plaintext(
     transcript_hash: &[u8; 32],
     device_id: &[u8; crate::protocol::DEVICE_ID_LEN],
     password: &str,
-) -> Vec<u8> {
+    server_capabilities: Option<crate::protocol::capabilities::ServerCapabilities>,
+    platform_capabilities: u64,
+) -> anyhow::Result<Vec<u8>> {
     let proof = config
         .auth
         .server_public_key
@@ -390,12 +653,22 @@ pub(crate) fn build_client_auth_plaintext(
         })
         .unwrap_or([0u8; 32]);
     let credentials = format!("{}:{password}", config.auth.username);
-    let mut plaintext = Vec::with_capacity(32 + 1 + device_id.len() + credentials.len());
+    let negotiated = crate::protocol::capabilities::negotiate_client_capabilities(
+        config,
+        server_capabilities,
+        platform_capabilities,
+    )?;
+    let extension_capacity = if negotiated.is_some() { 24 } else { 0 };
+    let mut plaintext =
+        Vec::with_capacity(32 + 1 + device_id.len() + extension_capacity + credentials.len());
     plaintext.extend_from_slice(&proof);
     plaintext.push(0);
     plaintext.extend_from_slice(device_id);
+    if let Some(capabilities) = negotiated {
+        crate::protocol::capabilities::append_client_capabilities(&mut plaintext, capabilities);
+    }
     plaintext.extend_from_slice(credentials.as_bytes());
-    plaintext
+    Ok(plaintext)
 }
 
 pub(crate) fn static_es(

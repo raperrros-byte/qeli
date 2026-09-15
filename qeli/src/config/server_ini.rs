@@ -52,9 +52,9 @@ use std::collections::HashMap;
 
 // ---------- serde baselines (real defaults live in #[serde(default)] fns) ----
 
-/// A `ProfileConfig` with every per-field serde default applied. Single source
-/// of truth lives in [`ProfileConfig::baseline`] (also served to the web UI via
-/// `/api/config/defaults`), so the INI codec and the panel never drift.
+/// A `ProfileConfig` with every per-field serde default applied. This is deliberately the
+/// upgrade-compatible parser baseline; the panel uses [`ProfileConfig::new_profile`] so new
+/// profiles can adopt newer safe defaults without changing sparse existing configs.
 fn baseline_profile() -> ProfileConfig {
     ProfileConfig::baseline()
 }
@@ -97,6 +97,20 @@ fn put_list(sec: &mut Section, key: &str, vals: &[String]) {
 impl ServerConfig {
     /// Parse a server config from the flat-INI format.
     pub fn from_ini(doc: &IniDoc) -> anyhow::Result<ServerConfig> {
+        // Repeatable section instances are executable/configuration identities, not display
+        // labels. Validate file-authored names at the same boundary as panel-authored names;
+        // otherwise a manual `[profile:]` is silently normalised/dropped and an overlong
+        // profile reaches iptables comments that cannot represent it.
+        for kind in ["profile", "user", "group"] {
+            for section in doc.sections_of(kind) {
+                let name = section.instance.as_deref().unwrap_or("");
+                if !crate::util::is_valid_ident(name) {
+                    anyhow::bail!(
+                        "server config: invalid [{kind}:<name>] instance {name:?} (must be 1..=128 bytes, without edge whitespace or control characters)"
+                    );
+                }
+            }
+        }
         let mut cfg = ServerConfig {
             auth: doc
                 .section("auth")
@@ -137,16 +151,16 @@ impl ServerConfig {
                     log::warn!(
                         "config: duplicate inline [user:{}] — keeping the first block and \
                          ignoring the later one (the lookup only ever saw the first)",
-                        u.username
+                        crate::util::log_identity(&u.username)
                     );
                     false
                 }
             })
             .collect();
         if !users.is_empty() {
-            // Inline users win over an explicitly-set users_file — warn so it isn't a
-            // silent surprise (users_file has a non-empty default, so only flag an
-            // *explicit* key, not the default). (audit 1.9)
+            // Both sources are intentional: the worker merges them and the external file wins
+            // duplicate users/groups. Only flag an explicit path so operators can see the
+            // precedence rule without warning on the ordinary default.
             let explicit_users_file = doc
                 .section("auth")
                 .and_then(|s| s.get("users_file"))
@@ -154,7 +168,7 @@ impl ServerConfig {
             if explicit_users_file {
                 log::warn!(
                     "config: both inline [user:*] blocks and an explicit auth.users_file \
-                     are set — inline users take precedence; users_file is ignored"
+                     are set — both are loaded; users_file takes precedence on duplicates"
                 );
             }
             cfg.auth.users = users;
@@ -164,6 +178,11 @@ impl ServerConfig {
                 cfg.auth.groups.insert(name.clone(), group_from(g));
             }
         }
+        UsersDb {
+            users: cfg.auth.users.clone(),
+            groups: cfg.auth.groups.clone(),
+        }
+        .validate_network_fields()?;
         // [web] / [logging] are populated in the struct-init above (with a serde baseline
         // when absent) — no separate override block needed.
 
@@ -199,16 +218,10 @@ impl ServerConfig {
 
 fn auth_to(a: &AuthConfig) -> Section {
     let mut s = Section::new("auth", None);
-    // Emit `users_file` XOR inline `[user:*]`, never both. The separate users file is the
-    // default; the web panel manages users through it (users_db → users.save(users_file)),
-    // so a file-mode config carries no inline users (`a.users` is empty) and we write the
-    // path. Only a config that was hand-written with inline `[user:*]` has `a.users`
-    // populated — there `users_file` is dead weight (inline wins) and, if emitted, would
-    // trip the both-sources warning on reload; so we omit it and keep the inline blocks
-    // (written by `to_ini_string`). This keeps every serialized config single-source.
-    if a.users.is_empty() {
-        put_str(&mut s, "users_file", &a.users_file);
-    }
+    // Runtime loads both sources and merges them, with the external file authoritative on
+    // duplicate users/groups. Always preserve the configured path when serializing; dropping it
+    // from a mixed config silently changes the access-control list after a panel save/restart.
+    put_str(&mut s, "users_file", &a.users_file);
     put(
         &mut s,
         "require_client_key_proof",
@@ -388,6 +401,14 @@ fn profile_to(p: &ProfileConfig) -> Section {
     // other transport. Tidiness is not worth a save that loses data.
     // (Audit 2026-07-27, P5.)
     put(&mut s, "enabled", p.enabled);
+    put(&mut s, "roaming.enabled", p.roaming.enabled);
+    put(&mut s, "roaming.grace_secs", p.roaming.grace_secs);
+    put(&mut s, "roaming.max_orphaned", p.roaming.max_orphaned);
+    put(
+        &mut s,
+        "roaming.max_orphan_bytes",
+        p.roaming.max_orphan_bytes,
+    );
     if let Some(k) = &p.identity_key {
         put_str(&mut s, "identity_key", k);
     }
@@ -402,8 +423,12 @@ fn profile_to(p: &ProfileConfig) -> Section {
         put_str(&mut s, "listen", l);
     }
     // tun
+    put(&mut s, "tun.ip_mode", p.tun.ip_mode);
     put_str(&mut s, "tun.name", &p.tun.name);
     put_str(&mut s, "tun.address", &p.tun.address);
+    if let Some(address) = &p.tun.ipv6_address {
+        put_str(&mut s, "tun.ipv6_address", address);
+    }
     put(&mut s, "tun.mtu", p.tun.mtu);
     put(&mut s, "tun.tx_queue_len", p.tun.tx_queue_len);
     put_str(&mut s, "tun.device_type", &p.tun.device_type);
@@ -414,6 +439,13 @@ fn profile_to(p: &ProfileConfig) -> Section {
     for (name, ip) in &p.pool.static_reservations {
         put_str(&mut s, &format!("pool.reservation.{}", name), ip);
     }
+    if !p.pool.ipv6.cidr.is_empty() {
+        put_str(&mut s, "pool.ipv6.cidr", &p.pool.ipv6.cidr);
+    }
+    put_list(&mut s, "pool.ipv6.exclude", &p.pool.ipv6.exclude);
+    for (name, ip) in &p.pool.ipv6.static_reservations {
+        put_str(&mut s, &format!("pool.ipv6.reservation.{}", name), ip);
+    }
     // routing
     put(
         &mut s,
@@ -423,6 +455,18 @@ fn profile_to(p: &ProfileConfig) -> Section {
     put(&mut s, "routing.forward_private", p.routing.forward_private);
     put(&mut s, "routing.nat.enabled", p.routing.nat.enabled);
     put_str(&mut s, "routing.nat.interface", &p.routing.nat.interface);
+    put(&mut s, "routing.ipv6.mode", p.routing.ipv6.mode);
+    if !p.routing.ipv6.interface.is_empty() {
+        put_str(&mut s, "routing.ipv6.interface", &p.routing.ipv6.interface);
+    }
+    put(&mut s, "routing.ipv6.ndp_proxy", p.routing.ipv6.ndp_proxy);
+    if !p.routing.ipv6.ndp_proxy_interface.is_empty() {
+        put_str(
+            &mut s,
+            "routing.ipv6.ndp_proxy_interface",
+            &p.routing.ipv6.ndp_proxy_interface,
+        );
+    }
     if !p.routing.post_up.is_empty() {
         put_str(&mut s, "routing.post_up", &p.routing.post_up);
     }
@@ -454,6 +498,9 @@ fn profile_to(p: &ProfileConfig) -> Section {
     // dns
     put(&mut s, "dns.enabled", p.dns.enabled);
     put_str(&mut s, "dns.listen", &p.dns.listen);
+    if let Some(address) = &p.dns.listen_ipv6 {
+        put_str(&mut s, "dns.listen_ipv6", address);
+    }
     put(&mut s, "dns.port", p.dns.port);
     put_list(&mut s, "dns.upstream", &p.dns.upstream);
     put_str(&mut s, "dns.upstream_protocol", &p.dns.upstream_protocol);
@@ -605,6 +652,72 @@ fn profile_to(p: &ProfileConfig) -> Section {
         "obf.traffic_shaping.stealth_rate_mbps",
         o.traffic_shaping.stealth_rate_mbps,
     );
+    put(&mut s, "obf.recordizer.policy", &o.recordizer.policy);
+    put(
+        &mut s,
+        "obf.recordizer.batch.delay_min_ms",
+        o.recordizer.batch.delay_min_ms,
+    );
+    put(
+        &mut s,
+        "obf.recordizer.batch.delay_max_ms",
+        o.recordizer.batch.delay_max_ms,
+    );
+    put(
+        &mut s,
+        "obf.recordizer.batch.max_packets",
+        o.recordizer.batch.max_packets,
+    );
+    put(
+        &mut s,
+        "obf.recordizer.batch.max_queue_bytes",
+        o.recordizer.batch.max_queue_bytes,
+    );
+    put(
+        &mut s,
+        "obf.recordizer.record.max_payload_bytes",
+        o.recordizer.record.max_payload_bytes,
+    );
+    put(
+        &mut s,
+        "obf.recordizer.record.small_min_ratio",
+        o.recordizer.record.small_min_ratio,
+    );
+    put(
+        &mut s,
+        "obf.recordizer.record.small_max_ratio",
+        o.recordizer.record.small_max_ratio,
+    );
+    put(
+        &mut s,
+        "obf.recordizer.record.full_probability",
+        o.recordizer.record.full_probability,
+    );
+    put(
+        &mut s,
+        "obf.recordizer.fragment.enabled",
+        o.recordizer.fragment.enabled,
+    );
+    put(
+        &mut s,
+        "obf.recordizer.fragment.reassembly_timeout_ms",
+        o.recordizer.fragment.reassembly_timeout_ms,
+    );
+    put(
+        &mut s,
+        "obf.recordizer.fragment.max_inflight_packets",
+        o.recordizer.fragment.max_inflight_packets,
+    );
+    put(
+        &mut s,
+        "obf.recordizer.fragment.max_reassembly_bytes",
+        o.recordizer.fragment.max_reassembly_bytes,
+    );
+    put(
+        &mut s,
+        "obf.recordizer.fragment.max_fragments_per_packet",
+        o.recordizer.fragment.max_fragments_per_packet,
+    );
     put(
         &mut s,
         "obf.anti_fingerprinting.enabled",
@@ -681,6 +794,11 @@ fn profile_from(s: &Section) -> ProfileConfig {
     let mut p = base.clone();
     p.name = s.instance.clone().unwrap_or_else(|| "default".to_string());
     p.enabled = s.bool_or("enabled", true);
+    p.roaming.enabled = s.bool_or("roaming.enabled", base.roaming.enabled);
+    p.roaming.grace_secs = s.parse_or("roaming.grace_secs", base.roaming.grace_secs);
+    p.roaming.max_orphaned = s.parse_or("roaming.max_orphaned", base.roaming.max_orphaned);
+    p.roaming.max_orphan_bytes =
+        s.parse_or("roaming.max_orphan_bytes", base.roaming.max_orphan_bytes);
     p.identity_key = s
         .get("identity_key")
         .filter(|k| !k.is_empty())
@@ -693,8 +811,13 @@ fn profile_from(s: &Section) -> ProfileConfig {
     // Extra listeners (#12): each `listen` line is one address:port [transport] spec.
     p.bind.listen = s.all("listen").iter().map(|l| l.to_string()).collect();
     // tun
+    p.tun.ip_mode = s.parse_or("tun.ip_mode", base.tun.ip_mode);
     p.tun.name = s.str_or("tun.name", &base.tun.name).to_string();
     p.tun.address = s.str_or("tun.address", &base.tun.address).to_string();
+    p.tun.ipv6_address = s
+        .get("tun.ipv6_address")
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
     if let Some(legacy_netmask) = s.get("tun.netmask") {
         log::warn!(
             "profile '{}': legacy tun.netmask = '{}' is ignored; pool.cidr is the single \
@@ -726,6 +849,27 @@ fn profile_from(s: &Section) -> ProfileConfig {
             .static_reservations
             .insert(name.to_string(), v.to_string());
     }
+    p.pool.ipv6.cidr = s
+        .get("pool.ipv6.cidr")
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    if s.get("pool.ipv6.exclude").is_some() {
+        p.pool.ipv6.exclude = s.list("pool.ipv6.exclude");
+    }
+    p.pool.ipv6.static_reservations = HashMap::new();
+    for (name, v) in s.entries_with_prefix("pool.ipv6.reservation.") {
+        if name.is_empty() {
+            log::warn!(
+                "config: skipping IPv6 reservation with empty username ('pool.ipv6.reservation. = {v}')"
+            );
+            continue;
+        }
+        p.pool
+            .ipv6
+            .static_reservations
+            .insert(name.to_string(), v.to_string());
+    }
     // routing
     p.routing.client_to_client =
         s.bool_or("routing.client_to_client", base.routing.client_to_client);
@@ -733,6 +877,17 @@ fn profile_from(s: &Section) -> ProfileConfig {
     p.routing.nat.enabled = s.bool_or("routing.nat.enabled", base.routing.nat.enabled);
     p.routing.nat.interface = s
         .str_or("routing.nat.interface", &base.routing.nat.interface)
+        .to_string();
+    p.routing.ipv6.mode = s.parse_or("routing.ipv6.mode", base.routing.ipv6.mode);
+    p.routing.ipv6.interface = s
+        .str_or("routing.ipv6.interface", &base.routing.ipv6.interface)
+        .to_string();
+    p.routing.ipv6.ndp_proxy = s.parse_or("routing.ipv6.ndp_proxy", base.routing.ipv6.ndp_proxy);
+    p.routing.ipv6.ndp_proxy_interface = s
+        .str_or(
+            "routing.ipv6.ndp_proxy_interface",
+            &base.routing.ipv6.ndp_proxy_interface,
+        )
         .to_string();
     p.routing.post_up = s
         .str_or("routing.post_up", &base.routing.post_up)
@@ -748,6 +903,10 @@ fn profile_from(s: &Section) -> ProfileConfig {
     // dns
     p.dns.enabled = s.bool_or("dns.enabled", base.dns.enabled);
     p.dns.listen = s.str_or("dns.listen", &base.dns.listen).to_string();
+    p.dns.listen_ipv6 = s
+        .get("dns.listen_ipv6")
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
     p.dns.port = s.parse_or("dns.port", base.dns.port);
     if s.get("dns.upstream").is_some() {
         p.dns.upstream = s.list("dns.upstream");
@@ -877,6 +1036,62 @@ fn profile_from(s: &Section) -> ProfileConfig {
         "obf.traffic_shaping.stealth_rate_mbps",
         bo.traffic_shaping.stealth_rate_mbps,
     );
+    o.recordizer.policy = s
+        .get("obf.recordizer.policy")
+        .unwrap_or(&bo.recordizer.policy)
+        .to_string();
+    o.recordizer.batch.delay_min_ms = s.parse_or(
+        "obf.recordizer.batch.delay_min_ms",
+        bo.recordizer.batch.delay_min_ms,
+    );
+    o.recordizer.batch.delay_max_ms = s.parse_or(
+        "obf.recordizer.batch.delay_max_ms",
+        bo.recordizer.batch.delay_max_ms,
+    );
+    o.recordizer.batch.max_packets = s.parse_or(
+        "obf.recordizer.batch.max_packets",
+        bo.recordizer.batch.max_packets,
+    );
+    o.recordizer.batch.max_queue_bytes = s.parse_or(
+        "obf.recordizer.batch.max_queue_bytes",
+        bo.recordizer.batch.max_queue_bytes,
+    );
+    o.recordizer.record.max_payload_bytes = s.parse_or(
+        "obf.recordizer.record.max_payload_bytes",
+        bo.recordizer.record.max_payload_bytes,
+    );
+    o.recordizer.record.small_min_ratio = s.parse_or(
+        "obf.recordizer.record.small_min_ratio",
+        bo.recordizer.record.small_min_ratio,
+    );
+    o.recordizer.record.small_max_ratio = s.parse_or(
+        "obf.recordizer.record.small_max_ratio",
+        bo.recordizer.record.small_max_ratio,
+    );
+    o.recordizer.record.full_probability = s.parse_or(
+        "obf.recordizer.record.full_probability",
+        bo.recordizer.record.full_probability,
+    );
+    o.recordizer.fragment.enabled = s.bool_or(
+        "obf.recordizer.fragment.enabled",
+        bo.recordizer.fragment.enabled,
+    );
+    o.recordizer.fragment.reassembly_timeout_ms = s.parse_or(
+        "obf.recordizer.fragment.reassembly_timeout_ms",
+        bo.recordizer.fragment.reassembly_timeout_ms,
+    );
+    o.recordizer.fragment.max_inflight_packets = s.parse_or(
+        "obf.recordizer.fragment.max_inflight_packets",
+        bo.recordizer.fragment.max_inflight_packets,
+    );
+    o.recordizer.fragment.max_reassembly_bytes = s.parse_or(
+        "obf.recordizer.fragment.max_reassembly_bytes",
+        bo.recordizer.fragment.max_reassembly_bytes,
+    );
+    o.recordizer.fragment.max_fragments_per_packet = s.parse_or(
+        "obf.recordizer.fragment.max_fragments_per_packet",
+        bo.recordizer.fragment.max_fragments_per_packet,
+    );
     o.anti_fingerprinting.enabled = s.bool_or(
         "obf.anti_fingerprinting.enabled",
         bo.anti_fingerprinting.enabled,
@@ -965,6 +1180,9 @@ mod route_line_tests {
         assert!(parse_route_checked("nonsense").is_none());
         // gateway must be a next-hop IP, never a subnet
         assert!(parse_route_checked("10.20.0.0/16 gateway=172.16.20.0/24").is_none());
+        // Route and next-hop must use the same address family.
+        assert!(parse_route_checked("2001:db8::/64 gateway=10.0.0.1").is_none());
+        assert!(parse_route_checked("10.0.0.0/8 gateway=fd00::1").is_none());
     }
 }
 
@@ -999,6 +1217,22 @@ fn parse_route_checked(line: &str) -> Option<PushedRoute> {
                  (it is the next hop, not a subnet).",
                 line,
                 gw
+            );
+            return None;
+        }
+        let route_family = r
+            .cidr
+            .split_once('/')
+            .and_then(|(address, _)| address.trim().parse::<std::net::IpAddr>().ok());
+        let gateway_family = gw.trim().parse::<std::net::IpAddr>().ok();
+        if !matches!(
+            (route_family, gateway_family),
+            (Some(std::net::IpAddr::V4(_)), Some(std::net::IpAddr::V4(_)))
+                | (Some(std::net::IpAddr::V6(_)), Some(std::net::IpAddr::V6(_)))
+        ) {
+            log::warn!(
+                "config: ignoring route {:?} — route CIDR and gateway use different address families",
+                line
             );
             return None;
         }
@@ -1087,6 +1321,9 @@ fn user_to(u: &UserEntry) -> Section {
     if let Some(ip) = &u.static_ip {
         put_str(&mut s, "static_ip", ip);
     }
+    if let Some(ip) = &u.static_ipv6 {
+        put_str(&mut s, "static_ipv6", ip);
+    }
     put(&mut s, "enabled", u.enabled);
     put_list(&mut s, "allowed_networks", &u.allowed_networks);
     if let Some(g) = &u.group {
@@ -1149,6 +1386,10 @@ fn user_from(s: &Section) -> UserEntry {
             .map(str::to_string),
         static_ip: s
             .get("static_ip")
+            .filter(|v| !v.is_empty())
+            .map(str::to_string),
+        static_ipv6: s
+            .get("static_ipv6")
             .filter(|v| !v.is_empty())
             .map(str::to_string),
         enabled: s.bool_or("enabled", true),
@@ -1222,6 +1463,117 @@ fn group_from(s: &Section) -> GroupTemplate {
 mod tests {
     use super::*;
 
+    #[test]
+    fn ipv6_flat_ini_round_trips_without_becoming_a_json_config() {
+        let source = r#"
+[profile:v6]
+tun.ip_mode = dual
+tun.address = 10.9.0.1
+tun.ipv6_address = fd71:e1:1234:1::1
+tun.mtu = 1400
+pool.cidr = 10.9.0.0/24
+pool.ipv6.cidr = fd71:e1:1234:1::/64
+pool.ipv6.exclude = fd71:e1:1234:1::10
+pool.ipv6.reservation.alice = fd71:e1:1234:1::50
+routing.ipv6.mode = nat66
+routing.ipv6.interface = eth0
+routing.ipv6.ndp_proxy = off
+routing.ipv6.ndp_proxy_interface = eth1
+dns.listen_ipv6 = fd71:e1:1234:1::1
+dns.push_servers = 10.9.0.1, fd71:e1:1234:1::1
+dns.upstream = 1.1.1.1, 2606:4700:4700::1111
+route = 2001:db8:100::/48 gateway=fd71:e1:1234:1::1 metric=10
+
+[user:alice]
+password_hash = x
+static_ip = 10.9.0.50
+static_ipv6 = fd71:e1:1234:1::50
+allowed_networks = 10.0.0.0/8, 2001:db8:200::/48
+client_subnet = 192.168.50.0/24, 2001:db8:300::/56
+route = 2001:db8:400::/48 gateway=fd71:e1:1234:1::1 metric=20
+"#;
+        let original = crate::config::parse_server_config(source).unwrap();
+        let profile = &original.profiles[0];
+        assert_eq!(profile.tun.ip_mode, IpMode::Dual);
+        assert_eq!(
+            profile.tun.ipv6_address.as_deref(),
+            Some("fd71:e1:1234:1::1")
+        );
+        assert_eq!(profile.routing.ipv6.mode, Ipv6RoutingMode::Nat66);
+        assert_eq!(profile.routing.ipv6.ndp_proxy, Ipv6NdpProxyMode::Off);
+        assert_eq!(profile.routing.ipv6.ndp_proxy_interface, "eth1");
+        assert_eq!(profile.routing.advertised_routes.len(), 1);
+        assert_eq!(
+            original.auth.users[0].static_ipv6.as_deref(),
+            Some("fd71:e1:1234:1::50")
+        );
+
+        let serialized = original.to_ini_string();
+        assert!(serialized.contains("tun.ip_mode = dual"));
+        assert!(serialized.contains("pool.ipv6.cidr = fd71:e1:1234:1::/64"));
+        assert!(serialized.contains("static_ipv6 = fd71:e1:1234:1::50"));
+        let reparsed = crate::config::parse_server_config(&serialized).unwrap();
+        assert_eq!(
+            serde_json::to_value(&original).unwrap(),
+            serde_json::to_value(&reparsed).unwrap()
+        );
+    }
+
+    #[test]
+    fn required_ndp_proxy_ini_is_valid_and_round_trips() {
+        let source = r#"
+[profile:on-link-v6]
+tun.ip_mode = ipv6
+tun.ipv6_address = 2001:db8:1200:10::1
+tun.mtu = 1280
+pool.ipv6.cidr = 2001:db8:1200:10::/64
+routing.ipv6.mode = route
+routing.ipv6.interface = ens3
+routing.ipv6.ndp_proxy = required
+routing.ipv6.ndp_proxy_interface = ens3
+"#;
+        let original = crate::config::parse_server_config(source).unwrap();
+        let profile = &original.profiles[0];
+        assert_eq!(profile.routing.ipv6.ndp_proxy, Ipv6NdpProxyMode::Required);
+        assert_eq!(profile.routing.ipv6.ndp_proxy_interface, "ens3");
+        crate::config::server::validate_ipv6_profile(profile).unwrap();
+
+        let serialized = original.to_ini_string();
+        assert!(serialized.contains("routing.ipv6.ndp_proxy = required"));
+        assert!(serialized.contains("routing.ipv6.ndp_proxy_interface = ens3"));
+        let reparsed = crate::config::parse_server_config(&serialized).unwrap();
+        assert_eq!(
+            serde_json::to_value(&original).unwrap(),
+            serde_json::to_value(&reparsed).unwrap()
+        );
+    }
+
+    #[test]
+    fn omitted_roaming_switch_stays_off_for_upgrade_compatibility() {
+        let cfg = crate::config::parse_server_config(
+            "[profile:edge]\n\
+             bind.transport = udp\n\
+             obf.mode = fake-tls\n",
+        )
+        .unwrap();
+        let roaming = &cfg.profiles[0].roaming;
+        assert!(!roaming.enabled);
+        assert_eq!(roaming.grace_secs, 30);
+        assert_eq!(roaming.max_orphaned, 256);
+        assert_eq!(roaming.max_orphan_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn invalid_ipv6_mode_is_reported_instead_of_falling_back_silently() {
+        let (_, findings) = crate::config::parse_server_config_reporting(
+            "[profile:x]\ntun.ip_mode = duall\nrouting.ipv6.mode = nat6\n",
+        )
+        .unwrap();
+        let all = findings.join("\n");
+        assert!(all.contains("tun.ip_mode"), "{all}");
+        assert!(all.contains("routing.ipv6.mode"), "{all}");
+    }
+
     /// An advertised-route `description` must survive parse → serialize → parse. It
     /// used to be DROPPED by the serializer, so any structured save from the panel
     /// silently destroyed a hand-written note. `desc=` is last and takes the rest of
@@ -1253,6 +1605,10 @@ mod tests {
             bind.address = 192.168.1.1
             bind.port = 8443
             bind.transport = udp
+            roaming.enabled = true
+            roaming.grace_secs = 45
+            roaming.max_orphaned = 128
+            roaming.max_orphan_bytes = 134217728
             tun.name = tun1
             tun.address = 10.1.0.1
             tun.mtu = 1400
@@ -1297,6 +1653,10 @@ mod tests {
         assert_eq!(p.name, "edge");
         assert_eq!(p.bind.port, 8443);
         assert_eq!(p.bind.transport, "udp");
+        assert!(p.roaming.enabled);
+        assert_eq!(p.roaming.grace_secs, 45);
+        assert_eq!(p.roaming.max_orphaned, 128);
+        assert_eq!(p.roaming.max_orphan_bytes, 134_217_728);
         assert_eq!(p.pool.cidr, "10.1.0.0/16");
         assert_eq!(p.pool.static_reservations.get("bob").unwrap(), "10.1.0.100");
         assert_eq!(p.dns.upstream, vec!["9.9.9.9"]);
@@ -1464,7 +1824,7 @@ max_sessions = 5
     }
 
     #[test]
-    fn serializes_users_file_xor_inline_users() {
+    fn serializes_users_file_together_with_inline_users() {
         // File mode (the default): no inline users → `users_file` is written, no [user:*].
         let file_mode =
             "[auth]\nusers_file = /etc/qeli/custom-users.conf\n\n[profile:tcp]\nbind.port = 443\n";
@@ -1476,15 +1836,15 @@ max_sessions = 5
             "file-mode config must not gain inline users"
         );
 
-        // Inline mode: inline users present → [user:*] written, NO `users_file` (it would be
-        // dead weight — inline wins — and would trip the both-sources warning on reload).
+        // Mixed mode: inline users and the configured users file are both preserved; runtime
+        // loads their union and lets the external file win duplicate names.
         let inline_mode = "[auth]\nusers_file = /etc/qeli/custom-users.conf\n\n[profile:tcp]\nbind.port = 443\n\n[user:alice]\npassword_hash = $argon2id$v=19$m=16384,t=2,p=1$abc$def\n";
         let cfg2 = ServerConfig::from_ini(&IniDoc::parse(inline_mode).unwrap()).unwrap();
         let out2 = cfg2.to_ini_string();
         assert!(out2.contains("[user:alice]"));
         assert!(
-            !out2.contains("users_file"),
-            "inline-mode config must not also emit users_file (single-source)"
+            out2.contains("users_file = /etc/qeli/custom-users.conf"),
+            "mixed config must preserve the authoritative users file"
         );
     }
 
@@ -1591,6 +1951,7 @@ brute_force.lockout_secs = 300
 password_hash = $argon2id$v=19$m=16384,t=2,p=1$c2FsdHNhbHQ$bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 password_enc = ENCVAL123
 static_ip = 10.5.0.77
+static_ipv6 = fd42:5::77
 enabled = false
 allowed_networks = 10.0.0.0/8,172.16.0.0/12
 group = staff
@@ -1616,22 +1977,29 @@ bind.port = 8501
 bind.transport = tcp
 tun.name = tunat
 tun.address = 10.5.0.1
+tun.ip_mode = dual
+tun.ipv6_address = fd42:5::1
 tun.mtu = 1380
 tun.tx_queue_len = 2000
 tun.device_type = tap
 tun.queues = 2
 pool.cidr = 10.5.0.0/16
+pool.ipv6.cidr = fd42:5::/64
+pool.ipv6.exclude = fd42:5::2
 pool.exclude = 10.5.0.2
 pool.reservation.alice = 10.5.0.50
 routing.client_to_client = true
 routing.forward_private = false
 routing.nat.enabled = true
 routing.nat.interface = eth7
+routing.ipv6.mode = nat66
+routing.ipv6.interface = eth7
 routing.post_up = echo up
 routing.post_down = echo down
 route = 10.5.9.0/24 gateway=10.5.0.1 metric=42 desc=lan seg
 dns.enabled = false
 dns.listen = 10.5.0.1
+dns.listen_ipv6 = fd42:5::1
 dns.port = 5353
 dns.upstream = 9.9.9.9
 dns.upstream_protocol = tcp
@@ -1680,6 +2048,20 @@ obf.traffic_shaping.min_size = 50
 obf.traffic_shaping.max_size = 900
 obf.traffic_shaping.stealth = true
 obf.traffic_shaping.stealth_rate_mbps = 5
+obf.recordizer.policy = required
+obf.recordizer.batch.delay_min_ms = 3
+obf.recordizer.batch.delay_max_ms = 11
+obf.recordizer.batch.max_packets = 7
+obf.recordizer.batch.max_queue_bytes = 123456
+obf.recordizer.record.max_payload_bytes = 1200
+obf.recordizer.record.small_min_ratio = 0.2
+obf.recordizer.record.small_max_ratio = 0.7
+obf.recordizer.record.full_probability = 0.33
+obf.recordizer.fragment.enabled = false
+obf.recordizer.fragment.reassembly_timeout_ms = 4321
+obf.recordizer.fragment.max_inflight_packets = 23
+obf.recordizer.fragment.max_reassembly_bytes = 765432
+obf.recordizer.fragment.max_fragments_per_packet = 17
 obf.anti_fingerprinting.enabled = true
 obf.anti_fingerprinting.add_jitter_to_handshake = false
 obf.awg.enabled = true
@@ -1708,22 +2090,29 @@ bind.port = 8502
 bind.transport = udp
 tun.name = tunau
 tun.address = 10.6.0.1
+tun.ip_mode = dual
+tun.ipv6_address = fd42:6::1
 tun.mtu = 1380
 tun.tx_queue_len = 2000
 tun.device_type = tap
 tun.queues = 2
 pool.cidr = 10.6.0.0/16
+pool.ipv6.cidr = fd42:6::/64
+pool.ipv6.exclude = fd42:6::2
 pool.exclude = 10.6.0.2
 pool.reservation.alice = 10.6.0.50
 routing.client_to_client = true
 routing.forward_private = false
 routing.nat.enabled = true
 routing.nat.interface = eth7
+routing.ipv6.mode = nat66
+routing.ipv6.interface = eth7
 routing.post_up = echo up
 routing.post_down = echo down
 route = 10.6.9.0/24 gateway=10.6.0.1 metric=42 desc=lan seg
 dns.enabled = false
 dns.listen = 10.6.0.1
+dns.listen_ipv6 = fd42:6::1
 dns.port = 5353
 dns.upstream = 9.9.9.9
 dns.upstream_protocol = tcp

@@ -3,7 +3,7 @@
 
 The .10 lab receives the exact clean local qeli source, then builds each artifact twice in
 independent target directories. Nothing is pulled unless A and B are byte-identical and the
-complete 6 Reality + 20 whole-client export surface is present. The final pull writes both
+complete 6 Reality + 22 whole-client export surface is present. The final pull writes both
 the canonical and client-consumed copies and records evidence for provenance.py.
 """
 
@@ -51,6 +51,8 @@ RCODESIGN = "/usr/local/bin/rcodesign"
 HOST = ("10.66.116.10", os.environ.get("QELI_LAB_USER", "root"))
 WIN_TARGET = "x86_64-pc-windows-gnu"
 MAC_TARGET = "universal2-apple-darwin"
+EXPECTED_REALITY_EXPORTS = "6"
+EXPECTED_CLIENT_EXPORTS = "22"
 
 ARTIFACTS = {
     "native-libs/windows-x64/qeli.dll": {
@@ -205,7 +207,7 @@ def build_pass(
     print(f"[win/{pass_name}] rc={return_code} in {time.time() - started:.0f}s")
     if return_code != 0:
         raise RuntimeError(f"Windows build pass {pass_name} failed")
-    built_win = f"{target_dir}/{WIN_TARGET}/release/qeli.dll"
+    built_win = f"{target_dir}/{WIN_TARGET}/release/qeli_core.dll"
     client.checked(
         f"cp {shlex.quote(built_win)} {shlex.quote(artifact_path(pass_name, WIN_TARGET, 'qeli.dll'))} "
         f"&& rm -rf {shlex.quote(f'{target_dir}/{WIN_TARGET}')}",
@@ -225,7 +227,7 @@ def build_pass(
     print(f"[mac/{pass_name}] rc={return_code} in {time.time() - started:.0f}s")
     if return_code != 0:
         raise RuntimeError(f"macOS build pass {pass_name} failed")
-    built_mac = f"{target_dir}/{MAC_TARGET}/release/libqeli.dylib"
+    built_mac = f"{target_dir}/{MAC_TARGET}/release/libqeli_core.dylib"
     normalize_and_sign_macos(client, built_mac, pass_name)
     client.checked(
         f"cp {shlex.quote(built_mac)} "
@@ -252,7 +254,10 @@ def verify_exports(client: LabConnection) -> None:
         f"[win] qeli.dll={win_size} bytes, qeli_realtls exports={reality}, "
         f"qeli_client exports={core}"
     )
-    if reality.strip() != "6" or core.strip() != "20":
+    if (
+        reality.strip() != EXPECTED_REALITY_EXPORTS
+        or core.strip() != EXPECTED_CLIENT_EXPORTS
+    ):
         raise RuntimeError("Windows artifact has an incomplete native export surface")
 
     mac = artifact_path("a", MAC_TARGET, "libqeli.dylib")
@@ -274,7 +279,10 @@ def verify_exports(client: LabConnection) -> None:
     )
     if "x86_64" not in architecture or "arm64" not in architecture:
         raise RuntimeError("macOS artifact is not universal x86_64 + arm64")
-    if reality.strip() != "6" or core.strip() != "20":
+    if (
+        reality.strip() != EXPECTED_REALITY_EXPORTS
+        or core.strip() != EXPECTED_CLIENT_EXPORTS
+    ):
         raise RuntimeError("macOS artifact has an incomplete native export surface")
     for mac_arch in ("x86_64", "arm64"):
         headers = client.checked(
@@ -308,7 +316,7 @@ def main() -> int:
         sftp = client.open_sftp()
         try:
             count = sync_qeli_source(client, sftp, LOCAL_QELI, REMOTE_SOURCE)
-            print(f"[sync] {count} .rs files + Cargo.toml/.lock -> {HOST[0]}:{REMOTE_SOURCE}")
+            print(f"[sync] {count} source/assets files + Cargo.toml/.lock -> {HOST[0]}:{REMOTE_SOURCE}")
             sftp.put(os.fspath(REPO / "scripts" / "macho_repro.py"), REMOTE_MACHO_REPRO)
             pass_hashes = collect_reproducible_hashes(
                 ARTIFACTS,

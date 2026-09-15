@@ -11,19 +11,17 @@ namespace Qeli.Shared.Protocol;
 /// </summary>
 public static class TlsHandshake
 {
-    /// <summary>The decoy hosts a bare-IP endpoint borrows, so a fake-TLS ClientHello and a WebSocket-fronted request both look like traffic to a large, unremarkable site.
-    ///
-    /// ONE list, mirroring the Rust canon (<c>protocol/tls.rs DEFAULT_SNI_POOL</c>). The SNI
-    /// picker and the WebSocket Host pool used to carry DIFFERENT sets — four names here, five
-    /// there — so a client could front a request as amazon.com while never offering it as an
-    /// SNI. Both are observable, and disagreeing between them is a fingerprint of its own.
-    /// (Audit 2026-07-31.)</summary>
-    public static readonly string[] DefaultSniPool =
+    // Chrome-compatible suite order shared with Rust
+    // protocol/realtls/clienthello.rs::CHROME_CIPHERS. GREASE is prepended per hello.
+    private static readonly ushort[] ChromeCiphers =
     {
-        "www.cloudflare.com", "www.google.com", "www.microsoft.com",
-        "www.apple.com", "www.amazon.com",
+        0x1301, 0x1302, 0x1303,
+        0xC02B, 0xC02F, 0xC02C, 0xC030,
+        0xCCA9, 0xCCA8,
+        0xC013, 0xC014,
+        0x009C, 0x009D,
+        0x002F, 0x0035,
     };
-
 
     private const byte ClientHelloType = 0x01;
     private const byte ServerHelloType = 0x02;
@@ -60,8 +58,11 @@ public static class TlsHandshake
     /// exchange). Kept for the <c>plain</c>-adjacent callers and tests; the live
     /// fake-tls / obfs / UDP paths use <see cref="BuildClientHelloPq"/> because the
     /// server now requires the X25519MLKEM768 share for the hybrid tunnel.</summary>
-    public static byte[] BuildClientHello(byte[] keyShare, string sni = "www.cloudflare.com", int padToMin = 0)
-        => BuildClientHelloInner(keyShare, null, sni, padToMin, null);
+    public static byte[] BuildClientHello(byte[] keyShare, string sni = "!", int padToMin = 0)
+    {
+        ValidateClientHelloInputs(sni, padToMin);
+        return BuildClientHelloInner(keyShare, null, sni, padToMin);
+    }
 
     /// <summary>Hybrid post-quantum ClientHello: carries the real ML-KEM-768
     /// encapsulation key in an X25519MLKEM768 (0x11ec) key_share alongside the classic
@@ -69,9 +70,11 @@ public static class TlsHandshake
     /// <c>build_client_hello_pq</c>. The caller keeps the matching <c>MlKem</c> handle
     /// to decapsulate the server's ciphertext.</summary>
     public static byte[] BuildClientHelloPq(byte[] x25519Pub, byte[] mlKemEk,
-        string sni = "www.cloudflare.com", int padToMin = 0, byte[]? realitySessionId = null)
+        string sni = "!", int padToMin = 0, byte[]? realitySessionId = null)
     {
-        // REALITY session_id must be sealed into legacy_session_id — the native builder
+        ValidateClientHelloInputs(sni, padToMin);
+        ValidateKeyShares(x25519Pub, mlKemEk);
+        // REALITY session_id must be sealed into legacy_session_id - the native builder
         // does not accept it yet, so use the managed path when present.
         if (realitySessionId is { Length: 32 })
             return BuildClientHelloInner(x25519Pub, mlKemEk, sni, padToMin, realitySessionId);
@@ -81,61 +84,139 @@ public static class TlsHandshake
         // qeli.dll) so the client never crashes on a stale native lib.
         try
         {
-            int rc = qeli_build_faketls_clienthello(
-                x25519Pub, mlKemEk, (UIntPtr)mlKemEk.Length,
-                sni, (UIntPtr)padToMin, out IntPtr p, out UIntPtr l);
-            if (rc == 0 && p != IntPtr.Zero && l != UIntPtr.Zero)
-            {
-                int n = (int)l;
-                var hello = new byte[n];
-                Marshal.Copy(p, hello, 0, n);
-                qeli_realtls_buf_free(p, l);
-                return hello;
-            }
+            return BuildClientHelloPqNative(x25519Pub, mlKemEk, sni, padToMin);
         }
         catch (DllNotFoundException) { /* qeli.dll missing → managed builder */ }
         catch (EntryPointNotFoundException) { /* old qeli.dll w/o the export → managed */ }
+        catch (InvalidOperationException) { /* native builder rejected otherwise valid input */ }
         return BuildClientHelloInner(x25519Pub, mlKemEk, sni, padToMin, null);
     }
 
-    private static byte[] BuildClientHelloInner(byte[] x25519Pub, byte[]? mlKemEk, string sni, int padToMin,
-        byte[]? realitySessionId)
+    /// <summary>
+    /// Invoke the Rust fake-TLS builder without the compatibility fallback. Conformance uses
+    /// this entry point so a missing DLL/export or native error fails the gate instead of
+    /// silently exercising the managed implementation.
+    /// </summary>
+    internal static byte[] BuildClientHelloPqNative(byte[] x25519Pub, byte[] mlKemEk,
+        string sni = "!", int padToMin = 0)
     {
+        ValidateClientHelloInputs(sni, padToMin);
+        ValidateKeyShares(x25519Pub, mlKemEk);
+
+        IntPtr buffer = IntPtr.Zero;
+        UIntPtr length = UIntPtr.Zero;
+        int rc = qeli_build_faketls_clienthello(
+            x25519Pub, mlKemEk, (UIntPtr)mlKemEk.Length,
+            sni, (UIntPtr)padToMin, out buffer, out length);
+        if (rc != 0 || buffer == IntPtr.Zero || length == UIntPtr.Zero)
+        {
+            if (buffer != IntPtr.Zero)
+                qeli_realtls_buf_free(buffer, length);
+            throw new InvalidOperationException(
+                $"native fake-TLS ClientHello builder failed (rc={rc})");
+        }
+
+        try
+        {
+            ulong nativeLength = length.ToUInt64();
+            if (nativeLength > int.MaxValue)
+                throw new InvalidOperationException("native fake-TLS ClientHello is too large");
+            var hello = new byte[(int)nativeLength];
+            Marshal.Copy(buffer, hello, 0, hello.Length);
+            return hello;
+        }
+        finally
+        {
+            qeli_realtls_buf_free(buffer, length);
+        }
+    }
+
+    private static void ValidateClientHelloInputs(string sni, int padToMin)
+    {
+        ArgumentNullException.ThrowIfNull(sni);
+        bool marker = sni is "" or "!" or "~" or "@";
+        if (!marker && (sni.Length > 253 || sni.Any(ch => ch > 0x7f)))
+            throw new ArgumentException("SNI must be ASCII and at most 253 bytes", nameof(sni));
+        // One TLS plaintext handshake record; matches Rust MAX_HANDSHAKE_SIZE + header.
+        if (padToMin is < 0 or > 16_389)
+            throw new ArgumentOutOfRangeException(nameof(padToMin),
+                "ClientHello padding target must be between 0 and 16389 bytes");
+    }
+
+    private static void ValidateKeyShares(byte[] x25519Pub, byte[]? mlKemEk)
+    {
+        ArgumentNullException.ThrowIfNull(x25519Pub);
+        if (x25519Pub.Length != 32)
+            throw new ArgumentException("x25519 public key must be exactly 32 bytes", nameof(x25519Pub));
+        if (mlKemEk != null && mlKemEk.Length != 1184)
+            throw new ArgumentException("ML-KEM-768 encapsulation key must be exactly 1184 bytes", nameof(mlKemEk));
+    }
+
+    private static byte[] BuildClientHelloInner(byte[] x25519Pub, byte[]? mlKemEk, string sni, int padToMin,
+        byte[]? realitySessionId = null)
+    {
+        ValidateKeyShares(x25519Pub, mlKemEk);
         bool pq = mlKemEk != null;
         var sessionId = realitySessionId is { Length: 32 }
             ? realitySessionId.ToArray()
             : RandomNumberGenerator.GetBytes(32);
-        var randomBytes = new byte[32]; RandomNumberGenerator.Fill(randomBytes);
+        var randomBytes = RandomNumberGenerator.GetBytes(32);
         int greaseFirst = GreaseValue();
         int greaseLast = GreaseValue();
+        int greaseCipher = GreaseValue();
 
-        var ext = new Buf();
-        BuildGreaseExtension(ext, greaseFirst);
-        // SNI: normal host, or special tokens (browser dialing a bare IP). "" / "!" =
-        // omit the extension; "~" = present but empty; "@" = empty server_name_list.
+        var shuffleable = new List<byte[]>();
+        void AddExtension(Action<Buf> build)
+        {
+            var one = new Buf();
+            build(one);
+            shuffleable.Add(one.ToArray());
+        }
+
         switch (sni)
         {
             case "": case "!": break;
-            case "~": BuildEmptySniExtension(ext); break;
-            case "@": BuildEmptySniListExtension(ext); break;
-            default: BuildSniExtension(ext, sni); break;
+            case "~": AddExtension(BuildEmptySniExtension); break;
+            case "@": AddExtension(BuildEmptySniListExtension); break;
+            default: AddExtension(e => BuildSniExtension(e, sni)); break;
         }
-        BuildEmptyExtension(ext, 0x0017); // extended_master_secret
-        BuildSupportedGroupsExtension(ext, pq);
-        if (pq) BuildClientKeyShareExtensionPq(ext, x25519Pub, mlKemEk!);
-        else BuildClientKeyShareExtension(ext, x25519Pub);
-        BuildPskKeyExchangeModesExtension(ext);
-        BuildSupportedVersionsExtension(ext);
-        BuildSignatureAlgorithmsExtension(ext);
-        BuildCompressCertificateExtension(ext);
+        AddExtension(e => BuildEmptyExtension(e, 0x0017)); // extended_master_secret
+        AddExtension(BuildEcPointFormatsExtension);
+        AddExtension(BuildRenegotiationInfoExtension);
+        AddExtension(e => BuildEmptyExtension(e, 0x0023)); // session_ticket
+        AddExtension(e => BuildSupportedGroupsExtension(e, pq));
+        AddExtension(e =>
+        {
+            if (pq) BuildClientKeyShareExtensionPq(e, x25519Pub, mlKemEk!);
+            else BuildClientKeyShareExtension(e, x25519Pub);
+        });
+        AddExtension(BuildPskKeyExchangeModesExtension);
+        AddExtension(BuildSupportedVersionsExtension);
+        AddExtension(BuildSignatureAlgorithmsExtension);
+        AddExtension(BuildCompressCertificateExtension);
+        AddExtension(BuildAlpnExtension);
+        AddExtension(BuildStatusRequestExtension);
+        AddExtension(e => BuildEmptyExtension(e, 0x0012)); // signed_certificate_timestamp
+        AddExtension(BuildApplicationSettingsExtension);
+
+        // Chrome 110+ permutes non-GREASE extensions per connection.
+        for (int i = shuffleable.Count - 1; i > 0; i--)
+        {
+            int j = RandomNumberGenerator.GetInt32(i + 1);
+            (shuffleable[i], shuffleable[j]) = (shuffleable[j], shuffleable[i]);
+        }
+
+        var ext = new Buf();
+        BuildGreaseExtension(ext, greaseFirst);
+        foreach (var one in shuffleable) ext.W(one);
         BuildGreaseExtension(ext, greaseLast);
 
-        // RFC 7685 padding: record size = 9 (record+handshake headers) + 79 (fixed body) + extLen.
-        int projected = 88 + ext.Size;
+        // Fixed record bytes plus GREASE and the 15-suite Chrome list.
+        int projected = 82 + 2 * (1 + ChromeCiphers.Length) + ext.Size;
         if (padToMin > projected + 4)
         {
-            int padData = padToMin - projected - 4; // 4 = padding ext header
-            ext.W(0x00); ext.W(0x15); // padding extension type
+            int padData = padToMin - projected - 4;
+            ext.WShort(0x0015);
             ext.WShort(padData);
             ext.W(new byte[padData]);
         }
@@ -145,10 +226,9 @@ public static class TlsHandshake
         body.W(randomBytes);
         body.W(sessionId.Length);
         body.W(sessionId);
-        body.WShort(6);
-        body.WShort(0x1301); // TLS_AES_128_GCM_SHA256
-        body.WShort(0x1302); // TLS_AES_256_GCM_SHA384
-        body.WShort(0x1303); // TLS_CHACHA20_POLY1305_SHA256
+        body.WShort(2 * (1 + ChromeCiphers.Length));
+        body.WShort(greaseCipher);
+        foreach (ushort cipher in ChromeCiphers) body.WShort(cipher);
         body.W(1);
         body.W(0x00);
         body.WShort(ext.Size);
@@ -312,10 +392,12 @@ public static class TlsHandshake
 
     private static void BuildSupportedVersionsExtension(Buf buf)
     {
-        buf.W(0x00); buf.W(0x2B);
-        buf.W(0x00); buf.W(0x03);
-        buf.W(0x02);
-        buf.W(0x03); buf.W(0x04); // TLS 1.3
+        buf.WShort(0x002B);
+        buf.WShort(7);
+        buf.W(6);
+        buf.WShort(GreaseValue());
+        buf.WShort(0x0304); // TLS 1.3
+        buf.WShort(0x0303); // TLS 1.2 compatibility
     }
 
     private static void BuildPskKeyExchangeModesExtension(Buf buf)
@@ -328,27 +410,26 @@ public static class TlsHandshake
 
     private static void BuildSignatureAlgorithmsExtension(Buf buf)
     {
-        byte[] algorithms =
+        ushort[] algorithms =
         {
-            0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x08, 0x04,
-            0x04, 0x01, 0x05, 0x01, 0x02, 0x01,
+            0x0403, 0x0804, 0x0401, 0x0503,
+            0x0805, 0x0501, 0x0806, 0x0601,
         };
-        buf.W(0x00); buf.W(0x0D);
-        buf.WShort(algorithms.Length + 2);
-        buf.WShort(algorithms.Length);
-        buf.W(algorithms);
+        buf.WShort(0x000D);
+        buf.WShort(2 + algorithms.Length * 2);
+        buf.WShort(algorithms.Length * 2);
+        foreach (ushort algorithm in algorithms) buf.WShort(algorithm);
     }
 
     private static void BuildSupportedGroupsExtension(Buf buf, bool pq)
     {
-        // PQ first like current Chrome when the hybrid share is offered.
-        byte[] groups = pq
-            ? new byte[] { 0x11, 0xEC, 0x00, 0x1D, 0x00, 0x17 } // X25519MLKEM768, x25519, secp256r1
-            : new byte[] { 0x00, 0x1D, 0x00, 0x17 };            // x25519, secp256r1
-        buf.W(0x00); buf.W(0x0A);
-        buf.WShort(groups.Length + 2);
-        buf.WShort(groups.Length);
-        buf.W(groups);
+        ushort[] groups = pq
+            ? new ushort[] { (ushort)GreaseValue(), 0x11EC, 0x001D, 0x0017, 0x0018 }
+            : new ushort[] { (ushort)GreaseValue(), 0x001D, 0x0017, 0x0018 };
+        buf.WShort(0x000A);
+        buf.WShort(2 + groups.Length * 2);
+        buf.WShort(groups.Length * 2);
+        foreach (ushort group in groups) buf.WShort(group);
     }
 
     private static void BuildCompressCertificateExtension(Buf buf)
@@ -357,6 +438,36 @@ public static class TlsHandshake
         buf.W(0x00); buf.W(0x03);
         buf.W(0x02);
         buf.W(0x00); buf.W(0x02); // brotli
+    }
+
+    private static void BuildAlpnExtension(Buf buf)
+    {
+        byte[] protocols = { 2, (byte)'h', (byte)'2', 8, (byte)'h', (byte)'t', (byte)'t',
+            (byte)'p', (byte)'/', (byte)'1', (byte)'.', (byte)'1' };
+        buf.WShort(0x0010);
+        buf.WShort(2 + protocols.Length);
+        buf.WShort(protocols.Length);
+        buf.W(protocols);
+    }
+
+    private static void BuildEcPointFormatsExtension(Buf buf)
+    {
+        buf.W(new byte[] { 0x00, 0x0B, 0x00, 0x02, 0x01, 0x00 });
+    }
+
+    private static void BuildRenegotiationInfoExtension(Buf buf)
+    {
+        buf.W(new byte[] { 0xFF, 0x01, 0x00, 0x01, 0x00 });
+    }
+
+    private static void BuildStatusRequestExtension(Buf buf)
+    {
+        buf.W(new byte[] { 0x00, 0x05, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00 });
+    }
+
+    private static void BuildApplicationSettingsExtension(Buf buf)
+    {
+        buf.W(new byte[] { 0x44, 0x69, 0x00, 0x05, 0x00, 0x03, 0x02, (byte)'h', (byte)'2' });
     }
 
     private static void BuildEmptyExtension(Buf buf, int extType)

@@ -104,8 +104,19 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: qeli
-      - name: Build
-        run: cargo build --locked --bin qeli --release
+      - name: Release server rejects builds without jemalloc
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          trap 'rm -f "$log"' EXIT
+          if cargo check --locked --release --bin qeli >"$log" 2>&1; then
+            cat "$log"
+            echo "release qeli unexpectedly built without jemalloc" >&2
+            exit 1
+          fi
+          grep -F "release qeli server builds require --features jemalloc" "$log"
+      - name: Build release server with jemalloc
+        run: cargo build --locked --bin qeli --release --features jemalloc
       - name: Test
         run: cargo test --locked --workspace -- --test-threads=1
       # The whole-client ABI is opt-in while clients migrate. Test its state machine with
@@ -137,10 +148,10 @@ jobs:
 
   # Hard gate: build and INSTALL the artifact that actually ships. (Audit 2026-07-27, G2)
   #
-  # `build-test` above runs a plain `cargo build --release` on the runner, which proves
-  # the code compiles and nothing else. The published artifact is a .deb produced by
-  # `make deb-portable` (cargo-zigbuild against a pinned glibc ABI) and NOTHING in CI
-  # ever built it, ran `check-abi`, or installed it anywhere. That gap is exactly how
+  # `build-test` above proves that release builds reject the glibc allocator and that the
+  # jemalloc server compiles. The published artifact is still a .deb produced by
+  # `make deb-portable` (cargo-zigbuild against a pinned glibc ABI), so CI must also build,
+  # run `check-abi`, and install that exact package. The historical gap is exactly how
   # 0.7.8–0.7.11 shipped requiring GLIBC_2.39 while declaring `Depends: libc6 (>= 2.28)`:
   # apt installed them without a word and they died at exec on Ubuntu 22.04.
   #
@@ -165,7 +176,7 @@ jobs:
         with:
           workspaces: qeli
       - name: Install cargo-zigbuild
-        run: cargo install cargo-zigbuild --locked
+        run: cargo install cargo-zigbuild --version 0.23.0 --locked
       # deb-portable itself runs check-abi (glibc floor + the AES-NI baseline check),
       # so a binary that outgrew either one fails right here.
       - name: Build the portable .deb (the exact release recipe)
@@ -184,6 +195,19 @@ jobs:
             set -e
             dpkg -x "$0" /tmp/x
             /tmp/x/usr/bin/qeli version
+            for name in server server-multiprofile server-ipv6 server-maxobf users client client-reality client-maxobf; do
+              test -f "/tmp/x/etc/qeli/$name.conf.example"
+            done
+            pin=0900000000000000000000000000000000000000000000000000000000000000
+            for name in client client-reality client-maxobf; do
+              sed "s/^key = .*/key = $pin/" "/tmp/x/etc/qeli/$name.conf.example" >"/tmp/$name.conf"
+              /tmp/x/usr/bin/qeli check-config --client --config "/tmp/$name.conf"
+            done
+            cp /tmp/x/etc/qeli/users.conf.example /tmp/qeli-users.conf
+            for name in server server-multiprofile server-ipv6 server-maxobf; do
+              sed "s|^users_file = .*|users_file = /tmp/qeli-users.conf|" "/tmp/x/etc/qeli/$name.conf.example" >"/tmp/$name.conf"
+              /tmp/x/usr/bin/qeli check-config --config "/tmp/$name.conf"
+            done
           ' "${{ steps.pkg.outputs.deb }}"
       - name: Installs and runs on an old supported distro (ubuntu:22.04)
         run: |
@@ -194,6 +218,19 @@ jobs:
             apt-get update -qq
             apt-get install -y --no-install-recommends "./$0"
             qeli version
+            for name in server server-multiprofile server-ipv6 server-maxobf users client client-reality client-maxobf; do
+              test -f "/etc/qeli/$name.conf.example"
+            done
+            pin=0900000000000000000000000000000000000000000000000000000000000000
+            for name in client client-reality client-maxobf; do
+              sed "s/^key = .*/key = $pin/" "/etc/qeli/$name.conf.example" >"/tmp/$name.conf"
+              qeli check-config --client --config "/tmp/$name.conf"
+            done
+            cp /etc/qeli/users.conf.example /tmp/qeli-users.conf
+            for name in server server-multiprofile server-ipv6 server-maxobf; do
+              sed "s|^users_file = .*|users_file = /tmp/qeli-users.conf|" "/etc/qeli/$name.conf.example" >"/tmp/$name.conf"
+              qeli check-config --config "/tmp/$name.conf"
+            done
           ' "${{ steps.pkg.outputs.deb }}"
 
   # Hard gate: the two installer scripts are the ONLY thing between a fresh VPS and a
@@ -224,6 +261,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
+          # Match the reproducible native-build toolchain so a moving `stable` cannot
+          # introduce new lints that force unrelated binary provenance updates.
+          toolchain: 1.97.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: qeli
@@ -251,6 +291,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: docs checks
         run: python3 scripts/check_docs.py
+      - name: release certification contracts
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_release_certification.py'
+          python3 -m unittest discover -s scripts -p 'test_ipv6_release_matrix.py'
+          bash -n scripts/ipv6_netns_case.sh
+
       - name: panel source checks
         run: python3 scripts/check_panel.py
       - name: embedded panel CSS is current
@@ -268,9 +314,9 @@ jobs:
 
   # HARD gates: the client apps must at least compile. None of these carry
   # `continue-on-error`, so a broken client build blocks the merge — which is the intent.
-  # They were labelled "soft gate" here while behaving as hard ones; the only genuinely
-  # soft job in this file is `fuzz-smoke` (nightly toolchain). Keep the label and the
-  # mechanics in step: a comment that misstates whether a gate blocks is how people come
+  # They were labelled "soft gate" here while behaving as hard ones. There are no soft
+  # jobs in this workflow; `fuzz-smoke` uses nightly but deliberately remains hard. Keep
+  # labels and mechanics in step: a comment that misstates whether a gate blocks is how people come
   # to believe a red job is expected. (Audit 2026-07-27, Z5.)
   #
   # The native realtls core (libqeli.so / qeli.dll / libqeli.dylib) is committed under each
@@ -279,7 +325,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+      - uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
         with:
           distribution: temurin
           java-version: '17'
@@ -320,6 +366,43 @@ jobs:
         working-directory: qeli-android
         run: ./gradlew --no-daemon assembleRelease
 
+  android-instrumented:
+    name: Android runtime gates (API ${{ matrix.api-level }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # API 29 executes the pre-Android-13 route-complement path; API 35 executes
+        # excludeRoute() and current VpnService.Builder behaviour.
+        api-level: [29, 35]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Validate the Gradle wrapper
+        uses: gradle/actions/wrapper-validation@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+      - name: Enable KVM for the Android emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Execute Android Keystore and production TUN-builder tests
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: ${{ matrix.api-level }}
+          target: google_apis
+          arch: x86_64
+          profile: pixel_2
+          working-directory: qeli-android
+          disable-animations: true
+          script: |
+            chmod +x ./gradlew
+            ./gradlew --no-daemon installDebug
+            adb shell appops set com.qeli ACTIVATE_VPN allow
+            ./gradlew --no-daemon connectedDebugAndroidTest
+
   windows-build:
     runs-on: windows-latest
     steps:
@@ -334,17 +417,32 @@ jobs:
       - name: Build QeliWin (Release)
         working-directory: qeli-win
         run: dotnet build QeliWin/QeliWin.csproj -c Release
-      # `dotnet build` only proved it compiles. The headless `selftest` verb checks the
-      # SHARED crypto/protocol (X25519, HKDF, ChaCha20-Poly1305, PacketCodec incl.
-      # counter/replay, ObfsStream, INI/qeli:// parsing) — no network, no admin.
-      # Invoked through the dotnet host on the managed DLL: the .exe manifest demands
-      # elevation, which the self-test itself does not need.
-      - name: Self-test QeliWin (headless crypto/codec/parse round-trips)
+      - name: Publish both Windows distributions with required third-party notices
+        working-directory: qeli-win
+        shell: pwsh
+        run: |
+          dotnet publish QeliWin/QeliWin.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o dist/net-required
+          dotnet publish QeliWin/QeliWin.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o dist/standalone
+          foreach ($dir in @('dist/net-required', 'dist/standalone')) {
+            foreach ($notice in @('Wintun-LICENSE.txt', 'WinDivert-LICENSE.txt', 'WinDivert-NOTICE.txt')) {
+              $path = Join-Path $dir $notice
+              if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "published package is missing $path" }
+            }
+          }
+      - name: Self-test QeliWin platform adapters
         working-directory: qeli-win
         run: dotnet exec QeliWin/bin/Release/net10.0-windows/win-x64/QeliWin.dll selftest
+      - name: Build managed conformance runner (Windows)
+        working-directory: qeli-shared
+        run: dotnet build QeliConformance/QeliConformance.csproj -c Release
+      - name: Managed crypto/codec/config conformance (Windows)
+        working-directory: qeli-shared
+        env:
+          QELI_CONFORMANCE_REQUIRED: '1'
+        run: dotnet exec QeliConformance/bin/Release/net10.0/QeliConformance.dll selftest
       - name: PacketCodec benchmark gate (managed Windows)
-        working-directory: qeli-win
-        run: dotnet exec QeliWin/bin/Release/net10.0-windows/win-x64/QeliWin.dll packetbench --ci
+        working-directory: qeli-shared
+        run: dotnet exec QeliConformance/bin/Release/net10.0/QeliConformance.dll packetbench --ci
 
   macos-build:
     runs-on: macos-latest
@@ -356,12 +454,45 @@ jobs:
       - name: Build QeliMac (Release)
         working-directory: qeli-mac
         run: dotnet build QeliMac/QeliMac.csproj -c Release
-      - name: Self-test QeliMac (headless crypto/codec/parse round-trips)
+      - name: Self-test QeliMac platform adapters
         working-directory: qeli-mac
         run: dotnet exec QeliMac/bin/Release/net10.0/QeliMac.dll selftest
+      - name: Build managed conformance runner (macOS)
+        working-directory: qeli-shared
+        run: dotnet build QeliConformance/QeliConformance.csproj -c Release
+      - name: Managed crypto/codec/config conformance (macOS)
+        working-directory: qeli-shared
+        env:
+          QELI_CONFORMANCE_REQUIRED: '1'
+        run: dotnet exec QeliConformance/bin/Release/net10.0/QeliConformance.dll selftest
       - name: PacketCodec benchmark gate (managed macOS)
+        working-directory: qeli-shared
+        run: dotnet exec QeliConformance/bin/Release/net10.0/QeliConformance.dll packetbench --ci
+      # This deliberately uses an UNREFERENCED disposable anchor: pfctl still performs the
+      # real kernel parse/load/read/flush operations, while the generated block-all rules do
+      # not cut the hosted runner off from GitHub. The full referenced-anchor traffic test is
+      # a physical-Mac release gate.
+      - name: macOS pf anchor runtime gate (load, read back, flush)
         working-directory: qeli-mac
-        run: dotnet exec QeliMac/bin/Release/net10.0/QeliMac.dll packetbench --ci
+        shell: bash
+        run: |
+          set -euo pipefail
+          rules="$(mktemp)"
+          anchor="qeli-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() {
+            sudo /sbin/pfctl -a "$anchor" -F rules >/dev/null 2>&1 || true
+            rm -f "$rules"
+          }
+          trap cleanup EXIT
+          dotnet exec QeliMac/bin/Release/net10.0/QeliMac.dll pf-selftest-rules "$rules"
+          test -s "$rules"
+          sudo /sbin/pfctl -n -f "$rules"
+          sudo /sbin/pfctl -a "$anchor" -f "$rules"
+          loaded="$(sudo /sbin/pfctl -a "$anchor" -sr 2>/dev/null)"
+          grep -F 'block drop out all' <<<"$loaded"
+          grep -F 'pass out quick on utun27 all' <<<"$loaded"
+          sudo /sbin/pfctl -a "$anchor" -F rules
+          test -z "$(sudo /sbin/pfctl -a "$anchor" -sr 2>/dev/null)"
       # Build BOTH macOS architectures explicitly. The utun ioctl P/Invoke has an
       # arch-conditional signature (Apple ARM64 passes the variadic arg on the stack,
       # x86_64 in a register — C-07), so the Intel path is a distinct code path that a
@@ -431,7 +562,7 @@ jobs:
             -destination "id=$dest" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
 
-  # Soft-gate: клиент для роутера (Keenetic) кросс-компилируется под обе арки —
+  # Hard build gate: клиент для роутера (Keenetic) кросс-компилируется под обе арки —
   # aarch64 (stable) и mipsel (tier-3: nightly + -Zbuild-std). Линкер/cc — zig через
   # cargo-zigbuild (OpenWrt SDK не нужен). Только сборка; рантайм проверяется на устройстве.
   # Арк-специфичные TUNSETIFF (тип/значение) и float-ABI mipsel видны ТОЛЬКО здесь, не на
@@ -482,9 +613,11 @@ jobs:
         with:
           workspaces: qeli
       - name: Install cargo-zigbuild
-        run: cargo install cargo-zigbuild --locked
+        run: cargo install cargo-zigbuild --version 0.23.0 --locked
       - name: Cross-build qeli-client (${{ matrix.arch }})
         run: |
+          sed -i 's/^crate-type = \["rlib", "cdylib", "staticlib"\]$/crate-type = ["rlib"]/' Cargo.toml
+          grep -qxF 'crate-type = ["rlib"]' Cargo.toml
           if [ "${{ matrix.arch }}" = "mipsel" ]; then
             RUSTFLAGS='-C link-arg=-msoft-float' cargo zigbuild --locked -Z build-std=std,panic_abort \
               --release --bin qeli-client --no-default-features --features client-bin \
@@ -527,7 +660,7 @@ jobs:
       - name: Smoke each target (30s)
         working-directory: qeli
         run: |
-          for t in clienthello client_config websocket_head packet_decrypt realtls_record obfs_datagram quic udp_frag; do
+          for t in clienthello client_config websocket_head packet_decrypt realtls_record obfs_datagram quic udp_frag data_frag roaming_wire ip_packet; do
             echo "=== fuzz $t ==="
             cargo +nightly fuzz run "$t" -- -max_total_time=30
           done
@@ -542,7 +675,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [clienthello, client_config, websocket_head, packet_decrypt, realtls_record, obfs_datagram, quic, udp_frag]
+        target: [clienthello, client_config, websocket_head, packet_decrypt, realtls_record, obfs_datagram, quic, udp_frag, data_frag, roaming_wire, ip_packet]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly

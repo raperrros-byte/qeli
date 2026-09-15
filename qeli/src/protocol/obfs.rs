@@ -13,11 +13,16 @@
 //! lets `poll_write` rewind on partial writes, so the transform is exact and
 //! never desyncs.
 //!
-//! Limit: the IETF ChaCha20 keystream is 256 GiB per direction. If a single
+//! Integrity: this outer transform intentionally provides camouflage only. Tunnel
+//! records inside it are always authenticated by the PacketCodec AEAD; an on-path bit
+//! flip can corrupt or terminate a connection (as can a dropped TCP segment/datagram)
+//! but cannot become accepted inner plaintext. Keep that invariant covered end-to-end.
+//!//! Limit: the IETF ChaCha20 keystream is 256 GiB per direction. If a single
 //! session transfers more than that one way, `poll_write` returns an error and
 //! the connection reconnects with a fresh nonce — fail-safe, never reusing
 //! keystream. Document for very-high-volume long-lived links.
 
+use bytes::BytesMut;
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::ChaCha20;
 use rand::prelude::*;
@@ -125,7 +130,6 @@ fn cipher_from(key: &[u8; 32], nonce: &[u8; NONCE_LEN]) -> ChaCha20 {
 // Public for the standalone fuzz crate: this HTTP head is received before
 // authentication and therefore has to be exercised directly with arbitrary bytes.
 pub mod ws {
-    use super::super::tls::DEFAULT_SNI_POOL;
     use base64::Engine;
     use hkdf::Hkdf;
     use rand::prelude::*;
@@ -162,7 +166,7 @@ pub mod ws {
         }
         msg.extend_from_slice(&bit_len.to_be_bytes());
 
-        for chunk in msg.chunks_exact(64) {
+        for chunk in msg.as_chunks::<64>().0 {
             let mut w = [0u32; 80];
             for (i, word) in w.iter_mut().take(16).enumerate() {
                 *word = u32::from_be_bytes([
@@ -250,9 +254,9 @@ pub mod ws {
 
     /// Build a randomised WebSocket Upgrade request (the client's first bytes).
     ///
-    /// `host` is the value for the `Host:` header. Pass the name the client actually
-    /// connected to (or the operator's configured front); `None` falls back to a random
-    /// decoy from the SNI pool, which is only appropriate when connecting to a bare IP.
+    /// `host` is the value for the `Host:` header. Production callers always pass
+    /// the actual connect host or an operator-configured front. `None` is retained only
+    /// for defensive API compatibility and uses `localhost`, never an unrelated CDN.
     ///
     /// The header used to ALWAYS be a random pick from a five-entry pool of big-name
     /// domains, sent in the clear to whatever VPS the client dialled. A passive observer
@@ -262,10 +266,19 @@ pub mod ws {
     /// existing `obfuscation.sni` override lets an operator pin a genuine front domain
     /// when one is actually in front. (Audit 2026-07-27, E2.)
     pub fn build_request(host: Option<&str>, key: &[u8; 32]) -> Vec<u8> {
+        build_request_with_accept(host, key).0
+    }
+
+    /// Build the request and retain the exact RFC 6455 accept value the response must carry.
+    /// The public wrapper above stays convenient for tests and callers that only need bytes.
+    pub(super) fn build_request_with_accept(
+        host: Option<&str>,
+        key: &[u8; 32],
+    ) -> (Vec<u8>, String) {
         let mut rng = rand::rng();
         let host = match host {
             Some(h) if !h.is_empty() => h,
-            _ => DEFAULT_SNI_POOL[rng.random_range(0..DEFAULT_SNI_POOL.len())],
+            _ => "localhost",
         };
         let ua = USER_AGENTS[rng.random_range(0..USER_AGENTS.len())];
 
@@ -276,7 +289,8 @@ pub mod ws {
         rng.fill_bytes(&mut nonce);
         let ws_key = b64(&nonce);
 
-        format!(
+        let expected_accept = accept_token(&ws_key);
+        let request = format!(
             "GET {path} HTTP/1.1\r\n\
              Host: {host}\r\n\
              User-Agent: {ua}\r\n\
@@ -287,7 +301,39 @@ pub mod ws {
              Sec-WebSocket-Version: 13\r\n\
              \r\n"
         )
-        .into_bytes()
+        .into_bytes();
+        (request, expected_accept)
+    }
+
+    /// Validate the complete server upgrade response, including the challenge binding.
+    /// Accepting only the status line allowed an HTTP endpoint (or active interceptor) to
+    /// return an arbitrary 101 and move the client into the binary tunnel handshake.
+    pub(super) fn validate_response(head: &[u8], expected_accept: &str) -> bool {
+        let text = String::from_utf8_lossy(head);
+        let mut status = text.split("\r\n").next().unwrap_or("").split_whitespace();
+        if status.next() != Some("HTTP/1.1") || status.next() != Some("101") {
+            return false;
+        }
+        let upgrade_ok = header_value(head, "upgrade")
+            .map(|v| v.trim().eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false);
+        let connection_ok = header_value(head, "connection")
+            .map(|v| {
+                v.split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+            })
+            .unwrap_or(false);
+        let accept_ok = header_value(head, "sec-websocket-accept")
+            .map(|value| {
+                value
+                    .trim()
+                    .as_bytes()
+                    .ct_eq(expected_accept.as_bytes())
+                    .unwrap_u8()
+                    == 1
+            })
+            .unwrap_or(false);
+        upgrade_ok && connection_ok && accept_ok
     }
 
     /// Build the `101 Switching Protocols` response for a received request head, or
@@ -551,6 +597,11 @@ fn ws_encode_frames(cipher_bytes: &[u8], masked: bool) -> Vec<u8> {
 /// payload bytes only).
 #[derive(Default)]
 struct WsReframer {
+    /// RFC 6455 direction contract: client frames are masked and server frames are not.
+    /// `None` is retained only for direction-agnostic parser unit tests.
+    expected_masked: Option<bool>,
+    /// Whether a fragmented binary message is awaiting continuation frames.
+    fragment_open: bool,
     /// Raw wire bytes read but not yet parsed into completed frames.
     buf: Vec<u8>,
     /// Delivered (binary) payload bytes ready to hand to the caller.
@@ -574,6 +625,13 @@ struct WsReframer {
 }
 
 impl WsReframer {
+    fn with_expected_mask(expected_masked: bool) -> Self {
+        Self {
+            expected_masked: Some(expected_masked),
+            ..Self::default()
+        }
+    }
+
     /// Append newly-read raw wire bytes.
     fn feed(&mut self, data: &[u8]) {
         self.buf.extend_from_slice(data);
@@ -590,9 +648,37 @@ impl WsReframer {
         }
         let b0 = self.buf[0];
         let b1 = self.buf[1];
+        let fin = (b0 & 0x80) != 0;
+        if b0 & 0x70 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "obfs ws: RSV bits set without a negotiated extension",
+            ));
+        }
         let opcode = b0 & 0x0f;
+        if !matches!(opcode, 0x0 | 0x2 | 0x8 | 0x9 | 0xA) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "obfs ws: unsupported opcode",
+            ));
+        }
         let masked = (b1 & 0x80) != 0;
+        if self
+            .expected_masked
+            .is_some_and(|expected| expected != masked)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "obfs ws: invalid MASK bit for peer direction",
+            ));
+        }
         let len7 = (b1 & 0x7f) as usize;
+        if opcode & 0x08 != 0 && (!fin || len7 > 125) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "obfs ws: fragmented or oversized control frame",
+            ));
+        }
         let mut off = 2usize;
         let payload_len: usize = if len7 == 126 {
             if self.buf.len() < off + 2 {
@@ -637,8 +723,33 @@ impl WsReframer {
         if self.buf.len() < off + payload_len {
             return Ok(FrameParse::NeedMore); // full payload not yet buffered
         }
-        // opcode 0x2 = binary (deliver); 0x0 continuation (deliver); others are control.
-        let deliver = opcode == 0x2 || opcode == 0x0;
+        // Update fragmentation state only once the whole frame is present; doing it while a
+        // partial frame is buffered would make the next poll see a false duplicate/open.
+        let deliver = match opcode {
+            0x0 => {
+                if !self.fragment_open {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "obfs ws: continuation without an open message",
+                    ));
+                }
+                if fin {
+                    self.fragment_open = false;
+                }
+                true
+            }
+            0x2 => {
+                if self.fragment_open {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "obfs ws: new data frame before final continuation",
+                    ));
+                }
+                self.fragment_open = !fin;
+                true
+            }
+            _ => false,
+        };
         if deliver {
             for (i, &b) in self.buf[off..off + payload_len].iter().enumerate() {
                 let plain = if masked { b ^ mask[i % 4] } else { b };
@@ -683,6 +794,11 @@ impl WsReframer {
     fn drain_frames(&mut self) -> io::Result<()> {
         while !matches!(self.parse_one_frame()?, FrameParse::NeedMore) {}
         Ok(())
+    }
+
+    /// True when EOF would truncate a header, mask key or payload already started on wire.
+    fn has_incomplete_frame(&self) -> bool {
+        !self.buf.is_empty()
     }
 
     /// Number of delivered payload bytes available to read.
@@ -914,6 +1030,24 @@ pub fn obfs_datagram_open(key: &[u8; 32], datagram: &[u8]) -> Option<Vec<u8>> {
     Some(body)
 }
 
+/// Open one sealed datagram in the caller's receive buffer.
+///
+/// The wire format is identical to [`obfs_datagram_open`]. Moving the encrypted body over its
+/// small nonce prefix lets the UDP hot path reuse a pooled receive slot instead of allocating a
+/// temporary `Vec` for every keyed-obfs datagram.
+fn obfs_datagram_open_in_place(key: &[u8; 32], datagram: &mut [u8]) -> Option<usize> {
+    if datagram.len() < 1 + NONCE_LEN {
+        return None;
+    }
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&datagram[1..1 + NONCE_LEN]);
+    let body_start = 1 + NONCE_LEN;
+    let body_len = datagram.len() - body_start;
+    datagram.copy_within(body_start.., 0);
+    cipher_from(key, &nonce).apply_keystream(&mut datagram[..body_len]);
+    Some(body_len)
+}
+
 /// A `tokio::net::UdpSocket` with transparent per-datagram obfs. When `key` is
 /// `None` it is a pass-through, so the UDP data-plane code is written once and
 /// works for both `fake-tls` and `obfs` wire modes. Mirrors the subset of the
@@ -955,13 +1089,31 @@ impl ObfsUdp {
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, std::net::SocketAddr)> {
         let (n, addr) = self.sock.recv_from(buf).await?;
         match &self.key {
-            Some(k) => match obfs_datagram_open(k, &buf[..n]) {
-                Some(plain) => {
-                    let m = plain.len().min(buf.len());
-                    buf[..m].copy_from_slice(&plain[..m]);
-                    Ok((m, addr)) // m may be < real len if buf too small (won't happen: payload<recv buf)
-                }
+            Some(k) => match obfs_datagram_open_in_place(k, &mut buf[..n]) {
+                Some(m) => Ok((m, addr)),
                 None => Ok((0, addr)), // malformed obfs frame → caller skips (n==0)
+            },
+            None => Ok((n, addr)),
+        }
+    }
+
+    /// Receive into spare `BytesMut` capacity and open keyed obfs in place.
+    pub async fn recv_buf_from(
+        &self,
+        buf: &mut BytesMut,
+    ) -> io::Result<(usize, std::net::SocketAddr)> {
+        let start = buf.len();
+        let (n, addr) = self.sock.recv_buf_from(buf).await?;
+        match &self.key {
+            Some(key) => match obfs_datagram_open_in_place(key, &mut buf[start..start + n]) {
+                Some(plain_len) => {
+                    buf.truncate(start + plain_len);
+                    Ok((plain_len, addr))
+                }
+                None => {
+                    buf.truncate(start);
+                    Ok((0, addr))
+                }
             },
             None => Ok((n, addr)),
         }
@@ -974,16 +1126,53 @@ impl ObfsUdp {
         }
     }
 
+    /// Non-blocking datagram send used by atomic control-path publication. Success means the
+    /// complete datagram was accepted by the socket; `WouldBlock` leaves the caller's state
+    /// transaction uncommitted and retryable.
+    pub fn try_send_to(&self, data: &[u8], addr: std::net::SocketAddr) -> io::Result<()> {
+        let sealed;
+        let wire = match &self.key {
+            Some(key) => {
+                sealed = obfs_datagram_seal(key, data);
+                sealed.as_slice()
+            }
+            None => data,
+        };
+        match self.sock.try_send_to(wire, addr) {
+            Ok(sent) if sent == wire.len() => Ok(()),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "UDP socket accepted only part of one datagram",
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.sock.recv(buf).await?;
         match &self.key {
-            Some(k) => match obfs_datagram_open(k, &buf[..n]) {
-                Some(plain) => {
-                    let m = plain.len().min(buf.len());
-                    buf[..m].copy_from_slice(&plain[..m]);
-                    Ok(m)
-                }
+            Some(k) => match obfs_datagram_open_in_place(k, &mut buf[..n]) {
+                Some(m) => Ok(m),
                 None => Ok(0),
+            },
+            None => Ok(n),
+        }
+    }
+
+    /// Connected-socket counterpart of [`Self::recv_buf_from`].
+    pub async fn recv_buf(&self, buf: &mut BytesMut) -> io::Result<usize> {
+        let start = buf.len();
+        let n = self.sock.recv_buf(buf).await?;
+        match &self.key {
+            Some(key) => match obfs_datagram_open_in_place(key, &mut buf[start..start + n]) {
+                Some(plain_len) => {
+                    buf.truncate(start + plain_len);
+                    Ok(plain_len)
+                }
+                None => {
+                    buf.truncate(start);
+                    Ok(0)
+                }
             },
             None => Ok(n),
         }
@@ -994,6 +1183,96 @@ impl ObfsUdp {
             Some(k) => self.sock.send(&obfs_datagram_seal(k, data)).await,
             None => self.sock.send(data).await,
         }
+    }
+
+    /// Batched counterpart of [`Self::recv_buf`] / [`Self::recv_buf_from`].
+    ///
+    /// Waits for readiness once, then takes every datagram already queued in a single
+    /// `recvmmsg` (one `recv_from` per datagram on platforms without it). It never waits for
+    /// the batch to fill, so this removes syscalls without adding latency.
+    ///
+    /// `slots` must be empty and hold spare capacity. On return the first `n` carry opened
+    /// plaintext; a slot left empty is a malformed obfs frame the caller must skip, exactly as
+    /// `n == 0` means today on the single-datagram path.
+    pub(crate) async fn recv_batch(
+        &self,
+        slots: &mut [BytesMut],
+        mut addrs: Option<&mut [std::net::SocketAddr]>,
+        scratch: &mut crate::transport_core::udp_batch::BatchScratch,
+    ) -> io::Result<usize> {
+        let received = self
+            .sock
+            .async_io(tokio::io::Interest::READABLE, || {
+                crate::transport_core::udp_batch::recv_batch(
+                    &self.sock,
+                    &mut *slots,
+                    addrs.as_deref_mut(),
+                    scratch,
+                )
+            })
+            .await?;
+        if let Some(key) = &self.key {
+            for slot in slots.iter_mut().take(received) {
+                match obfs_datagram_open_in_place(key, &mut slot[..]) {
+                    Some(plain_len) => slot.truncate(plain_len),
+                    None => slot.clear(),
+                }
+            }
+        }
+        Ok(received)
+    }
+
+    /// Batched counterpart of [`Self::send`] for a connected socket.
+    ///
+    /// Returns how many datagrams the kernel accepted; a short count is normal under pressure
+    /// and the caller must retry the remainder. Sealing still happens per datagram, so keyed
+    /// `obfs` behaves exactly as on the single-datagram path.
+    pub(crate) async fn send_batch(
+        &self,
+        datagrams: &[&[u8]],
+        scratch: &mut crate::transport_core::udp_batch::BatchScratch,
+    ) -> io::Result<usize> {
+        let sealed: Option<Vec<Vec<u8>>> = self.key.as_ref().map(|key| {
+            datagrams
+                .iter()
+                .map(|d| obfs_datagram_seal(key, d))
+                .collect()
+        });
+        let wire: Vec<&[u8]> = match &sealed {
+            Some(sealed) => sealed.iter().map(|d| d.as_slice()).collect(),
+            None => datagrams.to_vec(),
+        };
+        self.sock
+            .async_io(tokio::io::Interest::WRITABLE, || {
+                crate::transport_core::udp_batch::send_batch(&self.sock, &wire, scratch)
+            })
+            .await
+    }
+
+    /// Batched send for an unconnected server socket. All datagrams target one immutable
+    /// egress snapshot, so a concurrent roaming commit applies to the next batch only.
+    #[allow(dead_code)] // server-only in client/FFI feature builds
+    pub(crate) async fn send_batch_to(
+        &self,
+        datagrams: &[&[u8]],
+        peer: std::net::SocketAddr,
+        scratch: &mut crate::transport_core::udp_batch::BatchScratch,
+    ) -> io::Result<usize> {
+        let sealed: Option<Vec<Vec<u8>>> = self.key.as_ref().map(|key| {
+            datagrams
+                .iter()
+                .map(|datagram| obfs_datagram_seal(key, datagram))
+                .collect()
+        });
+        let wire: Vec<&[u8]> = match &sealed {
+            Some(sealed) => sealed.iter().map(|datagram| datagram.as_slice()).collect(),
+            None => datagrams.to_vec(),
+        };
+        self.sock
+            .async_io(tokio::io::Interest::WRITABLE, || {
+                crate::transport_core::udp_batch::send_batch_to(&self.sock, &wire, peer, scratch)
+            })
+            .await
     }
 
     /// Raw fd of the underlying UDP socket — used by the client to toggle
@@ -1128,16 +1407,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ObfsStream<S> {
         host: Option<&str>,
     ) -> io::Result<Self> {
         if fronting {
-            inner.write_all(&ws::build_request(host, key)).await?;
+            let (request, expected_accept) = ws::build_request_with_accept(host, key);
+            inner.write_all(&request).await?;
             inner.flush().await?;
             let head = ws::read_head(&mut inner).await?;
-            if !head.starts_with(b"HTTP/1.1 101") {
-                return Err(io::Error::other("obfs ws: server did not switch protocols"));
+            if !ws::validate_response(&head, &expected_accept) {
+                return Err(io::Error::other(
+                    "obfs ws: invalid or unbound protocol-switch response",
+                ));
             }
         }
         let jc = awg.effective_jc();
         let (jmin, jmax) = awg.clamp_window();
-        let mut reframer = WsReframer::default();
+        let mut reframer = WsReframer::with_expected_mask(false);
         // F2: client is the sender first — emit jc junk, then discard jc junk.
         if jc > 0 {
             if fronting {
@@ -1151,19 +1433,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ObfsStream<S> {
 
         let mut local = [0u8; NONCE_LEN];
         rand::Rng::fill_bytes(&mut rand::rng(), &mut local);
-        let peer: [u8; NONCE_LEN];
-        if fronting {
+        let peer: [u8; NONCE_LEN] = if fronting {
             // Nonce carried as a WS binary frame (masked: client→server).
             inner.write_all(&ws_encode_frames(&local, true)).await?;
             inner.flush().await?;
-            peer = read_ws_nonce(&mut inner, &mut reframer).await?;
+            read_ws_nonce(&mut inner, &mut reframer).await?
         } else {
             inner.write_all(&local).await?;
             inner.flush().await?;
             let mut p = [0u8; NONCE_LEN];
             inner.read_exact(&mut p).await?;
-            peer = p;
-        }
+            p
+        };
         Ok(Self {
             read_cipher: cipher_from(key, &peer),
             write_cipher: cipher_from(key, &local),
@@ -1232,7 +1513,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ObfsStream<S> {
         }
         let jc = awg.effective_jc();
         let (jmin, jmax) = awg.clamp_window();
-        let mut reframer = WsReframer::default();
+        let mut reframer = WsReframer::with_expected_mask(true);
         // F2: server is the receiver first — discard jc junk, then emit jc junk.
         if jc > 0 {
             if fronting {
@@ -1332,6 +1613,15 @@ impl SplitStream for ObfsStream<TcpStream> {
     type W = ObfsWriteHalf;
     fn split_io(self) -> (ObfsReadHalf, ObfsWriteHalf) {
         self.into_split()
+    }
+}
+
+impl SplitStream for tokio::io::DuplexStream {
+    type R = tokio::io::ReadHalf<Self>;
+    type W = tokio::io::WriteHalf<Self>;
+
+    fn split_io(self) -> (Self::R, Self::W) {
+        tokio::io::split(self)
     }
 }
 
@@ -1442,7 +1732,13 @@ fn ws_read<R: AsyncRead + Unpin>(
         ready!(Pin::new(&mut *inner).poll_read(cx, &mut rb))?;
         let filled = rb.filled().len();
         if filled == 0 {
-            // EOF from the socket. If nothing is pending, signal EOF (empty read).
+            if ws.reframer.has_incomplete_frame() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "obfs ws: EOF in the middle of a frame",
+                )));
+            }
+            // Clean EOF at a frame boundary.
             return Poll::Ready(Ok(()));
         }
         let bytes = rb.filled().to_vec();
@@ -1703,6 +1999,11 @@ mod tests {
         assert_eq!(sealed.len(), 1 + NONCE_LEN + plain.len());
         // round-trips
         assert_eq!(obfs_datagram_open(&key, &sealed).unwrap(), plain);
+        let mut in_place = sealed.clone();
+        let plain_len = obfs_datagram_open_in_place(&key, &mut in_place).unwrap();
+        assert_eq!(plain_len, plain.len());
+        assert_eq!(&in_place[..plain_len], plain);
+        assert_eq!(in_place.len(), sealed.len());
         // two seals of the same payload differ (fresh nonce each time)
         assert_ne!(
             obfs_datagram_seal(&key, plain),
@@ -1717,6 +2018,123 @@ mod tests {
         assert!(obfs_datagram_open(&key, &[0u8; 4]).is_none());
     }
 
+    #[tokio::test]
+    async fn keyed_udp_batch_roundtrips_different_sizes() {
+        let a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        let key = derive_obfs_key("keyed-udp-batch");
+        let sender = ObfsUdp::new(a, Some(key));
+        let receiver = ObfsUdp::new(b, Some(key));
+        let payloads: Vec<Vec<u8>> = (1..=8).map(|i| vec![i as u8; i * 137]).collect();
+
+        let mut send_scratch = crate::transport_core::udp_batch::BatchScratch::new(
+            crate::transport_core::udp_batch::MAX_BATCH,
+        );
+        let mut offset = 0;
+        while offset < payloads.len() {
+            let remaining: Vec<&[u8]> = payloads[offset..]
+                .iter()
+                .map(|payload| payload.as_slice())
+                .collect();
+            let sent = sender
+                .send_batch(&remaining, &mut send_scratch)
+                .await
+                .unwrap();
+            assert!(sent > 0, "a writable UDP socket must make progress");
+            offset += sent;
+        }
+
+        let mut received = Vec::new();
+        let mut receive_scratch = crate::transport_core::udp_batch::BatchScratch::new(
+            crate::transport_core::udp_batch::MAX_BATCH,
+        );
+        while received.len() < payloads.len() {
+            let mut slots: Vec<BytesMut> = (0..crate::transport_core::udp_batch::MAX_BATCH)
+                .map(|_| BytesMut::with_capacity(4096))
+                .collect();
+            let count = receiver
+                .recv_batch(&mut slots, None, &mut receive_scratch)
+                .await
+                .unwrap();
+            received.extend(slots.into_iter().take(count));
+        }
+        for (actual, expected) in received.iter().zip(payloads.iter()) {
+            assert_eq!(actual.as_ref(), expected.as_slice());
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_unconnected_udp_batch_roundtrips_different_sizes() {
+        let raw_sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let raw_receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = raw_receiver.local_addr().unwrap();
+        let key = derive_obfs_key("keyed-unconnected-udp-batch");
+        let sender = ObfsUdp::new(raw_sender, Some(key));
+        let receiver = ObfsUdp::new(raw_receiver, Some(key));
+        let payloads: Vec<Vec<u8>> = (1..=8).map(|i| vec![i as u8; i * 127]).collect();
+
+        let mut send_scratch = crate::transport_core::udp_batch::BatchScratch::new(
+            crate::transport_core::udp_batch::MAX_BATCH,
+        );
+        let mut offset = 0;
+        while offset < payloads.len() {
+            let remaining: Vec<&[u8]> = payloads[offset..]
+                .iter()
+                .map(|payload| payload.as_slice())
+                .collect();
+            let sent = sender
+                .send_batch_to(&remaining, peer, &mut send_scratch)
+                .await
+                .unwrap();
+            assert!(sent > 0, "a writable UDP socket must make progress");
+            offset += sent;
+        }
+
+        let mut received = Vec::new();
+        let mut receive_scratch = crate::transport_core::udp_batch::BatchScratch::new(
+            crate::transport_core::udp_batch::MAX_BATCH,
+        );
+        while received.len() < payloads.len() {
+            let mut slots: Vec<BytesMut> = (0..crate::transport_core::udp_batch::MAX_BATCH)
+                .map(|_| BytesMut::with_capacity(4096))
+                .collect();
+            let count = receiver
+                .recv_batch(&mut slots, None, &mut receive_scratch)
+                .await
+                .unwrap();
+            received.extend(slots.into_iter().take(count));
+        }
+        for (actual, expected) in received.iter().zip(payloads.iter()) {
+            assert_eq!(actual.as_ref(), expected.as_slice());
+        }
+    }
+
+    #[test]
+    fn outer_datagram_tamper_is_rejected_by_inner_aead() {
+        let packet_key = [0x5au8; 32];
+        let mut sender = crate::protocol::packet::PacketCodec::new(packet_key);
+        let inner = sender
+            .encrypt_packet(b"authenticated tunnel payload", &[])
+            .expect("inner AEAD encrypts");
+
+        let obfs_key = derive_obfs_key("outer-camouflage-key");
+        let mut wire = obfs_datagram_seal(&obfs_key, &inner);
+        *wire.last_mut().expect("sealed datagram has a body") ^= 0x01;
+
+        // The outer ChaCha20 layer is intentionally not an authentication boundary:
+        // it opens to corrupted bytes. The mandatory inner AEAD is the boundary and
+        // must reject those bytes instead of delivering modified tunnel plaintext.
+        let corrupted_inner =
+            obfs_datagram_open(&obfs_key, &wire).expect("outer shape remains parseable");
+        assert_ne!(corrupted_inner, inner);
+        let mut receiver = crate::protocol::packet::PacketCodec::new(packet_key);
+        assert!(
+            receiver.decrypt_packet(&corrupted_inner).is_err(),
+            "tampered outer ciphertext must never become accepted inner plaintext"
+        );
+    }
     #[tokio::test]
     async fn wrong_psk_yields_garbage() {
         let (a, b) = tokio::io::duplex(64 * 1024);
@@ -1821,9 +2239,11 @@ mod tests {
             req.contains("\r\nHost: vpn.example.com\r\n"),
             "explicit host must be used verbatim:\n{req}"
         );
-        // With no host (bare-IP server) it still has to produce SOME plausible Host.
+        // Defensive legacy fallback never impersonates an unrelated public CDN.
         let fallback = String::from_utf8(ws::build_request(None, &key)).unwrap();
-        assert!(fallback.contains("\r\nHost: "));
+        assert!(fallback.contains("\r\nHost: localhost\r\n"));
+        let ip = String::from_utf8(ws::build_request(Some("192.0.2.10"), &key)).unwrap();
+        assert!(ip.contains("\r\nHost: 192.0.2.10\r\n"));
     }
 
     /// The endpoint path is PSK-derived, stable, and the ONLY target that upgrades.
@@ -2035,12 +2455,11 @@ mod tests {
         // must hold for every deployment, not just for one lucky path. (Audit 2026-08-04.)
         for i in 0..64 {
             let key = derive_obfs_key(&format!("psk-fet-{i}"));
-            // Both host sources must satisfy the exemptions: an explicit connect
-            // hostname and the decoy fallback used for a bare-IP server. (E2)
+            // Both hostname and literal-IP connect targets must satisfy the exemptions.
             let req = if rand::random::<bool>() {
                 ws::build_request(Some("vpn.example.com"), &key)
             } else {
-                ws::build_request(None, &key)
+                ws::build_request(Some("192.0.2.10"), &key)
             };
             // Ex2: first 6 bytes printable ("GET /x").
             assert!(
@@ -2164,6 +2583,39 @@ mod tests {
         let mut out = vec![0u8; p.len()];
         assert_eq!(rf.read_pending(&mut out), p.len());
         assert_eq!(out, p);
+    }
+
+    #[test]
+    fn ws_reframer_enforces_mask_direction_and_fragment_state() {
+        let payload = b"direction";
+        let masked = ws_encode_frames(payload, true);
+        let unmasked = ws_encode_frames(payload, false);
+
+        let mut server = WsReframer::with_expected_mask(true);
+        server.feed(&unmasked);
+        assert!(
+            server.drain_frames().is_err(),
+            "server must reject an unmasked client frame"
+        );
+
+        let mut client = WsReframer::with_expected_mask(false);
+        client.feed(&masked);
+        assert!(
+            client.drain_frames().is_err(),
+            "client must reject a masked server frame"
+        );
+
+        let mut fragments = WsReframer::default();
+        fragments.feed(&[0x00, 0x00]);
+        assert!(
+            fragments.drain_frames().is_err(),
+            "orphan continuation must be rejected"
+        );
+
+        let mut truncated = WsReframer::with_expected_mask(false);
+        truncated.feed(&[0x82, 0x05, b'a']);
+        truncated.drain_frames().unwrap();
+        assert!(truncated.has_incomplete_frame());
     }
 
     /// End-to-end fronted round-trip over the WS-framed data plane, with a large

@@ -1,12 +1,14 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
-  <!-- Shared, platform-neutral adapter/model library for qeli-win and qeli-mac.
-       The active transport is the ABI 1.10 Rust core; this assembly owns lifecycle,
-       platform plan dispatch and retained conformance/diagnostic fixtures. It contains
-       no managed runtime transport fallback. NO OS/UI dependencies: net10.0 (not -windows). -->
+  <!-- Shared, platform-neutral production adapter/model library for qeli-win and qeli-mac.
+       The current core is ABI 1.15 and the compatibility floor is ABI 1.11; optional roaming
+       bindings follow ABI 1.14, while NOTICE/KICK management events use ABI 1.15.
+       Managed wire codecs and their
+       BouncyCastle dependency are compiled only by the sibling QeliConformance project.
+       NO OS/UI dependencies: net10.0 (not -windows). -->
   <PropertyGroup>
     <!-- Log lines must be greppable against the English error catalog in
-         docs/*/TROUBLESHOOTING.md. Framework exception text is otherwise localized to the
+         docs/*/manuals/TROUBLESHOOTING.md. Framework exception text is otherwise localized to the
          OS language, so a Russian Windows produced logs mixing qeli's own English strings
          with .NET messages like "Удаленный хост принудительно разорвал…" — unsearchable,
          and confusing when a user reports them. Shipping only the English resources keeps
@@ -21,14 +23,12 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>QeliShared</AssemblyName>
     <RootNamespace>Qeli.Shared</RootNamespace>
-    <Version>0.7.16</Version>
+    <Version>0.8.1</Version>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Retained cross-language wire/KAT and reachability diagnostics still exercise
-         X25519, ChaCha20-Poly1305 and ChaCha20. Production transport uses Rust.
-         Keep one BouncyCastle version for both desktop clients. -->
-    <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
+    <Compile Remove="Crypto\**\*.cs;Protocol\**\*.cs;Model\LinkConformance.cs" />
+    <InternalsVisibleTo Include="QeliConformance" />
   </ItemGroup>
 
   <ItemGroup>

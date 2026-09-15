@@ -2,13 +2,18 @@
 
 ## Implemented foundation
 
-- Connection / Profiles / Log navigation and Qeli visual language.
+- Connection / Profiles / Log navigation and Qeli visual language. Qeli-owned iOS screens use
+  the same explicit light/dark palette, header dimensions, segmented pill navigation, card
+  outlines and status colours as Android instead of UIKit's grouped-list palette. The Profiles
+  action bar adapts to compact widths and Dynamic Type without truncating Russian labels; profile
+  rows use the Android card/menu model, including explicit Move up/down actions. Apple permission
+  prompts, share sheets, pickers and other operating-system surfaces deliberately remain native.
 - Profile CRUD, active-profile locking while connected (refused with an alert, and the
   rows that cannot be picked are dimmed), reorder and reachability — TCP by a connect
   probe, UDP through ABI 1.8 `qeli_client_udp_probe`, which invokes the same Rust
   X25519+ML-KEM first-flight/fragment/QUIC/obfs builder as Android and the live tunnel.
-  While the active tunnel is up the probe measures the tunnel gateway rather than the
-  public endpoint.
+  While the active tunnel is up both protocols measure the exact authenticated tunnel
+  gateway rather than the public endpoint; UDP remains a UDP first-flight probe.
 - English / Russian UI with an in-app language picker. English is the default on every
   device, matching Android — the app does not follow the system locale.
 - Connection-properties card, shown only while connected and driven by the shared
@@ -21,21 +26,26 @@
   (`PushedFacts.routeSample`), because a server may advertise an arbitrarily long set. The
   session token is deliberately never surfaced: it is the credential that authorises a
   bonded stream to join the session.
-- INI, JSON, file, clipboard, QR and `qeli://` deep-link import.
+- Flat-INI file/clipboard import, QR and `qeli://` deep-link import. Legacy JSON is rejected
+  as a config format; JSON remains only inside the backup container.
 - Share link, QR generation and system share sheet.
 - Encrypted-at-rest profile store and Android-compatible backup encryption.
-- Theme, launch auto-connect, VPN On Demand, LAN bypass and log timestamp settings.
+- Theme, launch auto-connect, VPN On Demand, full-tunnel-only LAN bypass and log timestamp settings.
 - Opt-in, privacy-gated release check matching Android's public release metadata flow.
 - Network Extension manager/provider lifecycle and shared status/log channel.
-- The production Packet Tunnel is an ABI 1.10 adapter over the common Rust whole-client
-  core used by Linux, Android, Windows and macOS. Rust owns DNS/connect, plain and
+- The production Packet Tunnel uses the current ABI 1.15 core with the compatible ABI 1.11
+  base, optional ABI 1.12-1.14 path contracts and ABI 1.15 NOTICE/KICK management events over
+  the common Rust whole-client core used by Linux, Android, Windows and macOS. Rust owns
+  DNS/connect, plain and
   hybrid-PQ authentication, TCP/UDP/QUIC/obfs/REALITY, packet crypto, heartbeat/shaping,
-  MTU discovery and fixed/adaptive bonding for one generation; Swift owns only the
-  reconnect-policy lifecycle that starts the next Rust generation.
+  MTU discovery, fixed/adaptive bonding and the common TCP/UDP roaming policy. Swift owns
+  the Apple path observer, path-scoped DNS/NAT64 probe, socket binding and excluded-route
+  executor requested by that policy.
 - Swift owns only Apple platform operations: Keychain device/trust state,
   `NEPacketTunnelNetworkSettings`, lifecycle/status and bounded packet batches between
   `NEPacketTunnelFlow` and `qeli_client_tun_push/pull`. It ACKs a `NetworkPlan` only after
-  all IPv4 routes and supported DNS settings have been applied; unsupported plans fail closed.
+  all active-family IPv4/IPv6 routes and supported DNS settings have been applied;
+  unsupported plans fail closed.
 - Authenticated `NetworkPlan` UI facts keep server-pushed routes distinct from local/client
   routes and report effective post-push padding, heartbeat and shaping values without Swift
   parsing handshake payloads.
@@ -45,9 +55,17 @@
 - The iOS packet bridge has a fixed memory budget: two Rust pools of 32 × 65,535-byte
   buffers (4,194,240 bytes), 128-slot queues and at most three reusable 256 KiB Swift
   caller buffers, with backpressure and no fallback allocation.
-- `build_native.sh` builds device and simulator slices with `transport-core-ffi`, packages
-  the canonical ABI header and creates the XCFramework. The Rust `aarch64-apple-ios`
-  whole-client target is warning-free; the actual XCFramework/Xcode build remains a macOS gate.
+- `build_native.sh` builds device and simulator slices with
+  `transport-core-ffi experimental-roaming` by default, packages the canonical ABI header
+  and creates the XCFramework. CI runs that build, compiles the
+  generated Xcode project for the simulator and runs its unit tests. A signed physical-device
+  build and runtime pass remain outstanding.
+- `NWPathMonitor` ignores tunnel/loopback interfaces and submits generation-scoped path or wake
+  changes. A UDP `NWConnection` constrained by `requiredInterface` obtains the effective local
+  and remote endpoint after DNS/NAT64 resolution. PREPARE keeps old+new exact carrier exclusions,
+  BIND applies Darwin interface/source binding to the borrowed socket, COMMIT narrows routes to
+  new-only, and ABORT restores old-only. Ordinary TCP and all UDP modes share this Rust transaction;
+  explicit `local`/non-zero `lport`, old/default cores and unsupported peers reconnect normally.
 - WidgetKit status widget with an authenticated App Intent action and an iOS 18
   Control Center / Lock Screen / Action button control. The toggle drives the installed
   tunnel from the widget process, so it connects without foregrounding the app (matching
@@ -58,16 +76,20 @@
 
 ## Remaining verification milestones
 
-1. Build the ABI 1.10 Rust XCFramework and generated project on macOS/Xcode 16+, then compile
-   both the app and Packet Tunnel targets; this cannot be substituted by the Linux Rust
-   cross-target check.
+1. Build the feature-enabled ABI 1.15 Rust XCFramework and generated project on macOS/Xcode
+   16+, then compile both the app and Packet Tunnel targets; the strict
+   `aarch64-apple-ios` Rust cross-target Clippy passes on the Linux lab, but cannot substitute
+   for Swift/NetworkExtension compilation.
 2. Run physical-device interoperability tests against every Android/server wire mode,
-   including packet loss, Wi-Fi/cellular transitions and bonded-stream failure.
+   including packet loss, Wi-Fi/cellular transitions, wake, same-network NAT rebinding,
+   NAT64, route rollback, per-app/MDM interaction and bonded-stream failure.
 3. Measure packet-pump memory, backpressure, throughput, UDP loss and MTU behaviour on
    device. Buffer/queue tuning is intentionally a separate performance pass after the
    architecture migration.
 4. Complete App Store signing/provisioning and Apple Network Extension entitlement
-   approval for the final bundle identifiers.
+   approval for the final bundle identifiers. A runtime capability check now turns an incorrectly
+   re-signed build into one actionable signing alert instead of consecutive Keychain/Network
+   Extension errors, and `scripts/verify_ios_ipa.py` rejects such an IPA before distribution.
 
 ## iOS restrictions (not implementable as a normal consumer app)
 

@@ -47,7 +47,7 @@
       'Log out': 'Выйти',
       'Server online': 'Сервер онлайн',
       'Server offline': 'Сервер офлайн',
-      'Total clients:': 'Всего клиентов:',
+      'Inbound sessions:': 'Входящих сессий:',
       'Auto-refresh': 'Автообновление',
       'Language': 'Язык',
       'Qeli VPN': 'Qeli VPN',
@@ -77,6 +77,8 @@
       'Quick start — launch any masking mode in one click': 'Быстрый старт — запуск любого режима маскировки в один клик',
       'Each row is a complete masking mode. Click Launch and the panel builds a ready profile — TUN interface, NAT egress, in-tunnel DNS, an IP pool and the full obfuscation stack with the curated stealth posture (Poisson flow-shaping instead of a fixed heartbeat, MTU 1400, stream bonding on TCP) — then saves it and restarts the server.':
         'Каждая строка — полноценный режим маскировки. Нажмите Launch, и панель соберёт готовый профиль: интерфейс TUN, NAT-выход, DNS внутри туннеля, пул IP и полный стек обфускации с подобранной stealth-постурой (пуассоновский шейпинг вместо фиксированного heartbeat, MTU 1400, бондинг потоков на TCP) — затем сохранит его и перезапустит сервер.',
+      'Every newly created Quick Start profile enables authenticated session roaming. Clients use auto by default and reconnect normally when a platform, network or legacy peer cannot migrate the live session.':
+        'Каждый новый профиль Quick Start включает аутентифицированный роуминг сессии. Клиенты по умолчанию используют auto и штатно переподключаются, если платформа, сеть или устаревший пир не позволяют перенести активную сессию.',
       'Each mode gets its own interface, subnet and port, so they never collide — launch as many as you like and clients pick whichever port suits their network. After a server is up, add users and share a qeli:// link or QR; for full manual control over every option, open the config.':
         'У каждого режима свой интерфейс, подсеть и порт, поэтому они не конфликтуют — поднимайте сколько угодно, клиенты сами выберут подходящий их сети порт. После запуска сервера добавьте пользователей и поделитесь ссылкой qeli:// или QR; для полного ручного контроля над каждым параметром откройте конфигурацию.',
       'Modes are independent — running several at once is the recommended production layout (it is exactly what server-multiprofile.conf.example ships). A client connects to whichever port gets through its network.':
@@ -90,8 +92,8 @@
       '— set obfs_key to this on every client': '— задайте этим obfs_key на каждом клиенте',
       "Clients also need the server's pinned public key — run qeli show-identity on the server. Then add users below and share a QR/link from the Users page.":
         'Клиентам также нужен пиннингованный публичный ключ сервера — выполните qeli show-identity на сервере. Затем добавьте пользователей ниже и поделитесь QR/ссылкой со страницы «Пользователи».',
-      'Mobile / LTE clients: the large handshake can black-hole behind a sub-1500 path MTU. On the server apply the OS tuning (outer-port MSS clamp + BBR/PMTU probing) — see docs/PANEL.md → "Mobile / LTE" or CONFIG.md → "sysctl + iptables". The install-qeli-server.sh installer does this automatically.':
-        'Клиенты на Mobile / LTE: крупное рукопожатие может «провалиться» при path MTU ниже 1500. На сервере примените тюнинг ОС (MSS-clamp по внешнему порту + BBR/PMTU-зондирование) — см. docs/PANEL.md → «Mobile / LTE» или CONFIG.md → «sysctl + iptables». Установщик install-qeli-server.sh делает это автоматически.',
+      'Mobile / LTE clients: the large handshake can black-hole behind a sub-1500 path MTU. On the server apply the OS tuning (outer-port MSS clamp + BBR/PMTU probing) — see docs/*/manuals/PANEL.md → "Mobile / LTE" or CONFIG.md → "sysctl + iptables". The install-qeli-server.sh installer does this automatically.':
+        'Клиенты на Mobile / LTE: крупное рукопожатие может «провалиться» при path MTU ниже 1500. На сервере примените тюнинг ОС (MSS-clamp по внешнему порту + BBR/PMTU-зондирование) — см. docs/*/manuals/PANEL.md → «Mobile / LTE» или CONFIG.md → «sysctl + iptables». Установщик install-qeli-server.sh делает это автоматически.',
       'Open config': 'Открыть конфиг',
       'Add users': 'Добавить пользователей',
       'Close': 'Закрыть',
@@ -125,6 +127,7 @@
       'Filter by state': 'Фильтр по состоянию',
       'All states': 'Все состояния',
       'Active': 'Активен',
+      'Fixed': 'Фиксированный',
       'Ready': 'Готов',
       'Unavailable': 'Недоступен',
       'Refreshing…': 'Обновление…',
@@ -287,6 +290,13 @@
       'Restore /etc/qeli from "{}"?': 'Восстановить /etc/qeli из «{}»?',
       'Kick "{}" from "{}"?': 'Отключить «{}» от «{}»?',
       'Set up the "{}" server ({}) and restart now?': 'Настроить сервер «{}» ({}) и перезапустить сейчас?',
+      '{} server is live': '{}: сервер работает',
+      '{} profile saved; restart unconfirmed': 'Профиль {} сохранён; перезапуск не подтверждён',
+      'Applied — server still coming up': 'Применено — сервер ещё запускается',
+      'The profile was saved, but the panel could not confirm that the restarted server came back. Check `systemctl status qeli` before sharing the endpoint.':
+        'Профиль сохранён, но панель не смогла подтвердить запуск сервера после перезапуска. Перед публикацией адреса проверьте `systemctl status qeli`.',
+      'No free default profile slot remains (ports 4443–4698, vpn0–vpn255, or 10.8.0.0/16 are already in use). Change an existing profile manually first.':
+        'Не осталось свободного стандартного слота профиля (порты 4443–4698, vpn0–vpn255 или 10.8.0.0/16 уже заняты). Сначала вручную измените существующий профиль.',
       '{} {} selected user(s)?': '{}: выбранных пользователей — {}?',
       'This cannot be undone.': 'Это действие необратимо.',
       'Active sessions will be kicked.': 'Активные сессии будут разорваны.',
@@ -306,6 +316,74 @@
         'Пользователи, ссылающиеся на неё, вернутся к собственным значениям.',
       'This creates the profile with new credentials and brings the server up.':
         'Профиль будет создан с новыми учётными данными, сервер — поднят.',
+      'Inner IP mode': 'Режим IP внутри туннеля',
+      'Auto (dual-stack when native IPv6 and its firewall are available)':
+        'Авто (dual-stack при наличии нативного IPv6 и IPv6-файрвола)',
+      'IPv4 only': 'Только IPv4',
+      'IPv4 + IPv6': 'IPv4 + IPv6',
+      'Dual-stack (IPv4 + IPv6)': 'Dual-stack (IPv4 + IPv6)',
+      'IPv6 only': 'Только IPv6',
+      'Auto is resolved once and stored; relaunching an existing profile preserves its current mode.':
+        'Автоматический режим определяется один раз и сохраняется; повторный запуск существующего профиля сохраняет его текущий режим.',
+      'Inner IP mode: ': 'Режим IP внутри туннеля: ',
+      'Address families carried inside the tunnel; independent of the outer listener address.':
+        'Семейства адресов внутри туннеля; не зависят от адреса внешнего listener.',
+      'IPv4 gateway (server address)': 'IPv4-шлюз (адрес сервера)',
+      'IPv4 address of this server inside the VPN': 'IPv4-адрес этого сервера внутри VPN',
+      'IPv6 gateway (server address)': 'IPv6-шлюз (адрес сервера)',
+      'IPv6 address of this server inside the VPN allocation prefix':
+        'IPv6-адрес этого сервера внутри префикса адресов VPN',
+      'IPv6 allocation prefix (CIDR)': 'Префикс распределения IPv6 (CIDR)',
+      'Unique per profile; /64 is recommended. Must contain the IPv6 gateway.':
+        'Должен быть уникальным для профиля; рекомендуется /64. Обязан содержать IPv6-шлюз.',
+      'Excluded IPv6 addresses': 'Исключённые IPv6-адреса',
+      'IPv6 addresses inside the allocation prefix that will never be assigned':
+        'IPv6-адреса внутри префикса, которые никогда не будут выдаваться',
+      'Static IPv6 reservations': 'Статические резервации IPv6',
+      'Always assign a specific IPv6 address to a username':
+        'Всегда назначать пользователю определённый IPv6-адрес',
+      'IPv6 forwarding / NAT66': 'Маршрутизация IPv6 / NAT66',
+      'route preserves client source addresses; nat66 masquerades them on the selected IPv6 uplink':
+        'route сохраняет исходные адреса клиентов; nat66 маскарадует их на выбранном IPv6-интерфейсе',
+      'Upstream IPv6 NDP proxy': 'Внешний IPv6 NDP proxy',
+      'Answer only for active client IPv6 addresses and client_subnet prefixes; needed when the provider treats the delegated prefix as on-link':
+        'Отвечает только за IPv6-адреса активных клиентов и префиксы client_subnet; нужен, когда провайдер считает делегированный префикс on-link',
+      'IPv6 listen address': 'IPv6-адрес прослушивания',
+      'Should match the IPv6 VPN gateway': 'Должен совпадать с IPv6-шлюзом VPN',
+      'Tunnel addresses': 'Адреса туннеля',
+      'Static IPv6': 'Статический IPv6',
+      'Address family': 'Семейство адресов',
+      'Primary tunnel address': 'Основной адрес туннеля',
+      'Allow native IPv4 outside tunnel': 'Разрешён нативный IPv4 вне туннеля',
+      'Allow native IPv6 outside tunnel': 'Разрешён нативный IPv6 вне туннеля',
+      'Inner IPv6 policy': 'Политика IPv6 внутри туннеля',
+      'Tunnel include routes': 'Маршруты через туннель',
+      'Comma-separated IPv4/IPv6 CIDRs routed through this tunnel in split mode.':
+        'IPv4/IPv6 CIDR через запятую, направляемые в этот туннель в split-режиме.',
+      'Tunnel exclude routes': 'Маршруты в обход туннеля',
+      'Comma-separated IPv4/IPv6 CIDRs kept on their matching-family physical path.':
+        'IPv4/IPv6 CIDR через запятую, оставляемые на физическом пути того же семейства адресов.',
+      'IPv6 LAN behind this client': 'IPv6-сеть за этим клиентом',
+      "One routed IPv6 CIDR for gateway mode. Configure the same prefix as this user's client_subnet on the server.":
+        'Один маршрутизируемый IPv6 CIDR для режима шлюза. Укажите тот же префикс в client_subnet пользователя на сервере.',
+      "auto — accept the server's IPv4/dual/IPv6 plan":
+        'auto — принимать IPv4/dual/IPv6-план сервера',
+      'required — refuse a plan without IPv6': 'required — отклонять план без IPv6',
+      'off — refuse IPv6 inside the tunnel': 'off — запрещать IPv6 внутри туннеля',
+      'Advanced escape hatches: leave both disabled to block a missing address family fail-closed.':
+        'Дополнительные исключения: оставьте оба выключенными, чтобы отсутствующее семейство блокировалось fail-closed.',
+      'Allow native IPv4 outside an IPv6-only full tunnel':
+        'Разрешить нативный IPv4 вне IPv6-only full-tunnel',
+      'Allow native IPv6 outside an IPv4-only full tunnel':
+        'Разрешить нативный IPv6 вне IPv4-only full-tunnel',
+      'Need MTU, DNS, kill switch, routes or logging? Switch to Raw INI for advanced settings; form-managed and raw-only keys round-trip together.':
+        'Нужны MTU, DNS, kill switch, маршруты или журналирование? Переключитесь в Raw INI; поля формы и raw-only ключи сохраняются вместе.',
+      'Raw INI accepts the complete client schema, including ipv6, allow_ipv4_leak, allow_ipv6_leak, device_type, dev_attach, routes, DNS, MTU, kill switch and [logging]. See client.conf and the IPv6 guide.':
+        'Raw INI принимает полную схему клиента, включая ipv6, allow_ipv4_leak, allow_ipv6_leak, device_type, dev_attach, маршруты, DNS, MTU, kill switch и [logging]. См. client.conf и руководство по IPv6.',
+      'This profile already exists. Quick Start will keep its credentials, IP mode and manual settings, enable it and restart the server.':
+        'Этот профиль уже существует. Быстрый старт сохранит его учётные данные, IP-режим и ручные настройки, включит его и перезапустит сервер.',
+      'This profile already exists. Quick Start will keep its credentials and manual settings, explicitly switch its inner IP mode, enable it and restart the server.':
+        'Этот профиль уже существует. Быстрый старт сохранит его учётные данные и ручные настройки, явно изменит режим IP внутри туннеля, включит его и перезапустит сервер.',
       'This profile already exists. Quick Start will keep its credentials and manual settings, enable it and restart the server.':
         'Этот профиль уже существует. Быстрый старт сохранит его учётные данные и ручные настройки, включит его и перезапустит сервер.',
       'Every client of this profile must update its pinned server key, and a restart is needed for it to take effect.':
@@ -495,13 +573,17 @@
       'Web UI': 'Веб-интерфейс',
       'Logging': 'Логирование',
       'Server identity keys': 'Ключи идентичности сервера',
+      'Listen endpoint': 'Адрес прослушивания',
+      'Public key': 'Публичный ключ',
+      'Copy address': 'Копировать адрес',
+      'Copy key': 'Копировать ключ',
       'Transport, Bind & Identity': 'Транспорт, привязка и идентичность',
       'TUN/TAP Interface': 'Интерфейс TUN/TAP',
       'IP Address Pool': 'Пул IP-адресов',
       'Routing': 'Маршрутизация',
       'DNS Proxy': 'DNS-прокси',
       'DHCP Server': 'DHCP-сервер',
-      '(for TAP/bridged mode)': '(для режима TAP/bridged)',
+      '(for a local server-side TAP segment)': '(для локального серверного сегмента TAP)',
       'Traffic Obfuscation': 'Обфускация трафика',
       'Performance': 'Производительность',
       'Wire Mode': 'Режим канала',
@@ -632,9 +714,9 @@
 
       // ── config: tun ──
       'Device type': 'Тип устройства',
-      'TUN — IP-level (L3, the usual choice). TAP — Ethernet-level (L2, for bridging Ethernet frames).': 'TUN — на уровне IP (L3, обычный выбор). TAP — на уровне Ethernet (L2, для L2-моста / Ethernet-кадров).',
+      'TUN — IP-level (L3, the usual choice). TAP — local Ethernet framing for IPv4/IPv6 and ARP/NDP. The qeli wire remains L3; TAP is not a transparent Ethernet bridge and does not carry VLAN/STP/LLDP or arbitrary EtherTypes.': 'TUN — уровень IP (L3, обычный выбор). TAP — локальные Ethernet-кадры для IPv4/IPv6 и ARP/NDP. Транспорт qeli остаётся L3; TAP не является прозрачным Ethernet-мостом и не переносит VLAN/STP/LLDP или произвольные EtherType.',
       'TUN (IP)': 'TUN (IP)',
-      'TAP (Ethernet)': 'TAP (Ethernet)',
+      'TAP (IP over Ethernet)': 'TAP (IP через Ethernet)',
       'Interface name': 'Имя интерфейса',
       'Name of the OS network interface': 'Имя сетевого интерфейса ОС',
       'Max packet size. 1400–1480 avoids fragmentation with encapsulation overhead.': 'Макс. размер пакета. 1400–1480 избегает фрагментации с учётом инкапсуляции.',
@@ -654,9 +736,11 @@
       'Excluded IPs': 'Исключённые IP',
       'IPs that will never be assigned to clients (e.g. gateway, reserved hosts)': 'IP, которые никогда не выдаются клиентам (напр. шлюз, зарезервированные узлы)',
       '+ Add excluded IP': '+ Добавить исключённый IP',
+      '+ Add excluded IPv6': '+ Добавить исключённый IPv6',
       'Static reservations': 'Статические резервации',
       'Always assign a specific IP to a specific username': 'Всегда выдавать конкретный IP конкретному пользователю',
       '+ Add reservation': '+ Добавить резервацию',
+      '+ Add IPv6 reservation': '+ Добавить IPv6-резервацию',
 
       // ── config: routing ──
       'Client-to-client routing': 'Маршрутизация клиент-клиент',
@@ -704,20 +788,17 @@
       '+ Add blocked domain': '+ Добавить домен в блок',
 
       // ── config: dhcp ──
-      'In normal': 'В обычном режиме',
-      'mode client IPs are assigned by the built-in': 'IP клиентам выдаёт встроенный',
+      'qeli sessions receive their authenticated addresses from the built-in': 'qeli-сессии получают аутентифицированные адреса из встроенного',
+      'from DHCP. Enable this DHCPv4 server only for other devices on a local server-side TAP segment. It does not turn qeli into a transparent Ethernet bridge between sessions. Leave it off for normal TUN and qeli-client TAP profiles.': 'не через DHCP. Включайте этот DHCPv4-сервер только для других устройств в локальном серверном сегменте TAP. Он не превращает qeli в прозрачный Ethernet-мост между сессиями. Для обычного TUN и клиентских TAP-профилей qeli оставьте его выключенным.',
       'IP pool': 'пул IP',
       '(the': '(секция',
       'section above —': 'выше —',
       '/ static reservations),': 'CIDR / статические резервации),',
       'not': 'не',
-      'by DHCP. This DHCP server is only needed for': 'через DHCP. Этот DHCP-сервер нужен только для',
-      'TAP / bridged': 'TAP / bridged',
-      'setups. Leave it off for TUN — addresses are still assigned.': 'конфигураций. Для TUN оставьте выключенным — адреса всё равно выдаются.',
       'Enable DHCP server': 'Включить DHCP-сервер',
       'Automatically assign IPs via DHCP (mainly useful for TAP mode)': 'Автоматически выдавать IP по DHCP (в основном для режима TAP)',
       'DHCP listen address': 'Адрес прослушивания DHCP',
-      'Usually 0.0.0.0:67': 'Обычно 0.0.0.0:67',
+      'Leave empty for this profile interface on UDP/67': 'Оставьте пустым для интерфейса этого профиля на UDP/67',
       'Pool start IP': 'Начальный IP пула',
       'First IP to hand out via DHCP': 'Первый IP для выдачи по DHCP',
       'Pool end IP': 'Конечный IP пула',
@@ -1045,6 +1126,9 @@
       'Webhook notifications': 'Уведомления webhook',
       'Notify on': 'Уведомлять о',
       'Save changes': 'Сохранить изменения',
+      'Reload this page before saving.': 'Перезагрузите страницу перед сохранением.',
+      'Notification settings were not loaded:': 'Настройки уведомлений не загружены:',
+      'Notification settings were not loaded: ': 'Настройки уведомлений не загружены: ',
       'Test sent — see the result': 'Тест отправлен — см. результат',
       'Bot token': 'Токен бота',
       'Create a bot with @BotFather and paste its token. Write-only — leave blank to keep the current one.':
@@ -1271,10 +1355,10 @@
       "Effective: no per-user override → this user gets the profile's advertised routes.":
         'Действует: индивидуальных переопределений нет → пользователь получает маршруты, анонсируемые профилем.',
       'Client subnets': 'Подсети клиента',
-      "(iroute — subnets/addresses BEHIND this client; the server routes INBOUND traffic to them into this client's tunnel)":
-        '(iroute — подсети/адреса ЗА этим клиентом; сервер направляет ВХОДЯЩИЙ трафик к ним в туннель этого клиента)',
+      '(iroute — subnets/addresses BEHIND this client; with profile NDP proxy they also become live upstream IPv6 ownership)':
+        '(iroute — подсети/адреса ЗА этим клиентом; с NDP proxy профиля они также становятся активной IPv6-зоной ответственности на uplink)',
       '+ Add subnet': '+ Добавить подсеть',
-      '192.168.50.0/24 or 10.20.0.7': '192.168.50.0/24 или 10.20.0.7',
+      '192.168.50.0/24 or 2001:db8:50::/64': '192.168.50.0/24 или 2001:db8:50::/64',
       'My VPN': 'Мой VPN',
 
       // ── browser-tab titles (rendered server-side into <title>) ──
@@ -1294,6 +1378,84 @@
       'Applied via worker restart (container — systemctl not available)':
         'Применено через перезапуск воркера (контейнер — systemctl недоступен)',
       'Restart failed': 'Перезапуск не удался',
+
+      // ── 0.8.0 roaming / recordizer / dual-stack UI ──
+      'Session Roaming': 'Роуминг сессии',
+      'Keep one authenticated session and TUN interface while the client changes network or repairs a dead NAT mapping. The same policy applies to TCP and every UDP camouflage mode.':
+        'Сохраняет одну аутентифицированную сессию и интерфейс TUN при смене сети клиентом или восстановлении неработающего NAT-сопоставления. Одинаково применяется к TCP и всем режимам маскировки UDP.',
+      'Standard server and client builds include roaming. New profiles enable it by default; unsupported or legacy clients negotiate normal reconnect instead.':
+        'Стандартные сборки сервера и клиента поддерживают роуминг. В новых профилях он включён по умолчанию; неподдерживаемые и устаревшие клиенты используют обычное переподключение.',
+      'Resume grace period': 'Период ожидания восстановления',
+      'Seconds to retain an interrupted authenticated session. Range: 1–3600.':
+        'Сколько секунд хранить прерванную аутентифицированную сессию. Диапазон: 1–3600.',
+      'Maximum orphaned sessions': 'Максимум прерванных сессий',
+      'Profile-wide cap for sessions waiting to resume. Range: 1–65536.':
+        'Общий для профиля лимит сессий, ожидающих восстановления. Диапазон: 1–65536.',
+      'Orphan buffer limit (MiB)': 'Лимит буфера прерванных сессий (МиБ)',
+      'Profile-wide memory cap while sessions wait to resume. Range: 4–1024 MiB.':
+        'Общий для профиля лимит памяти, пока сессии ожидают восстановления. Диапазон: 4–1024 МиБ.',
+      'Clients choose': 'Клиенты выбирают',
+      ', or': ', или',
+      'in their profile. This server switch only advertises the negotiated capability; unsupported and legacy clients keep their normal reconnect behavior.':
+        'в своём профиле. Этот переключатель сервера только объявляет согласуемую возможность; неподдерживаемые и устаревшие клиенты продолжают обычное переподключение.',
+      'IPv4 VPN subnet (CIDR)': 'Подсеть VPN IPv4 (CIDR)',
+      'Leave the gateway empty and clients use the matching-family profile address: IPv4':
+        'Оставьте шлюз пустым, и клиенты используют адрес профиля соответствующего семейства: IPv4',
+      ', IPv6': ', IPv6',
+      'IPv4 listen address': 'Адрес прослушивания IPv4',
+      'Should match the IPv4 VPN gateway': 'Должен совпадать со шлюзом VPN IPv4',
+      'Browser-shaped TLS 1.3 on the wire. "Foreign"/prober traffic is transparently proxied to a real HTTPS site; qeli clients are authenticated by short_id, the inner identity proof and the pinned server key.':
+        'В сети выглядит как браузерный TLS 1.3. Посторонний трафик и пробы прозрачно перенаправляются на настоящий HTTPS-сайт; клиенты qeli проверяются по short_id, внутреннему доказательству идентичности и закреплённому ключу сервера.',
+      'TLS 1.3 outer transport': 'Внешний транспорт TLS 1.3',
+      'Run the qeli tunnel inside a TLS 1.3-compatible encrypted session. The borrowed public certificate is camouflage, not a PKI trust anchor: server authentication comes from qeli identity proof plus the pinned server key. Off = fake-TLS directly on the socket.':
+        'Запускает туннель qeli внутри совместимой с TLS 1.3 зашифрованной сессии. Заимствованный публичный сертификат служит маскировкой, а не корнем доверия PKI: сервер проверяется доказательством идентичности qeli и закреплённым ключом. Выкл. = fake-TLS непосредственно в сокете.',
+      'Requires static session binding and at least one short_id.':
+        'Требует статической привязки сессии и хотя бы один short_id.',
+      'Send dummy packets in non-Reality modes. Reality/H2 forces qeli heartbeat off; other modes re-roll interval ± jitter after each activity/send.':
+        'Отправляет маскирующие пакеты вне режимов Reality. Reality/H2 принудительно отключает heartbeat qeli; в остальных режимах интервал ± джиттер пересчитывается после каждой активности или отправки.',
+      'Reality HTTP/2 carrier': 'Носитель Reality HTTP/2',
+      'Automatic for': 'Автоматически для',
+      ': genuine H2, one streaming POST and randomized batching. There is no separate setting; retired synthetic':
+        ': настоящий H2, один потоковый POST и случайное объединение пакетов. Отдельной настройки нет; устаревшие синтетические',
+      'keys are ignored.': 'ключи игнорируются.',
+      'PACKET_MUX recordizer': 'Recordizer PACKET_MUX',
+      'Transport-independent packet/record boundary masking. The server pushes these values after authentication.':
+        'Независимая от транспорта маскировка границ пакетов и записей. Сервер передаёт эти значения после аутентификации.',
+      'Batch delay min (ms)': 'Мин. задержка пакета (мс)',
+      'Batch delay max (ms)': 'Макс. задержка пакета (мс)',
+      'Max packets per batch': 'Макс. пакетов в группе',
+      'Queue ceiling (bytes)': 'Лимит очереди (байт)',
+      'Max payload bytes': 'Макс. полезная нагрузка (байт)',
+      '0 = automatic carrier/path-safe budget': '0 = автоматический безопасный для носителя и маршрута бюджет',
+      'Small target min ratio': 'Мин. доля малого размера',
+      'Small target max ratio': 'Макс. доля малого размера',
+      'Full target probability': 'Вероятность полного размера',
+      'Inner packet fragmentation': 'Фрагментация внутреннего пакета',
+      'Allow one IP packet to cross encrypted-record boundaries. This is different from carrier/handshake fragmentation.':
+        'Разрешает одному IP-пакету пересекать границы зашифрованных записей. Это не фрагментация носителя или рукопожатия.',
+      'Reassembly timeout (ms)': 'Тайм-аут сборки (мс)',
+      'Max inflight packets': 'Макс. пакетов в сборке',
+      'Reassembly ceiling (bytes)': 'Лимит памяти сборки (байт)',
+      'Max fragments per packet': 'Макс. фрагментов на пакет',
+      'Use Prefer during migration. Required rejects clients whose core does not advertise PACKET_MUX_V1. Session reconnect is required after a change.':
+        'При переходе используйте «Предпочитать». «Обязательно» отклоняет клиенты, ядро которых не объявляет PACKET_MUX_V1. После изменения требуется переподключение сессии.',
+      'Wrap UDP packets in shallow QUIC-shaped compatibility headers; this is not genuine QUIC or HTTP/3':
+        'Оборачивает UDP-пакеты в упрощённые заголовки, похожие на QUIC; это не настоящий QUIC или HTTP/3',
+      'Session roaming': 'Роуминг сессии',
+      'Authenticated worker-lifetime outcomes. Counters reset when the data-plane worker restarts.':
+        'Результаты аутентифицированного роуминга за время работы процесса. Счётчики сбрасываются при перезапуске обработчика данных.',
+      'runtime unavailable': 'нет данных процесса',
+      'enabled profiles': 'включённых профилей',
+      'commits / attempts': 'переносы / попытки',
+      'failed / grace expired': 'ошибки / истёк период',
+      'pending paths': 'ожидающие пути',
+      'commits': 'переносов',
+      'failed': 'ошибок',
+      'pending': 'ожидает',
+      'IPv4 address / pool': 'Адрес / пул IPv4',
+      'IPv6 address / pool': 'Адрес / пул IPv6',
+      'IPv6 forwarding': 'Маршрутизация IPv6',
+      'DNS listen IPv6': 'Прослушивание DNS IPv6',
 
       // ── JS-built toasts / dialogs (wrapped in qeliT() at the call site) ──
       'Copied': 'Скопировано',
@@ -1382,6 +1544,40 @@
     if (root.nodeType === Node.ELEMENT_NODE) processAttrs(root);
   }
 
+  let selectMeasureContext = null;
+
+  function fitSelects(root) {
+    if (!root.querySelectorAll || typeof window.getComputedStyle !== 'function') return;
+    const selects = root.querySelectorAll('select.inp-fit, select[data-select-fit]');
+    if (!selects.length) return;
+    if (!selectMeasureContext) {
+      const canvas = document.createElement('canvas');
+      selectMeasureContext = canvas.getContext('2d');
+    }
+    if (!selectMeasureContext) return;
+
+    selects.forEach((select) => {
+      const style = window.getComputedStyle(select);
+      selectMeasureContext.font = style.font ||
+        [style.fontStyle, style.fontWeight, style.fontSize, style.fontFamily].join(' ');
+      const letterSpacing = Number.parseFloat(style.letterSpacing) || 0;
+      let longest = 0;
+      Array.from(select.options).forEach((option) => {
+        const text = (option.textContent || '').trim();
+        const measured = selectMeasureContext.measureText(text).width +
+          Math.max(0, text.length - 1) * letterSpacing;
+        if (measured > longest) longest = measured;
+      });
+      const chrome =
+        (Number.parseFloat(style.paddingLeft) || 0) +
+        (Number.parseFloat(style.paddingRight) || 0) +
+        (Number.parseFloat(style.borderLeftWidth) || 0) +
+        (Number.parseFloat(style.borderRightWidth) || 0);
+      const width = Math.ceil(longest + chrome + 2);
+      select.style.setProperty('--qeli-select-fit-width', String(width) + 'px');
+    });
+  }
+
   function apply() {
     if (!observer) return;
     // <title> lives in <head>, which the body walker never reaches — translate the
@@ -1393,7 +1589,10 @@
       if (document.title !== wantTitle) document.title = wantTitle;
     }
     observer.disconnect();
-    try { walk(document.body); } finally {
+    try {
+      walk(document.body);
+      fitSelects(document);
+    } finally {
       observer.observe(document.body, {
         childList: true, subtree: true, characterData: true,
         attributes: true, attributeFilter: ATTRS,
@@ -1459,6 +1658,9 @@
         apply();
         reveal();
       });
+      if (document.fonts && document.fonts.ready) {
+        document.fonts.ready.then(() => fitSelects(document));
+      }
     } else {
       reveal();
     }

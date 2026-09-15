@@ -25,7 +25,8 @@ android {
         minSdk = 28
         targetSdk = 37
         versionCode = 721
-        versionName = "0.7.16"
+        versionName = "0.8.1"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     signingConfigs {
@@ -57,6 +58,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             // Signed release: keystore.properties → release key (updates over prior release builds).
             // Without it → debug key (updates over prior debug/sideload builds on the same machine).
@@ -95,9 +97,9 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
     // QR scanning for importing a qeli:// profile via camera.
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
-    // Encrypted-at-rest profile store (passwords/obfs_key) — master key in the
-    // Android Keystore (TEE/StrongBox where available). See docs/RELEASE-FIXES.md E1.
-    implementation("androidx.security:security-crypto:1.1.0")
+    // Read-only one-shot migration of the old security-crypto/Tink preference keysets.
+    // New profile writes use AES-GCM + Android Keystore directly (ProfileStore).
+    implementation("com.google.crypto.tink:tink-android:1.23.0")
     // Local (JVM) unit tests — e.g. the F3 WebSocket masking wire-vector test that
     // pins byte parity with the Rust/C# obfs framers (ObfsStreamTest).
     testImplementation("junit:junit:4.13.2")
@@ -106,5 +108,7 @@ dependencies {
     // which is exactly what happened to the conformance test that reads
     // conformance/qeli-links.json. Test-only: the app itself uses the platform's real
     // implementation on-device.
-    testImplementation("org.json:json:20260719")
+    testImplementation("org.json:json:20260814")
+    androidTestImplementation("androidx.test.ext:junit:1.3.0")
+    androidTestImplementation("androidx.test:runner:1.7.0")
 }

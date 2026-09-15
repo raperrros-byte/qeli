@@ -22,8 +22,8 @@
 //! is no configuration in which overlapping the host's own addressing works.
 
 use crate::config::server::ServerConfig;
-use ipnet::Ipv4Net;
-use std::net::Ipv4Addr;
+use ipnet::{Ipv4Net, Ipv6Net};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 
 /// Snapshot of the host's IPv4 networking, as read from `ip`. Interface names are kept
@@ -37,12 +37,36 @@ pub struct HostNet {
     pub gateways: Vec<Ipv4Addr>,
     /// (interface, destination) of every non-default route.
     pub routes: Vec<(String, Ipv4Net)>,
+    /// (interface, address) for every non-loopback IPv6 address on the host.
+    pub ipv6_addrs: Vec<(String, Ipv6Addr)>,
+    /// IPv6 addresses ready for new egress traffic (not tentative, DAD-failed or
+    /// deprecated). Kept separate because every address still matters for collision checks.
+    pub ipv6_egress_addrs: Vec<(String, Ipv6Addr)>,
+    /// IPv6 next hops of default routes. A directly connected default has no next hop.
+    pub ipv6_gateways: Vec<Ipv6Addr>,
+    /// Interfaces carrying an IPv6 default route, including directly connected defaults.
+    pub ipv6_default_interfaces: Vec<String>,
+    /// (interface, destination) of every non-default IPv6 route.
+    pub ipv6_routes: Vec<(String, Ipv6Net)>,
 }
 
 /// Do two CIDR blocks share any address? Two blocks overlap iff one contains the
 /// other's network address (the smaller is then fully inside the larger).
 fn overlaps(a: &Ipv4Net, b: &Ipv4Net) -> bool {
     a.contains(&b.network()) || b.contains(&a.network())
+}
+
+fn overlaps_ipv6(a: &Ipv6Net, b: &Ipv6Net) -> bool {
+    a.contains(&b.network()) || b.contains(&a.network())
+}
+
+fn normalize_interface_name(value: &str) -> String {
+    value
+        .trim_end_matches(':')
+        .split('@')
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Parse `ip -4 -o addr show`:
@@ -58,11 +82,51 @@ pub fn parse_addr_lines(out: &str) -> Vec<(String, Ipv4Addr)> {
         let Some(cidr) = t.get(i + 1) else { continue };
         if let Ok(addr) = cidr.split('/').next().unwrap_or("").parse::<Ipv4Addr>() {
             if !addr.is_loopback() {
-                v.push((ifname.trim_end_matches(':').to_string(), addr));
+                v.push((normalize_interface_name(ifname), addr));
             }
         }
     }
     v
+}
+
+/// Parse `ip -6 -o addr show`. Link-local addresses are intentionally retained: a
+/// configured tunnel address may not use them, but their prefixes still matter when
+/// checking a proposed pool against the host's live network state.
+pub fn parse_ipv6_addr_lines(out: &str) -> Vec<(String, Ipv6Addr)> {
+    parse_ipv6_addr_lines_filtered(out, false)
+}
+
+fn parse_usable_ipv6_addr_lines(out: &str) -> Vec<(String, Ipv6Addr)> {
+    parse_ipv6_addr_lines_filtered(out, true)
+}
+
+fn parse_ipv6_addr_lines_filtered(out: &str, require_usable: bool) -> Vec<(String, Ipv6Addr)> {
+    let mut addresses = Vec::new();
+    for line in out.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if require_usable
+            && tokens
+                .iter()
+                .any(|item| matches!(*item, "tentative" | "dadfailed" | "deprecated"))
+        {
+            continue;
+        }
+        let (Some(interface), Some(index)) = (
+            tokens.get(1),
+            tokens.iter().position(|&item| item == "inet6"),
+        ) else {
+            continue;
+        };
+        let Some(cidr) = tokens.get(index + 1) else {
+            continue;
+        };
+        if let Ok(address) = cidr.split('/').next().unwrap_or("").parse::<Ipv6Addr>() {
+            if !address.is_loopback() {
+                addresses.push((normalize_interface_name(interface), address));
+            }
+        }
+    }
+    addresses
 }
 
 /// Parse `ip -4 route show`, splitting default routes (we want their gateway) from
@@ -100,7 +164,7 @@ pub fn parse_route_lines(out: &str) -> (Vec<Ipv4Addr>, Vec<(String, Ipv4Net)>) {
             .iter()
             .position(|&x| x == "dev")
             .and_then(|i| t.get(i + 1))
-            .map(|s| s.to_string())
+            .map(|s| normalize_interface_name(s))
             .unwrap_or_default();
         if destination == "default" {
             if let Some(gw) = t
@@ -139,6 +203,88 @@ pub fn parse_route_lines(out: &str) -> (Vec<Ipv4Addr>, Vec<(String, Ipv4Net)>) {
     (gws, routes)
 }
 
+/// Parse `ip -6 route show`. IPv6 defaults may be `default via fe80::1 dev eth0`
+/// or directly connected (`default dev eth0`), so the egress interface is tracked
+/// independently from the optional next hop.
+pub fn parse_ipv6_route_lines(out: &str) -> (Vec<Ipv6Addr>, Vec<String>, Vec<(String, Ipv6Net)>) {
+    let (mut gateways, mut default_interfaces, mut routes) = (Vec::new(), Vec::new(), Vec::new());
+    for line in out.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let Some(&first) = tokens.first() else {
+            continue;
+        };
+        let interface = tokens
+            .iter()
+            .position(|&item| item == "dev")
+            .and_then(|index| tokens.get(index + 1))
+            .map(|value| normalize_interface_name(value))
+            .unwrap_or_default();
+        if first == "default" {
+            // A multipath default may carry several nexthops on one line. Health flags
+            // belong to one nexthop, not the whole route: a dead first path must not hide
+            // a later usable path from Quick Start's native-IPv6 readiness check.
+            let nexthop_starts: Vec<usize> = tokens
+                .iter()
+                .enumerate()
+                .filter_map(|(index, token)| (*token == "nexthop").then_some(index + 1))
+                .collect();
+            let mut groups: Vec<&[&str]> = Vec::new();
+            if nexthop_starts.is_empty() {
+                groups.push(&tokens);
+            } else {
+                for (position, start) in nexthop_starts.iter().copied().enumerate() {
+                    let end = nexthop_starts
+                        .get(position + 1)
+                        .map(|next| next - 1)
+                        .unwrap_or(tokens.len());
+                    groups.push(&tokens[start..end]);
+                }
+            }
+            for group in groups {
+                if group
+                    .iter()
+                    .any(|item| matches!(*item, "dead" | "linkdown"))
+                {
+                    continue;
+                }
+                for pair in group.windows(2) {
+                    if pair[0] == "dev" {
+                        let candidate = normalize_interface_name(pair[1]);
+                        if !candidate.is_empty() && !default_interfaces.contains(&candidate) {
+                            default_interfaces.push(candidate);
+                        }
+                    } else if pair[0] == "via" {
+                        if let Some(gateway) = pair[1]
+                            .split('%')
+                            .next()
+                            .and_then(|value| value.parse::<Ipv6Addr>().ok())
+                        {
+                            if !gateways.contains(&gateway) {
+                                gateways.push(gateway);
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        // A prefix-less IPv6 destination is a /128 host route.
+        let parsed = if first.contains('/') {
+            first.parse::<Ipv6Net>().ok()
+        } else {
+            first
+                .split('%')
+                .next()
+                .and_then(|value| value.parse::<Ipv6Addr>().ok())
+                .and_then(|address| Ipv6Net::new(address, 128).ok())
+        };
+        if let Some(network) = parsed {
+            routes.push((interface, network));
+        }
+    }
+    (gateways, default_interfaces, routes)
+}
+
 /// Read the host's IPv4 state. `None` if `ip` is missing or fails — the caller then
 /// skips the check with a warning rather than blocking startup (see module docs).
 pub fn gather_host_net() -> Option<HostNet> {
@@ -154,10 +300,43 @@ pub fn gather_host_net() -> Option<HostNet> {
         return None;
     }
     let (gateways, routes) = parse_route_lines(&String::from_utf8_lossy(&route_out.stdout));
+    // Keep the useful IPv4 safety snapshot when an old/minimal `ip` cannot report
+    // IPv6. In that case the IPv6 half is empty and the caller follows the documented
+    // fail-open policy for state it could not observe.
+    let ipv6_addr_out = Command::new("ip")
+        .args(["-6", "-o", "addr", "show"])
+        .output()
+        .ok();
+    let ipv6_route_out = Command::new("ip")
+        .args(["-6", "route", "show"])
+        .output()
+        .ok();
+    let ipv6_addr_text = ipv6_addr_out
+        .as_ref()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout));
+    let ipv6_addrs = ipv6_addr_text
+        .as_deref()
+        .map(parse_ipv6_addr_lines)
+        .unwrap_or_default();
+    let ipv6_egress_addrs = ipv6_addr_text
+        .as_deref()
+        .map(parse_usable_ipv6_addr_lines)
+        .unwrap_or_default();
+    let (ipv6_gateways, ipv6_default_interfaces, ipv6_routes) = ipv6_route_out
+        .as_ref()
+        .filter(|output| output.status.success())
+        .map(|output| parse_ipv6_route_lines(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default();
     Some(HostNet {
         addrs: parse_addr_lines(&String::from_utf8_lossy(&addr_out.stdout)),
         gateways,
         routes,
+        ipv6_addrs,
+        ipv6_egress_addrs,
+        ipv6_gateways,
+        ipv6_default_interfaces,
+        ipv6_routes,
     })
 }
 
@@ -183,79 +362,163 @@ pub fn check(config: &ServerConfig, host: &HostNet) -> anyhow::Result<()> {
         host.addrs.iter().filter(|(i, _)| !is_own(i)).collect();
     let host_routes: Vec<&(String, Ipv4Net)> =
         host.routes.iter().filter(|(i, _)| !is_own(i)).collect();
+    let host_ipv6_addrs: Vec<&(String, Ipv6Addr)> = host
+        .ipv6_addrs
+        .iter()
+        .filter(|(interface, _)| !is_own(interface))
+        .collect();
+    let host_ipv6_routes: Vec<&(String, Ipv6Net)> = host
+        .ipv6_routes
+        .iter()
+        .filter(|(interface, _)| !is_own(interface))
+        .collect();
 
     let mut pools: Vec<(&str, Ipv4Net)> = Vec::new();
+    let mut ipv6_pools: Vec<(&str, Ipv6Net)> = Vec::new();
 
     for p in config.profiles.iter().filter(|p| p.enabled) {
         let name = p.name.as_str();
 
-        // ── tun.address ────────────────────────────────────────────────────────
-        // Parsed leniently: a malformed address is validate_profiles' business, and
-        // failing here would report the wrong problem.
-        if let Ok(tun_addr) = p.tun.address.trim().parse::<Ipv4Addr>() {
-            // THE lockout. The gateway must stay reachable through the physical link;
-            // taking its address onto a TUN black-holes every outbound packet.
-            if host.gateways.contains(&tun_addr) {
-                anyhow::bail!(
-                    "profile '{name}': tun.address {tun_addr} is this host's DEFAULT GATEWAY. \
+        if p.tun.ip_mode != crate::config::server::IpMode::Ipv6 {
+            // ── tun.address ────────────────────────────────────────────────────────
+            // Parsed leniently: a malformed address is validate_profiles' business, and
+            // failing here would report the wrong problem.
+            if let Ok(tun_addr) = p.tun.address.trim().parse::<Ipv4Addr>() {
+                // THE lockout. The gateway must stay reachable through the physical link;
+                // taking its address onto a TUN black-holes every outbound packet.
+                if host.gateways.contains(&tun_addr) {
+                    anyhow::bail!(
+                        "profile '{name}': tun.address {tun_addr} is this host's DEFAULT GATEWAY. \
                      Bringing the TUN up would make the gateway a local address and cut the \
                      server off the network (SSH and ping included). Move the tunnel to a free \
                      range, e.g. tun.address = 10.9.0.1 with pool.cidr = 10.9.0.0/24."
-                );
-            }
-            if let Some((ifname, _)) = host_addrs.iter().find(|(_, a)| *a == tun_addr) {
-                anyhow::bail!(
+                    );
+                }
+                if let Some((ifname, _)) = host_addrs.iter().find(|(_, a)| *a == tun_addr) {
+                    anyhow::bail!(
                     "profile '{name}': tun.address {tun_addr} is already assigned to interface \
                      '{ifname}'. Pick an address outside the host's own networks."
                 );
+                }
             }
-        }
 
-        // ── pool.cidr ──────────────────────────────────────────────────────────
-        let Ok(pool) = p.pool.cidr.trim().parse::<Ipv4Net>() else {
-            continue; // malformed CIDR — validate_profiles reports it
-        };
-
-        // A pool covering the gateway hands a client the gateway's address and, via the
-        // TUN's connected route, steals the host's return path just as fatally.
-        if let Some(gw) = host.gateways.iter().find(|gw| pool.contains(*gw)) {
-            anyhow::bail!(
+            // ── pool.cidr ──────────────────────────────────────────────────────────
+            if let Ok(pool) = p.pool.cidr.trim().parse::<Ipv4Net>() {
+                // A pool covering the gateway hands a client the gateway's address and, via the
+                // TUN's connected route, steals the host's return path just as fatally.
+                if let Some(gw) = host.gateways.iter().find(|gw| pool.contains(*gw)) {
+                    anyhow::bail!(
                 "profile '{name}': pool.cidr {pool} contains this host's DEFAULT GATEWAY {gw}. \
                  The tunnel's connected route would capture the host's own return path and cut \
                  the server off the network. Move the pool to a free range, e.g. 10.9.0.0/24."
             );
-        }
-        if let Some((ifname, a)) = host_addrs.iter().find(|(_, a)| pool.contains(a)) {
-            anyhow::bail!(
+                }
+                if let Some((ifname, a)) = host_addrs.iter().find(|(_, a)| pool.contains(a)) {
+                    anyhow::bail!(
                 "profile '{name}': pool.cidr {pool} contains {a}, the address of interface \
                  '{ifname}'. A client would be handed the host's own address. Move the pool to \
                  a free range."
             );
-        }
+                }
 
-        // The tunnel subnet must not shadow a network the host already routes (a LAN, a
-        // provider subnet, a peer VPN) — traffic to it would silently divert into the
-        // tunnel. Default routes are handled above; here only concrete prefixes.
-        if let Some((ifname, r)) = host_routes.iter().find(|(_, r)| overlaps(&pool, r)) {
-            anyhow::bail!(
+                // The tunnel subnet must not shadow a network the host already routes (a LAN, a
+                // provider subnet, a peer VPN) — traffic to it would silently divert into the
+                // tunnel. Default routes are handled above; here only concrete prefixes.
+                if let Some((ifname, r)) = host_routes.iter().find(|(_, r)| overlaps(&pool, r)) {
+                    anyhow::bail!(
                 "profile '{name}': pool.cidr {pool} overlaps the existing route {r} on interface \
                  '{ifname}'. Traffic to that network would be diverted into the tunnel. Move the \
                  pool to a range this host does not already route."
             );
+                }
+
+                // Two profiles sharing a pool hand the same tunnel IP to two clients on two
+                // TUNs — the kernel then routes the return traffic to whichever came up last.
+                if let Some((other, o)) = pools.iter().find(|(_, o)| overlaps(&pool, o)) {
+                    anyhow::bail!(
+                        "profile '{name}': pool.cidr {pool} overlaps profile '{other}' pool {o}. \
+                 Give every profile its own range (10.9.0.0/24, 10.9.1.0/24, …)."
+                    );
+                }
+                pools.push((name, pool));
+
+                // The TUN connected route uses this exact `pool.cidr` prefix, so the collision
+                // checks above cover both address allocation and the route installed by Linux.
+            }
         }
 
-        // Two profiles sharing a pool hand the same tunnel IP to two clients on two
-        // TUNs — the kernel then routes the return traffic to whichever came up last.
-        if let Some((other, o)) = pools.iter().find(|(_, o)| overlaps(&pool, o)) {
+        if p.tun.ip_mode == crate::config::server::IpMode::Ipv4 {
+            continue;
+        }
+
+        let Some(ipv6_pool) = (!p.pool.ipv6.cidr.trim().is_empty())
+            .then(|| p.pool.ipv6.cidr.trim().parse::<Ipv6Net>().ok())
+            .flatten()
+        else {
+            continue; // absent/malformed IPv6 CIDR is handled by validate_profiles
+        };
+
+        if let Some(tun_address) = p
+            .tun
+            .ipv6_address
+            .as_deref()
+            .and_then(|value| value.trim().parse::<Ipv6Addr>().ok())
+        {
+            if host.ipv6_gateways.contains(&tun_address) {
+                anyhow::bail!(
+                    "profile '{name}': tun.ipv6_address {tun_address} is this host's IPv6 DEFAULT GATEWAY. \
+                     Bringing it onto the tunnel would cut off the host's IPv6 uplink."
+                );
+            }
+            if let Some((interface, _)) = host_ipv6_addrs
+                .iter()
+                .find(|(_, address)| *address == tun_address)
+            {
+                anyhow::bail!(
+                    "profile '{name}': tun.ipv6_address {tun_address} is already assigned to \
+                     interface '{interface}'. Pick an address outside the host's own networks."
+                );
+            }
+        }
+
+        if let Some(gateway) = host
+            .ipv6_gateways
+            .iter()
+            .find(|gateway| ipv6_pool.contains(*gateway))
+        {
             anyhow::bail!(
-                "profile '{name}': pool.cidr {pool} overlaps profile '{other}' pool {o}. \
-                 Give every profile its own range (10.9.0.0/24, 10.9.1.0/24, …)."
+                "profile '{name}': pool.ipv6.cidr {ipv6_pool} contains this host's IPv6 \
+                 DEFAULT GATEWAY {gateway}. Move the pool to a free IPv6 prefix."
             );
         }
-        pools.push((name, pool));
-
-        // The TUN connected route uses this exact `pool.cidr` prefix, so the collision
-        // checks above cover both address allocation and the route installed by Linux.
+        if let Some((interface, address)) = host_ipv6_addrs
+            .iter()
+            .find(|(_, address)| ipv6_pool.contains(address))
+        {
+            anyhow::bail!(
+                "profile '{name}': pool.ipv6.cidr {ipv6_pool} contains {address}, the IPv6 \
+                 address of interface '{interface}'. Move the pool to a free IPv6 prefix."
+            );
+        }
+        if let Some((interface, route)) = host_ipv6_routes
+            .iter()
+            .find(|(_, route)| overlaps_ipv6(&ipv6_pool, route))
+        {
+            anyhow::bail!(
+                "profile '{name}': pool.ipv6.cidr {ipv6_pool} overlaps the existing IPv6 route \
+                 {route} on interface '{interface}'. Move the pool to a free IPv6 prefix."
+            );
+        }
+        if let Some((other, other_pool)) = ipv6_pools
+            .iter()
+            .find(|(_, other_pool)| overlaps_ipv6(&ipv6_pool, other_pool))
+        {
+            anyhow::bail!(
+                "profile '{name}': pool.ipv6.cidr {ipv6_pool} overlaps profile '{other}' IPv6 \
+                 pool {other_pool}. Give every profile its own IPv6 prefix."
+            );
+        }
+        ipv6_pools.push((name, ipv6_pool));
     }
     Ok(())
 }
@@ -319,6 +582,7 @@ mod tests {
             ),
             gateways,
             routes,
+            ..Default::default()
         }
     }
 
@@ -362,6 +626,7 @@ mod tests {
             addrs: parse_addr_lines("2: eth0    inet 192.168.1.10/24 scope global eth0\n"),
             gateways,
             routes,
+            ..Default::default()
         };
         let c = one("192.168.50.1", "192.168.50.0/24");
         let err = check(&c, &host).unwrap_err().to_string();
@@ -403,6 +668,7 @@ mod tests {
             addrs,
             gateways,
             routes,
+            ..Default::default()
         };
         let c = one("10.9.0.1", "10.9.0.0/24");
         assert!(check(&c, &host).is_ok());
@@ -427,6 +693,7 @@ mod tests {
             addrs: parse_addr_lines("2: eth0 inet 192.168.50.1/24 scope global eth0\n"),
             gateways,
             routes,
+            ..Default::default()
         };
         let error = check(&cfg(&[active, disabled]), &host)
             .expect_err("a disabled profile name must not mask the physical eth0")
@@ -476,5 +743,145 @@ mod tests {
         );
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].0, "net0");
+    }
+
+    #[test]
+    fn parses_ipv6_addresses_and_both_default_route_forms() {
+        let addresses = parse_ipv6_addr_lines(
+            "1: lo    inet6 ::1/128 scope host\n\
+             2: eth0  inet6 2001:db8::10/64 scope global\n\
+             2: eth0  inet6 fe80::10/64 scope link\n",
+        );
+        assert_eq!(addresses.len(), 2);
+        assert_eq!(addresses[0].0, "eth0");
+
+        let (gateways, interfaces, routes) = parse_ipv6_route_lines(
+            "default via fe80::1 dev eth0 proto ra\n\
+             default dev wwan0 metric 2048\n\
+             2001:db8:100::/48 dev eth1\n\
+             2001:db8::50 dev eth0\n",
+        );
+        assert_eq!(gateways, vec!["fe80::1".parse::<Ipv6Addr>().unwrap()]);
+        assert_eq!(interfaces, vec!["eth0", "wwan0"]);
+        assert_eq!(routes[0].1, "2001:db8:100::/48".parse().unwrap());
+        assert_eq!(routes[1].1, "2001:db8::50/128".parse().unwrap());
+    }
+
+    #[test]
+    fn ipv6_egress_parser_excludes_unusable_addresses_without_hiding_collisions() {
+        let input = "2: eth0@if7 inet6 2606:4700:4700::1111/64 scope global dynamic\n\
+                     2: eth0@if7 inet6 2606:4700:4700::2222/64 scope global tentative\n\
+                     2: eth0@if7 inet6 2606:4700:4700::3333/64 scope global dadfailed\n\
+                     2: eth0@if7 inet6 2606:4700:4700::4444/64 scope global deprecated\n";
+
+        let all = parse_ipv6_addr_lines(input);
+        let usable = parse_usable_ipv6_addr_lines(input);
+        assert_eq!(all.len(), 4, "collision snapshot must retain every address");
+        assert_eq!(usable.len(), 1);
+        assert_eq!(usable[0].0, "eth0");
+        assert_eq!(
+            usable[0].1,
+            "2606:4700:4700::1111".parse::<Ipv6Addr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn ipv6_route_parser_normalizes_interfaces_and_skips_down_defaults() {
+        let (gateways, interfaces, routes) = parse_ipv6_route_lines(
+            "default via fe80::1 dev eth0@if7 proto ra\n\
+             default dev wwan0 linkdown metric 2048\n\
+             default proto static metric 100 \
+                 nexthop via fe80::dead dev eth2 dead weight 1 \
+                 nexthop via fe80::2 dev eth3@if11 weight 1\n\
+             2001:db8:100::/48 dev eth1@if9\n",
+        );
+
+        assert_eq!(
+            gateways,
+            vec![
+                "fe80::1".parse::<Ipv6Addr>().unwrap(),
+                "fe80::2".parse::<Ipv6Addr>().unwrap()
+            ]
+        );
+        assert_eq!(interfaces, vec!["eth0", "eth3"]);
+        assert_eq!(routes[0].0, "eth1");
+    }
+
+    #[test]
+    fn ipv6_pool_collisions_with_host_and_profiles_are_refused() {
+        let mut first = profile_ini("first", 443, "vpn0", "10.9.0.1", "10.9.0.0/24");
+        first.push_str(
+            "tun.ip_mode = dual\n\
+             tun.ipv6_address = fd71:e1:1234:1::1\n\
+             pool.ipv6.cidr = fd71:e1:1234:1::/64\n",
+        );
+        let host = HostNet {
+            ipv6_addrs: vec![(
+                "eth1".into(),
+                "fd71:e1:1234:1::99".parse::<Ipv6Addr>().unwrap(),
+            )],
+            ..Default::default()
+        };
+        let error = check(&cfg(&[first.clone()]), &host)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pool.ipv6.cidr"), "got: {error}");
+        assert!(error.contains("eth1"), "got: {error}");
+
+        let mut second = profile_ini("second", 8443, "vpn1", "10.9.1.1", "10.9.1.0/24");
+        second.push_str(
+            "tun.ip_mode = dual\n\
+             tun.ipv6_address = fd71:e1:1234:1::2\n\
+             pool.ipv6.cidr = fd71:e1:1234:1::/80\n",
+        );
+        let error = check(&cfg(&[first, second]), &HostNet::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("overlaps profile 'first'"), "got: {error}");
+    }
+
+    #[test]
+    fn own_leftover_ipv6_tun_is_not_a_collision() {
+        let mut profile = profile_ini("dual", 443, "vpn0", "10.9.0.1", "10.9.0.0/24");
+        profile.push_str(
+            "tun.ip_mode = dual\n\
+             tun.ipv6_address = fd71:e1:1234:1::1\n\
+             pool.ipv6.cidr = fd71:e1:1234:1::/64\n",
+        );
+        let host = HostNet {
+            ipv6_addrs: vec![(
+                "vpn0".into(),
+                "fd71:e1:1234:1::1".parse::<Ipv6Addr>().unwrap(),
+            )],
+            ipv6_routes: vec![(
+                "vpn0".into(),
+                "fd71:e1:1234:1::/64".parse::<Ipv6Net>().unwrap(),
+            )],
+            ..Default::default()
+        };
+        assert!(check(&cfg(&[profile]), &host).is_ok());
+    }
+
+    #[test]
+    fn ipv6_only_ignores_ipv4_shadow_but_still_checks_ipv6_collisions() {
+        let mut profile = profile_ini("v6", 443, "vpn0", "not-an-ipv4-address", "not-an-ipv4-cidr");
+        profile.push_str(
+            "tun.ip_mode = ipv6\n\
+             tun.ipv6_address = fd71:e1:1234:1::1\n\
+             pool.ipv6.cidr = fd71:e1:1234:1::/64\n",
+        );
+        let config = cfg(&[profile]);
+        assert!(check(&config, &vps_host()).is_ok());
+
+        let host = HostNet {
+            ipv6_addrs: vec![(
+                "eth1".into(),
+                "fd71:e1:1234:1::99".parse::<Ipv6Addr>().unwrap(),
+            )],
+            ..Default::default()
+        };
+        let error = check(&config, &host).unwrap_err().to_string();
+        assert!(error.contains("pool.ipv6.cidr"), "got: {error}");
+        assert!(error.contains("eth1"), "got: {error}");
     }
 }

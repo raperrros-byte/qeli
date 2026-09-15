@@ -14,7 +14,7 @@ public sealed class AppSettings
     public string LogLevel { get; set; } = "info";           // "info" (compact) | "debug" (detailed)
     public bool ToastsEnabled { get; set; } = true;
     public bool CheckForUpdates { get; set; }           // opt-in: check GitHub for a newer version (default OFF)
-    public bool ProbeReachability { get; set; } = true; // poll each profile's server for the reachability dot/latency AUTOMATICALLY (opt-out). When off, only a manual "check reachability" probes.
+    public bool ProbeReachability { get; set; } = false; // privacy-safe opt-in; manual reachability checks remain available.
     public int ProbeIntervalSecs { get; set; } = 30;    // auto-poll period (only when ProbeReachability is on); clamped 10..3600
     public bool AutoStart { get; set; }                 // run GUI at login (LaunchAgent)
     public bool AutoConnect { get; set; }               // connect on app start
@@ -35,19 +35,69 @@ public sealed class AppSettings
 
     public static AppSettings Load()
     {
+        if (!File.Exists(FilePath))
+            return ReadBackupOrDefault();
         try
         {
-            if (File.Exists(FilePath))
-                return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath), Options) ?? new AppSettings();
+            return Read(FilePath);
         }
-        catch { /* fall through to defaults */ }
-        return new AppSettings();
+        catch (Exception error)
+        {
+            System.Diagnostics.Debug.WriteLine($"AppSettings: settings.json unreadable ({error.Message})");
+            try
+            {
+                File.Move(
+                    FilePath,
+                    FilePath + ".corrupt-" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            }
+            catch { /* preserve best-effort; never overwrite it here */ }
+            return ReadBackupOrDefault();
+        }
     }
 
     public void Save()
     {
         Directory.CreateDirectory(Dir);
-        File.WriteAllText(FilePath, JsonSerializer.Serialize(this, Options));
+        var temp = FilePath + $".tmp-{Environment.ProcessId}-{Guid.NewGuid():N}";
+        try
+        {
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(this, Options);
+            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write,
+                       FileShare.None, 16 * 1024, FileOptions.WriteThrough))
+            {
+                stream.Write(bytes);
+                stream.Flush(flushToDisk: true);
+            }
+            if (File.Exists(FilePath))
+                File.Replace(temp, FilePath, FilePath + ".bak");
+            else
+                File.Move(temp, FilePath);
+        }
+        finally
+        {
+            try { if (File.Exists(temp)) File.Delete(temp); } catch { }
+        }
         _current = this;
+    }
+
+    private static AppSettings Read(string path) =>
+        JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(path), Options)
+        ?? throw new JsonException("settings root is null");
+
+    private static AppSettings ReadBackupOrDefault()
+    {
+        try
+        {
+            var backup = FilePath + ".bak";
+            if (!File.Exists(backup)) return new AppSettings();
+            var settings = Read(backup);
+            System.Diagnostics.Debug.WriteLine("AppSettings: recovered settings.json from .bak");
+            return settings;
+        }
+        catch (Exception error)
+        {
+            System.Diagnostics.Debug.WriteLine($"AppSettings: .bak recovery failed ({error.Message})");
+            return new AppSettings();
+        }
     }
 }

@@ -17,14 +17,17 @@
 use super::carrier::{self, ConnectedCarrier};
 use super::{ClientCore, ClientState, NetworkPlan, RuntimeCounters};
 use crate::client::{
-    run_tcp_tunnel, run_udp_tunnel, ClientPlatform, IdentityVerifier, StreamConnector, TunnelSetup,
+    run_tcp_tunnel, run_udp_tunnel, ClientPlatform, IdentityVerifier, StreamConnectRequest,
+    StreamConnector, TunnelSetup,
 };
+#[cfg(feature = "experimental-roaming")]
+use crate::client::{CorePathController, PathAckFuture, PathController};
 use crate::config::client::ClientConfig;
 use crate::protocol::obfs::{AwgParams, ObfsStream};
 use crate::transport_core::network::HandshakeNetwork;
 use serde::Deserialize;
 use socket2::Socket;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +37,8 @@ use tokio::net::TcpStream;
 
 const PLATFORM_ACK_POLL: Duration = Duration::from_millis(20);
 const NETWORK_ACK_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_SUPPLIED_CARRIER_ADDRESSES: usize = 1024;
+const MAX_CARRIER_ADDRESSES_PER_FAMILY: usize = 32;
 
 async fn wait_for_runtime_cancel(cancel: Arc<AtomicBool>) {
     while !cancel.load(Ordering::Acquire) {
@@ -52,8 +57,9 @@ fn candidate_connect_budget(deadline: Instant, candidates_left: usize) -> Option
 pub(crate) struct RuntimeInput {
     #[serde(default)]
     fallback_dns_servers: Vec<String>,
-    /// Ordered A-records resolved by the platform on its physical network. Supplying these
-    /// prevents reconnect DNS from entering a retained/dead TUN and lets TCP try every A record.
+    /// Ordered A/AAAA records resolved by the platform on its physical network. Supplying
+    /// these prevents reconnect DNS from entering a retained/dead TUN and lets TCP try every
+    /// carrier address.
     #[serde(default)]
     carrier_addresses: Vec<String>,
 }
@@ -64,8 +70,10 @@ pub(crate) struct NativeCoreAdapter {
     cancel: Arc<AtomicBool>,
     counters: Arc<RuntimeCounters>,
     fallback_dns_servers: Arc<Vec<String>>,
-    carrier_addresses: Arc<Vec<Ipv4Addr>>,
+    carrier_addresses: Arc<Mutex<Vec<IpAddr>>>,
     carrier_address: Arc<Mutex<Option<IpAddr>>>,
+    #[cfg(feature = "experimental-roaming")]
+    path_controller: CorePathController,
 }
 
 impl NativeCoreAdapter {
@@ -80,90 +88,46 @@ impl NativeCoreAdapter {
         &self,
         config: &ClientConfig,
     ) -> anyhow::Result<ConnectedCarrier> {
-        let needs_protect =
-            self.lock().platform_capabilities() & super::platform_capability::SOCKET_PROTECT != 0;
-        if !needs_protect {
-            let connected = self
-                .connect_primary(carrier::open(config)?, config, false)
-                .await?;
-            self.note_carrier(&connected);
-            return Ok(connected);
-        }
-
-        #[cfg(not(unix))]
-        anyhow::bail!("socket protection requires a Unix descriptor");
-
-        #[cfg(unix)]
-        {
-            let timeout = Duration::from_secs(config.server.connection_timeout_secs.max(1));
-            let deadline = Instant::now() + timeout;
-            loop {
-                if self.cancel.load(Ordering::Acquire) {
-                    anyhow::bail!("transport cancelled while waiting for socket protection");
-                }
-                let socket = {
-                    let mut core = self.lock();
-                    match core.state {
-                        ClientState::Connecting => core
-                            .protected_wire_socket
-                            .take()
-                            .map(|protected| protected._socket),
-                        ClientState::Failed => {
-                            anyhow::bail!("platform rejected the initial carrier socket")
-                        }
-                        state => {
-                            anyhow::bail!("initial carrier is unavailable in core state {state:?}")
-                        }
-                    }
-                };
-                if let Some(socket) = socket {
-                    let connected = self.connect_primary(socket, config, true).await?;
-                    self.note_carrier(&connected);
-                    return Ok(connected);
-                }
-                if Instant::now() >= deadline {
-                    anyhow::bail!(
-                        "platform did not protect the initial carrier within {timeout:?}"
-                    );
-                }
-                tokio::time::sleep(PLATFORM_ACK_POLL).await;
-            }
-        }
+        let connected = self.connect_primary(config).await?;
+        self.note_carrier(&connected);
+        Ok(connected)
     }
 
     async fn carrier_candidates(&self, config: &ClientConfig) -> anyhow::Result<Vec<SocketAddr>> {
-        carrier::resolve_ipv4_candidates(
+        let supplied = self
+            .carrier_addresses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        carrier::resolve_ip_candidates(
             &config.server.address,
             config.server.port,
-            self.carrier_addresses.as_slice(),
+            supplied.as_slice(),
         )
         .await
     }
 
-    /// Try every A-record for TCP under one connection deadline. UDP connect cannot prove
+    /// Try every A/AAAA record for TCP under one connection deadline. UDP connect cannot prove
     /// reachability, so it uses the first address; platform adapters rotate that ordering on
     /// each reconnect generation.
-    async fn connect_primary(
-        &self,
-        initial: Socket,
-        config: &ClientConfig,
-        initial_is_protected: bool,
-    ) -> anyhow::Result<ConnectedCarrier> {
+    async fn connect_primary(&self, config: &ClientConfig) -> anyhow::Result<ConnectedCarrier> {
         let addresses = self.carrier_candidates(config).await?;
         let timeout = Duration::from_secs(config.server.connection_timeout_secs.max(1));
         let deadline = Instant::now() + timeout;
-        let mut initial = Some(initial);
         let mut failures = Vec::new();
         let candidate_count = addresses.len();
         for (index, address) in addresses.into_iter().enumerate() {
-            let socket = if index == 0 {
-                initial.take().expect("initial carrier socket")
-            } else {
-                carrier::open(config)?
+            let socket = match carrier::open_for(config, address.ip()) {
+                Ok(socket) => socket,
+                Err(error) => {
+                    // A platform may supply both A and AAAA records while `local` pins one
+                    // family. Treat the incompatible candidate like any other dial failure;
+                    // aborting here would skip a usable address later in the same DNS set.
+                    failures.push(format!("{address}: socket setup failed: {error}"));
+                    continue;
+                }
             };
-            if index > 0 || !initial_is_protected {
-                self.protect_socket(&socket).await?;
-            }
+            self.protect_socket(&socket).await?;
             let candidates_left = if config.server.protocol == "udp" {
                 1
             } else {
@@ -180,10 +144,7 @@ impl NativeCoreAdapter {
                 break;
             }
         }
-        anyhow::bail!(
-            "all IPv4 carrier candidates failed: {}",
-            failures.join("; ")
-        )
+        anyhow::bail!("all carrier candidates failed: {}", failures.join("; "))
     }
 
     async fn protect_socket(&self, _socket: &Socket) -> anyhow::Result<()> {
@@ -218,14 +179,30 @@ impl NativeCoreAdapter {
         }
     }
 
-    async fn dial_tcp(&self, config: &ClientConfig) -> anyhow::Result<TcpStream> {
+    async fn dial_tcp(
+        &self,
+        config: &ClientConfig,
+        request: StreamConnectRequest,
+    ) -> anyhow::Result<TcpStream> {
+        #[cfg(feature = "experimental-roaming")]
+        if let Some(candidate) = request.path_candidate.as_ref() {
+            return self.dial_candidate_tcp(config, candidate).await;
+        }
+        #[cfg(not(feature = "experimental-roaming"))]
+        let _ = request;
         let addresses = self.carrier_candidates(config).await?;
         let timeout = Duration::from_secs(config.server.connection_timeout_secs.max(1));
         let deadline = Instant::now() + timeout;
         let mut failures = Vec::new();
         let candidate_count = addresses.len();
         for (index, address) in addresses.into_iter().enumerate() {
-            let socket = carrier::open_secondary(config)?;
+            let socket = match carrier::open_secondary_for(config, address.ip()) {
+                Ok(socket) => socket,
+                Err(error) => {
+                    failures.push(format!("{address}: socket setup failed: {error}"));
+                    continue;
+                }
+            };
             self.protect_socket(&socket).await?;
             let Some(candidate_budget) =
                 candidate_connect_budget(deadline, candidate_count.saturating_sub(index))
@@ -247,6 +224,56 @@ impl NativeCoreAdapter {
         )
     }
 
+    #[cfg(feature = "experimental-roaming")]
+    async fn dial_candidate_tcp(
+        &self,
+        config: &ClientConfig,
+        candidate: &super::path::PreparedPathCandidate,
+    ) -> anyhow::Result<TcpStream> {
+        let addresses = candidate
+            .update
+            .compatible_resolved_addresses()
+            .into_iter()
+            .map(|address| SocketAddr::new(address, config.server.port))
+            .collect::<Vec<_>>();
+        let mut setup_failures = Vec::new();
+        let (address, socket) = addresses
+            .into_iter()
+            .find_map(
+                |address| match carrier::open_candidate_for(config, address.ip()) {
+                    Ok(socket) => Some((address, socket)),
+                    Err(error) => {
+                        setup_failures.push(format!("{address}: {error}"));
+                        None
+                    }
+                },
+            )
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no candidate socket could be created: {}",
+                    setup_failures.join("; ")
+                )
+            })?;
+        let socket_handle = carrier::candidate_socket_handle(&socket)?;
+        let binding = self.bind_candidate_socket(candidate, socket_handle)?;
+        tokio::time::timeout(NETWORK_ACK_TIMEOUT, binding)
+            .await
+            .map_err(|_| anyhow::anyhow!("BIND_SOCKET acknowledgement timed out"))??;
+
+        let timeout = Duration::from_secs(config.server.connection_timeout_secs.max(1));
+        match carrier::connect_to(socket, config, address, timeout).await {
+            Ok(ConnectedCarrier::Tcp(stream)) => {
+                configure_tcp(&stream, config)?;
+                Ok(stream)
+            }
+            Ok(ConnectedCarrier::Udp(_)) => anyhow::bail!("TCP candidate dialer received UDP"),
+            Err(error) => Err(anyhow::anyhow!(
+                "candidate path {} connect to {address} failed: {error}",
+                candidate.update.platform_path_id
+            )),
+        }
+    }
+
     fn note_carrier(&self, carrier: &ConnectedCarrier) {
         let peer = match carrier {
             ConnectedCarrier::Tcp(stream) => stream.peer_addr().ok(),
@@ -262,9 +289,86 @@ impl NativeCoreAdapter {
     }
 }
 
+#[cfg(feature = "experimental-roaming")]
+impl PathController for NativeCoreAdapter {
+    fn prepared_candidate(&self) -> Option<super::path::PreparedPathCandidate> {
+        let required = super::platform_capability::ROAMING_PATH;
+        (self.platform_capabilities() & required == required)
+            .then(|| self.path_controller.prepared_candidate())
+            .flatten()
+    }
+
+    fn candidate_is_current(&self, candidate: &super::path::PreparedPathCandidate) -> bool {
+        self.path_controller.candidate_is_current(candidate)
+    }
+
+    fn can_request_same_network_nat_rebind(&self) -> bool {
+        self.platform_capabilities() & super::platform_capability::PATH_REFRESH != 0
+    }
+
+    fn request_same_network_nat_rebind(&self) -> anyhow::Result<()> {
+        self.lock()
+            .request_path_refresh()
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
+    }
+
+    fn bind_candidate_socket(
+        &self,
+        candidate: &super::path::PreparedPathCandidate,
+        socket_fd: i64,
+    ) -> anyhow::Result<PathAckFuture> {
+        self.path_controller
+            .bind_candidate_socket(candidate, socket_fd)
+    }
+
+    fn commit_candidate_path(
+        &self,
+        candidate: &super::path::PreparedPathCandidate,
+    ) -> anyhow::Result<PathAckFuture> {
+        let commit = self.path_controller.commit_candidate_path(candidate)?;
+        let addresses = candidate
+            .update
+            .resolved_addresses
+            .iter()
+            .filter_map(|entry| entry.address.parse::<IpAddr>().ok())
+            .collect::<Vec<_>>();
+        let active_addresses = self.carrier_addresses.clone();
+        Ok(Box::pin(async move {
+            commit.await?;
+            *active_addresses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = addresses;
+            Ok(())
+        }))
+    }
+
+    fn abort_candidate_path(
+        &self,
+        candidate: &super::path::PreparedPathCandidate,
+        reason: &str,
+    ) -> anyhow::Result<PathAckFuture> {
+        self.path_controller.abort_candidate_path(candidate, reason)
+    }
+}
+
 impl ClientPlatform for NativeCoreAdapter {
     fn next_generation(&mut self) -> u64 {
         self.lock().last_plan_generation.saturating_add(1)
+    }
+
+    fn platform_capabilities(&self) -> u64 {
+        self.lock().platform_capabilities()
+    }
+
+    #[cfg(feature = "experimental-roaming")]
+    fn path_controller(&self) -> Option<Arc<dyn PathController>> {
+        let required = super::platform_capability::ROAMING_PATH;
+        if self.platform_capabilities() & required == required {
+            Some(Arc::new(self.clone()))
+        } else {
+            None
+        }
     }
 
     fn device_id(&self) -> anyhow::Result<[u8; crate::protocol::DEVICE_ID_LEN]> {
@@ -407,6 +511,24 @@ impl ClientPlatform for NativeCoreAdapter {
     fn counters(&self) -> Arc<RuntimeCounters> {
         self.counters.clone()
     }
+
+    fn management_event(
+        &mut self,
+        event: &crate::protocol::control_v2::ManagementEvent,
+    ) -> anyhow::Result<()> {
+        let terminal = matches!(event, crate::protocol::control_v2::ManagementEvent::Kick(_));
+        let result = self.lock().publish_management(event.clone());
+        if let Err(error) = result {
+            if terminal {
+                return Err(anyhow::Error::new(error));
+            }
+            log::warn!("dropping NOTICE because the platform event queue is full: {error}");
+        }
+        if terminal {
+            self.cancel.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn run(core: Arc<Mutex<ClientCore>>, input: RuntimeInput) -> anyhow::Result<()> {
@@ -420,6 +542,15 @@ pub(crate) fn run(core: Arc<Mutex<ClientCore>>, input: RuntimeInput) -> anyhow::
 }
 
 async fn run_async(core: Arc<Mutex<ClientCore>>, input: RuntimeInput) -> anyhow::Result<()> {
+    let supplied_carrier_count = input.carrier_addresses.len();
+    let carrier_addresses = normalize_carrier_addresses(&input.carrier_addresses);
+    if carrier_addresses.len() < supplied_carrier_count {
+        log::warn!(
+            "platform supplied {supplied_carrier_count} carrier addresses; using {} unique \
+             candidates after canonicalisation and the per-family limit",
+            carrier_addresses.len()
+        );
+    }
     let (config, cancel, counters) = {
         let mut guard = lock_core(&core);
         if guard.state != ClientState::Connecting {
@@ -446,14 +577,10 @@ async fn run_async(core: Arc<Mutex<ClientCore>>, input: RuntimeInput) -> anyhow:
         cancel: cancel.clone(),
         counters: counters.clone(),
         fallback_dns_servers: Arc::new(input.fallback_dns_servers),
-        carrier_addresses: Arc::new(
-            input
-                .carrier_addresses
-                .iter()
-                .filter_map(|address| address.parse::<Ipv4Addr>().ok())
-                .collect(),
-        ),
+        carrier_addresses: Arc::new(Mutex::new(carrier_addresses)),
         carrier_address: Arc::new(Mutex::new(None)),
+        #[cfg(feature = "experimental-roaming")]
+        path_controller: CorePathController::new(core.clone()),
     };
     // `qeli_client_stop` is the ownership boundary used by every GUI adapter. It must cancel
     // every phase, not only the established data loop: carrier DNS/connect and TLS/qeli
@@ -504,11 +631,11 @@ async fn run_tcp(
             let first = wrap_obfs(stream, config).await?;
             let dialer = adapter.clone();
             let cfg = Arc::new(config.clone());
-            let connector: StreamConnector<_> = Arc::new(move || {
+            let connector: StreamConnector<_> = Arc::new(move |request| {
                 let dialer = dialer.clone();
                 let cfg = cfg.clone();
                 Box::pin(async move {
-                    let stream = dialer.dial_tcp(&cfg).await?;
+                    let stream = dialer.dial_tcp(&cfg, request).await?;
                     wrap_obfs(stream, &cfg).await
                 })
             });
@@ -518,11 +645,11 @@ async fn run_tcp(
             let first = wrap_reality(stream, config).await?;
             let dialer = adapter.clone();
             let cfg = Arc::new(config.clone());
-            let connector: StreamConnector<_> = Arc::new(move || {
+            let connector: StreamConnector<_> = Arc::new(move |request| {
                 let dialer = dialer.clone();
                 let cfg = cfg.clone();
                 Box::pin(async move {
-                    let stream = dialer.dial_tcp(&cfg).await?;
+                    let stream = dialer.dial_tcp(&cfg, request).await?;
                     wrap_reality(stream, &cfg).await
                 })
             });
@@ -531,10 +658,10 @@ async fn run_tcp(
         "fake-tls" | "plain" => {
             let dialer = adapter.clone();
             let cfg = Arc::new(config.clone());
-            let connector: StreamConnector<_> = Arc::new(move || {
+            let connector: StreamConnector<_> = Arc::new(move |request| {
                 let dialer = dialer.clone();
                 let cfg = cfg.clone();
-                Box::pin(async move { dialer.dial_tcp(&cfg).await })
+                Box::pin(async move { dialer.dial_tcp(&cfg, request).await })
             });
             run_tcp_tunnel(stream, connector, config, password, adapter).await
         }
@@ -553,17 +680,13 @@ async fn wrap_obfs(
         jmin: config.obfuscation.awg.jmin,
         jmax: config.obfuscation.awg.jmax,
     };
-    let host = match config.obfuscation.sni.as_deref() {
-        Some(value) if !value.is_empty() => Some(value),
-        _ if config.server.address.parse::<IpAddr>().is_ok() => None,
-        _ => Some(config.server.address.as_str()),
-    };
+    let host = config.effective_fronting_host();
     ObfsStream::connect_with_host(
         stream,
         &key,
         config.obfuscation.fronting == "websocket",
         awg,
-        host,
+        Some(&host),
     )
     .await
     .map_err(anyhow::Error::from)
@@ -572,14 +695,8 @@ async fn wrap_obfs(
 async fn wrap_reality(
     mut stream: TcpStream,
     config: &ClientConfig,
-) -> anyhow::Result<crate::protocol::realtls::stream::RealTlsStream<TcpStream>> {
-    let server_name = match config.obfuscation.sni.as_deref() {
-        Some(value) if !value.is_empty() => value.to_string(),
-        _ if config.server.address.parse::<IpAddr>().is_ok() => {
-            crate::protocol::pick_random_sni().to_string()
-        }
-        _ => config.server.address.clone(),
-    };
+) -> anyhow::Result<tokio::io::DuplexStream> {
+    let server_name = config.effective_reality_sni().to_string();
     let ephemeral = crate::crypto::Keypair::generate();
     let short_id = config
         .obfuscation
@@ -609,10 +726,14 @@ async fn wrap_reality(
     )
     .await
     .map_err(|_| anyhow::anyhow!("reality-tls handshake timed out"))??;
-    Ok(crate::protocol::realtls::stream::RealTlsStream::new(
-        stream,
-        established,
-    ))
+    let tls = crate::protocol::realtls::stream::RealTlsStream::new(stream, established);
+    tokio::time::timeout(
+        timeout,
+        crate::protocol::h2_carrier::connect(tls, &server_name),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("reality-tls HTTP/2 carrier timed out"))?
+    .map_err(|error| anyhow::anyhow!("reality-tls HTTP/2 carrier failed: {error}"))
 }
 
 fn configure_tcp(stream: &TcpStream, config: &ClientConfig) -> anyhow::Result<()> {
@@ -641,15 +762,49 @@ fn validate_input(input: &RuntimeInput) -> anyhow::Result<()> {
             .parse::<IpAddr>()
             .map_err(|_| anyhow::anyhow!("invalid fallback DNS server '{server}'"))?;
     }
-    if input.carrier_addresses.len() > 16 {
-        anyhow::bail!("at most 16 carrier addresses are accepted");
+    if input.carrier_addresses.len() > MAX_SUPPLIED_CARRIER_ADDRESSES {
+        anyhow::bail!(
+            "at most {MAX_SUPPLIED_CARRIER_ADDRESSES} supplied carrier addresses are accepted"
+        );
     }
     for address in &input.carrier_addresses {
         address
-            .parse::<Ipv4Addr>()
-            .map_err(|_| anyhow::anyhow!("invalid IPv4 carrier address '{address}'"))?;
+            .parse::<IpAddr>()
+            .map_err(|_| anyhow::anyhow!("invalid carrier IP address '{address}'"))?;
     }
     Ok(())
+}
+
+fn normalize_carrier_addresses(addresses: &[String]) -> Vec<IpAddr> {
+    let mut output = Vec::new();
+    let mut ipv4_count = 0usize;
+    let mut ipv6_count = 0usize;
+    for raw in addresses {
+        let Ok(address) = raw.parse::<IpAddr>() else {
+            // `validate_input` owns the diagnostic. Keep this helper total so its output can
+            // never accidentally re-introduce an unvalidated string at the socket boundary.
+            continue;
+        };
+        let address = carrier::canonical_carrier_ip(address);
+        if output.contains(&address) {
+            continue;
+        }
+        let accepted = match address {
+            IpAddr::V4(_) if ipv4_count < MAX_CARRIER_ADDRESSES_PER_FAMILY => {
+                ipv4_count += 1;
+                true
+            }
+            IpAddr::V6(_) if ipv6_count < MAX_CARRIER_ADDRESSES_PER_FAMILY => {
+                ipv6_count += 1;
+                true
+            }
+            _ => false,
+        };
+        if accepted {
+            output.push(address);
+        }
+    }
+    output
 }
 
 fn finish_generation(
@@ -702,5 +857,48 @@ fn lock_core(shared: &Arc<Mutex<ClientCore>>) -> MutexGuard<'_, ClientCore> {
     match shared.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_dns_can_supply_more_than_sixteen_dual_stack_addresses() {
+        let mut carrier_addresses: Vec<String> =
+            (1..=40).map(|host| format!("192.0.2.{host}")).collect();
+        carrier_addresses.extend(["2001:db8::1".into(), "2001:db8::2".into()]);
+        let input = RuntimeInput {
+            fallback_dns_servers: Vec::new(),
+            carrier_addresses,
+        };
+
+        validate_input(&input).unwrap();
+        let normalized = normalize_carrier_addresses(&input.carrier_addresses);
+        assert_eq!(normalized.len(), 34);
+        assert_eq!(
+            normalized
+                .iter()
+                .filter(|address| address.is_ipv4())
+                .count(),
+            MAX_CARRIER_ADDRESSES_PER_FAMILY
+        );
+        assert_eq!(
+            normalized
+                .iter()
+                .filter(|address| address.is_ipv6())
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn mapped_carrier_addresses_are_canonicalised_and_deduplicated() {
+        let addresses = vec!["192.0.2.1".into(), "::ffff:192.0.2.1".into()];
+        assert_eq!(
+            normalize_carrier_addresses(&addresses),
+            vec!["192.0.2.1".parse::<IpAddr>().unwrap()]
+        );
     }
 }

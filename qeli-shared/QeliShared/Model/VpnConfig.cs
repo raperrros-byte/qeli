@@ -95,14 +95,27 @@ public sealed class VpnConfig : INotifyPropertyChanged
     public bool MtuProbe { get; init; } = true;
     // routing
     public string RoutingMode { get; init; } = "full-tunnel";
+    /// <summary>Inner IPv6 negotiation policy: auto, required or off.</summary>
+    public string Ipv6Policy { get; init; } = "auto";
+    /// <summary>Session migration policy: off, auto or required.</summary>
+    public string RoamingPolicy { get; init; } = "auto";
     public bool AddDefaultGateway { get; init; } = true;
     public List<string> IncludeRoutes { get; init; } = new();
     public List<string> ExcludeRoutes { get; init; } = new();
     public bool RouteLocalNetworks { get; init; }
-    // Extra split-tunnel routes loaded from a FILE of CIDRs (one per line, '#'/';'
-    // comments allowed) — OpenVPN's route-include-from-file. Merged with IncludeRoutes at
-    // tunnel setup. Empty = none.
+    // Extra split-tunnel routes loaded from CIDR/OpenVPN route files. Repeating route_file
+    // is intentional: RouteFile keeps the first path for profile-store compatibility and
+    // AdditionalRouteFiles keeps the remaining paths in declaration order.
     public string? RouteFile { get; init; }
+    public List<string> AdditionalRouteFiles { get; init; } = new();
+    [JsonIgnore]
+    public IReadOnlyList<string> RouteFilePaths =>
+        (string.IsNullOrWhiteSpace(RouteFile)
+            ? AdditionalRouteFiles
+            : new[] { RouteFile }.Concat(AdditionalRouteFiles))
+        .Where(path => !string.IsNullOrWhiteSpace(path))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
     // TUN interface routing metric (OpenVPN `route-metric` / a lower value = higher
     // priority). 0 = OS default. Applied to the tunnel adapter after addressing.
     public int InterfaceMetric { get; init; }
@@ -123,11 +136,12 @@ public sealed class VpnConfig : INotifyPropertyChanged
     // onto the physical NIC during reconnect. Platform-specific (Win: Windows
     // Firewall default-block + allow rules; mac: pf anchor). Default off.
     public bool KillSwitch { get; init; }
-    // Full-tunnel captures IPv6 into the tunnel (the server is IPv4-only, so it is black-holed)
-    // to close the classic dual-stack IPv6 leak. Set true to OPT OUT — a dual-stack user who
-    // wants native IPv6, accepting that it bypasses the tunnel. Default off (fail-closed);
-    // mirrors the Rust client's `allow_ipv6_leak`.
+    // In a full tunnel whose negotiated plan has no IPv6 address, the platform blocks that
+    // family to close the classic dual-stack leak. Set true to explicitly allow native IPv6
+    // to bypass such an IPv4-only tunnel. A dual/IPv6 plan always carries IPv6 in qeli.
     public bool AllowIpv6Leak { get; init; }
+    // Symmetric escape hatch for an IPv6-only full tunnel. Secure default blocks IPv4.
+    public bool AllowIpv4Leak { get; init; }
     // Per-application routing. The value syntax is platform-owned: Android and macOS use
     // package/signing identifiers, while Windows uses canonical executable paths. Keeping the
     // common model typed means a profile can be edited on any desktop without losing the
@@ -225,10 +239,11 @@ public sealed class VpnConfig : INotifyPropertyChanged
         // by this port now — see FromIni/ToIni — so it moved to KnownIniKeys below. Leaving it
         // here as well would have made it both carried and modelled, and `ToIni` would emit it
         // twice: once from CarriedKeys, once from the DNS block. (Audit 2026-08-03, D2.)
-        "autostart", "dev_attach", "exit_node",
-        "gateway_nat", "keepalive", "lan_subnet", "post_down", "post_up", "tcp_nodelay",
+        "autostart", "dev_attach", "device_type", "exit_node",
+        "gateway_nat", "keepalive", "lan_subnet", "lan_subnet_ipv6", "post_down", "post_up", "tcp_nodelay",
         // Socket settings plus headless-only password sources.
-        "password_command", "password_file", "recv_buffer_size", "send_buffer_size",
+        "password_command", "password_file", "reality_compact", "reality_split",
+        "reality_split_delay", "recv_buffer_size", "send_buffer_size",
         // `allow_lan` remains mobile-owned. `apps`/`apps_mode` are modelled below because the
         // Windows and macOS clients now apply the same per-application contract as Android.
         "allow_lan",
@@ -237,11 +252,11 @@ public sealed class VpnConfig : INotifyPropertyChanged
     private static readonly HashSet<string> KnownIniKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
         // Read by this port.
-        "allow_ipv6_leak", "allow_unpinned_tofu", "apps", "apps_mode", "awg", "bind_static", "dev", "dev_node", "dns", "dns_servers",
+        "allow_ipv4_leak", "allow_ipv6_leak", "allow_unpinned_tofu", "apps", "apps_mode", "awg", "bind_static", "dev", "dev_node", "dns", "dns_servers",
         "exclude", "forward",
         "front", "gateway", "heartbeat", "heartbeat_interval", "heartbeat_jitter",
         "heartbeat_size", "include", "jc", "jmax", "jmin", "key", "kill_switch", "local",
-        "lport", "metric", "mode", "mtu", "mtu_probe", "name", "obfs_key", "padding",
+        "ipv6", "lport", "metric", "mode", "mtu", "mtu_probe", "name", "obfs_key", "padding", "roaming",
         "padding_max", "padding_min", "pass", "persist_tun", "proto", "quic", "reality_sid",
         "reconnect", "reconnect_base_delay", "reconnect_max_delay", "reconnect_retries",
         "route_file", "route_local", "server", "shaping", "shaping_budget", "shaping_gap_max",
@@ -355,19 +370,22 @@ public sealed class VpnConfig : INotifyPropertyChanged
         ServerAddress = ServerAddress, Port = Port, Protocol = Protocol,
         ConnectionTimeoutSecs = ConnectionTimeoutSecs,
         LocalAddress = LocalAddress, LocalPort = LocalPort,
-        RouteFile = RouteFile, InterfaceMetric = InterfaceMetric, DevNode = DevNode,
+        RouteFile = RouteFile, AdditionalRouteFiles = AdditionalRouteFiles,
+        InterfaceMetric = InterfaceMetric, DevNode = DevNode,
         ReconnectEnabled = ReconnectEnabled, ReconnectMaxRetries = ReconnectMaxRetries,
         ReconnectBaseDelaySecs = ReconnectBaseDelaySecs, ReconnectMaxDelaySecs = ReconnectMaxDelaySecs,
         Username = Username, Password = Password, ServerPublicKeyHex = ServerPublicKeyHex,
         BindStaticToSession = BindStaticToSession, AllowUnpinnedTofu = AllowUnpinnedTofu,
         Mtu = Mtu, MtuProbe = MtuProbe, RoutingMode = RoutingMode, AddDefaultGateway = AddDefaultGateway,
         IncludeRoutes = IncludeRoutes, ExcludeRoutes = ExcludeRoutes, RouteLocalNetworks = RouteLocalNetworks,
-        PersistTun = PersistTun, KillSwitch = KillSwitch, AllowIpv6Leak = AllowIpv6Leak, Forward = Forward,
+        PersistTun = PersistTun, KillSwitch = KillSwitch,
+        AllowIpv4Leak = AllowIpv4Leak, AllowIpv6Leak = AllowIpv6Leak, Forward = Forward,
         AppsMode = AppsMode, Apps = Apps,
         DnsServers = DnsServers, DnsMode = DnsMode, WireMode = WireMode, ObfsKey = ObfsKey, ObfsFronting = ObfsFronting,
         AwgEnabled = AwgEnabled, AwgJc = AwgJc, AwgJmin = AwgJmin, AwgJmax = AwgJmax,
         QuicEnabled = QuicEnabled, Sni = Sni,
         RealityShortId = RealityShortId,
+        Ipv6Policy = Ipv6Policy, RoamingPolicy = RoamingPolicy,
         PaddingEnabled = PaddingEnabled, PaddingMin = PaddingMin, PaddingMax = PaddingMax,
         HeartbeatEnabled = hbEnabled, HeartbeatIntervalMs = hbIntervalMs,
         HeartbeatDataSize = hbDataSize, HeartbeatJitterMs = hbJitterMs,
@@ -419,7 +437,9 @@ public sealed class VpnConfig : INotifyPropertyChanged
         string? appsMode = null, List<string>? apps = null,
         long? connectionTimeoutSecs = null, bool? reconnectEnabled = null,
         int? reconnectMaxRetries = null, bool? persistTun = null,
-        bool? mtuProbe = null, bool? killSwitch = null, string? dnsMode = null) => new()
+        bool? mtuProbe = null, bool? killSwitch = null, string? dnsMode = null,
+        string? ipv6Policy = null, string? roamingPolicy = null,
+        bool? allowIpv4Leak = null, bool? allowIpv6Leak = null) => new()
     {
         // ── form-edited fields (from params) ──
         ServerAddress = serverAddress, Port = port, Protocol = protocol, WireMode = wireMode,
@@ -428,9 +448,10 @@ public sealed class VpnConfig : INotifyPropertyChanged
         Username = username, Password = password, ServerPublicKeyHex = serverPublicKeyHex,
         RoutingMode = routingMode, AddDefaultGateway = addDefaultGateway, RouteLocalNetworks = routeLocalNetworks,
         Mtu = mtu, DnsServers = dnsServers,
-        // The current desktop editors expose DNS mode directly. Older callers omit it: in
-        // that compatibility path, entering resolvers still means "use these" and moves a
-        // legacy off/system profile back to tunnel-managed DNS.
+        // Typing resolvers into the form MEANS "use these", so it has to move the mode off
+        // `off`/`system` — otherwise the address the user just entered is stored and then
+        // ignored, with the UI showing it as if it applied. The mode is kept when the field is
+        // left empty, so a `dns = off` profile saved without touching DNS stays `off`.
         DnsMode = dnsMode ?? (dnsServers.Count > 0 ? "tunnel" : DnsMode),
         PaddingEnabled = paddingEnabled, PaddingMin = paddingMin, PaddingMax = paddingMax,
         HeartbeatEnabled = heartbeatEnabled, HeartbeatIntervalMs = heartbeatIntervalMs, HeartbeatJitterMs = heartbeatJitterMs,
@@ -449,11 +470,15 @@ public sealed class VpnConfig : INotifyPropertyChanged
         // ── preserved from `this` (no form control) ──
         Id = Id,
         LocalAddress = LocalAddress, LocalPort = LocalPort,
-        RouteFile = RouteFile, InterfaceMetric = InterfaceMetric, DevNode = DevNode,
+        RouteFile = RouteFile, AdditionalRouteFiles = AdditionalRouteFiles,
+        InterfaceMetric = InterfaceMetric, DevNode = DevNode,
         ReconnectBaseDelaySecs = ReconnectBaseDelaySecs, ReconnectMaxDelaySecs = ReconnectMaxDelaySecs,
         BindStaticToSession = BindStaticToSession, AllowUnpinnedTofu = AllowUnpinnedTofu,
+        Ipv6Policy = ipv6Policy ?? Ipv6Policy,
+        RoamingPolicy = roamingPolicy ?? RoamingPolicy,
         IncludeRoutes = IncludeRoutes, ExcludeRoutes = ExcludeRoutes,
-        AllowIpv6Leak = AllowIpv6Leak, Forward = Forward,
+        AllowIpv4Leak = allowIpv4Leak ?? AllowIpv4Leak,
+        AllowIpv6Leak = allowIpv6Leak ?? AllowIpv6Leak, Forward = Forward,
         AwgEnabled = AwgEnabled, AwgJc = AwgJc, AwgJmin = AwgJmin, AwgJmax = AwgJmax,
         HeartbeatDataSize = HeartbeatDataSize,
         ShapingEnabled = ShapingEnabled, ShapingGapMeanMs = ShapingGapMeanMs, ShapingGapMinMs = ShapingGapMinMs,
@@ -578,13 +603,12 @@ public sealed class VpnConfig : INotifyPropertyChanged
         // round-trips to plain UDP and a quic-mode server stays silent.
         if (QuicEnabled) q.Add("quic=1");
         if (Mtu > 0) q.Add($"mtu={Mtu}");  // 0 = auto, omit
-        // Keep the cross-platform per-application contract in share links too.  INI
-        // already round-trips these fields, but dropping them here made a profile widen
-        // back to `all` merely by sharing it between clients.
-        if (!AppsMode.Equals("all", StringComparison.OrdinalIgnoreCase))
-            q.Add($"apps_mode={Uri.EscapeDataString(AppsMode)}");
-        if (Apps.Count > 0)
-            q.Add($"apps={Uri.EscapeDataString(string.Join(",", Apps))}");
+        if (!RoamingPolicy.Equals("auto", StringComparison.OrdinalIgnoreCase))
+            q.Add($"roaming={RoamingPolicy.ToLowerInvariant()}");
+        // Per-application routing is deliberately file-only. Application identifiers are
+        // platform-owned (Windows paths versus Android/macOS identifiers), and Rust, Android
+        // and iOS all treat qeli:// as a connection descriptor rather than device policy.
+        // Emitting apps_* here made the shared link contract platform-dependent.
         sb.Append('?').Append(string.Join("&", q));
 
         if (!string.IsNullOrWhiteSpace(Name)) sb.Append('#').Append(Uri.EscapeDataString(Name!));
@@ -608,7 +632,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
         var sb = new StringBuilder();
         sb.AppendLine("[qeli]");
         if (!string.IsNullOrWhiteSpace(Name)) sb.AppendLine($"name = {IniSafe(Name)}");
-        sb.AppendLine($"server = {IniSafe(ServerAddress)}:{Port}");
+        sb.AppendLine($"server = {IniSafe(UriHost(ServerAddress))}:{Port}");
         sb.AppendLine($"proto = {IniSafe(Protocol)}");
         sb.AppendLine($"user = {IniSafe(Username)}");
         sb.AppendLine($"pass = {IniSafe(Password)}");
@@ -633,6 +657,10 @@ public sealed class VpnConfig : INotifyPropertyChanged
         // Routing: emit `gateway = false` only for split-tunnel so the choice survives
         // a save/export round-trip (mirrors the Rust/Android client's `gateway` key).
         if (!IsFullTunnel) sb.AppendLine("gateway = false");
+        if (!Ipv6Policy.Equals("auto", StringComparison.OrdinalIgnoreCase))
+            sb.AppendLine($"ipv6 = {IniSafe(Ipv6Policy.ToLowerInvariant())}");
+        if (!RoamingPolicy.Equals("auto", StringComparison.OrdinalIgnoreCase))
+            sb.AppendLine($"roaming = {IniSafe(RoamingPolicy.ToLowerInvariant())}");
         if (RouteLocalNetworks) sb.AppendLine("route_local = true");
         if (IncludeRoutes.Count > 0) sb.AppendLine($"include = {string.Join(", ", IncludeRoutes.Select(IniSafe))}");
         if (ExcludeRoutes.Count > 0) sb.AppendLine($"exclude = {string.Join(", ", ExcludeRoutes.Select(IniSafe))}");
@@ -646,9 +674,11 @@ public sealed class VpnConfig : INotifyPropertyChanged
         if (Forward) sb.AppendLine("forward = true");
         if (KillSwitch) sb.AppendLine("kill_switch = true");
         if (AllowIpv6Leak) sb.AppendLine("allow_ipv6_leak = true");
+        if (AllowIpv4Leak) sb.AppendLine("allow_ipv4_leak = true");
         if (!string.IsNullOrEmpty(LocalAddress)) sb.AppendLine($"local = {IniSafe(LocalAddress)}");
         if (LocalPort > 0) sb.AppendLine($"lport = {LocalPort}");
-        if (!string.IsNullOrEmpty(RouteFile)) sb.AppendLine($"route_file = {IniSafe(RouteFile)}");
+        foreach (string routeFile in RouteFilePaths)
+            sb.AppendLine($"route_file = {IniSafe(routeFile)}");
         if (InterfaceMetric > 0) sb.AppendLine($"metric = {InterfaceMetric}");
         if (!string.IsNullOrEmpty(DevNode)) sb.AppendLine($"dev_node = {IniSafe(DevNode)}");
         // `dns` is the MODE, `dns_servers` is the resolver LIST — the split the key table in
@@ -938,6 +968,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
         }
         var q = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var dupKeys = new List<string>();
+        var routeFiles = new List<string>();
         string section = "";
         foreach (var raw in text.Replace("\r", "").Split('\n'))
         {
@@ -950,6 +981,15 @@ public sealed class VpnConfig : INotifyPropertyChanged
             {
                 var iniKey = line[..eq].Trim();
                 var iniValue = line[(eq + 1)..].Trim();
+                // route_file is the sole repeatable flat-INI key. Each occurrence adds one
+                // source file; treating it as an ambiguous scalar made multi-file route sets
+                // impossible while the last-wins dictionary silently discarded earlier files.
+                if (iniKey.Equals("route_file", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (iniValue.Length > 0) routeFiles.Add(iniValue);
+                    q[iniKey] = iniValue;
+                    continue;
+                }
                 if (!q.TryAdd(iniKey, iniValue))
                 {
                     // Second occurrence: keep the map's LAST-wins behaviour, so a config that
@@ -1006,7 +1046,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
         // whereas this jumps to the DEFAULT, which is somewhere else entirely. `lport = 99999`
         // became 0 (bind anywhere), a negative heartbeat became 15 s — the setting the user
         // wrote silently replaced by an unrelated one. The `server` port a few lines below had
-        // already been fixed this way and the rest were left behind; the C# selftest then
+        // already been fixed this way and the rest were left behind; QeliConformance then
         // pinned the silent behaviour as correct. (Audit 2026-08-02, §11.)
         int RangedNum(string key, int dflt, int lo, int hi)
         {
@@ -1025,13 +1065,33 @@ public sealed class VpnConfig : INotifyPropertyChanged
         var iniPad = CheckedPadding(NumAt("padding_min", 0), NumAt("padding_max", 255));
         string host = "127.0.0.1";
         int port = 443;
-        int colon = server.LastIndexOf(':');
-        if (colon > 0)
+        int colon = -1;
+        if (server.StartsWith('['))
         {
-            host = server[..colon];
-            if (!int.TryParse(server[(colon + 1)..], out port)) badNums.Add("server (port)");
+            int close = server.IndexOf(']');
+            if (close <= 1 || close + 1 >= server.Length || server[close + 1] != ':')
+                throw new ArgumentException(
+                    $"'server' IPv6 endpoint must be [address]:port, got '{server}'");
+            host = server[1..close];
+            colon = close + 1;
+            if (!System.Net.IPAddress.TryParse(host, out var address)
+                || address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetworkV6)
+                throw new ArgumentException($"'server' contains an invalid IPv6 address '{host}'");
+            if (!int.TryParse(server[(close + 2)..], out port)) badNums.Add("server (port)");
         }
-        else if (server.Length > 0) host = server;
+        else
+        {
+            colon = server.LastIndexOf(':');
+            if (colon > 0)
+            {
+                host = server[..colon];
+                if (host.Contains(':'))
+                    throw new ArgumentException(
+                        $"'server' IPv6 endpoint must be bracketed as [address]:port, got '{server}'");
+                if (!int.TryParse(server[(colon + 1)..], out port)) badNums.Add("server (port)");
+            }
+            else if (server.Length > 0) host = server;
+        }
         if (port is < 1 or > 65535)
         {
             // Out of range is as wrong as unparseable: `:0` and `:99999` are not ports, and
@@ -1153,10 +1213,14 @@ public sealed class VpnConfig : INotifyPropertyChanged
             // dropped the kill-switch flag — the leak protection the user asked for failed
             // OPEN. The Rust client reads it (client.rs); mirror it.
             KillSwitch = BoolAt("kill_switch", false),
+            Ipv6Policy = Get("ipv6", "auto").Trim().ToLowerInvariant(),
+            RoamingPolicy = Get("roaming", "auto").Trim().ToLowerInvariant(),
             AllowIpv6Leak = BoolAt("allow_ipv6_leak", false),
+            AllowIpv4Leak = BoolAt("allow_ipv4_leak", false),
             LocalAddress = Get("local").Length > 0 ? Get("local") : null,
-            LocalPort = RangedNum("lport", 0, 1, 65535),
-            RouteFile = Get("route_file").Length > 0 ? Get("route_file") : null,
+            LocalPort = RangedNum("lport", 0, 0, 65535),
+            RouteFile = routeFiles.Count > 0 ? routeFiles[0] : null,
+            AdditionalRouteFiles = routeFiles.Skip(1).ToList(),
             InterfaceMetric = RangedNum("metric", 0, 1, int.MaxValue),
             // Accept the Rust/Android client's `dev` key as an alias for `dev_node` so a
             // shared flat-INI config's TUN interface name transfers across clients.
@@ -1242,11 +1306,11 @@ public sealed class VpnConfig : INotifyPropertyChanged
     // `qeli://…?mtu=999999` (or a negative) became a profile that failed at connect with
     // an opaque TUN/socket error, and an out-of-range padding_max built records the peer
     // rejects as oversized. Same ranges the Rust client enforces — config/client.rs:
-    // mtu is 0 (auto) or 576..=16638; padding is bounded by the 1400-byte wire ceiling the
+    // mtu is 0 (auto) or 576..=16602; padding is bounded by the 1400-byte wire ceiling the
     // per-packet pad_cap uses. (Audit 2026-07-27, C6)
-    private const int MtuMin = 576;
+    internal const int MtuMin = 576;
     /// <summary>Derived, in Rust, from the record format (protocol/packet.rs MAX_TUNNEL_MTU): a record holds nonce + counter + payload + padding-length + tag and must fit MAX_RECORD_SIZE, so anything larger the PEER REJECTS. Mirrored here as a literal; the four ports and the two UIs must all carry the same number, because raising it in one place only is worse than not raising it — see Audit 2026-08-01 §1.</summary>
-    private const int MtuMax = 16638;
+    internal const int MtuMax = 16602;
     private const int PaddingCeiling = 1400;
 
     /// <summary>Range-check an explicit TUN MTU from a config FILE (flat-INI);
@@ -1297,11 +1361,10 @@ public sealed class VpnConfig : INotifyPropertyChanged
     /// The AUTH plaintext is <c>proof(32)</c> + the optional <c>[0x00 device_id(16)]</c> prefix
     /// + <c>user:pass</c>, and the whole thing rides in one unfragmented datagram — so the
     /// credentials are what decides whether it survives a path that drops IP fragments.
-    /// Derived from <see cref="Qeli.Shared.Protocol.UdpFrag.MaxChunk"/> rather than written
-    /// out, so it tracks the budget. Fully qualified: the bare namespace `Protocol` is
-    /// shadowed here by this class's own `Protocol` property (the tcp/udp string).
+    /// Derived from <see cref="TransportWireLimits.AuthCredentialBudget"/>, the same
+    /// production wire-size contract used by the standalone managed conformance codec.
     /// </remarks>
-    public static int AuthCredentialBudget => Qeli.Shared.Protocol.UdpFrag.MaxChunk - (32 + 17);
+    public static int AuthCredentialBudget => TransportWireLimits.AuthCredentialBudget;
 
     /// <summary>True for a bare IPv4 or IPv6 literal.</summary>
     /// <remarks>
@@ -1337,15 +1400,12 @@ public sealed class VpnConfig : INotifyPropertyChanged
     /// Called at CONNECT, not at load: an editor must still be able to open a bad profile in
     /// order to fix it. Same split as the Rust client. (Audit 2026-07-31.)
     ///
-    /// <para><paramref name="platformCapabilities"/> gates the checks that are about what THIS
-    /// client can currently do rather than about whether the profile is well-formed — today
-    /// just the IPv6-endpoint refusal. The import paths pass false: the cross-language
-    /// fixture <c>conformance/qeli-links.json</c> contains an IPv6-literal link that every
-    /// port must PARSE, and Kotlin's and Swift's validate() have no such check, so running it
-    /// at import would make C# reject a link the shared contract says is valid. It still runs
-    /// at connect, where it belongs. (Audit 2026-08-04, H-07.)</para></summary>
+    /// <para><paramref name="platformCapabilities"/> is retained for source compatibility
+    /// with older callers. Runtime family support is now negotiated by the Rust core against
+    /// the concrete adapter capabilities before a NetworkPlan is emitted.</para></summary>
     public void Validate(bool platformCapabilities = true)
     {
+        _ = platformCapabilities;
         // The flat INI spells the MODE and the RESOLVER LIST with the same `dns` key, so a
         // misspelled mode does not fall through to an error — it falls through to being read
         // as an ADDRESS. `dns = of` became a resolver named "of", the tunnel installed it, and
@@ -1365,6 +1425,33 @@ public sealed class VpnConfig : INotifyPropertyChanged
         {
             throw new ArgumentException(
                 $"dns mode must be off, tunnel or system — got '{DnsMode}'");
+        }
+        if (!new[] { "auto", "required", "off" }.Contains(Ipv6Policy.ToLowerInvariant()))
+        {
+            throw new ArgumentException(
+                $"ipv6 policy must be auto, required or off — got '{Ipv6Policy}'");
+        }
+        if (!new[] { "off", "auto", "required" }.Contains(RoamingPolicy.ToLowerInvariant()))
+        {
+            throw new ArgumentException(
+                $"roaming policy must be off, auto or required — got '{RoamingPolicy}'");
+        }
+        if (RoamingPolicy.Equals("required", StringComparison.OrdinalIgnoreCase)
+            && (!string.IsNullOrWhiteSpace(LocalAddress) || LocalPort != 0))
+        {
+            throw new ArgumentException(
+                "roaming = required cannot be combined with local or a non-zero lport");
+        }
+        if (Mtu != 0 && (Mtu < MtuMin || Mtu > MtuMax))
+        {
+            throw new ArgumentException(
+                $"mtu must be 0 (auto) or {MtuMin}..{MtuMax}, got {Mtu}");
+        }
+        if (Ipv6Policy.Equals("required", StringComparison.OrdinalIgnoreCase)
+            && Mtu > 0 && Mtu < 1280)
+        {
+            throw new ArgumentException(
+                $"ipv6 = required needs an explicit mtu of at least 1280 (or 0 for auto), got {Mtu}");
         }
         // Credentials must leave the AUTH message inside one datagram on UDP.
         //
@@ -1425,19 +1512,13 @@ public sealed class VpnConfig : INotifyPropertyChanged
         }
 
         if (Port is < 1 or > 65535) throw new ArgumentException($"'server' port out of range: {Port}");
-        // An IPv6 endpoint parses and round-trips, but no core can USE it: the sockets below are
-        // created AddressFamily.InterNetwork and the resolver discards AAAA. Accepting it meant
-        // a confusing "address family not supported" at connect time instead of a clear refusal
-        // here — the same reason the Rust client refuses it. Real support is tracked for 0.8.0.
-        // (Audit 2026-08-01, §9.)
-        if (platformCapabilities
-            && System.Net.IPAddress.TryParse(ServerAddress.Trim('[', ']'), out var parsed)
-            && parsed.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6)
-        {
+        if (string.IsNullOrWhiteSpace(ServerAddress))
+            throw new ArgumentException("'server' has empty host");
+        if (ServerAddress.Contains('[') || ServerAddress.Contains(']'))
             throw new ArgumentException(
-                $"'server' is an IPv6 address ('{ServerAddress}') — not supported yet: the data "
-                + "plane binds IPv4 only. Use an IPv4 address or a hostname that resolves to one.");
-        }
+                "'server' stores a bare host; brackets belong only around an IPv6 endpoint in INI");
+        if (ServerAddress.Contains(':') && !IsIpLiteral(ServerAddress))
+            throw new ArgumentException($"'server' contains an invalid IPv6 address '{ServerAddress}'");
         Enum_("proto", Protocol, "tcp", "udp");
         Enum_("mode", WireMode, "fake-tls", "obfs", "plain", "reality-tls");
         Enum_("apps_mode", AppsMode, "all", "include", "exclude");
@@ -1445,6 +1526,15 @@ public sealed class VpnConfig : INotifyPropertyChanged
             throw new ArgumentException(
                 "'apps_mode' is include/exclude but 'apps' is empty — refusing to silently "
                 + "turn a per-application profile into an unrestricted tunnel");
+        // Forwarded LAN packets have no owning desktop application. WinDivert therefore has
+        // no process identity with which to include/exclude them, and the macOS transparent
+        // proxy only receives application flows. Both platform SetupTun branches deliberately
+        // skip host forwarding in per-app mode; accepting the pair made `forward = true` look
+        // active while it did nothing. Refuse the unsupported topology at the config boundary.
+        if (Forward && UsesAppFilter)
+            throw new ArgumentException(
+                "'forward = true' cannot be combined with per-application routing on desktop — "
+                + "forwarded LAN traffic has no application identity; use 'apps_mode = all'");
         // Both fields are individually valid and the PAIR is not. The server refuses these two
         // combinations, so a client that accepts them cannot reach any working profile — it
         // just fails later and less clearly. Worse for `reality-tls`: nothing about the name
@@ -1530,13 +1620,29 @@ public sealed class VpnConfig : INotifyPropertyChanged
                         $"'{field}' route '{route}' is not an IPv4/IPv6 CIDR literal");
             }
         }
+        if (ShapingGapMeanMs <= 0 || ShapingGapMinMs <= 0 || ShapingGapMaxMs <= 0
+            || ShapingBudgetBytesPerSec <= 0 || ShapingMinSize <= 0 || ShapingMaxSize <= 0
+            || ShapingStealthRateMbps <= 0)
+        {
+            throw new ArgumentException(
+                "shaping durations, sizes, budget and stealth rate must be positive");
+        }
+        if (ShapingGapMinMs > ShapingGapMaxMs)
+            throw new ArgumentException(
+                $"shaping gap range is inverted: {ShapingGapMinMs}..{ShapingGapMaxMs}");
+        if (ShapingMinSize > ShapingMaxSize)
+            throw new ArgumentException(
+                $"shaping size range is inverted: {ShapingMinSize}..{ShapingMaxSize}");
+        if (ShapingEnabled && ShapingBudgetBytesPerSec < ShapingMaxSize)
+        {
+            throw new ArgumentException(
+                $"shaping budget ({ShapingBudgetBytesPerSec}) must be at least max_size "
+                + $"({ShapingMaxSize}) so each scheduled cover record can be emitted");
+        }
         if (ConnectionTimeoutSecs is < 1 or > 300)
             throw new ArgumentException($"'timeout' must be 1..300, got {ConnectionTimeoutSecs}");
     }
 
-    private static bool IniBool(string v) =>
-        v.Equals("true", StringComparison.OrdinalIgnoreCase) || v == "1" ||
-        v.Equals("yes", StringComparison.OrdinalIgnoreCase) || v.Equals("on", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Split a comma-separated CIDR list, trimming blanks. Values are validated
     /// again (strict IP literal) before being spliced into route commands.</summary>
@@ -1602,6 +1708,9 @@ public sealed class VpnConfig : INotifyPropertyChanged
             if (rb < 0 || rb + 1 >= hostPort.Length || hostPort[rb + 1] != ':')
                 throw new FormatException("qeli:// authority malformed IPv6 [host]:port");
             host = hostPort[1..rb];
+            if (!System.Net.IPAddress.TryParse(host, out var address)
+                || address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetworkV6)
+                throw new FormatException($"invalid IPv6 address in qeli:// link: '{host}'");
             if (!int.TryParse(hostPort[(rb + 2)..], out port))
                 throw new FormatException("invalid port in qeli:// link");
         }
@@ -1610,6 +1719,9 @@ public sealed class VpnConfig : INotifyPropertyChanged
             int colonIdx = hostPort.LastIndexOf(':');
             if (colonIdx <= 0) throw new FormatException("qeli:// authority missing :port");
             host = hostPort[..colonIdx];
+            if (host.Contains(':') || host.Contains('[') || host.Contains(']'))
+                throw new FormatException(
+                    "qeli:// IPv6 authority must be bracketed as [address]:port");
             if (!int.TryParse(hostPort[(colonIdx + 1)..], out port))
                 throw new FormatException("invalid port in qeli:// link");
         }
@@ -1629,14 +1741,13 @@ public sealed class VpnConfig : INotifyPropertyChanged
         }
 
         string proto = "tcp", mode = "fake-tls", obfs = "", front = "websocket";
-        string appsMode = "all";
-        var apps = new List<string>();
         string? key = null, sni = null, rsid = null;
         bool quic = false;
         int mtu = 0;  // 0 = auto (use server-pushed MTU)
         // F2 AmneziaWG junk params (off unless awg=1).
         bool awg = false;
         uint awgJc = 0;
+        string roaming = "auto";
         ushort awgJmin = 40, awgJmax = 300;
         if (query != null)
         {
@@ -1677,14 +1788,7 @@ public sealed class VpnConfig : INotifyPropertyChanged
                     case "front": if (v.Length > 0) front = v; break;
                     case "quic": quic = v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase); break;
                     case "mtu": int.TryParse(v, out mtu); break;
-                    case "apps_mode": appsMode = v.Trim().ToLowerInvariant(); break;
-                    case "apps":
-                        apps = v.Split(',')
-                            .Select(item => item.Trim())
-                            .Where(item => item.Length > 0)
-                            .Distinct(StringComparer.OrdinalIgnoreCase)
-                            .ToList();
-                        break;
+                    case "roaming": roaming = v.Trim().ToLowerInvariant(); break;
                     case "awg": awg = v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase); break;
                     case "jc": if (uint.TryParse(v, out var jcp)) awgJc = Math.Min(jcp, 128u); break;
                     case "jmin": if (ushort.TryParse(v, out var jminp)) awgJmin = Math.Min(jminp, (ushort)1400); break;
@@ -1700,11 +1804,26 @@ public sealed class VpnConfig : INotifyPropertyChanged
         var cfg = new VpnConfig
         {
             Name = label,
-            ServerAddress = host, Port = port, Protocol = proto,
-            Username = user, Password = pass, ServerPublicKeyHex = key,
-            WireMode = mode, ObfsKey = obfs, ObfsFronting = front, Sni = sni, QuicEnabled = quic,
-            AwgEnabled = awg, AwgJc = awgJc, AwgJmin = awgJmin, AwgJmax = awgJmax,
-            RealityShortId = rsid, Mtu = LinkMtu(mtu), AppsMode = appsMode, Apps = apps,
+            ServerAddress = host,
+            Port = port,
+            Protocol = proto,
+            Username = user,
+            Password = pass,
+            ServerPublicKeyHex = key,
+            WireMode = mode,
+            ObfsKey = obfs,
+            ObfsFronting = front,
+            Sni = sni,
+            QuicEnabled = quic,
+            AwgEnabled = awg,
+            AwgJc = awgJc,
+            AwgJmin = awgJmin,
+            AwgJmax = awgJmax,
+            RealityShortId = rsid,
+            RoamingPolicy = roaming,
+            Mtu = LinkMtu(mtu),
+            AppsMode = appsMode,
+            Apps = apps,
         };
         // Kotlin's fromQeliUri and Swift's fromQeliURI both end with validate(); C# defined
         // the same checks and then never ran them on any import path — grep found Validate()

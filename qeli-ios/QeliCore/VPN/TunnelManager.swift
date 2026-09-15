@@ -290,7 +290,6 @@ final class TunnelManager: NSObject, ObservableObject {
     func disconnect() {
         operationGeneration &+= 1
         let status = manager?.connection.status ?? .invalid
-        manager?.connection.stopVPNTunnel()
         var value = snapshot
         if !connectInProgress && (status == .invalid || status == .disconnected) {
             value.phase = .disconnected
@@ -301,6 +300,10 @@ final class TunnelManager: NSObject, ObservableObject {
             value.message = "Stopping tunnel…"
         }
         publish(value)
+        // Publish the loss of the private path before asking NetworkExtension to remove it.
+        // AppModel normally cancels and awaits update checks before calling this method; this
+        // ordering also makes every observer see the loss before the stop completes.
+        manager?.connection.stopVPNTunnel()
     }
 
     func refreshSnapshot() {
@@ -363,11 +366,15 @@ final class TunnelManager: NSObject, ObservableObject {
 
     private func clearConnectionFields(_ value: inout TunnelSnapshot) {
         value.clientAddress = nil
+        value.tunnelAddresses = nil
+        value.tunnelGateway = nil
         value.connectedAt = nil
         value.bytesUploaded = 0
         value.bytesDownloaded = 0
         value.uploadBytesPerSecond = 0
         value.downloadBytesPerSecond = 0
+        value.privateUpdatePath = nil
+        value.liveConnectionProperties = nil
         value.updatedAt = Date()
     }
 
@@ -422,29 +429,17 @@ final class TunnelManager: NSObject, ObservableObject {
         isOnDemandEnabled: Bool,
         rules: [NEOnDemandRule]
     ) -> Bool {
-        guard isOnDemandEnabled else { return false }
-        return rules.contains(where: { rule in
-            rule is NEOnDemandRuleDisconnect
-                && rule.interfaceTypeMatch == .wiFi
-                && !(rule.ssidMatch?.isEmpty ?? true)
-        })
+        OnDemandPolicy.hasTrustedWiFiDisconnectRule(
+            isOnDemandEnabled: isOnDemandEnabled,
+            rules: rules
+        )
     }
 
     /// Ordered first-match policy: exact trusted Wi-Fi names pause the tunnel; every other
     /// known or unknown network falls through to Connect. `connectionDesired` is cleared by
     /// an explicit Disconnect, disabling the whole policy until the next explicit Connect.
     nonisolated static func makeOnDemandRules(settings: AppSettings) -> [NEOnDemandRule] {
-        guard settings.onDemandEnabled, settings.connectionDesired else { return [] }
-        var rules: [NEOnDemandRule] = []
-        let ssids = TrustedWiFiPolicy.normalized(settings.trustedWiFiSSIDs)
-        if settings.trustedWiFiEnabled, !ssids.isEmpty {
-            let disconnect = NEOnDemandRuleDisconnect()
-            disconnect.interfaceTypeMatch = .wiFi
-            disconnect.ssidMatch = ssids
-            rules.append(disconnect)
-        }
-        rules.append(NEOnDemandRuleConnect())
-        return rules
+        OnDemandPolicy.makeRules(settings: settings)
     }
 
     private static func configure(
@@ -457,13 +452,15 @@ final class TunnelManager: NSObject, ObservableObject {
         tunnelProtocol.providerBundleIdentifier = AppConstants.tunnelBundleIdentifier
         tunnelProtocol.serverAddress = config.serverAddress
         let strictFullTunnel = config.isFullTunnel
+            && !config.allowIPv4Leak
             && !config.allowIPv6Leak
             && !config.allowLAN
             && !settings.allowLAN
             && config.excludeRoutes.isEmpty
         tunnelProtocol.includeAllNetworks = strictFullTunnel
         tunnelProtocol.enforceRoutes = config.isFullTunnel
-        tunnelProtocol.excludeLocalNetworks = config.allowLAN || settings.allowLAN
+        tunnelProtocol.excludeLocalNetworks = config.isFullTunnel
+            && (config.allowLAN || settings.allowLAN)
         tunnelProtocol.excludeAPNs = false
         tunnelProtocol.excludeCellularServices = false
         // No credentials/profile text in Network Extension preferences. The provider

@@ -22,7 +22,6 @@
     <string name="move_up">Move up</string>
     <string name="move_down">Move down</string>
     <string name="profile_actions">Actions</string>
-    <string name="check_servers">Check servers</string>
     <string name="no_profiles">No profiles yet. Tap “Import” or “+ New”.</string>
     <string name="save">Save</string>
     <string name="cancel">Cancel</string>
@@ -41,7 +40,7 @@
     <string name="tap_to_cancel_resume">TAP TO CANCEL AUTO-RESUME</string>
     <string name="notif_trusted_wifi">Paused on trusted Wi-Fi %1$s</string>
     <string name="auto_probe_profiles">Poll profiles automatically</string>
-    <string name="auto_probe_profiles_desc">Checks saved profiles while the app is open and the VPN is disconnected. Each sweep contacts every configured server.</string>
+    <string name="auto_probe_profiles_desc">Disabled by default. When enabled, checks saved profiles while the app is open and the VPN is disconnected. Each sweep contacts every configured server.</string>
     <string name="probe_interval">Polling interval</string>
     <string name="seconds_short">s</string>
     <string name="backup_profiles">Back up profiles…</string>
@@ -103,6 +102,13 @@
     <string name="edit_profile_title">Edit profile</string>
     <string name="profile_name_hint">Profile name</string>
     <string name="config_ini_label">Config (INI)</string>
+    <string name="roaming_policy_label">Session roaming</string>
+    <string-array name="roaming_policy_options">
+        <item>Automatic (when supported)</item>
+        <item>Required</item>
+        <item>Disabled</item>
+    </string-array>
+    <string name="roaming_policy_hint">Auto keeps the authenticated session across network changes when supported, otherwise reconnects. Required refuses unsupported servers or platforms.</string>
     <string name="add_profile_title">Add profile</string>
     <string name="add_scan_qr">Scan QR code</string>
     <string name="add_paste_link">Paste qeli:// link</string>
@@ -195,7 +201,7 @@
     <string name="update_available_open">Update available: %1$s — tap to open</string>
     <string name="check_now">Check now</string>
     <string name="close">Close</string>
-    <string name="update_connect_first">Connect first to check for updates privately</string>
+    <string name="update_private_path_required">Use a connected full tunnel without IPv4/IPv6 leaks, LAN bypass, excluded routes, or include-only app filtering</string>
     <string name="update_checking">Checking…</string>
     <string name="update_check_failed">Could not check for updates</string>
     <string name="update_latest">You have the latest version</string>
@@ -219,27 +225,21 @@
     <string name="protection_apps">Apps</string>
     <string name="protection_always_on">Always-on</string>
     <!-- Headlines -->
-    <string name="protection_all_traffic">All traffic is protected</string>
     <string name="protection_selected_apps">%1$d app(s) protected</string>
     <string name="protection_except_apps">All apps except %1$d protected</string>
     <string name="protection_split">Split tunnel — only selected routes</string>
-    <string name="protection_idle">Will be used on connect</string>
-    <string name="protection_no_profile">No profile selected</string>
-    <string name="protection_invalid">Profile config is invalid</string>
     <!-- Detail bits -->
     <string name="protection_pq">Hybrid post-quantum</string>
     <string name="protection_classic">X25519 (no post-quantum)</string>
     <!-- Same facts, sized for the one-line strip. -->
     <string name="protection_pq_short">PQ</string>
     <string name="protection_classic_short">X25519</string>
-    <string name="protection_dns_tunnel">DNS through VPN</string>
     <string name="protection_dns_system">system DNS</string>
     <string name="protection_key_pinned">server key pinned</string>
     <string name="protection_key_tofu">server key on trust (TOFU)</string>
-    <string name="protection_sep">%1$s · %2$s</string>
-    <string name="protection_mode_line">%1$s · %2$s · %3$s</string>
     <!-- Warnings: things that narrow what the tunnel carries -->
     <string name="protection_warn_lan">Local network stays outside the tunnel</string>
+    <string name="protection_warn_ipv4">IPv4 bypasses the tunnel</string>
     <string name="protection_warn_ipv6">IPv6 bypasses the tunnel</string>
     <string name="protection_warn_excluded">%1$d route(s) excluded from the tunnel</string>
     <string name="protection_warn_no_key">Without a pinned key the first connection is trusted blindly</string>
@@ -261,8 +261,19 @@
     <string name="detail_transport">Transport</string>
     <string name="detail_crypto">Encryption</string>
     <string name="detail_server_key">Server key</string>
+    <string name="detail_warning">Warning</string>
     <string name="detail_dns">DNS</string>
     <string name="detail_mtu">MTU</string>
+    <string name="detail_ip_family">IP family</string>
+    <string name="detail_ipv4">IPv4</string>
+    <string name="detail_ipv6">IPv6</string>
+    <string name="detail_dual_stack">Dual-stack</string>
+    <string name="detail_carrier">Carrier</string>
+    <string name="detail_recordizer">Packet recordizer</string>
+    <string name="detail_roaming">Session roaming</string>
+    <string name="detail_legacy_packet_record">Legacy packet-per-record</string>
+    <string name="detail_reconnect_fallback">Reconnect fallback</string>
+    <string name="detail_mode_policy">%1$s (%2$s)</string>
     <string name="detail_multipath">Multipath</string>
     <string name="detail_streams">up to %1$d streams</string>
     <string name="detail_pushed_routes">Pushed routes</string>
@@ -271,7 +282,7 @@
     <string name="detail_reconnect">Auto-reconnect</string>
     <string name="detail_on">On</string>
     <string name="detail_off">Off</string>
-    <string name="detail_tunnel_ip">Tunnel IP</string>
+    <string name="detail_tunnel_ip">Tunnel addresses</string>
     <string name="detail_adaptive">adaptive</string>
     <string name="detail_padding">Padding</string>
     <string name="detail_heartbeat">Heartbeat</string>

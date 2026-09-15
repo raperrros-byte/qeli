@@ -14,6 +14,7 @@ from native_repro import require_lab_password, sha256_file
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LOCAL = os.fspath(REPO_ROOT / "qeli-android")
+CONFORMANCE = REPO_ROOT / "conformance"
 REMOTE = "/root/android-project"
 HOST = ("10.66.116.11", os.environ.get("QELI_LAB_USER", "root"))
 # Build via the project's Gradle wrapper (version pinned in
@@ -27,6 +28,18 @@ SYNC_EXT = (
 SYNC_FILES = {"gradlew"}
 SKIP_DIRS = {"build", ".gradle", ".kotlin", "dist", ".idea", "jniLibs"}
 SKIP_FILES = {"local.properties"}
+# These source trees must be mirrors of the checkout. Merely overwriting files
+# leaves deleted Kotlin classes/tests behind on the persistent Android builder,
+# allowing stale code from an older branch to enter the APK or fail its tests.
+# Keep jniLibs outside the list: step 1 installs the independently reproduced
+# native cores there, and the lab's signing/local configuration lives elsewhere.
+MIRRORED_SOURCE_TREES = (
+    "app/src/androidTest",
+    "app/src/main/kotlin",
+    "app/src/main/res",
+    "app/src/test",
+)
+
 DIST = os.path.join(LOCAL, "dist")
 if len(sys.argv) > 2 or (len(sys.argv) == 2 and sys.argv[1] != "--release"):
     raise SystemExit("usage: rebuild_apk.py [--release]")
@@ -50,8 +63,17 @@ for abi in ("arm64-v8a", "x86_64"):
     sf.put(lp, rp)
     print(f"  [push] {abi}/libqeli.so ({os.path.getsize(lp)} bytes)")
 
-# 2. Sync Kotlin/resources/gradle in place (skip jniLibs so the .so stays).
-print("=== 2. sync sources (preserving jniLibs) ===")
+# 2. Sync Kotlin/resources/gradle and the repo-level shared conformance fixtures in place
+# (skip jniLibs so the freshly rebuilt .so stays). Android's JVM tests deliberately read
+# the same fixtures as Rust/C#/Swift; leaving the lab's old copies behind can make a release
+# fail or, worse, certify vectors from a different commit.
+print("=== 2. sync sources + shared conformance (preserving jniLibs) ===")
+for relative in MIRRORED_SOURCE_TREES:
+    remote_tree = posixpath.join(REMOTE, relative)
+    clean_output, clean_rc = sh(c, f"rm -rf -- {shlex.quote(remote_tree)}")
+    if clean_rc != 0:
+        raise RuntimeError(f"remote source cleanup failed for {relative}:\n{clean_output}")
+
 sources = []
 remote_directories = set()
 for root, dirs, names in os.walk(LOCAL):
@@ -64,6 +86,10 @@ for root, dirs, names in os.walk(LOCAL):
         remote = posixpath.join(REMOTE, rel)
         sources.append((full, remote))
         remote_directories.add(posixpath.dirname(remote))
+for fixture in sorted(CONFORMANCE.glob("*.json")):
+    remote = posixpath.join(REMOTE, "conformance", fixture.name)
+    sources.append((os.fspath(fixture), remote))
+    remote_directories.add(posixpath.dirname(remote))
 mkdir_output, mkdir_rc = sh(
     c,
     "mkdir -p " + " ".join(shlex.quote(path) for path in sorted(remote_directories)),
@@ -72,7 +98,7 @@ if mkdir_rc != 0:
     raise RuntimeError(f"remote source directory creation failed:\n{mkdir_output}")
 for full, remote in sources:
     sf.put(full, remote)
-print(f"  [sync] {len(sources)} files in one directory-preflight batch")
+print(f"  [sync] {len(sources)} files including shared conformance fixtures")
 print("  [versionName on .11]:",
       sh(c, f"grep -E 'versionCode|versionName' {REMOTE}/app/build.gradle.kts")[0])
 
@@ -81,8 +107,9 @@ assemble_task = "assembleRelease" if RELEASE else "assembleDebug"
 print(f"=== 3. ./gradlew testDebugUnitTest {assemble_task} --offline ===")
 sh(c, "pkill -9 -f GradleDaemon 2>/dev/null; rm -rf /root/.gradle/caches/journal-1 2>/dev/null; true")
 out, rc = sh(c, f"cd {REMOTE} && chmod +x gradlew && ./gradlew clean testDebugUnitTest {assemble_task} --offline --no-daemon "
-                f"-Dorg.gradle.vfs.watch=false 2>&1", t=1200)
-print("\n".join(out.splitlines()[-15:]))
+                f"--max-workers=1 -Dorg.gradle.vfs.watch=false "
+                f"'-Dorg.gradle.jvmargs=-Xmx1536m -Dfile.encoding=UTF-8' 2>&1", t=1200)
+print("\n".join(out.splitlines()[-80:]))
 if rc != 0 or "BUILD SUCCESSFUL" not in out:
     print(f"[build] FAILED (rc={rc})"); c.close(); sys.exit(1)
 

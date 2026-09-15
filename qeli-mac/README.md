@@ -1,24 +1,23 @@
 # qeli-mac
 
 Нативный macOS-клиент для VPN **qeli** (Quick Easy Link IP): C# / .NET 10 + Avalonia
-как platform/UI слой и общее Rust transport-ядро через ABI 1.10. Rust владеет
+как platform/UI слой и общее Rust transport-ядро ABI 1.15 (compatibility floor 1.11). Rust владеет
 DNS/connect, handshake, crypto, TCP/UDP/QUIC/Reality, heartbeat/shaping, bonding и
 utun payload; C# управляет lifecycle/reconnect, созданием интерфейса,
 маршрутами/DNS/pf, trust и UI.
 
-Режим **`reality-tls`** (полноценный REALITY) несёт туннель внутри *настоящего*
-браузерного TLS 1.3 (byte-exact Chrome ClientHello, JA4 `t13d1516h2_8daaf6152771`):
-qeli-протокол работает **вложенно** внутри этой TLS-сессии, на проводе DPI видит только
-реальный Chrome-handshake. Весь transport, включая внешний TLS-слой, выполняет то же
-Rust-ядро через whole-client FFI — одна нативная либа на все клиенты (Rust, Android
-`.so`, Windows `qeli.dll`, macOS `libqeli.dylib`).
+Режим **`reality-tls`** использует браузероподобный TLS 1.3 и настоящий HTTP/2 carrier:
+один streaming POST с ALPN `h2` и случайным batching, без прежнего внутреннего fake-TLS
+handshake/framing. Внешний TLS и внутренний qeli AEAD сохраняются. Transport выполняет общее
+Rust-ядро через whole-client FFI. macOS получит эту логику только после пересборки,
+упаковки и установки приложения с обновлённой `libqeli.dylib`; сервер не обновляет клиент.
 
 ## Технологии
 
 | Компонент             | Чем реализовано                                                       |
 |-----------------------|----------------------------------------------------------------------|
 | TUN-устройство        | macOS `utun` (PF_SYSTEM kernel-control, P/Invoke в libc)             |
-| Transport/crypto      | Rust `libqeli.dylib`, ABI 1.10 (`qeli_client_run` + native utun fd)  |
+| Transport/crypto      | Rust `libqeli.dylib`, ABI 1.15 (`qeli_client_run` + native utun fd)  |
 | Conformance/diagnostics | .NET wire/KAT и reachability tools; production fallback отсутствует |
 | GUI                   | Avalonia UI 11 (.NET 10) — кросс-платформенный аналог WPF             |
 | Логотип / иконки / трей | SkiaSharp (пути, градиенты, текст → PNG)                            |
@@ -31,8 +30,8 @@ Rust-ядро через whole-client FFI — одна нативная либа
 ```
 qeli-mac/
 ├── QeliMac/
-│   ├── Model/         VpnConfig (INI / qeli://), AppSettings, ProfileStore, Paths
-│   ├── Vpn/           UtunDevice lifecycle, NetworkConfigurator, ABI 1.10 adapter
+│   ├── Model/         VpnConfig (flat-INI / qeli://), AppSettings, ProfileStore, Paths (profiles.json — внутреннее хранилище приложения)
+│   ├── Vpn/           UtunDevice lifecycle, NetworkConfigurator, ABI 1.15 adapter
 │   ├── native/        libqeli.dylib — whole-client core (universal arm64+x86_64)
 │   ├── Service/       ServiceState, ServiceManager (launchd daemon), ServiceHost
 │   ├── Styles/        Controls.axaml — стили кнопок/инпутов/списка (палитра темы)
@@ -50,7 +49,7 @@ qeli-mac/
 ├── build_app.sh       сборка Qeli.app (dylib + publish + .icns + бандл + ad-hoc подпись)
 ├── per-app/           Swift system extension + controller, XcodeGen project и build gate
 ├── README.md
-└── ../qeli-shared/    lifecycle/model + retained conformance diagnostics
+└── ../qeli-shared/    production lifecycle/model + отдельный QeliConformance runner
 ```
 
 ## Сборка (в лабе — Linux, либо на Mac)
@@ -161,7 +160,7 @@ bundle ID, например `com.apple.Safari`), `exclude` — все прило
 Подписанное system extension объединяет `NETransparentProxyProvider` для TCP/UDP и
 `NEDNSProxyProvider` для DNS. Выбранные сокеты привязываются через публичные
 `IP_BOUND_IF`/`IPV6_BOUND_IF` к активному qeli `utun`, после чего трафик обрабатывает то же
-Rust-ядро ABI 1.10. Невыбранные потоки остаются на системном маршруте/DNS. Во время reconnect
+Rust-ядро ABI 1.15. Невыбранные потоки остаются на системном маршруте/DNS. Во время reconnect
 выбранные потоки закрыты fail-closed. Flow API не даёт per-app ICMP; глобальный pf
 `kill_switch` в per-app-профиле не включается, иначе он заблокировал бы bypass-приложения.
 
@@ -178,7 +177,7 @@ Rust-ядро ABI 1.10. Невыбранные потоки остаются н�
 | Автозапуск через `schtasks` (ONLOGON)    | launchd LaunchAgent (`…autostart`)                |
 | Тема/accent из реестра                   | `defaults read -g AppleInterfaceStyle / AppleAccentColor` |
 | `requireAdministrator` (UAC)             | root (sudo) либо демон от root                    |
-| Whole-client `qeli.dll` (ABI 1.10)       | `libqeli.dylib` (universal, тот же ABI 1.10)      |
+| Whole-client `qeli.dll` (ABI 1.15)       | `libqeli.dylib` (universal, тот же ABI 1.15)      |
 | WinDivert per-app capture                | transparent + DNS Network Extension               |
 
 Палитра, темизация (светлая/тёмная + accent), тосты, поиск профилей, индикатор
@@ -188,21 +187,31 @@ Rust-ядро ABI 1.10. Невыбранные потоки остаются н�
 ## Headless-режимы (отладка/CI)
 
 ```bash
-QeliMac selftest                         # крипто/кодек/парсинг (без сети, без root) — все PASS
+QeliMac selftest                         # DNS/routes/pf/utun platform checks (без root)
+QeliMac pf-selftest-rules /tmp/qeli.pf    # CI: production rules для pfctl parse/load/flush
 QeliMac handshake <link|ini|file>        # TCP/UDP + полное рукопожатие, печатает выданный IP
 sudo QeliMac connect <link|ini|file> [сек]   # поднимает полный туннель на N секунд (нужен root)
 QeliMac genassets <dir>                  # рендер брендовых PNG (использует build_app.sh для .icns)
 ```
 
-`selftest` проходит все проверки (X25519 симметричен, HKDF совпадает с RFC 5869,
-ChaCha20-Poly1305 round-trip, PacketCodec + anti-replay, obfs, разбор `qeli://`/INI,
-ClientHello c UDP-паддингом, рендер логотипа Skia).
+`uishot` и зависимость `Avalonia.Headless` не входят в production-сборку. Для снимков UI
+соберите отдельный инструмент: `dotnet build QeliMac/QeliMac.csproj -c Release
+-p:QeliBuildTools=true`, затем запустите `QeliMac uishot <dir>`.
+
+Portable crypto/codec/config KAT и benchmark вынесены из production-приложения:
+`dotnet run --project ../qeli-shared/QeliConformance -c Release -- selftest` и
+`... -- packetbench --ci`. Platform `QeliMac selftest` отдельно проверяет DNS journal,
+маршруты, pf-правила, cleanup IPv4/IPv6 utun и Skia renderer.
 
 ## Замечания по реализации utun
 
-`utun` на macOS — точка-точка L3-интерфейс ядра. Кадры несут 4-байтовый префикс
-семейства адресов (AF_INET = 2, big-endian), который `UtunDevice` срезает при чтении и
-добавляет при записи — наружу остаётся «голый» IPv4-пакет, как у Wintun-обёртки.
-Полный туннель ставится двумя `/1`-маршрутами (`0.0.0.0/1` + `128.0.0.0/1`) через
-интерфейс, как у WireGuard; маршрут к серверу пиннится через физический шлюз, чтобы
-зашифрованный трафик не зациклился. Все изменения сети откатываются при отключении.
+`utun` на macOS — точка-точка L3-интерфейс ядра. Каждый пакет несёт 4-байтовый
+big-endian префикс семейства: `AF_INET = 2` для IPv4 или `AF_INET6 = 30` для IPv6.
+`UtunDevice` передаёт descriptor общему Rust-ядру, а ядро снимает этот префикс перед
+L3-кодеком и восстанавливает его при записи пакета соответствующего семейства.
+
+Для IPv4 full-tunnel ставятся `0.0.0.0/1` и `128.0.0.0/1`. Активный IPv6-план также
+ставит `::/1`, `8000::/1`, более специфичные GUA-маршруты `2000::/4` + `3000::/4` и
+ULA `fc00::/7`, чтобы router-advertised маршруты не обошли туннель. Внешний маршрут к
+серверу пиннится через физический gateway/interface своего семейства, а все изменения
+сети транзакционно откатываются при отключении.

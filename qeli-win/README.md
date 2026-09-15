@@ -1,24 +1,24 @@
 # qeli-win
 
 Нативный Windows-клиент для VPN **qeli** (Quick Easy Link IP): C# / .NET 10 + WPF
-как platform/UI слой и общее Rust transport-ядро через ABI 1.10. Rust владеет
+как platform/UI слой и общее Rust transport-ядро ABI 1.15 (compatibility floor 1.11). Rust владеет
 DNS/connect, handshake, crypto, TCP/UDP/QUIC/Reality, heartbeat/shaping, bonding и
 Wintun session/rings; C# управляет lifecycle/reconnect, созданием интерфейса,
 маршрутами/DNS/kill-switch, trust и UI. Только для per-app-профиля C# передаёт
 перехваченные WinDivert-пакеты в то же Rust-ядро через общий packet-device ABI.
 
-Режим **`reality-tls`** несёт туннель внутри *настоящего* браузерного TLS 1.3
-(byte-exact Chrome ClientHello, JA4 `t13d1516h2_8daaf6152771`): qeli-протокол
-работает **вложенно** внутри этой TLS-сессии, на проводе DPI видит только реальный
-Chrome-handshake. Весь transport, включая внешний TLS-слой, выполняет общее Rust-ядро
-через P/Invoke — нативная `qeli.dll` с whole-client ABI, вшитая в exe.
+Режим **`reality-tls`** использует браузероподобный TLS 1.3 и настоящий HTTP/2 carrier:
+один streaming POST с ALPN `h2` и случайным batching, без прежнего внутреннего fake-TLS
+handshake/framing. Внешний TLS и внутренний qeli AEAD сохраняются. Весь transport выполняет
+общее Rust-ядро через P/Invoke — версия попадёт пользователю только после пересборки и
+установки exe с обновлённой `qeli.dll`; сервер не обновляет ядро установленного клиента.
 
 ## Технологии
 
 | Компонент            | Чем реализовано                                              |
 |----------------------|-------------------------------------------------------------|
 | TUN-устройство       | Wintun для `apps_mode=all`; WinDivert capture для `include`/`exclude` (обе пары DLL/драйверов вшиты в exe) |
-| Transport/crypto     | Rust `qeli.dll`, ABI 1.10 (`qeli_client_run` + native Wintun rings) |
+| Transport/crypto     | Rust `qeli.dll`, ABI 1.15 (`qeli_client_run` + native Wintun rings) |
 | Conformance/diagnostics | .NET wire/KAT и reachability tools; production fallback отсутствует |
 | GUI                  | WPF (.NET 10)                                                |
 | Маршруты / DNS / IP  | `iphlpapi` (LUID→index, gateway, `CreateIpForwardEntry2` для маршрутов) + `netsh` / `route` (fallback) |
@@ -28,8 +28,8 @@ Chrome-handshake. Весь transport, включая внешний TLS-слой
 ```
 qeli-win/
 ├── QeliWin/
-│   ├── Model/         VpnConfig (INI + qeli://), ProfileStore
-│   ├── Vpn/           Wintun lifecycle, NetworkConfigurator, ABI 1.10 adapter
+│   ├── Model/         VpnConfig (flat-INI + qeli://), ProfileStore (profiles.json — внутреннее зашифрованное хранилище приложения)
+│   ├── Vpn/           Wintun lifecycle, NetworkConfigurator, ABI 1.15 adapter
 │   ├── App.xaml(.cs)  точка входа + headless CLI
 │   ├── MainWindow.*   интерфейс (авто-транспорт, SNI, **Авто** у Connect)
 │   ├── SniSpeedWindow.*  матрица Mode × SNI (Select all, пауза, Apply best)
@@ -39,7 +39,7 @@ qeli-win/
 │   ├── wintun/wintun.dll  (встраивается в exe как ресурс)
 │   └── windivert/         WinDivert.dll + WinDivert64.sys (встраиваются в exe)
 ├── dist/              готовые сборки — QeliWin-standalone.exe / QeliWin-net-required.exe
-└── ../qeli-shared/    lifecycle/model + retained conformance diagnostics
+└── ../qeli-shared/    production lifecycle/model + отдельный QeliConformance runner
 ```
 
 ## Запуск
@@ -47,7 +47,7 @@ qeli-win/
 VPN требует прав администратора (создание Wintun-адаптера, изменение маршрутов/DNS).
 
 Из релиза приходят **два варианта приложения** — выберите один. Рядом лежат общие
-`WinDivert-LICENSE.txt` и `WinDivert-NOTICE.txt`, необходимые для поставки драйвера:
+`Wintun-LICENSE.txt`, `WinDivert-LICENSE.txt` и `WinDivert-NOTICE.txt`; они являются обязательной частью поставки встроенных драйверов:
 
 | Файл | Размер | Что нужно на машине |
 |---|---|---|
@@ -77,6 +77,12 @@ NAT и fragment affinity не дают DNS и последующим IPv4-фра
 пакета. При reconnect выбранный трафик остаётся fail-closed. Обычные профили этот путь не
 включают и работают через прежние нативные Wintun rings.
 
+Настроенный или полученный от сервера tunnel DNS в per-app-профиле применяется ко всем DNS
+запросам: Windows обычно выполняет их из общего системного процесса, поэтому привязка к PID
+ошибочно отправляла бы DNS выбранного приложения в обход туннеля. IPv4-запрос поддерживает
+IPv6 tunnel resolver и наоборот через семейство-преобразующий DNS NAT. На обычный TCP/UDP
+эта оговорка не распространяется — он по-прежнему фильтруется по приложению.
+
 ### Логотип
 
 Логотип (Q-кольцо `#4A9EFF` с хвостом + зелёный link-узел `#00E676` на тёмно-синем
@@ -97,13 +103,14 @@ NAT и fragment affinity не дают DNS и последующим IPv4-фра
 
 #### Обфускация в редакторе
 
-Клиентских wire-режима **три**: `fake-tls` (мимикрия TLS 1.3), `obfs` (поток
-ChaCha20) и `reality-tls` (настоящий Chrome-TLS 1.3, туннель внутри). Обфускация
-шире, и в форме доступны все клиентские параметры:
+Клиентских wire-режима **четыре**: `plain` (сырой TCP без DPI-маскировки),
+`fake-tls` (мимикрия TLS 1.3), `obfs` (поток ChaCha20) и `reality-tls`
+(настоящий Chrome-TLS 1.3, туннель внутри). `plain` допустим только с TCP.
+В форме доступны все клиентские параметры:
 
 | Параметр | Значения |
 |----------|----------|
-| Wire-режим | fake-tls / obfs / reality-tls |
+| Wire-режим | plain / fake-tls / obfs / reality-tls |
 | SNI | пресеты доменов + произвольный |
 | Авто-транспорт | тумблер на главном экране + failover между профилями |
 | **Авто** у Connect | матрица режимы × выбранные SNI → лучшая связка → connect |
@@ -111,15 +118,12 @@ ChaCha20) и `reality-tls` (настоящий Chrome-TLS 1.3, туннель в
 | Panel speedtest | `/api/speedtest` с TLS-bypass и URL-fallback |
 | QUIC-маскировка | вкл/выкл (для UDP) |
 | Паддинг (маскировка размера) | выкл / стандартный / усиленный / максимальный |
-| Heartbeat (keep-alive) | выкл / 15с / 30с / 60с |
+| Heartbeat (keep-alive) | выкл / 15с / 30с / 60с; Reality/H2 принудительно игнорирует |
 | Ключ obfs (PSK) | для режима obfs |
 
-`reality-tls` — полноценный клиентский режим (см. выше: настоящий Chrome-TLS 1.3
-через `qeli.dll`). Профиль сервера **`reality`** (`mode=fake-tls` + `reality_sid`
-в ссылке, обычно `:8443`) тоже требует seal short_id в ClientHello — без `rsid`
-сервер отвечает как decoy (`Failed to parse hybrid ServerHello`). REALITY-proxy,
-fragmentation, traffic-normalization, http2-masking, anti-fingerprinting —
-**серверные** механизмы, для клиента прозрачны.
+`reality-tls` — полноценный клиентский режим (TLS 1.3 + автоматический настоящий H2
+через `qeli.dll`). Отдельного `http2-masking` переключателя нет; REALITY bridge/proxy,
+fragmentation, traffic-normalization и anti-fingerprinting настраиваются сервером.
 
 ### Метрики сервера (CPU/RAM)
 
@@ -185,7 +189,9 @@ dotnet build QeliWin\QeliWin.csproj -c Debug
 dotnet publish QeliWin\QeliWin.csproj -c Release -r win-x64 --self-contained false `
   -p:PublishSingleFile=true -o dist\net-required
 Copy-Item dist\net-required\QeliWin.exe dist\QeliWin-net-required.exe
-Copy-Item dist\net-required\WinDivert-*.txt dist\
+Copy-Item dist\net-required\Wintun-LICENSE.txt dist\
+Copy-Item dist\net-required\WinDivert-LICENSE.txt dist\
+Copy-Item dist\net-required\WinDivert-NOTICE.txt dist\
 
 # ── вариант B: сжатый self-contained (~77 МБ, без установки .NET) ──
 dotnet publish QeliWin\QeliWin.csproj -c Release -r win-x64 --self-contained true `
@@ -194,8 +200,7 @@ dotnet publish QeliWin\QeliWin.csproj -c Release -r win-x64 --self-contained tru
 Copy-Item dist\standalone\QeliWin.exe dist\QeliWin-standalone.exe
 ```
 
-Wintun вшит в exe как ресурс (`EmbeddedResource`) — отдельный файл рядом не нужен
-ни в одном из вариантов.
+Wintun DLL вшита в exe как ресурс (`EmbeddedResource`), но `Wintun-LICENSE.txt` и notices WinDivert должны распространяться рядом с обоими вариантами приложения.
 
 ## Headless-режимы (для отладки/CI)
 
@@ -204,25 +209,26 @@ Wintun вшит в exe как ресурс (`EmbeddedResource`) — отдель
 
 | Команда                                   | Что делает                                            | Админ |
 |-------------------------------------------|-------------------------------------------------------|-------|
-| `selftest`                                | Проверки крипто/кодека/парсинга (без сети)            | нет   |
+| `selftest`                                | WinDivert/Wintun/routes/DNS platform checks            | нет   |
+| `windivert-smoke`                         | Открывает и сразу закрывает production WinDivert filter | да    |
 | `handshake <link\|ini\|file>`             | TCP/UDP + полное рукопожатие, печатает выданный IP    | нет   |
 | `connect <link\|ini\|file> [секунды]`     | Поднимает полный туннель на N секунд                  | да    |
 
-## Статус тестирования (2026-08-10)
+Managed crypto/codec/config KAT и benchmark вынесены из production EXE:
+`dotnet run --project ../qeli-shared/QeliConformance -c Release -- selftest` и
+`... -- packetbench --ci`.
 
-- ✅ `selftest` — все проверки PASS (X25519 симметричен, HKDF совпадает с RFC 5869,
-  ChaCha20-Poly1305 round-trip, PacketCodec + anti-replay, obfs, разбор `qeli://`,
-  ClientHello c UDP-паддингом).
-- ✅ ABI 1.10 source gates: Rust tests и strict Clippy зелёные; UDP buffer telemetry доступна
-  через расширенный stats ABI.
-- ⏳ `scripts/e2e_windows_native.py` и полный Wintun data-plane нужно повторить с заново
-  собранной ABI 1.10 `qeli.dll`; лежащая в дереве ABI 1.9 DLL новых stats-полей не содержит.
-- ✅ `handshake` против **боевого** сервера `YOUR_PROD_HOST` с пиннингом ключа
-  `7ff1c274…2057` (клиент `client1`) → IP `10.9.0.2`.
-- ⏳ Полный live data-plane acceptance (Rust Wintun rings + маршруты + DNS) — реализован, требует
-  запуска с правами администратора на реальной машине (UAC), автотест headless
-  невозможен.
+## Состояние сборки и release gate 0.8.0
 
-> Прим.: у тестового сервера `10.66.116.10` ключ идентичности отличается от
-> боевого, поэтому для него используйте конфиг **без** пиннинга (`key=` опустить)
-> либо подставьте его реальный ключ из `qeli show-identity`.
+Windows-клиент сохраняет compatibility floor ABI 1.11, а fail-closed roaming использует
+типизированные path results ABI 1.14. Закоммиченная `qeli.dll` уже соответствует текущему
+Rust source digest и прошла reproducible A/B provenance. Перед выпуском 0.8.0 обязательно:
+
+- пересобрать core только если изменилось Rust-дерево, но всегда заново собрать оба EXE;
+- пройти `native-libs/provenance.py --check`, hash/ABI/package/signing gates;
+- прогнать elevated Wintun full-tunnel, IPv4/IPv6/dual-stack, DNS, kill-switch, reconnect;
+- записать результат и SHA-256 проверенного EXE в release certification manifest.
+
+Публичный ключ сервера не копируют из этого README. Для каждого сервера получите актуальный
+pin командой `qeli show-identity` по доверенному каналу; отключение pinning допустимо только
+как осознанная временная диагностика, а не как инструкция для рабочего профиля.

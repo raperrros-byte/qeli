@@ -1,0 +1,643 @@
+//! Session-aware upstream IPv6 Neighbor Discovery proxy.
+//!
+//! Some providers deliver a prefix as on-link instead of routing it to the server's own
+//! address. Their router consequently sends a Neighbor Solicitation for each VPN client.
+//! Relaying all multicast into the tunnel would expose every client to unrelated L2 control
+//! traffic and still would not identify the owner of a delegated prefix. This responder keeps
+//! NDP on the server: it emits a proxy Neighbor Advertisement only when the current SessionMap
+//! contains the exact `/128` lease or a non-default IPv6 `client_subnet` covering the target.
+
+use crate::server::ProfileRuntime;
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::io;
+use std::net::Ipv6Addr;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::io::unix::AsyncFd;
+
+const ETH_P_IPV6: u16 = 0x86dd;
+const ETH_P_8021Q: u16 = 0x8100;
+const ETH_P_8021AD: u16 = 0x88a8;
+const ICMPV6_NS: u8 = 135;
+const ICMPV6_NA: u8 = 136;
+const ICMPV6_NEXT_HEADER: u8 = 58;
+const PACKET_OUTGOING: u8 = 4;
+const SOL_PACKET: libc::c_int = 263;
+const PACKET_IGNORE_OUTGOING: libc::c_int = 23;
+const MAX_FRAME_SIZE: usize = 65_535 + 64;
+const RATE_WINDOW: Duration = Duration::from_secs(1);
+const GLOBAL_RESPONSES_PER_WINDOW: u32 = 4_096;
+const RESPONSES_PER_MAC_PER_WINDOW: u32 = 256;
+const MAX_RATE_SOURCES: usize = 4_096;
+
+pub(crate) struct NdpProxy {
+    fd: AsyncFd<OwnedFd>,
+    interface: String,
+    ifindex: i32,
+    mac: [u8; 6],
+}
+
+impl NdpProxy {
+    pub(crate) fn bind(interface: &str) -> anyhow::Result<Self> {
+        let interface = interface.trim();
+        if interface.is_empty()
+            || interface.len() > 15
+            || interface.contains('/')
+            || interface.contains('\\')
+            || interface.contains('\0')
+            || interface.contains(char::is_whitespace)
+        {
+            anyhow::bail!("invalid NDP proxy interface name '{interface}'");
+        }
+        let c_name = CString::new(interface)
+            .map_err(|_| anyhow::anyhow!("invalid NDP proxy interface name"))?;
+        let ifindex = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+        if ifindex == 0 {
+            return Err(anyhow::anyhow!(
+                "interface '{interface}' does not exist: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let link_type = std::fs::read_to_string(format!("/sys/class/net/{interface}/type"))
+            .map_err(|error| anyhow::anyhow!("cannot read link type for '{interface}': {error}"))?;
+        if link_type.trim() != "1" {
+            anyhow::bail!(
+                "interface '{interface}' is not an Ethernet-compatible link (ARPHRD type {})",
+                link_type.trim()
+            );
+        }
+        let mac = read_mac(interface)?;
+        let protocol = i32::from(ETH_P_IPV6.to_be());
+        let raw = unsafe {
+            libc::socket(
+                libc::AF_PACKET,
+                libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                protocol,
+            )
+        };
+        if raw < 0 {
+            return Err(anyhow::anyhow!(
+                "cannot open AF_PACKET socket on '{interface}': {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+        let address = libc::sockaddr_ll {
+            sll_family: libc::AF_PACKET as u16,
+            sll_protocol: ETH_P_IPV6.to_be(),
+            sll_ifindex: ifindex as i32,
+            sll_hatype: 0,
+            sll_pkttype: 0,
+            sll_halen: 0,
+            sll_addr: [0; 8],
+        };
+        let bind_result = unsafe {
+            libc::bind(
+                owned.as_raw_fd(),
+                (&address as *const libc::sockaddr_ll).cast(),
+                std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+            )
+        };
+        if bind_result != 0 {
+            return Err(anyhow::anyhow!(
+                "cannot bind AF_PACKET socket to '{interface}': {}",
+                io::Error::last_os_error()
+            ));
+        }
+        // Client /128 addresses are intentionally not assigned to this host, so the NIC is
+        // not subscribed to their many solicited-node multicast MACs. A packet socket alone
+        // does not change the physical multicast filter. Join ALLMULTI for this socket only;
+        // the membership is released automatically with the fd and does not toggle the
+        // interface's persistent IFF_ALLMULTI flag.
+        let membership = libc::packet_mreq {
+            mr_ifindex: ifindex as i32,
+            mr_type: libc::PACKET_MR_ALLMULTI as u16,
+            mr_alen: 0,
+            mr_address: [0; 8],
+        };
+        let membership_result = unsafe {
+            libc::setsockopt(
+                owned.as_raw_fd(),
+                libc::SOL_PACKET,
+                libc::PACKET_ADD_MEMBERSHIP,
+                (&membership as *const libc::packet_mreq).cast(),
+                std::mem::size_of_val(&membership) as libc::socklen_t,
+            )
+        };
+        if membership_result != 0 {
+            return Err(anyhow::anyhow!(
+                "cannot enable socket-local all-multicast reception on '{interface}': {}",
+                io::Error::last_os_error()
+            ));
+        }
+        // Best-effort kernel filtering; recv_frame also rejects PACKET_OUTGOING so older
+        // kernels remain correct when this socket option is unavailable.
+        let one: libc::c_int = 1;
+        unsafe {
+            libc::setsockopt(
+                owned.as_raw_fd(),
+                SOL_PACKET,
+                PACKET_IGNORE_OUTGOING,
+                (&one as *const libc::c_int).cast(),
+                std::mem::size_of_val(&one) as libc::socklen_t,
+            );
+        }
+        let fd = AsyncFd::new(owned)
+            .map_err(|error| anyhow::anyhow!("cannot register NDP socket: {error}"))?;
+        Ok(Self {
+            fd,
+            interface: interface.to_string(),
+            ifindex: ifindex as i32,
+            mac,
+        })
+    }
+
+    pub(crate) async fn run(self, profile: Arc<ProfileRuntime>) -> anyhow::Result<()> {
+        log::info!(
+            "Profile '{}': session-aware IPv6 NDP proxy active on '{}' ({})",
+            profile.name,
+            self.interface,
+            format_mac(self.mac)
+        );
+        let mut frame = vec![0u8; MAX_FRAME_SIZE];
+        let mut limiter = NdpRateLimiter::new(Instant::now());
+        loop {
+            let (length, outgoing) = loop {
+                let mut ready = self.fd.readable().await?;
+                match ready.try_io(|inner| recv_frame(inner.get_ref().as_raw_fd(), &mut frame)) {
+                    Ok(result) => break result?,
+                    Err(_) => continue,
+                }
+            };
+            if outgoing {
+                continue;
+            }
+            let Some(request) = parse_solicitation(&frame[..length]) else {
+                continue;
+            };
+            let owned = profile
+                .sessions
+                .read()
+                .await
+                .owns_ipv6_neighbor_target(request.target);
+            if !owned {
+                continue;
+            }
+            if !limiter.allow(request.source_mac, Instant::now()) {
+                if limiter.take_warning() {
+                    log::warn!(
+                        "Profile '{}': IPv6 NDP proxy rate limit reached on '{}'",
+                        profile.name,
+                        self.interface
+                    );
+                }
+                continue;
+            }
+            let response = build_advertisement(&frame[..length], request, self.mac);
+            loop {
+                let mut ready = self.fd.writable().await?;
+                match ready.try_io(|inner| {
+                    send_frame(
+                        inner.get_ref().as_raw_fd(),
+                        self.ifindex,
+                        response.destination_mac,
+                        &response.bytes,
+                    )
+                }) {
+                    Ok(result) => {
+                        result?;
+                        break;
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
+    }
+}
+
+fn read_mac(interface: &str) -> anyhow::Result<[u8; 6]> {
+    let text = std::fs::read_to_string(format!("/sys/class/net/{interface}/address"))
+        .map_err(|error| anyhow::anyhow!("cannot read MAC for '{interface}': {error}"))?;
+    let parts: Vec<&str> = text.trim().split(':').collect();
+    if parts.len() != 6 {
+        anyhow::bail!("interface '{interface}' has an unsupported MAC address");
+    }
+    let mut mac = [0u8; 6];
+    for (slot, part) in mac.iter_mut().zip(parts) {
+        *slot = u8::from_str_radix(part, 16)
+            .map_err(|_| anyhow::anyhow!("interface '{interface}' has an invalid MAC address"))?;
+    }
+    if mac == [0; 6] || mac[0] & 1 != 0 {
+        anyhow::bail!("interface '{interface}' has no usable unicast MAC address");
+    }
+    Ok(mac)
+}
+
+fn format_mac(mac: [u8; 6]) -> String {
+    mac.iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn recv_frame(fd: i32, buffer: &mut [u8]) -> io::Result<(usize, bool)> {
+    let mut address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+    let mut address_len = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+    let length = unsafe {
+        libc::recvfrom(
+            fd,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            0,
+            (&mut address as *mut libc::sockaddr_ll).cast(),
+            &mut address_len,
+        )
+    };
+    if length < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((length as usize, address.sll_pkttype == PACKET_OUTGOING))
+}
+
+fn send_frame(fd: i32, ifindex: i32, destination: [u8; 6], frame: &[u8]) -> io::Result<()> {
+    let mut address = libc::sockaddr_ll {
+        sll_family: libc::AF_PACKET as u16,
+        sll_protocol: ETH_P_IPV6.to_be(),
+        sll_ifindex: ifindex,
+        sll_hatype: 0,
+        sll_pkttype: 0,
+        sll_halen: 6,
+        sll_addr: [0; 8],
+    };
+    address.sll_addr[..6].copy_from_slice(&destination);
+    let written = unsafe {
+        libc::sendto(
+            fd,
+            frame.as_ptr().cast(),
+            frame.len(),
+            0,
+            (&address as *const libc::sockaddr_ll).cast(),
+            std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+        )
+    };
+    if written < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if written as usize != frame.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!("partial NDP frame send: {written}/{}", frame.len()),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Solicitation {
+    l3_offset: usize,
+    source_mac: [u8; 6],
+    source_ip: Ipv6Addr,
+    target: Ipv6Addr,
+    dad: bool,
+}
+
+fn parse_solicitation(frame: &[u8]) -> Option<Solicitation> {
+    if frame.len() < 14 {
+        return None;
+    }
+    let source_mac: [u8; 6] = frame[6..12].try_into().ok()?;
+    if source_mac == [0; 6] || source_mac[0] & 1 != 0 {
+        return None;
+    }
+    let mut ether_type = u16::from_be_bytes(frame[12..14].try_into().ok()?);
+    let mut l3_offset = 14usize;
+    let mut vlan_depth = 0;
+    while matches!(ether_type, ETH_P_8021Q | ETH_P_8021AD) {
+        if vlan_depth == 2 || frame.len() < l3_offset + 4 {
+            return None;
+        }
+        ether_type = u16::from_be_bytes(frame[l3_offset + 2..l3_offset + 4].try_into().ok()?);
+        l3_offset += 4;
+        vlan_depth += 1;
+    }
+    if ether_type != ETH_P_IPV6 || frame.len() < l3_offset + 40 {
+        return None;
+    }
+    let ipv6 = &frame[l3_offset..];
+    if ipv6[0] >> 4 != 6 || ipv6[6] != ICMPV6_NEXT_HEADER || ipv6[7] != 255 {
+        return None;
+    }
+    let payload_len = usize::from(u16::from_be_bytes(ipv6[4..6].try_into().ok()?));
+    let packet_len = 40usize.checked_add(payload_len)?;
+    if payload_len < 24 || packet_len > ipv6.len() {
+        return None;
+    }
+    let source_ip = Ipv6Addr::from(<[u8; 16]>::try_from(&ipv6[8..24]).ok()?);
+    let destination_ip = Ipv6Addr::from(<[u8; 16]>::try_from(&ipv6[24..40]).ok()?);
+    let icmp = &ipv6[40..packet_len];
+    if icmp[0] != ICMPV6_NS || icmp[1] != 0 || icmpv6_checksum(source_ip, destination_ip, icmp) != 0
+    {
+        return None;
+    }
+    let target = Ipv6Addr::from(<[u8; 16]>::try_from(&icmp[8..24]).ok()?);
+    if !proxyable_target(target) {
+        return None;
+    }
+    if destination_ip.is_multicast() && destination_ip != solicited_node_multicast(target) {
+        return None;
+    }
+    if destination_ip.is_unspecified()
+        || (!source_ip.is_unspecified() && (source_ip.is_multicast() || source_ip.is_loopback()))
+    {
+        return None;
+    }
+    let dad = source_ip.is_unspecified();
+    let mut options = &icmp[24..];
+    while !options.is_empty() {
+        if options.len() < 2 {
+            return None;
+        }
+        let length = usize::from(options[1]).checked_mul(8)?;
+        if length == 0 || length > options.len() {
+            return None;
+        }
+        // RFC 4861: a DAD solicitation (source ::) must not contain SLLA.
+        if dad && options[0] == 1 {
+            return None;
+        }
+        options = &options[length..];
+    }
+    Some(Solicitation {
+        l3_offset,
+        source_mac,
+        source_ip,
+        target,
+        dad,
+    })
+}
+
+fn proxyable_target(target: Ipv6Addr) -> bool {
+    let first = target.segments()[0];
+    !target.is_unspecified()
+        && !target.is_loopback()
+        && !target.is_multicast()
+        && first & 0xffc0 != 0xfe80
+        && target.to_ipv4_mapped().is_none()
+}
+
+fn solicited_node_multicast(target: Ipv6Addr) -> Ipv6Addr {
+    let target = target.octets();
+    let mut address = [0u8; 16];
+    address[0] = 0xff;
+    address[1] = 0x02;
+    address[11] = 0x01;
+    address[12] = 0xff;
+    address[13..].copy_from_slice(&target[13..]);
+    Ipv6Addr::from(address)
+}
+
+struct Advertisement {
+    destination_mac: [u8; 6],
+    bytes: Vec<u8>,
+}
+
+fn build_advertisement(
+    request_frame: &[u8],
+    request: Solicitation,
+    proxy_mac: [u8; 6],
+) -> Advertisement {
+    // RFC 4861 sections 7.2.4 and 7.2.8: a solicited proxy advertisement MUST clear
+    // Override so a real on-link owner can take precedence. DAD replies are unsolicited
+    // all-nodes advertisements; keep both Solicited and Override clear there as well.
+    let (destination_ip, destination_mac, flags) = if request.dad {
+        (
+            "ff02::1".parse::<Ipv6Addr>().expect("constant IPv6"),
+            [0x33, 0x33, 0, 0, 0, 1],
+            0u32,
+        )
+    } else {
+        (request.source_ip, request.source_mac, 0x4000_0000u32)
+    };
+    let mut frame = Vec::with_capacity(request.l3_offset + 72);
+    frame.extend_from_slice(&request_frame[..request.l3_offset]);
+    frame[..6].copy_from_slice(&destination_mac);
+    frame[6..12].copy_from_slice(&proxy_mac);
+
+    let mut ipv6 = [0u8; 40];
+    ipv6[0] = 0x60;
+    ipv6[4..6].copy_from_slice(&32u16.to_be_bytes());
+    ipv6[6] = ICMPV6_NEXT_HEADER;
+    ipv6[7] = 255;
+    ipv6[8..24].copy_from_slice(&request.target.octets());
+    ipv6[24..40].copy_from_slice(&destination_ip.octets());
+    frame.extend_from_slice(&ipv6);
+
+    let mut icmp = [0u8; 32];
+    icmp[0] = ICMPV6_NA;
+    icmp[4..8].copy_from_slice(&flags.to_be_bytes());
+    icmp[8..24].copy_from_slice(&request.target.octets());
+    icmp[24] = 2; // Target Link-Layer Address
+    icmp[25] = 1; // 8-byte option
+    icmp[26..32].copy_from_slice(&proxy_mac);
+    let checksum = icmpv6_checksum(request.target, destination_ip, &icmp);
+    icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+    frame.extend_from_slice(&icmp);
+    Advertisement {
+        destination_mac,
+        bytes: frame,
+    }
+}
+
+fn icmpv6_checksum(source: Ipv6Addr, destination: Ipv6Addr, payload: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    sum = add_words(sum, &source.octets());
+    sum = add_words(sum, &destination.octets());
+    sum = add_words(sum, &(payload.len() as u32).to_be_bytes());
+    sum = add_words(sum, &[0, 0, 0, ICMPV6_NEXT_HEADER]);
+    sum = add_words(sum, payload);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn add_words(mut sum: u32, bytes: &[u8]) -> u32 {
+    let mut chunks = bytes.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    }
+    if let Some(byte) = chunks.remainder().first() {
+        sum += u32::from(*byte) << 8;
+    }
+    sum
+}
+
+struct NdpRateLimiter {
+    window_started: Instant,
+    global: u32,
+    by_mac: HashMap<[u8; 6], u32>,
+    warning_pending: bool,
+}
+
+impl NdpRateLimiter {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_started: now,
+            global: 0,
+            by_mac: HashMap::new(),
+            warning_pending: false,
+        }
+    }
+
+    fn allow(&mut self, source: [u8; 6], now: Instant) -> bool {
+        if now.duration_since(self.window_started) >= RATE_WINDOW {
+            self.window_started = now;
+            self.global = 0;
+            self.by_mac.clear();
+            self.warning_pending = false;
+        }
+        if self.global >= GLOBAL_RESPONSES_PER_WINDOW {
+            self.warning_pending = true;
+            return false;
+        }
+        if !self.by_mac.contains_key(&source) && self.by_mac.len() >= MAX_RATE_SOURCES {
+            self.warning_pending = true;
+            return false;
+        }
+        let source_count = self.by_mac.entry(source).or_default();
+        if *source_count >= RESPONSES_PER_MAC_PER_WINDOW {
+            self.warning_pending = true;
+            return false;
+        }
+        self.global += 1;
+        *source_count += 1;
+        true
+    }
+
+    fn take_warning(&mut self) -> bool {
+        std::mem::take(&mut self.warning_pending)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn solicitation(source: Ipv6Addr, target: Ipv6Addr, include_slla: bool) -> Vec<u8> {
+        let source_mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let destination = solicited_node_multicast(target);
+        let mut frame = vec![0u8; 14 + 40];
+        frame[..6].copy_from_slice(&[
+            0x33,
+            0x33,
+            0xff,
+            target.octets()[13],
+            target.octets()[14],
+            target.octets()[15],
+        ]);
+        frame[6..12].copy_from_slice(&source_mac);
+        frame[12..14].copy_from_slice(&ETH_P_IPV6.to_be_bytes());
+        frame[14] = 0x60;
+        let payload_len = if include_slla { 32u16 } else { 24u16 };
+        frame[18..20].copy_from_slice(&payload_len.to_be_bytes());
+        frame[20] = ICMPV6_NEXT_HEADER;
+        frame[21] = 255;
+        frame[22..38].copy_from_slice(&source.octets());
+        frame[38..54].copy_from_slice(&destination.octets());
+        let mut icmp = vec![0u8; usize::from(payload_len)];
+        icmp[0] = ICMPV6_NS;
+        icmp[8..24].copy_from_slice(&target.octets());
+        if include_slla {
+            icmp[24] = 1;
+            icmp[25] = 1;
+            icmp[26..32].copy_from_slice(&source_mac);
+        }
+        let checksum = icmpv6_checksum(source, destination, &icmp);
+        icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+        frame.extend_from_slice(&icmp);
+        frame
+    }
+
+    #[test]
+    fn valid_solicitation_builds_a_valid_proxy_advertisement() {
+        let source = "fe80::1234".parse().unwrap();
+        let target = "2001:db8:100::42".parse().unwrap();
+        let request = solicitation(source, target, true);
+        let parsed = parse_solicitation(&request).unwrap();
+        let proxy_mac = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+        let reply = build_advertisement(&request, parsed, proxy_mac);
+
+        assert_eq!(&reply.bytes[..6], &parsed.source_mac);
+        assert_eq!(&reply.bytes[6..12], &proxy_mac);
+        let ipv6 = &reply.bytes[14..];
+        assert_eq!(ipv6[7], 255);
+        assert_eq!(
+            Ipv6Addr::from(<[u8; 16]>::try_from(&ipv6[8..24]).unwrap()),
+            target
+        );
+        assert_eq!(
+            Ipv6Addr::from(<[u8; 16]>::try_from(&ipv6[24..40]).unwrap()),
+            source
+        );
+        let icmp = &ipv6[40..72];
+        assert_eq!(icmp[0], ICMPV6_NA);
+        assert_eq!(
+            u32::from_be_bytes(icmp[4..8].try_into().unwrap()),
+            0x4000_0000
+        );
+        assert_eq!(icmpv6_checksum(target, source, icmp), 0);
+    }
+
+    #[test]
+    fn malformed_or_unsafe_solicitations_are_ignored() {
+        let source = "fe80::1234".parse().unwrap();
+        let target = "2001:db8:100::42".parse().unwrap();
+        let valid = solicitation(source, target, true);
+
+        let mut bad_hop = valid.clone();
+        bad_hop[21] = 64;
+        assert!(parse_solicitation(&bad_hop).is_none());
+        let mut bad_checksum = valid.clone();
+        *bad_checksum.last_mut().unwrap() ^= 1;
+        assert!(parse_solicitation(&bad_checksum).is_none());
+        let multicast_target = solicitation(source, "ff02::1".parse().unwrap(), true);
+        assert!(parse_solicitation(&multicast_target).is_none());
+        let dad_with_slla = solicitation(Ipv6Addr::UNSPECIFIED, target, true);
+        assert!(parse_solicitation(&dad_with_slla).is_none());
+    }
+
+    #[test]
+    fn dad_gets_an_unsolicited_all_nodes_advertisement() {
+        let target = "2001:db8:100::42".parse().unwrap();
+        let request = solicitation(Ipv6Addr::UNSPECIFIED, target, false);
+        let parsed = parse_solicitation(&request).unwrap();
+        let reply = build_advertisement(&request, parsed, [0x02, 1, 2, 3, 4, 5]);
+        assert_eq!(reply.destination_mac, [0x33, 0x33, 0, 0, 0, 1]);
+        let ipv6 = &reply.bytes[14..];
+        assert_eq!(
+            Ipv6Addr::from(<[u8; 16]>::try_from(&ipv6[24..40]).unwrap()),
+            "ff02::1".parse::<Ipv6Addr>().unwrap()
+        );
+        assert_eq!(u32::from_be_bytes(ipv6[44..48].try_into().unwrap()), 0);
+        assert_eq!(
+            icmpv6_checksum(target, "ff02::1".parse().unwrap(), &ipv6[40..72]),
+            0
+        );
+    }
+
+    #[test]
+    fn rate_limiter_is_bounded_and_resets() {
+        let start = Instant::now();
+        let mut limiter = NdpRateLimiter::new(start);
+        let mac = [0x02, 1, 2, 3, 4, 5];
+        for _ in 0..RESPONSES_PER_MAC_PER_WINDOW {
+            assert!(limiter.allow(mac, start));
+        }
+        assert!(!limiter.allow(mac, start));
+        assert!(limiter.take_warning());
+        assert!(limiter.allow(mac, start + RATE_WINDOW));
+        assert!(!limiter.take_warning());
+    }
+}

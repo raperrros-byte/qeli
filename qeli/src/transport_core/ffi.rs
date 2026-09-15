@@ -5,8 +5,14 @@
 //! platform TUN implementations that cannot yield a portable descriptor, and ABI 1.8
 //! exposes the same UDP first-flight diagnostic to every native adapter. ABI 1.9 lets the
 //! Windows core own the Wintun session and packet rings. ABI 1.10 appends UDP buffer/drop
-//! telemetry while preserving the complete 64-byte stats V1 prefix.
+//! telemetry while preserving the complete 64-byte stats V1 prefix. ABI 1.11 adds the
+//! dual-family NetworkPlan; ABI 1.12 adds generation-scoped path commands and separate roam
+//! telemetry, ABI 1.13 adds a generation-scoped no-payload path-refresh event, and ABI 1.14
+//! distinguishes reversible path rejection from incomplete platform rollback. ABI 1.15 adds
+//! server NOTICE/KICK events. Both fixed ABI
+//! prefixes remain unchanged.
 
+use super::path::PathCommandOutcome;
 use super::{
     core_capability, ClientCore, ClientEvent, CoreOptions, CoreStats, ErrorCode, EventKind,
     ABI_VERSION, DEFAULT_EVENT_CAPACITY,
@@ -18,12 +24,17 @@ use zeroize::Zeroize;
 
 pub(crate) const OK: i32 = 0;
 pub(crate) const NO_EVENT: i32 = 1;
+const PATH_COMMAND_ACCEPTED: i32 = 0;
+const PATH_COMMAND_REJECTED: i32 = 1;
+const PATH_COMMAND_PLATFORM_STATE_UNKNOWN: i32 = 2;
 const PAYLOAD_NONE: u32 = 0;
 const PAYLOAD_JSON: u32 = 1;
 const PAYLOAD_UTF8: u32 = 2;
 pub(crate) const EVENT_V1_SIZE: usize = 48;
 const STATS_V1_SIZE: usize = 64;
+#[cfg(test)]
 const STATS_V2_SIZE: usize = 96;
+const STATS_V3_SIZE: usize = 144;
 
 pub(crate) static CLIENTS: Registry<ClientCore> = Registry::new();
 
@@ -76,12 +87,18 @@ pub struct QeliClientStats {
     pub udp_internal_drops: u64,
     pub udp_buffer_grows: u64,
     pub udp_recv_buffer_bytes: u64,
+    pub roam_attempts: u64,
+    pub roam_successes: u64,
+    pub roam_failures: u64,
+    pub roam_reconnect_fallbacks: u64,
+    pub roam_candidates: u64,
+    pub last_roam_latency_ms: u64,
 }
 
 impl Default for QeliClientStats {
     fn default() -> Self {
         Self {
-            struct_size: STATS_V2_SIZE as u32,
+            struct_size: STATS_V3_SIZE as u32,
             abi_version: ABI_VERSION,
             state: 0,
             reserved: 0,
@@ -95,6 +112,12 @@ impl Default for QeliClientStats {
             udp_internal_drops: 0,
             udp_buffer_grows: 0,
             udp_recv_buffer_bytes: 0,
+            roam_attempts: 0,
+            roam_successes: 0,
+            roam_failures: 0,
+            roam_reconnect_fallbacks: 0,
+            roam_candidates: 0,
+            last_roam_latency_ms: 0,
         }
     }
 }
@@ -345,6 +368,88 @@ pub unsafe extern "C" fn qeli_client_network_plan_result(
         };
         match CLIENTS.try_with(handle, |core| {
             core.ack_network_plan(generation, result_code == 0, reason)
+        }) {
+            Ok(Ok(())) => OK,
+            Ok(Err(error)) => error.code() as i32,
+            Err(error) => registry_error_code(error),
+        }
+    })
+}
+
+/// Submit a bounded, generation-scoped physical path observation.
+///
+/// On success `out_candidate_id` receives the stable id of the new or idempotently repeated
+/// candidate. The feature is compiled only with `experimental-roaming`, and the handle must
+/// advertise both path transaction and exact socket-binding platform capabilities.
+///
+/// # Safety
+/// `input` must address `input_len` readable UTF-8 JSON bytes and `out_candidate_id` must be
+/// writable. The core copies every accepted value before returning.
+#[no_mangle]
+pub unsafe extern "C" fn qeli_client_path_update(
+    handle: u64,
+    input: *const u8,
+    input_len: usize,
+    out_candidate_id: *mut u64,
+) -> i32 {
+    ffi_guard(|| {
+        if out_candidate_id.is_null()
+            || input.is_null()
+            || input_len == 0
+            || input_len > super::path::MAX_PATH_UPDATE_BYTES
+        {
+            return ErrorCode::InvalidArgument as i32;
+        }
+        unsafe { *out_candidate_id = 0 };
+        let bytes = unsafe { std::slice::from_raw_parts(input, input_len) };
+        let text = match std::str::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => return ErrorCode::InvalidArgument as i32,
+        };
+        match CLIENTS.try_with(handle, |core| core.submit_path_update(text)) {
+            Ok(Ok(candidate_id)) => {
+                unsafe { *out_candidate_id = candidate_id };
+                OK
+            }
+            Ok(Err(error)) => error.code() as i32,
+            Err(error) => registry_error_code(error),
+        }
+    })
+}
+
+/// Acknowledge one `PathCommand` event using all three correlation dimensions.
+///
+/// `QELI_PATH_COMMAND_ACCEPTED` accepts the command. `QELI_PATH_COMMAND_REJECTED` is a
+/// rollback-safe rejection and schedules mandatory ABORT for PREPARE/BIND/COMMIT.
+/// `QELI_PATH_COMMAND_PLATFORM_STATE_UNKNOWN` reports an incomplete internal rollback and
+/// terminates the generation without issuing a stale ABORT. Rejecting ABORT returns
+/// `PlatformRejected` and records a reconnect fallback.
+///
+/// # Safety
+/// A non-empty `reason` must address `reason_len` readable UTF-8 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn qeli_client_path_command_result(
+    handle: u64,
+    generation: u64,
+    candidate_id: u64,
+    request_sequence: u64,
+    result_code: i32,
+    reason: *const u8,
+    reason_len: usize,
+) -> i32 {
+    ffi_guard(|| {
+        let reason = match unsafe { optional_utf8(reason, reason_len) } {
+            Ok(reason) => reason,
+            Err(code) => return code as i32,
+        };
+        let outcome = match result_code {
+            PATH_COMMAND_ACCEPTED => PathCommandOutcome::Accepted,
+            PATH_COMMAND_PLATFORM_STATE_UNKNOWN => PathCommandOutcome::PlatformStateUnknown,
+            PATH_COMMAND_REJECTED | -1 => PathCommandOutcome::Rejected,
+            _ => return ErrorCode::InvalidArgument as i32,
+        };
+        match CLIENTS.try_with(handle, |core| {
+            core.ack_path_command(generation, candidate_id, request_sequence, outcome, reason)
         }) {
             Ok(Ok(())) => OK,
             Ok(Err(error)) => error.code() as i32,
@@ -796,6 +901,28 @@ fn event_payload(event: &ClientEvent) -> Result<(Vec<u8>, u32), ErrorCode> {
                     .map(|payload| (payload, PAYLOAD_JSON))
                     .map_err(|_| ErrorCode::Panic)
             }),
+        EventKind::PathCommand => event
+            .path_command
+            .as_ref()
+            .ok_or(ErrorCode::Panic)
+            .and_then(|command| {
+                serde_json::to_vec(command)
+                    .map(|payload| (payload, PAYLOAD_JSON))
+                    .map_err(|_| ErrorCode::Panic)
+            }),
+        EventKind::PathRefresh => event
+            .path_refresh_generation
+            .map(|_| (Vec::new(), PAYLOAD_NONE))
+            .ok_or(ErrorCode::Panic),
+        EventKind::Notice | EventKind::Kick => event
+            .management
+            .as_ref()
+            .ok_or(ErrorCode::Panic)
+            .and_then(|management| {
+                serde_json::to_vec(management)
+                    .map(|payload| (payload, PAYLOAD_JSON))
+                    .map_err(|_| ErrorCode::Panic)
+            }),
     }
 }
 
@@ -808,7 +935,18 @@ fn event_header(event: &ClientEvent, payload_format: u32, payload_len: usize) ->
         payload_format,
         reserved: 0,
         sequence: event.sequence,
-        plan_generation: event.plan.as_ref().map_or(0, |plan| plan.generation),
+        plan_generation: event
+            .plan
+            .as_ref()
+            .map(|plan| plan.generation)
+            .or_else(|| {
+                event
+                    .path_command
+                    .as_ref()
+                    .map(|command| command.generation)
+            })
+            .or(event.path_refresh_generation)
+            .unwrap_or(0),
         error_code: event.fault.as_ref().map_or(0, |fault| fault.code as i32),
         payload_len: payload_len.min(u32::MAX as usize) as u32,
     }
@@ -830,6 +968,12 @@ fn ffi_stats(stats: CoreStats) -> QeliClientStats {
         udp_internal_drops: stats.udp_internal_drops,
         udp_buffer_grows: stats.udp_buffer_grows,
         udp_recv_buffer_bytes: stats.udp_recv_buffer_bytes,
+        roam_attempts: stats.roam_attempts,
+        roam_successes: stats.roam_successes,
+        roam_failures: stats.roam_failures,
+        roam_reconnect_fallbacks: stats.roam_reconnect_fallbacks,
+        roam_candidates: stats.roam_candidates,
+        last_roam_latency_ms: stats.last_roam_latency_ms,
     }
 }
 
@@ -853,16 +997,18 @@ fn ffi_guard(operation: impl FnOnce() -> i32) -> i32 {
 mod tests {
     use super::*;
     use crate::transport_core::{platform_capability, NetworkDns, NetworkPlan, NetworkRoute};
+    #[cfg(feature = "experimental-roaming")]
+    use crate::transport_core::{NetworkAddress, NetworkAddressFamily, NetworkFamilyMode};
 
     const CONFIG: &str = "[qeli]\nserver = 127.0.0.1:443\nproto = tcp\nuser = test\npass = secret\nkey = 1111111111111111111111111111111111111111111111111111111111111111\nmode = fake-tls\n";
 
-    unsafe fn new_handle() -> u64 {
+    unsafe fn new_handle_with_capabilities(platform_capabilities: u64) -> u64 {
         let mut handle = 0;
         let rc = unsafe {
             qeli_client_new(
                 CONFIG.as_ptr(),
                 CONFIG.len(),
-                platform_capability::SYSTEM_PLAN,
+                platform_capabilities,
                 0,
                 &mut handle,
             )
@@ -872,22 +1018,64 @@ mod tests {
         handle
     }
 
+    unsafe fn new_handle() -> u64 {
+        unsafe { new_handle_with_capabilities(platform_capability::SYSTEM_PLAN) }
+    }
+
     #[test]
     fn abi_reports_version_and_capabilities() {
         assert_eq!(qeli_client_abi_version(), ABI_VERSION);
         assert_eq!(qeli_client_core_capabilities(), core_capability::ALL);
+        #[cfg(feature = "experimental-roaming")]
+        assert_ne!(
+            qeli_client_core_capabilities() & core_capability::PATH_TRANSACTIONS,
+            0
+        );
+        #[cfg(not(feature = "experimental-roaming"))]
+        assert_eq!(
+            qeli_client_core_capabilities() & core_capability::PATH_TRANSACTIONS,
+            0
+        );
+        #[cfg(not(feature = "experimental-roaming"))]
+        {
+            let handle = unsafe {
+                new_handle_with_capabilities(
+                    platform_capability::SYSTEM_PLAN | platform_capability::ROAMING_PATH,
+                )
+            };
+            let mut candidate_id = 0;
+            let input = b"{}";
+            assert_eq!(
+                unsafe {
+                    qeli_client_path_update(handle, input.as_ptr(), input.len(), &mut candidate_id)
+                },
+                ErrorCode::Unsupported as i32
+            );
+            assert_eq!(qeli_client_free(handle), OK);
+        }
         assert_eq!(std::mem::size_of::<QeliClientEvent>(), 48);
-        assert_eq!(std::mem::size_of::<QeliClientStats>(), 96);
+        assert_eq!(std::mem::size_of::<QeliClientStats>(), 144);
         assert_eq!(std::mem::size_of::<QeliClientEvent>(), EVENT_V1_SIZE);
-        assert_eq!(std::mem::size_of::<QeliClientStats>(), STATS_V2_SIZE);
+        assert_eq!(std::mem::size_of::<QeliClientStats>(), STATS_V3_SIZE);
 
         let header = include_str!("../../include/qeli_transport_core.h");
-        assert!(header.contains("QELI_CLIENT_ABI_VERSION UINT32_C(0x0001000a)"));
+        assert!(header.contains("QELI_CLIENT_ABI_VERSION UINT32_C(0x0001000f)"));
         assert!(header.contains("QELI_CLIENT_ABI_IS_COMPATIBLE"));
         assert!(header.contains("QELI_CLIENT_PLATFORM_REJECTED = -10"));
         assert!(header.contains("QELI_CLIENT_EVENT_V1_SIZE UINT32_C(48)"));
         assert!(header.contains("QELI_CLIENT_STATS_V1_SIZE UINT32_C(64)"));
         assert!(header.contains("QELI_CLIENT_STATS_V2_SIZE UINT32_C(96)"));
+        assert!(header.contains("QELI_CLIENT_STATS_V3_SIZE UINT32_C(144)"));
+        assert!(header.contains("QELI_CLIENT_PATH_COMMAND = 6"));
+        assert!(header.contains("QELI_CLIENT_PATH_REFRESH = 7"));
+        assert!(header.contains("QELI_PATH_COMMAND_REJECTED = 1"));
+        assert!(header.contains("QELI_PATH_COMMAND_PLATFORM_STATE_UNKNOWN = 2"));
+        assert!(header.contains("QELI_CORE_PATH_TRANSACTIONS"));
+        assert!(header.contains("QELI_PLATFORM_PATH_SOCKET_BINDING"));
+        assert!(header.contains("QELI_CORE_PATH_REFRESH_EVENTS"));
+        assert!(header.contains("QELI_PLATFORM_PATH_REFRESH"));
+        assert!(header.contains("qeli_client_path_update"));
+        assert!(header.contains("qeli_client_path_command_result"));
         assert!(header.contains("qeli_client_network_plan_result"));
         assert!(header.contains("qeli_client_set_tun_fd"));
         assert!(header.contains("qeli_client_set_wintun_adapter"));
@@ -912,6 +1100,33 @@ mod tests {
         assert!(header.contains("qeli_client_udp_probe"));
     }
 
+    #[cfg(feature = "experimental-roaming")]
+    #[test]
+    fn path_refresh_event_reuses_the_frozen_header_without_a_payload() {
+        let event = ClientEvent {
+            sequence: 73,
+            kind: EventKind::PathRefresh,
+            state: super::super::ClientState::Running,
+            plan: None,
+            socket_protect: None,
+            server_identity: None,
+            path_command: None,
+            path_refresh_generation: Some(19),
+            management: None,
+            fault: None,
+        };
+        let (payload, format) = event_payload(&event).unwrap();
+        let header = event_header(&event, format, payload.len());
+
+        assert!(payload.is_empty());
+        assert_eq!(header.struct_size, EVENT_V1_SIZE as u32);
+        assert_eq!(header.abi_version, ABI_VERSION);
+        assert_eq!(header.kind, EventKind::PathRefresh as u32);
+        assert_eq!(header.payload_format, PAYLOAD_NONE);
+        assert_eq!(header.sequence, 73);
+        assert_eq!(header.plan_generation, 19);
+        assert_eq!(header.payload_len, 0);
+    }
     #[test]
     fn udp_probe_abi_rejects_wrong_protocol_and_invalid_outputs() {
         let mut latency = 99;
@@ -981,6 +1196,14 @@ mod tests {
             .with(handle, |core| {
                 core.publish_network_plan(NetworkPlan {
                     generation: 7,
+                    family_mode: crate::transport_core::NetworkFamilyMode::Ipv4,
+                    addresses: vec![crate::transport_core::NetworkAddress {
+                        family: crate::transport_core::NetworkAddressFamily::Ipv4,
+                        address: "10.0.0.2".into(),
+                        prefix_len: 24,
+                        on_link_prefix_len: 24,
+                        gateway: Some("10.0.0.1".into()),
+                    }],
                     tunnel_address: "10.0.0.2".into(),
                     prefix_len: 24,
                     mtu: 1400,
@@ -991,6 +1214,8 @@ mod tests {
                     dns_servers: Vec::new(),
                     full_tunnel: false,
                     kill_switch: false,
+                    allow_ipv4_leak: false,
+                    allow_ipv6_leak: false,
                     max_streams: 1,
                     adaptive: false,
                     data_plane: Default::default(),
@@ -1189,13 +1414,27 @@ mod tests {
 
     #[test]
     fn event_buffer_probe_does_not_consume_network_plan() {
-        let handle = unsafe { new_handle() };
+        let handle = unsafe {
+            new_handle_with_capabilities(
+                platform_capability::SYSTEM_PLAN
+                    | platform_capability::IPV6_ROUTES
+                    | platform_capability::IPV6_KILL_SWITCH,
+            )
+        };
         assert_eq!(qeli_client_start(handle), OK);
         CLIENTS.with(handle, |core| {
             core.poll_event();
             core.poll_event();
             core.publish_network_plan(NetworkPlan {
                 generation: 1,
+                family_mode: crate::transport_core::NetworkFamilyMode::Ipv4,
+                addresses: vec![crate::transport_core::NetworkAddress {
+                    family: crate::transport_core::NetworkAddressFamily::Ipv4,
+                    address: "10.0.0.2".into(),
+                    prefix_len: 24,
+                    on_link_prefix_len: 24,
+                    gateway: Some("10.0.0.1".into()),
+                }],
                 tunnel_address: "10.0.0.2".into(),
                 prefix_len: 24,
                 mtu: 1400,
@@ -1213,6 +1452,8 @@ mod tests {
                 }],
                 full_tunnel: true,
                 kill_switch: true,
+                allow_ipv4_leak: false,
+                allow_ipv6_leak: false,
                 max_streams: 1,
                 adaptive: false,
                 data_plane: Default::default(),
@@ -1254,6 +1495,7 @@ mod tests {
     #[test]
     fn socket_protect_event_round_trips_through_the_frozen_abi() {
         use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
 
         let mut handle = 0;
         let rc = unsafe {
@@ -1267,12 +1509,13 @@ mod tests {
         };
         assert_eq!(rc, OK);
         assert_eq!(qeli_client_start(handle), OK);
-        let (sequence, fd) = CLIENTS
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let fd = socket.as_raw_fd();
+        let (sequence, mut result) = CLIENTS
             .with(handle, |core| {
                 core.poll_event();
                 core.poll_event();
-                let pending = core.pending_wire_socket.as_ref().unwrap();
-                (pending.sequence, pending.socket.as_raw_fd())
+                core.request_socket_protect(fd).unwrap()
             })
             .unwrap();
 
@@ -1309,12 +1552,7 @@ mod tests {
             unsafe { qeli_client_socket_protect_result(handle, sequence, 0, std::ptr::null(), 0,) },
             OK
         );
-        assert_eq!(
-            CLIENTS
-                .with(handle, |core| core.protected_wire_socket_raw_fd())
-                .unwrap(),
-            Some(fd)
-        );
+        assert_eq!(result.try_recv().unwrap(), Ok(()));
         assert_eq!(
             unsafe { qeli_client_socket_protect_result(handle, sequence, 0, std::ptr::null(), 0,) },
             ErrorCode::StaleRequest as i32
@@ -1381,6 +1619,170 @@ mod tests {
             unsafe { qeli_client_server_identity_result(handle, sequence, 0, std::ptr::null(), 0) },
             ErrorCode::StaleRequest as i32
         );
+        assert_eq!(qeli_client_free(handle), OK);
+    }
+
+    #[cfg(feature = "experimental-roaming")]
+    #[test]
+    fn path_transaction_roundtrips_through_the_versioned_c_abi() {
+        fn poll_json(handle: u64) -> (QeliClientEvent, serde_json::Value) {
+            let mut event = QeliClientEvent::default();
+            let mut required = 0usize;
+            assert_eq!(
+                unsafe {
+                    qeli_client_poll_event(
+                        handle,
+                        &mut event,
+                        std::ptr::null_mut(),
+                        0,
+                        &mut required,
+                    )
+                },
+                ErrorCode::BufferTooSmall as i32
+            );
+            let mut payload = vec![0u8; required];
+            assert_eq!(
+                unsafe {
+                    qeli_client_poll_event(
+                        handle,
+                        &mut event,
+                        payload.as_mut_ptr(),
+                        payload.len(),
+                        &mut required,
+                    )
+                },
+                OK
+            );
+            (event, serde_json::from_slice(&payload).unwrap())
+        }
+
+        let capabilities = platform_capability::SYSTEM_PLAN
+            | platform_capability::IPV6_ROUTES
+            | platform_capability::IPV6_KILL_SWITCH
+            | platform_capability::ROAMING_PATH;
+        let handle = unsafe { new_handle_with_capabilities(capabilities) };
+        CLIENTS
+            .try_with(handle, |core| {
+                core.poll_event();
+                core.start()?;
+                core.poll_event();
+                core.publish_network_plan(NetworkPlan {
+                    generation: 7,
+                    family_mode: NetworkFamilyMode::Ipv4,
+                    addresses: vec![NetworkAddress {
+                        family: NetworkAddressFamily::Ipv4,
+                        address: "10.9.0.2".into(),
+                        prefix_len: 24,
+                        on_link_prefix_len: 24,
+                        gateway: Some("10.9.0.1".into()),
+                    }],
+                    tunnel_address: "10.9.0.2".into(),
+                    prefix_len: 24,
+                    mtu: 1400,
+                    tunnel_gateway: "10.9.0.1".into(),
+                    carrier_address: Some("198.51.100.7".into()),
+                    routes: vec![NetworkRoute {
+                        cidr: "0.0.0.0/0".into(),
+                        gateway: "10.9.0.1".into(),
+                        metric: 100,
+                    }],
+                    pushed_routes: Vec::new(),
+                    dns_servers: vec![NetworkDns {
+                        address: "1.1.1.1".into(),
+                        port: 53,
+                    }],
+                    full_tunnel: true,
+                    kill_switch: true,
+                    allow_ipv4_leak: false,
+                    allow_ipv6_leak: false,
+                    max_streams: 1,
+                    adaptive: false,
+                    data_plane: Default::default(),
+                    connection_log: Vec::new(),
+                })?;
+                core.poll_event();
+                core.poll_event();
+                core.ack_network_plan(7, true, None)?;
+                core.poll_event();
+                Ok::<_, crate::transport_core::CoreError>(())
+            })
+            .unwrap()
+            .unwrap();
+
+        let update = serde_json::json!({
+            "generation": 7,
+            "update_id": 1,
+            "platform_path_id": "wifi-primary",
+            "reason": "wake",
+            "network_token": "android-network-42",
+            "local_addresses": ["192.0.2.8"],
+            "resolved_addresses": [{"address": "198.51.100.7", "ttl_secs": 30}],
+            "flags": {"wake": true}
+        })
+        .to_string();
+        let mut candidate_id = 0u64;
+        assert_eq!(
+            unsafe {
+                qeli_client_path_update(handle, update.as_ptr(), update.len(), &mut candidate_id)
+            },
+            OK
+        );
+        assert_ne!(candidate_id, 0);
+
+        let (prepare, prepare_json) = poll_json(handle);
+        assert_eq!(prepare.kind, EventKind::PathCommand as u32);
+        assert_eq!(prepare.plan_generation, 7);
+        assert_eq!(prepare_json["action"], "prepare_path");
+        assert_eq!(prepare_json["candidate_id"], candidate_id);
+        assert_eq!(prepare_json["path"]["flags"]["wake"], true);
+        assert_eq!(
+            unsafe {
+                qeli_client_path_command_result(
+                    handle,
+                    7,
+                    candidate_id,
+                    prepare.sequence,
+                    99,
+                    std::ptr::null(),
+                    0,
+                )
+            },
+            ErrorCode::InvalidArgument as i32
+        );
+        assert_eq!(
+            unsafe {
+                qeli_client_path_command_result(
+                    handle,
+                    7,
+                    candidate_id,
+                    prepare.sequence,
+                    PATH_COMMAND_ACCEPTED,
+                    std::ptr::null(),
+                    0,
+                )
+            },
+            OK
+        );
+        assert_eq!(
+            unsafe {
+                qeli_client_path_command_result(
+                    handle,
+                    7,
+                    candidate_id,
+                    prepare.sequence,
+                    0,
+                    std::ptr::null(),
+                    0,
+                )
+            },
+            ErrorCode::StaleRequest as i32
+        );
+
+        let mut stats = QeliClientStats::default();
+        assert_eq!(unsafe { qeli_client_stats(handle, &mut stats) }, OK);
+        assert_eq!(stats.roam_attempts, 1);
+        assert_eq!(stats.roam_candidates, 1);
+        assert_eq!(stats.reconnects, 0);
         assert_eq!(qeli_client_free(handle), OK);
     }
 
@@ -1451,7 +1853,26 @@ mod tests {
         );
         let mut stats = QeliClientStats::default();
         assert_eq!(unsafe { qeli_client_stats(handle, &mut stats) }, OK);
-        assert_eq!(stats.struct_size as usize, STATS_V2_SIZE);
+        assert_eq!(stats.struct_size as usize, STATS_V3_SIZE);
+
+        // ABI 1.10 callers allocate only the 96-byte V2 prefix. V3 roaming fields must remain
+        // untouched just as the older UDP tail remains untouched for a 64-byte V1 caller.
+        let canary = 0xCCDD_EEFF_1122_3344;
+        let mut v2_stats = QeliClientStats {
+            struct_size: STATS_V2_SIZE as u32,
+            roam_attempts: canary,
+            roam_successes: canary,
+            roam_failures: canary,
+            roam_reconnect_fallbacks: canary,
+            roam_candidates: canary,
+            last_roam_latency_ms: canary,
+            ..QeliClientStats::default()
+        };
+        v2_stats.struct_size = STATS_V2_SIZE as u32;
+        assert_eq!(unsafe { qeli_client_stats(handle, &mut v2_stats) }, OK);
+        assert_eq!(v2_stats.struct_size as usize, STATS_V2_SIZE);
+        assert_eq!(v2_stats.roam_attempts, canary);
+        assert_eq!(v2_stats.last_roam_latency_ms, canary);
 
         // An ABI 1.x caller that allocated only the original 64-byte prefix remains valid;
         // the four V2 counters beyond its declared size are not touched.
@@ -1508,6 +1929,14 @@ mod tests {
             core.poll_event();
             core.publish_network_plan(NetworkPlan {
                 generation: 9,
+                family_mode: crate::transport_core::NetworkFamilyMode::Ipv4,
+                addresses: vec![crate::transport_core::NetworkAddress {
+                    family: crate::transport_core::NetworkAddressFamily::Ipv4,
+                    address: "10.0.0.2".into(),
+                    prefix_len: 24,
+                    on_link_prefix_len: 24,
+                    gateway: Some("10.0.0.1".into()),
+                }],
                 tunnel_address: "10.0.0.2".into(),
                 prefix_len: 24,
                 mtu: 1400,
@@ -1518,6 +1947,8 @@ mod tests {
                 dns_servers: Vec::new(),
                 full_tunnel: false,
                 kill_switch: false,
+                allow_ipv4_leak: false,
+                allow_ipv6_leak: false,
                 max_streams: 1,
                 adaptive: false,
                 data_plane: Default::default(),
@@ -1584,6 +2015,14 @@ mod tests {
             core.poll_event();
             core.publish_network_plan(NetworkPlan {
                 generation: 9,
+                family_mode: crate::transport_core::NetworkFamilyMode::Ipv4,
+                addresses: vec![crate::transport_core::NetworkAddress {
+                    family: crate::transport_core::NetworkAddressFamily::Ipv4,
+                    address: "10.0.0.2".into(),
+                    prefix_len: 24,
+                    on_link_prefix_len: 24,
+                    gateway: Some("10.0.0.1".into()),
+                }],
                 tunnel_address: "10.0.0.2".into(),
                 prefix_len: 24,
                 mtu: 1400,
@@ -1594,6 +2033,8 @@ mod tests {
                 dns_servers: Vec::new(),
                 full_tunnel: false,
                 kill_switch: false,
+                allow_ipv4_leak: false,
+                allow_ipv6_leak: false,
                 max_streams: 1,
                 adaptive: false,
                 data_plane: Default::default(),

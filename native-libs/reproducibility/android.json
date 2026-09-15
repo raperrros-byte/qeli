@@ -2,28 +2,28 @@
   "artifacts": {
     "native-libs/android/arm64-v8a/libqeli.so": {
       "consumed": {
-        "qeli-android/app/src/main/jniLibs/arm64-v8a/libqeli.so": "2a278090c1087d6eb8f197e61dfc1378f095ad1f120be7b2da045834ce1c7a9b"
+        "qeli-android/app/src/main/jniLibs/arm64-v8a/libqeli.so": "1fe647ca6e28edfdf4b9459161831163c5199e777376113e42ca8d27538f16b8"
       },
-      "final_sha256": "2a278090c1087d6eb8f197e61dfc1378f095ad1f120be7b2da045834ce1c7a9b",
-      "pass_a_sha256": "2a278090c1087d6eb8f197e61dfc1378f095ad1f120be7b2da045834ce1c7a9b",
-      "pass_b_sha256": "2a278090c1087d6eb8f197e61dfc1378f095ad1f120be7b2da045834ce1c7a9b",
+      "final_sha256": "1fe647ca6e28edfdf4b9459161831163c5199e777376113e42ca8d27538f16b8",
+      "pass_a_sha256": "1fe647ca6e28edfdf4b9459161831163c5199e777376113e42ca8d27538f16b8",
+      "pass_b_sha256": "1fe647ca6e28edfdf4b9459161831163c5199e777376113e42ca8d27538f16b8",
       "reproducible": true
     },
     "native-libs/android/x86_64/libqeli.so": {
       "consumed": {
-        "qeli-android/app/src/main/jniLibs/x86_64/libqeli.so": "0c1e3db7472fb69589ff91bfce8f7601a295af2d14ced9cb574ac9b815ad90c8"
+        "qeli-android/app/src/main/jniLibs/x86_64/libqeli.so": "061ae9bb86cd71081ee9511546798ddbcc4d4e15f35cc506bbf798fc74524631"
       },
-      "final_sha256": "0c1e3db7472fb69589ff91bfce8f7601a295af2d14ced9cb574ac9b815ad90c8",
-      "pass_a_sha256": "0c1e3db7472fb69589ff91bfce8f7601a295af2d14ced9cb574ac9b815ad90c8",
-      "pass_b_sha256": "0c1e3db7472fb69589ff91bfce8f7601a295af2d14ced9cb574ac9b815ad90c8",
+      "final_sha256": "061ae9bb86cd71081ee9511546798ddbcc4d4e15f35cc506bbf798fc74524631",
+      "pass_a_sha256": "061ae9bb86cd71081ee9511546798ddbcc4d4e15f35cc506bbf798fc74524631",
+      "pass_b_sha256": "061ae9bb86cd71081ee9511546798ddbcc4d4e15f35cc506bbf798fc74524631",
       "reproducible": true
     }
   },
   "recipe": "qeli-native-repro-v1",
   "schema": 1,
-  "source_commit": "b1e220d0dd5b28573786ea037f39617a3a50ef04",
-  "source_date_epoch": 1787147248,
-  "source_digest": "85d7163bd1f2632077070cd3706ceb49993cc13b21671353ab225161aef4e7e7",
+  "source_commit": "98e251528b11574a9bacf196c8a71a1ab312c987",
+  "source_date_epoch": 1788951429,
+  "source_digest": "c73f00afe1033e9e4c560fa0af9f42b486cb544a6ac06ec898173cc9f99c4ed4",
   "source_dirty": false,
   "toolchain": {
     "android_ndk": "26.3.11579264",

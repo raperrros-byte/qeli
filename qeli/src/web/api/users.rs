@@ -27,12 +27,8 @@ pub(super) fn validate_argon2_hash(hash: &str) -> Result<(), String> {
 /// is best-effort: on key failure we still return the hash (enc = None) so user
 /// creation isn't blocked — re-issue then needs a one-time reset.
 pub(crate) fn hash_and_enc(pw: &str) -> Result<(String, Option<String>), String> {
-    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
-    let salt = SaltString::generate(&mut OsRng);
-    let hash = crate::crypto::password_hasher()
-        .hash_password(pw.as_bytes(), &salt)
-        .map_err(|e| format!("hashing failed: {}", e))?
-        .to_string();
+    let hash = crate::crypto::hash_password(pw.as_bytes())
+        .map_err(|e| format!("hashing failed: {}", e))?;
     let enc = match crate::crypto::secret::encrypt_password(pw) {
         Ok(e) => Some(e),
         Err(e) => {
@@ -87,7 +83,19 @@ pub(crate) fn gen_password(len: usize) -> String {
 /// operator sees the mistake. Blank rows (the panel's empty repeater row) are ignored,
 /// matching the compiler.
 fn validate_allowed_networks(nets: &[String]) -> Result<(), String> {
-    crate::config::users::validate_allowed_networks(nets, "allowed_networks")
+    for n in nets {
+        let s = n.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let ok = crate::util::is_valid_cidr(s) || s.parse::<std::net::IpAddr>().is_ok();
+        if !ok {
+            return Err(format!(
+                "allowed_networks: {s:?} is not a valid IPv4/IPv6 CIDR or address"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Validate a `static_ip` value: must be a bare IPv4 address.
@@ -111,6 +119,42 @@ fn validate_static_ip(ip: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_static_ipv6(ip: &str) -> Result<(), String> {
+    let value = ip.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    let address = value.parse::<std::net::Ipv6Addr>().map_err(|_| {
+        format!(
+            "static_ipv6 {value:?} is not a valid bare IPv6 address; leave empty for a dynamic address"
+        )
+    })?;
+    crate::config::server::validate_tunnel_ipv6_address("static_ipv6", address)
+}
+
+/// Read a nullable string field from a partial JSON update.
+///
+/// The three states are intentionally distinct:
+/// - missing key => leave the stored value unchanged;
+/// - `null` or a blank string => clear the stored value;
+/// - non-empty string => store its trimmed value.
+///
+/// Treating `null` like a missing key made the Users form report success while retaining
+/// `static_ip`, `static_ipv6` and `group`, because the browser uses `null` for an emptied
+/// optional input. Reject other JSON types instead of silently turning a malformed update
+/// into a no-op.
+fn nullable_trimmed_string(body: &Value, key: &str) -> Result<Option<Option<String>>, String> {
+    match body.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            Ok(Some((!value.is_empty()).then(|| value.to_string())))
+        }
+        Some(value) => Err(format!("{key} must be a string or null (got {value})")),
+    }
+}
+
 /// The other user already holding `ip` as their static address, if any.
 ///
 /// Two users cannot share one static address: `IpPool::allocate_fixed` hands it to
@@ -127,6 +171,13 @@ fn static_ip_owner(
         .iter()
         .find(|u| u.username != except && u.static_ip.as_deref() == Some(ip))
         .map(|u| u.username.clone())
+}
+
+fn static_ipv6_owner(db: &UsersDb, ip: &str, except: &str) -> Option<String> {
+    db.users
+        .iter()
+        .find(|user| user.username != except && user.static_ipv6.as_deref() == Some(ip))
+        .map(|user| user.username.clone())
 }
 
 /// Narrow a JSON-supplied limit to `u32`, REJECTING an out-of-range value instead of
@@ -261,7 +312,10 @@ pub async fn list_users(
     State(state): State<Arc<ServerState>>,
     _guard: auth::AuthGuard,
 ) -> Result<Json<Value>, AuthError> {
-    let users = state.users_db.read().await;
+    let (_, users) = match super::current_config_and_users(&state).await {
+        Ok(current) => current,
+        Err(error) => return Ok(Json(super::err_json(error))),
+    };
     Ok(Json(
         json!({ "ok": true, "users": users.users, "groups": users.groups }),
     ))
@@ -272,7 +326,10 @@ pub async fn get_user(
     _guard: auth::AuthGuard,
     Path(username): Path<String>,
 ) -> Result<Json<Value>, AuthError> {
-    let users = state.users_db.read().await;
+    let (_, users) = match super::current_config_and_users(&state).await {
+        Ok(current) => current,
+        Err(error) => return Ok(Json(super::err_json(error))),
+    };
     match users.users.iter().find(|u| u.username == username) {
         Some(user) => Ok(Json(json!({ "ok": true, "user": user }))),
         None => Ok(Json(super::err_json(format!(
@@ -291,6 +348,18 @@ pub async fn create_user(
     if username.is_empty() {
         return Ok(Json(super::err_json("username required")));
     }
+    let static_ip = match nullable_trimmed_string(&body, "static_ip") {
+        Ok(value) => value.flatten(),
+        Err(error) => return Ok(Json(super::err_json(error))),
+    };
+    let static_ipv6 = match nullable_trimmed_string(&body, "static_ipv6") {
+        Ok(value) => value.flatten(),
+        Err(error) => return Ok(Json(super::err_json(error))),
+    };
+    let group = match nullable_trimmed_string(&body, "group") {
+        Ok(value) => value.flatten(),
+        Err(error) => return Ok(Json(super::err_json(error))),
+    };
     // Restrict to a safe charset (alnum + . _ -) and a sane length so a username can't
     // break the INI users file / control-channel JSON / downstream find() matching.
     if username.len() > 64
@@ -326,14 +395,24 @@ pub async fn create_user(
         }
     };
 
+    let _config_write_guard = state.config_write_lock.lock().await;
+    let config = match super::current_server_config(&state).await {
+        Ok(config) => config,
+        Err(error) => return Ok(Json(super::err_json(error))),
+    };
+    let current_users = match super::effective_users(&config) {
+        Ok(users) => users,
+        Err(error) => return Ok(Json(super::err_json(error))),
+    };
     let mut users = state.users_db.write().await;
+    *users = current_users;
     if users.users.iter().any(|u| u.username == username) {
         return Ok(Json(super::err_json(format!(
             "user '{}' already exists",
             username
         ))));
     }
-    if let Some(ip) = body["static_ip"].as_str().filter(|s| !s.is_empty()) {
+    if let Some(ip) = static_ip.as_deref() {
         if let Err(e) = validate_static_ip(ip) {
             return Ok(Json(super::err_json(e)));
         }
@@ -341,6 +420,17 @@ pub async fn create_user(
             return Ok(Json(super::err_json(format!(
                 "static_ip {} is already assigned to user '{}' — two users cannot share one \
                  address (they would evict each other on every reconnect)",
+                ip, other
+            ))));
+        }
+    }
+    if let Some(ip) = static_ipv6.as_deref() {
+        if let Err(error) = validate_static_ipv6(ip) {
+            return Ok(Json(super::err_json(error)));
+        }
+        if let Some(other) = static_ipv6_owner(&users, ip, &username) {
+            return Ok(Json(super::err_json(format!(
+                "static_ipv6 {} is already assigned to user '{}' — two users cannot share one address",
                 ip, other
             ))));
         }
@@ -374,12 +464,13 @@ pub async fn create_user(
         password_hash,
         password_enc,
         enabled: body["enabled"].as_bool().unwrap_or(true),
-        static_ip: body["static_ip"].as_str().map(|s| s.to_string()),
+        static_ip,
+        static_ipv6,
         bandwidth: crate::config::users::BandwidthLimit {
             limit_mbps,
             burst_mbps,
         },
-        group: body["group"].as_str().map(|s| s.to_string()),
+        group,
         allowed_networks: allowed_networks_new,
         max_sessions,
         profiles: strings_from_json(&body["profiles"]),
@@ -387,19 +478,27 @@ pub async fn create_user(
         client_subnets: strings_from_json(&body["client_subnets"]),
         ..Default::default()
     };
+    let mut candidate_users = users.clone();
+    candidate_users.users.push(new_user.clone());
+    if let Err(error) = crate::server::validate_static_address_sources(&config, &candidate_users) {
+        return Ok(Json(super::err_json(format!(
+            "static address conflicts with the active profile configuration: {error}"
+        ))));
+    }
     // Append on a freshly re-read copy: this process's view may lag the file (the worker
     // rewrites it on any control-socket change), and writing it back verbatim reverted
     // whatever it had missed. Re-check the name there too — it may have appeared since.
-    let users_file = state.config.auth.users_file.clone();
-    let taken = match UsersDb::update_locked(&users_file, |db| {
-        if db.users.iter().any(|u| u.username == new_user.username) {
-            return true;
+    let users_file = config.auth.users_file.clone();
+    let taken = match UsersDb::update_locked_checked(&users_file, |db| {
+        let taken = db.users.iter().any(|u| u.username == new_user.username);
+        if !taken {
+            db.users.push(new_user);
         }
-        db.users.push(new_user);
-        false
+        let effective = super::effective_users_from_external(&config, db.clone())?;
+        Ok((taken, effective))
     }) {
-        Ok((fresh, taken)) => {
-            *users = fresh;
+        Ok((_fresh, (taken, effective))) => {
+            *users = effective;
             taken
         }
         Err(e) => {
@@ -447,6 +546,9 @@ fn merge_changed_fields(
     if after.static_ip != before.static_ip {
         slot.static_ip = after.static_ip.clone();
     }
+    if after.static_ipv6 != before.static_ipv6 {
+        slot.static_ipv6 = after.static_ipv6.clone();
+    }
     if after.enabled != before.enabled {
         slot.enabled = after.enabled;
     }
@@ -488,10 +590,32 @@ pub async fn update_user(
     Path(username): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<Value>, AuthError> {
+    let static_ip_update = match nullable_trimmed_string(&body, "static_ip") {
+        Ok(value) => value,
+        Err(error) => return Ok(Json(super::err_json(error))),
+    };
+    let static_ipv6_update = match nullable_trimmed_string(&body, "static_ipv6") {
+        Ok(value) => value,
+        Err(error) => return Ok(Json(super::err_json(error))),
+    };
+    let group_update = match nullable_trimmed_string(&body, "group") {
+        Ok(value) => value,
+        Err(error) => return Ok(Json(super::err_json(error))),
+    };
+    let _config_write_guard = state.config_write_lock.lock().await;
+    let config = match super::current_server_config(&state).await {
+        Ok(config) => config,
+        Err(error) => return Ok(Json(super::err_json(error))),
+    };
+    let current_users = match super::effective_users(&config) {
+        Ok(users) => users,
+        Err(error) => return Ok(Json(super::err_json(error))),
+    };
     let mut users = state.users_db.write().await;
+    *users = current_users;
     // Check the static-IP collision BEFORE taking the mutable borrow below (and before
     // any mutation): two users sharing one static address evict each other forever.
-    if let Some(ip) = body["static_ip"].as_str().filter(|s| !s.is_empty()) {
+    if let Some(ip) = static_ip_update.as_ref().and_then(|value| value.as_deref()) {
         if let Err(e) = validate_static_ip(ip) {
             return Ok(Json(super::err_json(e)));
         }
@@ -503,13 +627,24 @@ pub async fn update_user(
             ))));
         }
     }
-    // Build the complete candidate on a clone. Validation errors must not mutate
-    // the panel's in-memory database when nothing was written to disk.
-    let existing = users
-        .users
-        .iter()
-        .find(|user| user.username == username)
-        .cloned();
+    if let Some(ip) = static_ipv6_update
+        .as_ref()
+        .and_then(|value| value.as_deref())
+    {
+        if let Err(error) = validate_static_ipv6(ip) {
+            return Ok(Json(super::err_json(error)));
+        }
+        if let Some(other) = static_ipv6_owner(&users, ip, &username) {
+            return Ok(Json(super::err_json(format!(
+                "static_ipv6 {} is already assigned to user '{}' — two users cannot share one address",
+                ip, other
+            ))));
+        }
+    }
+    // Build the candidate on the in-memory entry, then merge only changed fields into a
+    // freshly locked disk copy below. The in-memory database is replaced only after that
+    // atomic update succeeds.
+    let existing = users.users.iter().find(|u| u.username == username);
 
     match existing {
         Some(before) => {
@@ -537,19 +672,14 @@ pub async fn update_user(
             if let Some(v) = body["enabled"].as_bool() {
                 edited.enabled = v;
             }
-            if let Some(static_ip) = body["static_ip"].as_str() {
-                edited.static_ip = if static_ip.is_empty() {
-                    None
-                } else {
-                    Some(static_ip.to_string())
-                };
+            if let Some(static_ip) = static_ip_update {
+                edited.static_ip = static_ip;
             }
-            if let Some(group) = body["group"].as_str() {
-                edited.group = if group.is_empty() {
-                    None
-                } else {
-                    Some(group.to_string())
-                };
+            if let Some(static_ipv6) = static_ipv6_update {
+                edited.static_ipv6 = static_ipv6;
+            }
+            if let Some(group) = group_update {
+                edited.group = group;
             }
             // An INVALID value is now an error, not a silent no-op: `as_u64()` returns
             // None for "-5"/"1.5"/"abc" exactly as for a missing key, so the old
@@ -596,6 +726,21 @@ pub async fn update_user(
             if body.get("client_subnets").is_some() {
                 edited.client_subnets = strings_from_json(&body["client_subnets"]);
             }
+            let mut candidate_users = users.clone();
+            if let Some(candidate) = candidate_users
+                .users
+                .iter_mut()
+                .find(|user| user.username == username)
+            {
+                *candidate = edited.clone();
+            }
+            if let Err(error) =
+                crate::server::validate_static_address_sources(&config, &candidate_users)
+            {
+                return Ok(Json(super::err_json(format!(
+                    "static address conflicts with the active profile configuration: {error}"
+                ))));
+            }
             // Persist just THIS entry onto a freshly re-read file. Writing the whole
             // in-memory database back is what let one edit revert another writer's — most
             // visibly its own follow-up `set-bandwidth`, which the worker applied to its
@@ -608,18 +753,25 @@ pub async fn update_user(
             // reverted those. So diff the
             // entry against its pre-edit state and copy over ONLY what this request
             // actually changed, leaving every other field at whatever the file now holds.
-            let users_file = state.config.auth.users_file.clone();
-            let applied = match UsersDb::update_locked(&users_file, |db| {
-                match db.users.iter_mut().find(|u| u.username == username) {
+            let users_file = config.auth.users_file.clone();
+            let applied = match UsersDb::update_locked_checked(&users_file, |db| {
+                let applied = match db.users.iter_mut().find(|u| u.username == username) {
                     Some(slot) => {
-                        merge_changed_fields(&before, &edited, slot);
+                        merge_changed_fields(before, &edited, slot);
+                        true
+                    }
+                    None if config.auth.users.iter().any(|u| u.username == username) => {
+                        // An inline user becomes a file override; the file copy wins at runtime.
+                        db.users.push(edited.clone());
                         true
                     }
                     None => false,
-                }
+                };
+                let effective = super::effective_users_from_external(&config, db.clone())?;
+                Ok((applied, effective))
             }) {
-                Ok((fresh, applied)) => {
-                    *users = fresh;
+                Ok((_fresh, (applied, effective))) => {
+                    *users = effective;
                     applied
                 }
                 Err(e) => {
@@ -660,18 +812,37 @@ pub async fn delete_user(
     _guard: auth::AuthGuard,
     Path(username): Path<String>,
 ) -> Result<Json<Value>, AuthError> {
-    let users_file = state.config.auth.users_file.clone();
+    let _config_write_guard = state.config_write_lock.lock().await;
+    let config = match super::current_server_config(&state).await {
+        Ok(config) => config,
+        Err(error) => return Ok(Json(super::err_json(error))),
+    };
+    let users_file = config.auth.users_file.clone();
     let mut users = state.users_db.write().await;
     // Delete on a freshly re-read copy: this process's snapshot may predate changes the
     // worker made over the control socket, and writing it back verbatim reverted them.
-    let outcome = UsersDb::update_locked(&users_file, |db| {
+    let outcome = UsersDb::update_locked_checked(&users_file, |db| {
         let before = db.users.len();
         db.users.retain(|u| u.username != username);
-        db.users.len() < before
+        let removed = db.users.len() < before;
+        if !removed
+            && config
+                .auth
+                .users
+                .iter()
+                .any(|user| user.username == username)
+        {
+            anyhow::bail!(
+                "user '{}' is defined inline in server.conf; remove that [user:*] section or disable the user instead",
+                username
+            );
+        }
+        let effective = super::effective_users_from_external(&config, db.clone())?;
+        Ok((removed, effective))
     });
     let removed = match outcome {
-        Ok((fresh, removed)) => {
-            *users = fresh;
+        Ok((_fresh, (removed, effective))) => {
+            *users = effective;
             removed
         }
         Err(e) => {
@@ -725,21 +896,36 @@ async fn set_user_enabled(
     username: &str,
     enabled: bool,
 ) -> Result<Json<Value>, AuthError> {
-    let users_file = state.config.auth.users_file.clone();
+    let _config_write_guard = state.config_write_lock.lock().await;
+    let config = match super::current_server_config(state).await {
+        Ok(config) => config,
+        Err(error) => return Ok(Json(super::err_json(error))),
+    };
+    let users_file = config.auth.users_file.clone();
     let mut users = state.users_db.write().await;
     // Flip the flag on a freshly re-read copy (see delete_user).
-    let outcome = UsersDb::update_locked(&users_file, |db| {
-        match db.users.iter_mut().find(|u| u.username == username) {
+    let outcome = UsersDb::update_locked_checked(&users_file, |db| {
+        let found = match db.users.iter_mut().find(|u| u.username == username) {
             Some(u) => {
                 u.enabled = enabled;
                 true
             }
-            None => false,
-        }
+            None => match config.auth.users.iter().find(|u| u.username == username) {
+                Some(inline) => {
+                    let mut entry = inline.clone();
+                    entry.enabled = enabled;
+                    db.users.push(entry);
+                    true
+                }
+                None => false,
+            },
+        };
+        let effective = super::effective_users_from_external(&config, db.clone())?;
+        Ok((found, effective))
     });
     let found = match outcome {
-        Ok((fresh, found)) => {
-            *users = fresh;
+        Ok((_fresh, (found, effective))) => {
+            *users = effective;
             found
         }
         Err(e) => {
@@ -781,23 +967,39 @@ pub async fn set_user_bandwidth(
         Err(e) => return Ok(Json(super::err_json(e))),
     };
 
-    // persist to the users file
-    let users_file = state.config.auth.users_file.clone();
+    // Persist to the users file selected by the current server config.
+    let _config_write_guard = state.config_write_lock.lock().await;
+    let config = match super::current_server_config(&state).await {
+        Ok(config) => config,
+        Err(error) => return Ok(Json(super::err_json(error))),
+    };
+    let users_file = config.auth.users_file.clone();
     let mut users = state.users_db.write().await;
     // Apply on a freshly re-read copy (see create_user).
     let outcome: Result<bool, String> = {
-        match UsersDb::update_locked(&users_file, |db| {
-            match db.users.iter_mut().find(|u| u.username == username) {
+        match UsersDb::update_locked_checked(&users_file, |db| {
+            let found = match db.users.iter_mut().find(|u| u.username == username) {
                 Some(user) => {
                     user.bandwidth.limit_mbps = limit_mbps;
                     user.bandwidth.burst_mbps = burst_mbps;
                     true
                 }
-                None => false,
-            }
+                None => match config.auth.users.iter().find(|u| u.username == username) {
+                    Some(inline) => {
+                        let mut entry = inline.clone();
+                        entry.bandwidth.limit_mbps = limit_mbps;
+                        entry.bandwidth.burst_mbps = burst_mbps;
+                        db.users.push(entry);
+                        true
+                    }
+                    None => false,
+                },
+            };
+            let effective = super::effective_users_from_external(&config, db.clone())?;
+            Ok((found, effective))
         }) {
-            Ok((fresh, found)) => {
-                *users = fresh;
+            Ok((_fresh, (found, effective))) => {
+                *users = effective;
                 Ok(found)
             }
             Err(e) => {
@@ -840,7 +1042,10 @@ pub async fn list_groups(
     State(state): State<Arc<ServerState>>,
     _guard: auth::AuthGuard,
 ) -> Result<Json<Value>, AuthError> {
-    let users = state.users_db.read().await;
+    let (_, users) = match super::current_config_and_users(&state).await {
+        Ok(current) => current,
+        Err(error) => return Ok(Json(super::err_json(error))),
+    };
     Ok(Json(json!({ "ok": true, "groups": users.groups })))
 }
 
@@ -887,15 +1092,21 @@ pub async fn upsert_group(
         allowed_networks: group_nets,
     };
 
+    let _config_write_guard = state.config_write_lock.lock().await;
+    let config = match super::current_server_config(&state).await {
+        Ok(config) => config,
+        Err(error) => return Ok(Json(super::err_json(error))),
+    };
     let mut users = state.users_db.write().await;
     // Snapshot before mutating so a failed write can be undone (see create_user) —
     // the group no longer lingers in memory after a failed persist, so the message
     // below is now literally true.
-    let users_file = state.config.auth.users_file.clone();
-    if let Err(e) = UsersDb::update_locked(&users_file, |db| {
+    let users_file = config.auth.users_file.clone();
+    if let Err(e) = UsersDb::update_locked_checked(&users_file, |db| {
         db.groups.insert(name.clone(), group);
+        super::effective_users_from_external(&config, db.clone())
     })
-    .map(|(fresh, ())| *users = fresh)
+    .map(|(_fresh, effective)| *users = effective)
     {
         log::error!("Failed to save users file after group upsert: {}", e);
         return Ok(Json(super::err_json(format!(
@@ -915,13 +1126,27 @@ pub async fn delete_group(
     _guard: auth::AuthGuard,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, AuthError> {
+    let _config_write_guard = state.config_write_lock.lock().await;
+    let config = match super::current_server_config(&state).await {
+        Ok(config) => config,
+        Err(error) => return Ok(Json(super::err_json(error))),
+    };
     let mut users = state.users_db.write().await;
     // Snapshot before mutating so a failed write can be undone (see create_user).
-    let users_file = state.config.auth.users_file.clone();
-    let existed = match UsersDb::update_locked(&users_file, |db| db.groups.remove(&name).is_some())
-    {
-        Ok((fresh, existed)) => {
-            *users = fresh;
+    let users_file = config.auth.users_file.clone();
+    let existed = match UsersDb::update_locked_checked(&users_file, |db| {
+        let existed = db.groups.remove(&name).is_some();
+        if !existed && config.auth.groups.contains_key(&name) {
+            anyhow::bail!(
+                "group '{}' is defined inline in server.conf; remove that [group:*] section there",
+                name
+            );
+        }
+        let effective = super::effective_users_from_external(&config, db.clone())?;
+        Ok((existed, effective))
+    }) {
+        Ok((_fresh, (existed, effective))) => {
+            *users = effective;
             existed
         }
         Err(e) => {
@@ -948,7 +1173,7 @@ mod merge_tests {
     //! panel edits a user from a snapshot that may already be stale — the worker changes
     //! bandwidth/limits/expiry over the control socket — so writing the whole entry back
     //! reverted whatever it had not seen. These pin that only the edited fields travel.
-    use super::{merge_changed_fields, routes_from_json};
+    use super::{merge_changed_fields, nullable_trimmed_string, routes_from_json};
     use crate::config::users::UserEntry;
 
     fn user(name: &str) -> UserEntry {
@@ -956,6 +1181,55 @@ mod merge_tests {
             username: name.to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn nullable_optional_fields_distinguish_missing_clear_and_value() {
+        let missing = serde_json::json!({});
+        assert_eq!(
+            nullable_trimmed_string(&missing, "static_ipv6").unwrap(),
+            None
+        );
+
+        let clear_null = serde_json::json!({"static_ipv6": null});
+        assert_eq!(
+            nullable_trimmed_string(&clear_null, "static_ipv6").unwrap(),
+            Some(None)
+        );
+
+        let clear_blank = serde_json::json!({"static_ipv6": "  "});
+        assert_eq!(
+            nullable_trimmed_string(&clear_blank, "static_ipv6").unwrap(),
+            Some(None)
+        );
+
+        let value = serde_json::json!({"static_ipv6": "  fd71:e1:1234:1::50  "});
+        assert_eq!(
+            nullable_trimmed_string(&value, "static_ipv6").unwrap(),
+            Some(Some("fd71:e1:1234:1::50".into()))
+        );
+
+        let wrong_type = serde_json::json!({"static_ipv6": 6});
+        assert!(nullable_trimmed_string(&wrong_type, "static_ipv6").is_err());
+    }
+
+    #[test]
+    fn clearing_optional_user_fields_reaches_the_fresh_slot() {
+        let mut before = user("clear-me");
+        before.static_ip = Some("10.9.0.50".into());
+        before.static_ipv6 = Some("fd71:e1:1234:1::50".into());
+        before.group = Some("limited".into());
+        let mut after = before.clone();
+        after.static_ip = None;
+        after.static_ipv6 = None;
+        after.group = None;
+        let mut slot = before.clone();
+
+        merge_changed_fields(&before, &after, &mut slot);
+
+        assert_eq!(slot.static_ip, None);
+        assert_eq!(slot.static_ipv6, None);
+        assert_eq!(slot.group, None);
     }
 
     #[test]

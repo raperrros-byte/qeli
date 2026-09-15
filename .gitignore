@@ -33,6 +33,10 @@ release/prod-client-configs/
 # ── Private (not for GitHub) ──
 site/
 site.zip
+# Raw packet captures may contain environment-specific traffic. Commit only
+# sanitized reports, manifests and aggregate analysis derived from them.
+*.pcap
+*.pcapng
 
 # ── Obsolete one-off ops/debug scripts (kept locally only) ──
 scripts/archive/
@@ -101,6 +105,7 @@ qeli-android/gradle-*-bin.zip
 
 # ── Misc ──
 *.log
+*.orig
 .DS_Store
 Thumbs.db
 
@@ -111,3 +116,5 @@ qeli/config/client-*.conf
 release/qeli-*-amd64
 # Stray debug APKs in the android root
 qeli-android/*.apk
+# Local compact source snapshots used for offline review
+/qeli-compact-src.tar.gz

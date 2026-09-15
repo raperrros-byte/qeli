@@ -5,12 +5,13 @@ built-in obfuscation, running over TCP or UDP. The goal is resilience against
 passive/signature-based DPI while keeping the convenience of classic TUN/TAP
 VPNs, with a built-in web admin panel.
 
-- **Language**: Rust 2021, version 0.7.16 (beta)
+- **Language**: Rust 2021, version 0.8.1 (beta)
 - **Crypto stack**: `x25519-dalek`, `ml-kem` (PQ hybrid X25519MLKEM768), `chacha20poly1305`, `chacha20`, `aes-gcm`, `hkdf`, `sha2`, `argon2`, `zeroize`; `rustls`/`ring` — server-side termination of real TLS 1.3 in `reality-tls`
 - **Transport**: TCP or UDP; multiple profiles (interfaces) in a single daemon
-- **Wire modes**: `plain` (no obfuscation — a bare encrypted tunnel, TCP) · `fake-tls` (mimicry of TLS 1.3) · `obfs` (ChaCha20 stream + WS-fronting) · `reality` (proxying other parties' handshakes to a real site) · `reality-tls` (real TLS 1.3 carries the tunnel; `handrolled` borrows the target's real certificate — cert-borrowing, parity with Xray-REALITY) · QUIC-masking for UDP
-- **TUN/TAP**: Linux only (`libc::ioctl(TUNSETIFF)`)
-- **Web admin**: `axum` + `alpine.js`; native HTTPS (rustls, self-signed or your own cert), Argon2id password (fail-closed), IP allowlist, security headers/HSTS, same-origin CSRF, RU/EN localization, `qeli://` link/QR issuance without typing the password; assets embedded (no CDN). Guide — [PANEL.md](PANEL.md)
+- **Wire modes**: `plain` · `fake-tls` · `obfs` · `reality` · `reality-tls` (REALITY TLS 1.3 + a genuine HTTP/2 carrier; `handrolled` borrows the target certificate) · QUIC-shaped UDP compatibility masking, not real QUIC/HTTP3
+- **Rust daemon/CLI TUN/TAP backend**: Linux only (`libc::ioctl(TUNSETIFF)`); native clients
+  use their platform VPN APIs (Wintun, utun, Android `VpnService`, iOS Network Extension)
+- **Web admin**: `axum` + `alpine.js`; native HTTPS (rustls, self-signed or your own cert), Argon2id password (fail-closed), IP allowlist, security headers/HSTS, same-origin CSRF, RU/EN localization, `qeli://` link/QR issuance without typing the password; assets embedded (no CDN). Guide — [PANEL.md](manuals/PANEL.md)
 - **Configs**: a single flat-INI (`server.conf` / `client.conf` / `users.conf`); the client is a `[qeli]` section, expanded from a `qeli://` link (QR)
 
 ## Why this was built
@@ -22,16 +23,17 @@ themselves excellently, but they are **per-application proxies** (SOCKS/HTTP),
 not a system-wide VPN: they don't route all traffic/DNS at the OS level and are
 heavier to operate.
 
-**Qeli closes this gap** — the convenience of a real full-tunnel TUN VPN (all
-traffic, DNS, routes, many clients, a web admin) **plus** Xray-REALITY-grade
-masking: the traffic looks like ordinary HTTPS to a real site, which holds up
-against both **passive** signature-based DPI and **active** probing.
+**Qeli targets this gap** — the convenience of a real full-tunnel TUN VPN (all
+traffic, DNS, routes, many clients, a web admin) **plus** REALITY-style masking.
+`reality-tls` is designed to resemble ordinary HTTPS to a configured target and sends
+unauthorised probes to that site, reducing known **passive** signatures and **active**
+probing tells. It is not a universal indistinguishability or censorship-bypass guarantee.
 
 **A fully bespoke stack — not a wrapper.** The protocol, obfuscation, and
 REALITY/real TLS 1.3 are written **from scratch in Rust**: this is **NOT** the use
 of off-the-shelf REALITY libraries and **NOT** a wrapper over Xray/sing-box. Our
-own fake-TLS, our own hand-rolled TLS 1.3 (`realtls`) with cert-borrowing (JA3S
-parity with Xray-REALITY), our own crypto channel (X25519 + ML-KEM-768 PQ hybrid,
+own fake-TLS, our own hand-rolled TLS 1.3 (`realtls`) with cert-borrowing (the target's certificate and JA3S shape,
+without claiming full Xray/browser parity), our own crypto channel (X25519 + ML-KEM-768 PQ hybrid,
 ChaCha20-Poly1305, channel-binding, key-pinning, PRP-nonce). Full control and
 auditability of the code, with no dependency on third-party proxy cores.
 
@@ -43,7 +45,7 @@ auditability of the code, with no dependency on third-party proxy cores.
 **How it differs:** WireGuard is fast but easily fingerprinted; Xray/V2Ray have
 excellent masking, but they are a proxy, not a TUN, and run on third-party cores;
 commercial VPNs are not self-hosted. Qeli = self-hosted full-TUN VPN +
-REALITY-grade masking on a **bespoke implementation** + a built-in multi-client
+REALITY-style masking on a **bespoke implementation** + a built-in multi-client
 and admin panel.
 
 ## What is implemented in-house
@@ -54,7 +56,7 @@ are written in this repository from scratch:
 - **`realtls` — real TLS 1.3 by hand.** A sans-IO core (no socket coupling) +
   client and server: ClientHello/ServerHello, key schedule (HKDF), record layer,
   AEAD. **Cert-borrowing** — the server borrows the target's real certificate, so
-  the JA3S matches the real site (parity with Xray-REALITY). Exported to native
+  the JA3S shape matches the probed real site; that is one measured dimension, not full Xray/browser parity. Exported to native
   clients via C-ABI FFI and JNI.
 - **fake-TLS** — our own TLS-1.3-mimicking handshake: GREASE, randomized
   extension order (JA3 changes per-connection), SNI, X25519MLKEM768 key_share
@@ -63,6 +65,9 @@ are written in this repository from scratch:
 - **REALITY proxy** — peek-and-decide on accept: a crypto token in the
   ClientHello's `session_id` + anti-replay guard; "foreign" handshakes are
   transparently bridged to a real site (protection against active probing).
+- **Genuine HTTP/2 carrier** — authenticated `reality-tls` uses ALPN `h2`, one long-lived
+  bidirectional `POST /v1/events/stream`, real SETTINGS/HEADERS/DATA/flow-control and randomized
+  2–8 ms batching. There is no user-facing H2 switch and no second inner fake-TLS handshake.
 - **Crypto channel** — X25519 + **ML-KEM-768** (PQ hybrid X25519MLKEM768),
   HKDF-SHA256, ChaCha20-Poly1305 / AES-GCM, Argon2id for passwords.
 - **Channel-binding authentication** — the server's proof is bound to the
@@ -91,7 +96,7 @@ qeli_vpn/
 │   │   ├── client/        — TCP/UDP client, routes, DNS, reconnect
 │   │   ├── server/        — handler.rs (TCP), udp_handler.rs (UDP), web/, control/, reality.rs
 │   │   ├── crypto/        — X25519, ML-KEM-768, ChaCha20-Poly1305, HKDF, auth (channel-binding/pinning), PRP-nonce
-│   │   ├── protocol/      — fake-tls, obfs (ChaCha20 stream), realtls/ (real TLS 1.3: client+server+sans-IO/FFI), QUIC-wrap, packet codec
+│   │   ├── protocol/      — fake-tls, obfs, realtls/, h2_carrier.rs, QUIC-shape, packet codec
 │   │   ├── tun/           — TUN/TAP via libc
 │   │   ├── web/           — admin UI + REST API
 │   │   └── config/        — serde structs + flat-INI loader (format.rs/server_ini.rs)
@@ -109,26 +114,19 @@ qeli_vpn/
 
 ## What the protocol does on the wire
 
-1. **Handshake.** The client sends a fake-TLS ClientHello (SNI, x25519 key_share,
-   GREASE, randomized extension order → JA3 changes per-connection). The server
-   replies with ServerHello/Certificate/Finished. The shared key is X25519, the
-   AEAD keys are HKDF-SHA256. (In `obfs` mode the entire flow is additionally
-   XOR'd with a ChaCha20 keystream; in `reality`, "foreign" handshakes are proxied
-   to a real site.)
-2. **Server → client authentication.** The server proves ownership of its
-   long-term key; the proof is bound to the **handshake transcript** (channel
-   binding). The client checks it against the pinned key (`auth.server_public_key`).
-   **Before credentials are sent** — a MITM cannot intercept the password.
-3. **Client → server authentication.** The client sends (inside the AEAD channel)
-   a proof of knowledge of the server key + `username:password` (Argon2id). With
-   `require_client_key_proof`, unpinned clients are rejected.
-4. **Data.** Each IP packet → AEAD (ChaCha20-Poly1305; the nonce is masked by a
-   96-bit Feistel-PRP — there is no incrementing counter on the wire) → optional
-   padding → write: fake-TLS application_data `0x17`; or a bare `[len][nonce][ct]`
-   in `plain` mode (no TLS wrapper); or an obfs stream; or a QUIC wrapper; or
-   inside real TLS 1.3 in `reality-tls`.
-
-Security details — [AUDIT.md](AUDIT.md). Against **active** probing, REALITY does
+1. **Carrier handshake.** `fake-tls` sends the qeli TLS-shaped ClientHello; `obfs` performs its
+   configured fronting; `plain` starts the private handshake directly. `reality-tls` instead
+   establishes authenticated REALITY TLS 1.3 and negotiates ALPN `h2`.
+2. **Reality/H2 carrier.** The client opens exactly one long-lived bidirectional
+   `POST /v1/events/stream`. The qeli byte stream is carried in genuine HTTP/2 DATA frames;
+   randomized 2–8 ms batching deliberately breaks message/record boundary correlation.
+3. **Mutual qeli authentication.** The server proof is bound to the handshake transcript and
+   checked against the pinned profile key before credentials are sent. The client then proves
+   knowledge of that key and authenticates inside the qeli AEAD channel.
+4. **Data.** PacketCodec remains end-to-end ChaCha20-Poly1305 with PRP-masked nonces. Legacy
+   camouflage modes retain their own framing; current `reality-tls` carries raw private qeli
+   records inside H2. This is still outer TLS AEAD plus inner qeli AEAD, but no nested fake-TLS.
+Security details — [AUDIT.md](reports/AUDIT.md). Against **active** probing, REALITY does
 the work: `reality` bridges foreign parties to a real site, while `reality-tls`
 carries the tunnel inside real TLS 1.3 (with `handrolled` — the target's borrowed
 real certificate). The X25519MLKEM768 PQ hybrid is now also in the **inner** qeli
@@ -143,7 +141,7 @@ passive/entropy-based DPI.
 ## Quick start
 
 ```bash
-cd qeli && cargo build --release
+cd qeli && cargo build --release --features jemalloc
 
 # configs (flat-INI) — samples in qeli/config/
 sudo install -Dm644 config/server.conf /etc/qeli/server.conf
@@ -158,12 +156,13 @@ sudo /usr/bin/qeli client --config /etc/qeli/client.conf
 Fully documented examples with all parameters:
 [server.conf](../../qeli/config/server.conf) (exhaustive reference) ·
 [server-multiprofile.conf](../../qeli/config/server-multiprofile.conf) (ready 10-mode template) ·
+[server-ipv6.conf](../../qeli/config/server-ipv6.conf) (runnable dual-stack deployment) ·
 [client.conf](../../qeli/config/client.conf) · [users.conf](../../qeli/config/users.conf).
-Config reference — [CONFIG.md](CONFIG.md).
+Config reference — [CONFIG.md](manuals/CONFIG.md).
 
 > 📘 **New here?** A step-by-step from-scratch guide — from installing the server to
 > creating users with routes and connecting a client, via both the CLI and the web
-> panel — is in [GETTING-STARTED.md](GETTING-STARTED.md).
+> panel — is in [GETTING-STARTED.md](manuals/GETTING-STARTED.md).
 
 ## Commands
 
@@ -204,11 +203,12 @@ The full set of CLI subcommands (`qeli <command> --help` for all options).
 
 Most used:
 
-- **[GETTING-STARTED.md](GETTING-STARTED.md)** — install and first run, step by step.
-- **[CONFIG.md](CONFIG.md)** — configuration (flat-INI), every parameter.
-- **[CLIENT-CONFIG-MATRIX.md](CLIENT-CONFIG-MATRIX.md)** — all 73 client keys before/after the refactor.
-- **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — diagnostics and error reference.
-- **[PANEL.md](PANEL.md)** — web panel: installation and usage.
+- **[GETTING-STARTED.md](manuals/GETTING-STARTED.md)** — install and first run, step by step.
+- **[CONFIG.md](manuals/CONFIG.md)** — configuration (flat-INI), every parameter.
+- **[IPV6.md](manuals/IPV6.md)** — complete dual-stack/IPv6-only, NAT66/route setup and troubleshooting.
+- **[CLIENT-CONFIG-MATRIX.md](reference/CLIENT-CONFIG-MATRIX.md)** — the current 80 client keys and refactor history.
+- **[TROUBLESHOOTING.md](manuals/TROUBLESHOOTING.md)** — diagnostics and error reference.
+- **[PANEL.md](manuals/PANEL.md)** — web panel: installation and usage.
 
 ## Status
 
@@ -223,16 +223,15 @@ Confirmed in the lab: auto-reconnect, crash-safe DNS, brute-force lockout,
 channel-binding, server key pinning, per-profile authorization, and end-to-end runs of
 every wire mode.
 
-Performance (2 vCPU lab, measured on v0.5.6; PQ/H-1 affect only the handshake — a one-time
-cost that does not change throughput). Methodology and current figures —
-[BENCHMARK.md](BENCHMARK.md):
+Performance (2-VM lab, latest structured run: v0.8.0, 2026-08-26, binary SHA-256
+`2f69b48f…`). Methodology and raw data — [BENCHMARK.md](reports/BENCHMARK.md):
 
-- **TCP**: ~560–571 ↑ / ~690–717 ↓ Mbps (plain/fake-tls/reality), all modes stable
-  with no drops; obfs −12%; reality-proxy ≈ plain; reality-tls ↓ ~430 (the cost of
-  nested real TLS — double AEAD on the client).
-- **UDP**: clean up to 300 Mbps, ~400 Mbps at <1% loss, saturation ~500.
-- Latency overhead ~1.5–1.9 ms; worker memory ~7–8 MB; the bottleneck is the
-  single-core decryption CPU.
+- **TCP, current 12-mode run**: 713.2–1182 ↑ / 647.8–1330 ↓ Mbps, zero server drops.
+  Genuine-H2 `reality-tls`: 827.9 ↑ / 647.8 ↓ Mbps.
+- **UDP**: loss was 0–0.01% at 100 Mbps, 0.01–5.05% at 400 Mbps,
+  5.97–19.69% at 500 Mbps, and 27.88–33.21% at 600 Mbps.
+- Mean RTT across measured modes was 12.553–24.756 ms; TCP qeli RSS was 84.8–90.3 MB.
+  This is one lab snapshot, not a capacity guarantee; repeat H2 5× on the final SHA.
 
 ## License
 

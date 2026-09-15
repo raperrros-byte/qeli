@@ -15,32 +15,24 @@ struct ProfilesView: View {
 
     var body: some View {
         VStack(spacing: 10) {
-            HStack {
-                Button { showingImportChoices = true } label: { Label("Import", systemImage: "square.and.arrow.down") }
-                    .buttonStyle(.bordered)
-                Button { creatingProfile = true } label: { Label("New", systemImage: "plus") }
-                    .buttonStyle(.borderedProminent).tint(QeliTheme.primary)
-                Spacer()
-                Button { model.pingAll() } label: { Label("Ping all", systemImage: "wave.3.right") }
-                    .buttonStyle(.bordered)
-                EditButton()
-            }
-            .padding(.horizontal, 16)
+            profileActions
 
-            List {
-                ForEach(model.profiles) { profile in
-                    profileRow(profile)
-                        .listRowBackground(QeliTheme.surface)
-                        .listRowSeparator(.hidden)
-                        .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
+            ScrollView {
+                LazyVStack(spacing: 8) {
+                    ForEach(model.profiles) { profile in
+                        profileRow(profile)
+                    }
                 }
-                .onMove(perform: model.move)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 16)
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
             .overlay {
                 if model.profiles.isEmpty {
-                    ContentUnavailableView("No profiles", systemImage: "network.slash", description: Text("Import or create a profile."))
+                    ContentUnavailableView(
+                        "No profiles",
+                        systemImage: "network.slash",
+                        description: Text("Import or create a profile.")
+                    )
                 }
             }
         }
@@ -83,7 +75,7 @@ struct ProfilesView: View {
         }
         .fileImporter(
             isPresented: $showingFileImporter,
-            allowedContentTypes: [.plainText, .json, .data],
+            allowedContentTypes: [.plainText, .data],
             allowsMultipleSelection: false
         ) { result in
             Task { @MainActor in
@@ -109,21 +101,68 @@ struct ProfilesView: View {
         }
     }
 
+    private var profileActions: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 6) {
+                importButton
+                newProfileButton
+                pingAllButton
+            }
+            VStack(spacing: 6) {
+                HStack(spacing: 6) {
+                    importButton
+                    newProfileButton
+                }
+                HStack {
+                    Spacer()
+                    pingAllButton
+                }
+            }
+            VStack(spacing: 6) {
+                importButton
+                newProfileButton
+                pingAllButton.frame(maxWidth: .infinity, alignment: .trailing)
+            }
+        }
+        .padding(.horizontal, 16)
+    }
+
+    private var importButton: some View {
+        Button("Import") { showingImportChoices = true }
+            .buttonStyle(QeliOutlinedActionButtonStyle())
+    }
+
+    private var newProfileButton: some View {
+        Button("New") { creatingProfile = true }
+            .buttonStyle(QeliOutlinedActionButtonStyle())
+    }
+
+    private var pingAllButton: some View {
+        Button("Ping all") { model.pingAll() }
+            .buttonStyle(QeliTextActionButtonStyle())
+    }
+
     private func profileRow(_ profile: Profile) -> some View {
         HStack(spacing: 12) {
             Button { model.selectProfile(profile.id) } label: {
-                HStack(spacing: 12) {
-                    Circle().fill(reachabilityColor(profile)).frame(width: 10, height: 10)
+                HStack(spacing: 8) {
+                    VStack(spacing: 3) {
+                        Circle().fill(reachabilityColor(profile)).frame(width: 10, height: 10)
+                        Text(reachabilityCompactText(profile))
+                            .font(.system(size: 9))
+                            .foregroundStyle(QeliTheme.textSecondary)
+                            .lineLimit(1)
+                    }
+                    .frame(width: 42)
                     VStack(alignment: .leading, spacing: 3) {
                         HStack {
-                            Text(profile.name).font(.headline).foregroundStyle(.primary).lineLimit(1)
+                            Text(profile.name).font(.headline).foregroundStyle(QeliTheme.textPrimary).lineLimit(1)
                             if profile.id == model.activeProfileID {
                                 Text("ACTIVE").font(.system(size: 9, weight: .bold)).foregroundStyle(QeliTheme.primary)
                             }
                         }
                         Text(profile.parsedConfig.map { "\($0.serverAddress):\($0.port) · \($0.protocolName.uppercased()) / \($0.wireMode)" } ?? "⚠ invalid config")
-                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                        Text(reachabilityText(profile)).font(.caption2).foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(QeliTheme.textSecondary).lineLimit(1)
                     }
                 }
                 .contentShape(Rectangle())
@@ -142,20 +181,33 @@ struct ProfilesView: View {
                 Button { model.duplicate(profile.id) } label: { Label("Duplicate", systemImage: "plus.square.on.square") }
                 Button { model.ping(profile) } label: { Label("Ping", systemImage: "wave.3.right") }
                 Button {} label: { Label("Apps through VPN (MDM only)", systemImage: "building.2") }.disabled(true)
+                Button { model.move(profile.id, by: -1) } label: {
+                    Label("Move up", systemImage: "arrow.up")
+                }
+                .disabled(model.profiles.first?.id == profile.id)
+                Button { model.move(profile.id, by: 1) } label: {
+                    Label("Move down", systemImage: "arrow.down")
+                }
+                .disabled(model.profiles.last?.id == profile.id)
                 Divider()
                 Button(role: .destructive) { deletingProfile = profile } label: { Label("Delete", systemImage: "trash") }
             } label: {
-                Image(systemName: "ellipsis.circle").font(.title3).frame(width: 34, height: 34)
+                Image(systemName: "ellipsis")
+                    .font(.title3.weight(.semibold))
+                    .rotationEffect(.degrees(90))
+                    .frame(width: 44, height: 44)
             }
+            .foregroundStyle(QeliTheme.textSecondary)
+            .accessibilityLabel("Profile actions")
         }
         .padding(14)
         .background(
-            RoundedRectangle(cornerRadius: 17, style: .continuous)
-                .fill(profile.id == model.activeProfileID ? QeliTheme.primary.opacity(0.10) : QeliTheme.surface)
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(profile.id == model.activeProfileID ? QeliTheme.primaryContainer : QeliTheme.surface)
         )
         .overlay {
-            RoundedRectangle(cornerRadius: 17, style: .continuous)
-                .stroke(profile.id == model.activeProfileID ? QeliTheme.primary.opacity(0.45) : Color.primary.opacity(0.08))
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(profile.id == model.activeProfileID ? QeliTheme.primary : QeliTheme.outline)
         }
     }
 
@@ -165,12 +217,11 @@ struct ProfilesView: View {
         !model.canSwitchProfile && profile.id != model.activeProfileID
     }
 
-    private func reachabilityText(_ profile: Profile) -> String {
+    private func reachabilityCompactText(_ profile: Profile) -> String {
         switch model.reachability[profile.id] ?? .idle {
-        case .idle: return "not checked"
-        case .checking: return "checking…"
+        case .checking: return "…"
         case .reachable(let milliseconds): return "\(milliseconds) ms"
-        case .unavailable(let message): return message
+        case .idle, .unavailable: return ""
         }
     }
 

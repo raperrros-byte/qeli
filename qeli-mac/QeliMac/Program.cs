@@ -6,13 +6,14 @@ namespace QeliMac;
 
 /// <summary>
 /// Entry point. "--service" runs the headless launchd daemon (root, no GUI); the
-/// selftest/packetbench/handshake/connect/genassets/genicns verbs run headless for debugging/CI;
-/// "uishot" renders UI screenshots; anything else launches the Avalonia GUI.
+/// selftest/handshake/connect/genassets/genicns verbs run headless for debugging/CI;
+/// Build-tools-only "uishot" renders UI screenshots; anything else launches the Avalonia GUI.
 /// A top-level guard logs any startup exception so a launch crash is diagnosable.
 /// </summary>
 public static class Program
 {
-    private static readonly string[] CliVerbs = { "selftest", "packetbench", "handshake", "connect", "genassets", "genicns" };
+    private static readonly string[] CliVerbs = { "selftest", "handshake", "connect", "genassets", "genicns",
+        "pf-selftest-rules" };
 
     // Darwin's sigset_t is a bare uint32 with signal N in bit N-1, and SIG_SETMASK is 3.
     // Both read out of the macOS SDK headers rather than assumed: Linux's sigset_t is
@@ -96,6 +97,13 @@ public static class Program
     [STAThread]
     public static int Main(string[] args)
     {
+        // A self-test is explicitly side-effect free (no network and no root). Dispatch it
+        // before startup recovery so CI cannot restore host DNS/firewall state merely by
+        // validating the binary.
+        if (args.Length > 0 &&
+            string.Equals(args[0], "selftest", StringComparison.OrdinalIgnoreCase))
+            return CliRunner.Run(args[0], args.Skip(1).ToArray());
+
         // Before the elevated helper spawns a child process — see the method above.
         uint inheritedMask = ClearInheritedSignalMaskForElevatedDaemonHelper(args);
         if (inheritedMask != 0)
@@ -146,9 +154,11 @@ public static class Program
         if (args.Length > 0 && CliVerbs.Contains(args[0].ToLowerInvariant()))
             return CliRunner.Run(args[0], args.Skip(1).ToArray());
 
-        // Offscreen UI screenshots — builds its own headless Avalonia app.
+#if QELI_BUILD_TOOLS
+        // Offscreen UI screenshots are excluded from production builds.
         if (args.Length > 0 && string.Equals(args[0], "uishot", StringComparison.OrdinalIgnoreCase))
             return UiShot.Run(args.Skip(1).ToArray());
+#endif
 
         try
         {

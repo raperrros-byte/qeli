@@ -18,6 +18,7 @@ namespace QeliMac.Vpn;
 internal sealed class PerAppController
 {
     internal const string HelperName = "QeliPerAppCtl";
+    private const int RoutingStateVersion = 4;
     private readonly Action<string> _log;
     private bool _started;
     private Process? _guardian;
@@ -48,6 +49,10 @@ internal sealed class PerAppController
         IReadOnlyList<string> includeRoutes,
         IReadOnlyList<string> excludeRoutes,
         IReadOnlyList<string> pushedRoutes,
+        IReadOnlyList<string> tunnelSubnets,
+        IReadOnlyList<string> physicalLocalRoutes,
+        bool tunnelIpv4,
+        bool tunnelIpv6,
         bool tunnelUp)
     {
         string helper = Path.Combine(AppContext.BaseDirectory, HelperName);
@@ -66,7 +71,7 @@ internal sealed class PerAppController
 
         var state = new RoutingState
         {
-            Version = 2,
+            Version = RoutingStateVersion,
             TunnelUp = tunnelUp,
             // The guardian installs this state before activation and then renews it to a
             // rolling five-second lease, including while macOS waits for user approval.
@@ -78,12 +83,17 @@ internal sealed class PerAppController
             CarrierAddress = carrierIp.ToString(),
             CarrierPort = config.Port,
             CarrierProtocol = config.Protocol,
+            TunnelIpv4 = tunnelIpv4,
+            TunnelIpv6 = tunnelIpv6,
+            AllowIpv4Leak = config.AllowIpv4Leak,
             AllowIpv6Leak = config.AllowIpv6Leak,
             FullTunnel = config.IsFullTunnel,
             RouteLocalNetworks = config.RouteLocalNetworks,
             IncludeRoutes = includeRoutes.ToArray(),
             ExcludeRoutes = excludeRoutes.ToArray(),
             PushedRoutes = pushedRoutes.ToArray(),
+            TunnelSubnets = tunnelSubnets.ToArray(),
+            PhysicalLocalRoutes = physicalLocalRoutes.ToArray(),
             AlwaysBypassApps = new[] { "ru.qeli.app", "ru.qeli.app.perapp" },
         };
 
@@ -262,12 +272,17 @@ internal sealed class PerAppController
         public string CarrierAddress { get; init; } = "";
         public int CarrierPort { get; init; }
         public string CarrierProtocol { get; init; } = "tcp";
+        public bool TunnelIpv4 { get; init; }
+        public bool TunnelIpv6 { get; init; }
+        public bool AllowIpv4Leak { get; init; }
         public bool AllowIpv6Leak { get; init; }
         public bool FullTunnel { get; init; }
         public bool RouteLocalNetworks { get; init; }
         public string[] IncludeRoutes { get; init; } = Array.Empty<string>();
         public string[] ExcludeRoutes { get; init; } = Array.Empty<string>();
         public string[] PushedRoutes { get; init; } = Array.Empty<string>();
+        public string[] TunnelSubnets { get; init; } = Array.Empty<string>();
+        public string[] PhysicalLocalRoutes { get; init; } = Array.Empty<string>();
         public string[] AlwaysBypassApps { get; init; } = Array.Empty<string>();
     }
 }
