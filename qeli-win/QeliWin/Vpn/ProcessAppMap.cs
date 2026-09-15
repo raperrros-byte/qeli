@@ -422,7 +422,9 @@ internal sealed class ProcessAppMap : IDisposable
             && path.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>Installed / running apps suitable for the picker UI.</summary>
+    /// <summary>Installed / running apps suitable for the picker UI.
+    /// Uses PROCESS_QUERY_LIMITED_INFORMATION so elevated processes are visible
+    /// without requiring the GUI itself to run as admin.</summary>
     public static List<(string path, string name)> ListCandidateApps()
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -433,14 +435,18 @@ internal sealed class ProcessAppMap : IDisposable
             {
                 try
                 {
-                    string? path = null;
-                    try { path = p.MainModule?.FileName; } catch { }
+                    string? path = TryQueryImageName((uint)p.Id);
+                    if (string.IsNullOrEmpty(path))
+                    {
+                        try { path = NormalizePath(p.MainModule?.FileName); }
+                        catch { path = null; }
+                    }
                     if (string.IsNullOrEmpty(path)) continue;
-                    path = NormalizePath(path);
-                    if (path.Length == 0 || !seen.Add(path)) continue;
+                    if (!seen.Add(path)) continue;
                     if (!path.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) continue;
                     if (path.Contains(@"\Windows\System32\", StringComparison.OrdinalIgnoreCase)
-                        || path.Contains(@"\Windows\SysWOW64\", StringComparison.OrdinalIgnoreCase))
+                        || path.Contains(@"\Windows\SysWOW64\", StringComparison.OrdinalIgnoreCase)
+                        || path.Contains(@"\Windows\SystemApps\", StringComparison.OrdinalIgnoreCase))
                         continue;
                     string name = p.ProcessName;
                     try { name = Path.GetFileNameWithoutExtension(path); } catch { }

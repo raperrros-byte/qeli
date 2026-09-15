@@ -817,10 +817,13 @@ public partial class MainWindow : Window
     {
         if (GlobalAppsPickBtn == null) return;
         string mode = TagOf(GlobalAppsModeBox) ?? "all";
-        bool enabled = mode is "include" or "exclude";
-        GlobalAppsPickBtn.IsEnabled = enabled;
-        GlobalAppsPickBtn.Opacity = enabled ? 1.0 : 0.45;
-        GlobalAppsCountText.Text = enabled ? Loc.F("AppsPicked", _globalApps.Count) : "";
+        bool filter = mode is "include" or "exclude";
+        // Always allow picking; OnGlobalPickApps switches to include when needed.
+        GlobalAppsPickBtn.IsEnabled = true;
+        GlobalAppsPickBtn.Opacity = 1.0;
+        GlobalAppsCountText.Text = filter || _globalApps.Count > 0
+            ? Loc.F("AppsPicked", _globalApps.Count)
+            : "";
     }
 
     private void UpdateGatewayRadiosVisibility()
@@ -870,14 +873,37 @@ public partial class MainWindow : Window
         if (_suppressTrafficUi) return;
         UpdateGlobalAppsUi();
         UpdateGatewayRadiosVisibility();
+        string mode = NormalizeAppsMode(TagOf(GlobalAppsModeBox) ?? "all");
+        // Keep include/exclude selected so the pick button stays usable; apply only when
+        // there is at least one app (or the mode is "all").
+        if (mode is ("include" or "exclude") && _globalApps.Count == 0)
+        {
+            Toast.Show(ToastKind.Info, Loc.T("NeedApps"), "");
+            return;
+        }
         if (!PersistTrafficSettingsFromUi()) return;
         _ = ApplyTrafficModeAndMaybeReconnectAsync(userInitiated: true);
     }
 
     private void OnGlobalPickApps(object sender, RoutedEventArgs e)
     {
+        var mode = NormalizeAppsMode(TagOf(GlobalAppsModeBox) ?? "all");
+        if (mode is not ("include" or "exclude"))
+        {
+            // User clicked pick while still on "all" — switch to include automatically.
+            _suppressTrafficUi = true;
+            try { SelectComboTag(GlobalAppsModeBox, "include"); }
+            finally { _suppressTrafficUi = false; }
+            UpdateGlobalAppsUi();
+            UpdateGatewayRadiosVisibility();
+        }
         var picked = AppPickerWindow.Show(this, _globalApps);
         if (picked == null) return;
+        if (picked.Count == 0)
+        {
+            Toast.Show(ToastKind.Error, Loc.T("NeedAppsPick"), "");
+            return;
+        }
         _globalApps = picked;
         UpdateGlobalAppsUi();
         if (!PersistTrafficSettingsFromUi()) return;
@@ -926,13 +952,9 @@ public partial class MainWindow : Window
         string appsMode = NormalizeAppsMode(TagOf(GlobalAppsModeBox) ?? "all");
         if (appsMode is ("include" or "exclude") && _globalApps.Count == 0)
         {
-            Toast.Show(ToastKind.Error, Loc.T("NeedApps"), "");
-            _suppressTrafficUi = true;
-            try { SelectComboTag(GlobalAppsModeBox, "all"); }
-            finally { _suppressTrafficUi = false; }
-            UpdateGlobalAppsUi();
-            UpdateGatewayRadiosVisibility();
-            appsMode = "all";
+            // Do not snap the combo back to "all" — that disabled the pick button.
+            Toast.Show(ToastKind.Info, Loc.T("NeedApps"), "");
+            return false;
         }
 
         s.AppsMode = appsMode;

@@ -82,6 +82,15 @@ public partial class AppPickerWindow : Window
 
     private void OnFilterChanged(object sender, TextChangedEventArgs e) => RebuildList();
 
+    private void OnRowClicked(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    {
+        if (sender is FrameworkElement { DataContext: AppRow row })
+        {
+            row.IsSelected = !row.IsSelected;
+            e.Handled = true;
+        }
+    }
+
     private void OnBrowse(object sender, RoutedEventArgs e)
     {
         var dlg = new Microsoft.Win32.OpenFileDialog

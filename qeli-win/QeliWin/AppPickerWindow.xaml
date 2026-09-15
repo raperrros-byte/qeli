@@ -65,7 +65,9 @@
                             <CheckBox Grid.Column="0"
                                       IsChecked="{Binding IsSelected, Mode=TwoWay}"
                                       VerticalAlignment="Center"/>
-                            <StackPanel Grid.Column="1" Margin="10,0,4,0" VerticalAlignment="Center">
+                            <StackPanel Grid.Column="1" Margin="10,0,4,0" VerticalAlignment="Center"
+                                        Background="Transparent"
+                                        MouseLeftButtonUp="OnRowClicked">
                                 <TextBlock Text="{Binding Name}"
                                            Foreground="{DynamicResource Fg}" FontSize="13"
                                            TextTrimming="CharacterEllipsis"/>
