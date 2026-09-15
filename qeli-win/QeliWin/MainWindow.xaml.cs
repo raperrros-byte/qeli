@@ -665,7 +665,7 @@ public partial class MainWindow : Window
         if (MemLabel != null) MemLabel.Text = Loc.T("StatServerMem");
     }
 
-    // -- global traffic: apps + DNS + proxy apply to every profile ----------------------
+    // -- global traffic: 3 presets + DNS apply to every profile -------------------------
     private List<string> _globalApps = new();
 
     private void InitTrafficModeUi()
@@ -678,11 +678,6 @@ public partial class MainWindow : Window
             GlobalProxyModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("ProxyModeSocks5"), Tag = "socks5" });
             GlobalProxyModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("ProxyModeHttp"), Tag = "http" });
 
-            GlobalAppsModeBox.Items.Clear();
-            GlobalAppsModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("AppsAll"), Tag = "all" });
-            GlobalAppsModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("AppsInclude"), Tag = "include" });
-            GlobalAppsModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("AppsExclude"), Tag = "exclude" });
-
             GlobalDnsModeBox.Items.Clear();
             GlobalDnsModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("DnsTunnel"), Tag = "tunnel" });
             GlobalDnsModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("DnsSystem"), Tag = "system" });
@@ -690,56 +685,20 @@ public partial class MainWindow : Window
 
             var s = AppSettings.Current;
             s.MigrateTrafficMode();
-            if (SeedGlobalRoutingFromProfilesIfNeeded(s))
-                s.Save();
+            // Do not auto-seed apps from profiles — that silently forced WinDivert on everyone.
+            s.ApplyTrafficPreset(s.TrafficPreset);
+            s.Save();
 
             _globalApps = s.Apps.ToList();
-            SelectComboTag(GlobalAppsModeBox, NormalizeAppsMode(s.AppsMode));
+            SelectPresetRadio(s.TrafficPreset);
             SelectComboTag(GlobalDnsModeBox, NormalizeDnsMode(s.DnsMode));
             GlobalDnsServersBox.Text = string.Join(", ", s.DnsServers);
-            ModeTunnelRadio.IsChecked = s.PreferFullTunnel;
-            ModeSplitRadio.IsChecked = !s.PreferFullTunnel;
-            GlobalProxyCheck.IsChecked = s.EnableLocalProxy;
-            ProxyOptsPanel.Visibility = s.EnableLocalProxy ? Visibility.Visible : Visibility.Collapsed;
             GlobalProxyPortBox.Text = ClampProxyPort(s.ProxyPort).ToString();
             SelectProxyModeTag(string.IsNullOrWhiteSpace(s.ProxyMode) ? "mixed" : s.ProxyMode);
-            UpdateGlobalAppsUi();
-            UpdateGatewayRadiosVisibility();
+            UpdatePresetPanels();
             UpdateGlobalDnsUi();
         }
         finally { _suppressTrafficUi = false; }
-    }
-
-    /// <summary>One-shot: if settings have no apps yet, copy include/exclude from the first
-    /// profile that already defines them so upgrading users keep their filter.
-    /// Returns true when settings were mutated.</summary>
-    private bool SeedGlobalRoutingFromProfilesIfNeeded(AppSettings s)
-    {
-        bool changed = false;
-        if (s.Apps.Count == 0)
-        {
-            var donor = _profiles.FirstOrDefault(p =>
-                p.UsesAppFilter && p.Apps.Count > 0);
-            if (donor != null)
-            {
-                s.AppsMode = donor.AppsMode;
-                s.Apps = donor.Apps.ToList();
-                s.PreferFullTunnel = false;
-                changed = true;
-            }
-        }
-        if (s.DnsServers.Count == 0
-            && s.DnsMode.Equals("tunnel", StringComparison.OrdinalIgnoreCase))
-        {
-            var donor = _profiles.FirstOrDefault(p => p.DnsServers.Count > 0);
-            if (donor != null)
-            {
-                s.DnsMode = donor.DnsMode;
-                s.DnsServers = donor.DnsServers.ToList();
-                changed = true;
-            }
-        }
-        return changed;
     }
 
     private void RefreshTrafficModeLabels()
@@ -749,20 +708,11 @@ public partial class MainWindow : Window
         try
         {
             TrafficModeLabel.Text = Loc.T("TrafficMode");
-            ModeTunnelRadio.Content = Loc.T("TrafficModeTunnel");
-            ModeSplitRadio.Content = Loc.T("TrafficModeSplit");
-            if (GatewayWhenAllLabel != null)
-                GatewayWhenAllLabel.Text = Loc.T("TrafficGatewayWhenAll");
-            GlobalProxyCheck.Content = Loc.T("TrafficModeProxy");
+            PresetFullRadio.Content = Loc.T("TrafficPresetFull");
+            PresetAppsRadio.Content = Loc.T("TrafficPresetApps");
+            PresetAppsProxyRadio.Content = Loc.T("TrafficPresetAppsProxy");
             if (GlobalAppsPickBtn != null)
                 GlobalAppsPickBtn.Content = Loc.T("AppsPick");
-
-            string? appsTag = (GlobalAppsModeBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "all";
-            GlobalAppsModeBox.Items.Clear();
-            GlobalAppsModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("AppsAll"), Tag = "all" });
-            GlobalAppsModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("AppsInclude"), Tag = "include" });
-            GlobalAppsModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("AppsExclude"), Tag = "exclude" });
-            SelectComboTag(GlobalAppsModeBox, appsTag);
 
             string? dnsTag = (GlobalDnsModeBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "tunnel";
             GlobalDnsModeBox.Items.Clear();
@@ -777,7 +727,7 @@ public partial class MainWindow : Window
             GlobalProxyModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("ProxyModeSocks5"), Tag = "socks5" });
             GlobalProxyModeBox.Items.Add(new ComboBoxItem { Content = Loc.T("ProxyModeHttp"), Tag = "http" });
             SelectProxyModeTag(tag);
-            UpdateGlobalAppsUi();
+            UpdatePresetPanels();
         }
         finally { _suppressTrafficUi = false; }
     }
@@ -801,11 +751,6 @@ public partial class MainWindow : Window
     private static string? TagOf(ComboBox box) =>
         (box.SelectedItem as ComboBoxItem)?.Tag as string;
 
-    private static string NormalizeAppsMode(string mode) =>
-        mode.Equals("include", StringComparison.OrdinalIgnoreCase) ? "include"
-        : mode.Equals("exclude", StringComparison.OrdinalIgnoreCase) ? "exclude"
-        : "all";
-
     private static string NormalizeDnsMode(string mode) => mode.ToLowerInvariant() switch
     {
         "system" => "system",
@@ -813,26 +758,33 @@ public partial class MainWindow : Window
         _ => "tunnel",
     };
 
-    private void UpdateGlobalAppsUi()
+    private string CurrentPresetFromUi() =>
+        PresetAppsProxyRadio.IsChecked == true ? "apps-proxy"
+        : PresetAppsRadio.IsChecked == true ? "apps"
+        : "full";
+
+    private void SelectPresetRadio(string preset)
     {
-        if (GlobalAppsPickBtn == null) return;
-        string mode = TagOf(GlobalAppsModeBox) ?? "all";
-        bool filter = mode is "include" or "exclude";
-        // Always allow picking; OnGlobalPickApps switches to include when needed.
-        GlobalAppsPickBtn.IsEnabled = true;
-        GlobalAppsPickBtn.Opacity = 1.0;
-        GlobalAppsCountText.Text = filter || _globalApps.Count > 0
-            ? Loc.F("AppsPicked", _globalApps.Count)
-            : "";
+        preset = (preset ?? "full").Trim().ToLowerInvariant();
+        PresetFullRadio.IsChecked = preset == "full";
+        PresetAppsRadio.IsChecked = preset == "apps";
+        PresetAppsProxyRadio.IsChecked = preset == "apps-proxy";
+        if (PresetFullRadio.IsChecked != true
+            && PresetAppsRadio.IsChecked != true
+            && PresetAppsProxyRadio.IsChecked != true)
+            PresetFullRadio.IsChecked = true;
     }
 
-    private void UpdateGatewayRadiosVisibility()
+    private void UpdatePresetPanels()
     {
-        if (GatewayRadiosPanel == null) return;
-        bool allApps = (TagOf(GlobalAppsModeBox) ?? "all") == "all";
-        GatewayRadiosPanel.Visibility = allApps ? Visibility.Visible : Visibility.Collapsed;
-        if (GatewayWhenAllLabel != null)
-            GatewayWhenAllLabel.Visibility = allApps ? Visibility.Visible : Visibility.Collapsed;
+        string preset = CurrentPresetFromUi();
+        bool needsApps = preset is "apps" or "apps-proxy";
+        if (AppsPickPanel != null)
+            AppsPickPanel.Visibility = needsApps ? Visibility.Visible : Visibility.Collapsed;
+        if (ProxyOptsPanel != null)
+            ProxyOptsPanel.Visibility = preset == "apps-proxy" ? Visibility.Visible : Visibility.Collapsed;
+        if (GlobalAppsCountText != null)
+            GlobalAppsCountText.Text = needsApps ? Loc.F("AppsPicked", _globalApps.Count) : "";
     }
 
     private void UpdateGlobalDnsUi()
@@ -849,7 +801,7 @@ public partial class MainWindow : Window
     {
         var s = AppSettings.Current;
         return c.WithGlobalTrafficMode(
-            s.PreferFullTunnel,
+            s.TrafficPreset,
             s.EnableLocalProxy,
             $"127.0.0.1:{ClampProxyPort(s.ProxyPort)}",
             string.IsNullOrWhiteSpace(s.ProxyMode) ? "mixed" : s.ProxyMode.Trim(),
@@ -862,21 +814,9 @@ public partial class MainWindow : Window
     private void OnTrafficModeChanged(object sender, RoutedEventArgs e)
     {
         if (_suppressTrafficUi) return;
-        bool proxy = GlobalProxyCheck.IsChecked == true;
-        ProxyOptsPanel.Visibility = proxy ? Visibility.Visible : Visibility.Collapsed;
-        if (!PersistTrafficSettingsFromUi()) return;
-        _ = ApplyTrafficModeAndMaybeReconnectAsync(userInitiated: true);
-    }
-
-    private void OnGlobalAppsModeChanged(object sender, SelectionChangedEventArgs e)
-    {
-        if (_suppressTrafficUi) return;
-        UpdateGlobalAppsUi();
-        UpdateGatewayRadiosVisibility();
-        string mode = NormalizeAppsMode(TagOf(GlobalAppsModeBox) ?? "all");
-        // Keep include/exclude selected so the pick button stays usable; apply only when
-        // there is at least one app (or the mode is "all").
-        if (mode is ("include" or "exclude") && _globalApps.Count == 0)
+        UpdatePresetPanels();
+        string preset = CurrentPresetFromUi();
+        if (preset is ("apps" or "apps-proxy") && _globalApps.Count == 0)
         {
             Toast.Show(ToastKind.Info, Loc.T("NeedApps"), "");
             return;
@@ -887,15 +827,12 @@ public partial class MainWindow : Window
 
     private void OnGlobalPickApps(object sender, RoutedEventArgs e)
     {
-        var mode = NormalizeAppsMode(TagOf(GlobalAppsModeBox) ?? "all");
-        if (mode is not ("include" or "exclude"))
+        if (CurrentPresetFromUi() == "full")
         {
-            // User clicked pick while still on "all" — switch to include automatically.
             _suppressTrafficUi = true;
-            try { SelectComboTag(GlobalAppsModeBox, "include"); }
+            try { PresetAppsRadio.IsChecked = true; }
             finally { _suppressTrafficUi = false; }
-            UpdateGlobalAppsUi();
-            UpdateGatewayRadiosVisibility();
+            UpdatePresetPanels();
         }
         var picked = AppPickerWindow.Show(this, _globalApps);
         if (picked == null) return;
@@ -905,7 +842,7 @@ public partial class MainWindow : Window
             return;
         }
         _globalApps = picked;
-        UpdateGlobalAppsUi();
+        UpdatePresetPanels();
         if (!PersistTrafficSettingsFromUi()) return;
         _ = ApplyTrafficModeAndMaybeReconnectAsync(userInitiated: true);
     }
@@ -930,7 +867,7 @@ public partial class MainWindow : Window
     private void OnGlobalProxyOptsChanged(object sender, EventArgs e)
     {
         if (_suppressTrafficUi) return;
-        if (GlobalProxyCheck.IsChecked != true) return;
+        if (CurrentPresetFromUi() != "apps-proxy") return;
         if (!PersistTrafficSettingsFromUi()) return;
         _ = ApplyTrafficModeAndMaybeReconnectAsync(userInitiated: true);
     }
@@ -944,27 +881,23 @@ public partial class MainWindow : Window
         }
     }
 
-    /// <summary>Write main-window traffic controls into AppSettings. Returns false if the
-    /// proxy port is invalid or include/exclude has no apps (and shows a toast).</summary>
+    /// <summary>Write main-window traffic controls into AppSettings.</summary>
     private bool PersistTrafficSettingsFromUi()
     {
         var s = AppSettings.Current;
-        string appsMode = NormalizeAppsMode(TagOf(GlobalAppsModeBox) ?? "all");
-        if (appsMode is ("include" or "exclude") && _globalApps.Count == 0)
+        string preset = CurrentPresetFromUi();
+        if (preset is ("apps" or "apps-proxy") && _globalApps.Count == 0)
         {
-            // Do not snap the combo back to "all" — that disabled the pick button.
             Toast.Show(ToastKind.Info, Loc.T("NeedApps"), "");
             return false;
         }
 
-        s.AppsMode = appsMode;
         s.Apps = _globalApps.ToList();
         s.DnsMode = NormalizeDnsMode(TagOf(GlobalDnsModeBox) ?? "tunnel");
         s.DnsServers = GlobalDnsServersBox.Text
             .Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Where(x => x.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        s.PreferFullTunnel = appsMode == "all" && ModeTunnelRadio.IsChecked == true;
-        s.EnableLocalProxy = GlobalProxyCheck.IsChecked == true;
+        s.ApplyTrafficPreset(preset);
         if (s.EnableLocalProxy)
         {
             if (!int.TryParse(GlobalProxyPortBox.Text.Trim(), out int port) || port is < 1 or > 65535)
@@ -976,7 +909,6 @@ public partial class MainWindow : Window
             s.ProxyPort = port;
             s.ProxyMode = TagOf(GlobalProxyModeBox) ?? "mixed";
         }
-        s.MigrateTrafficMode();
         s.Save();
         return true;
     }

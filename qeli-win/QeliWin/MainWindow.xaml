@@ -1,4 +1,4 @@
-﻿<Window x:Class="QeliWin.MainWindow"
+<Window x:Class="QeliWin.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:QeliWin"
@@ -318,80 +318,63 @@
             </Border>
 
             <Border Grid.Row="1" Style="{StaticResource StatTile}" Padding="12,10" Margin="0,10,0,0">
-                <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" MinWidth="200"/>
-                        <ColumnDefinition Width="14"/>
-                        <ColumnDefinition Width="*" MinWidth="200"/>
-                    </Grid.ColumnDefinitions>
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto"/>
-                        <RowDefinition Height="Auto"/>
-                    </Grid.RowDefinitions>
+                <StackPanel>
+                    <TextBlock x:Name="TrafficModeLabel" Text="{local:Loc TrafficMode}"
+                               Style="{StaticResource TileLabel}" Margin="0,0,0,6"/>
+                    <RadioButton x:Name="PresetFullRadio" GroupName="TrafficPreset"
+                                 Content="{local:Loc TrafficPresetFull}"
+                                 Margin="0,0,0,4" Checked="OnTrafficModeChanged"/>
+                    <RadioButton x:Name="PresetAppsRadio" GroupName="TrafficPreset"
+                                 Content="{local:Loc TrafficPresetApps}"
+                                 Margin="0,0,0,4" Checked="OnTrafficModeChanged"/>
+                    <RadioButton x:Name="PresetAppsProxyRadio" GroupName="TrafficPreset"
+                                 Content="{local:Loc TrafficPresetAppsProxy}"
+                                 Margin="0,0,0,8" Checked="OnTrafficModeChanged"/>
 
-                    <TextBlock Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="3"
-                               x:Name="TrafficModeLabel" Text="{local:Loc TrafficMode}"
-                               Style="{StaticResource TileLabel}" Margin="0,0,0,8"/>
+                    <Grid x:Name="AppsPickPanel" Margin="0,0,0,8" Visibility="Collapsed">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="8"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock x:Name="GlobalAppsCountText" Grid.Column="0"
+                                   Style="{StaticResource TileSub}" VerticalAlignment="Center"/>
+                        <Button x:Name="GlobalAppsPickBtn" Grid.Column="2"
+                                Content="{local:Loc AppsPick}" Click="OnGlobalPickApps"
+                                Padding="10,5" MinWidth="120"/>
+                    </Grid>
 
-                    <StackPanel Grid.Row="1" Grid.Column="0">
-                        <TextBlock Text="{local:Loc FieldApps}" Style="{StaticResource TileLabel}" Margin="0,0,0,4"/>
-                        <ComboBox x:Name="GlobalAppsModeBox" Margin="0,0,0,6"
-                                  SelectionChanged="OnGlobalAppsModeChanged"/>
-                        <Grid Margin="0,0,0,4">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*"/>
-                                <ColumnDefinition Width="8"/>
-                                <ColumnDefinition Width="Auto"/>
-                            </Grid.ColumnDefinitions>
-                            <TextBlock x:Name="GlobalAppsCountText" Grid.Column="0"
-                                       Style="{StaticResource TileSub}" VerticalAlignment="Center"/>
-                            <Button x:Name="GlobalAppsPickBtn" Grid.Column="2"
-                                    Content="{local:Loc AppsPick}" Click="OnGlobalPickApps"
-                                    Padding="10,5" MinWidth="120"/>
-                        </Grid>
-                        <TextBlock x:Name="GatewayWhenAllLabel" Text="{local:Loc TrafficGatewayWhenAll}"
-                                   Style="{StaticResource TileLabel}" Margin="0,6,0,4"/>
-                        <StackPanel x:Name="GatewayRadiosPanel" Orientation="Horizontal">
-                            <RadioButton x:Name="ModeTunnelRadio" GroupName="TrafficMode"
-                                         Content="{local:Loc TrafficModeTunnel}"
-                                         VerticalAlignment="Center" Margin="0,0,14,0"
-                                         Checked="OnTrafficModeChanged"/>
-                            <RadioButton x:Name="ModeSplitRadio" GroupName="TrafficMode"
-                                         Content="{local:Loc TrafficModeSplit}"
-                                         VerticalAlignment="Center"
-                                         Checked="OnTrafficModeChanged"/>
-                        </StackPanel>
-                    </StackPanel>
+                    <Grid x:Name="ProxyOptsPanel" Margin="0,0,0,8" Visibility="Collapsed">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="70"/>
+                            <ColumnDefinition Width="10"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Grid.Column="0" Text="{local:Loc FieldProxyPort}"
+                                   VerticalAlignment="Center" Margin="0,0,6,0"
+                                   Foreground="{DynamicResource FgDim}" FontSize="12"/>
+                        <TextBox x:Name="GlobalProxyPortBox" Grid.Column="1"
+                                 VerticalContentAlignment="Center" Padding="6,3"
+                                 LostFocus="OnGlobalProxyOptsChanged" KeyDown="OnGlobalProxyPortKeyDown"/>
+                        <ComboBox x:Name="GlobalProxyModeBox" Grid.Column="3"
+                                  SelectionChanged="OnGlobalProxyOptsChanged"/>
+                    </Grid>
 
-                    <StackPanel Grid.Row="1" Grid.Column="2">
-                        <TextBlock Text="{local:Loc FieldDnsMode}" Style="{StaticResource TileLabel}" Margin="0,0,0,4"/>
-                        <ComboBox x:Name="GlobalDnsModeBox" Margin="0,0,0,6"
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="140"/>
+                            <ColumnDefinition Width="8"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <ComboBox x:Name="GlobalDnsModeBox" Grid.Column="0"
                                   SelectionChanged="OnGlobalDnsChanged"/>
-                        <TextBox x:Name="GlobalDnsServersBox" Margin="0,0,0,10"
+                        <TextBox x:Name="GlobalDnsServersBox" Grid.Column="2"
                                  VerticalContentAlignment="Center" Padding="6,4"
                                  ToolTip="{local:Loc FieldDns}"
                                  LostFocus="OnGlobalDnsChanged" KeyDown="OnGlobalDnsServersKeyDown"/>
-                        <CheckBox x:Name="GlobalProxyCheck" Content="{local:Loc TrafficModeProxy}"
-                                  VerticalAlignment="Center"
-                                  Checked="OnTrafficModeChanged" Unchecked="OnTrafficModeChanged"/>
-                        <Grid x:Name="ProxyOptsPanel" Margin="0,8,0,0" Visibility="Collapsed">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto"/>
-                                <ColumnDefinition Width="70"/>
-                                <ColumnDefinition Width="10"/>
-                                <ColumnDefinition Width="*"/>
-                            </Grid.ColumnDefinitions>
-                            <TextBlock Grid.Column="0" Text="{local:Loc FieldProxyPort}"
-                                       VerticalAlignment="Center" Margin="0,0,6,0"
-                                       Foreground="{DynamicResource FgDim}" FontSize="12"/>
-                            <TextBox x:Name="GlobalProxyPortBox" Grid.Column="1"
-                                     VerticalContentAlignment="Center" Padding="6,3"
-                                     LostFocus="OnGlobalProxyOptsChanged" KeyDown="OnGlobalProxyPortKeyDown"/>
-                            <ComboBox x:Name="GlobalProxyModeBox" Grid.Column="3"
-                                      SelectionChanged="OnGlobalProxyOptsChanged"/>
-                        </Grid>
-                    </StackPanel>
-                </Grid>
+                    </Grid>
+                </StackPanel>
             </Border>
 
             <Border Grid.Row="2" Style="{StaticResource StatTile}" Padding="12,10" Margin="0,10,0,0">

@@ -546,22 +546,47 @@ public sealed class VpnConfig : INotifyPropertyChanged
         // gone, so carrying the marker would reject a profile that is now fine.
     };
 
-    /// <summary>Apply main-window traffic defaults to a profile: proxy, full-tunnel preference,
-    /// global apps filter, and DNS. Proxy can run together with WinDivert include/exclude.</summary>
+    /// <summary>Apply main-window traffic preset to a profile.
+    /// Presets: full (gateway), apps (WinDivert include), apps-proxy (include + SOCKS/HTTP).</summary>
     public VpnConfig WithGlobalTrafficMode(
-        bool preferFullTunnel, bool proxyEnabled, string proxyListen, string proxyMode,
+        string trafficPreset, bool proxyEnabled, string proxyListen, string proxyMode,
         string appsMode, IReadOnlyList<string> apps,
         string dnsMode, IReadOnlyList<string> dnsServers)
     {
-        string mode = (appsMode ?? "all").Trim().ToLowerInvariant();
-        if (mode is not ("include" or "exclude")) mode = "all";
+        string preset = (trafficPreset ?? "full").Trim().ToLowerInvariant();
+        if (preset is not ("full" or "apps" or "apps-proxy")) preset = "full";
+
         var appList = (apps ?? Array.Empty<string>())
             .Select(a => a.Trim()).Where(a => a.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
-        if (mode is ("include" or "exclude") && appList.Count == 0)
-            mode = "all"; // invalid empty filter → widen rather than fail connect
-        bool usesApps = mode is "include" or "exclude";
-        bool fullTunnel = preferFullTunnel && !usesApps;
+
+        bool fullTunnel;
+        bool proxy;
+        string mode;
+        switch (preset)
+        {
+            case "apps":
+                fullTunnel = false;
+                proxy = false;
+                mode = appList.Count > 0 ? "include" : "all";
+                if (mode == "all") fullTunnel = true; // no apps yet → safe full tunnel
+                break;
+            case "apps-proxy":
+                fullTunnel = false;
+                proxy = true;
+                mode = appList.Count > 0 ? "include" : "all";
+                // Proxy without WinDivert still works on Wintun split (bind+pin).
+                break;
+            default:
+                fullTunnel = true;
+                proxy = false;
+                mode = "all";
+                appList = new List<string>();
+                break;
+        }
+        // Explicit proxyEnabled only gates listen when preset already wants proxy.
+        if (!proxy) proxyEnabled = false;
+        else proxyEnabled = true;
 
         string dns = (dnsMode ?? "tunnel").Trim().ToLowerInvariant();
         if (dns is not ("tunnel" or "system" or "off")) dns = "tunnel";
@@ -587,6 +612,19 @@ public sealed class VpnConfig : INotifyPropertyChanged
             appsMode: mode,
             apps: appList,
             dnsMode: dns);
+    }
+
+    /// <summary>Legacy overload kept for callers that still pass preferFullTunnel.</summary>
+    public VpnConfig WithGlobalTrafficMode(
+        bool preferFullTunnel, bool proxyEnabled, string proxyListen, string proxyMode,
+        string appsMode, IReadOnlyList<string> apps,
+        string dnsMode, IReadOnlyList<string> dnsServers)
+    {
+        string preset = preferFullTunnel && !proxyEnabled ? "full"
+            : proxyEnabled ? "apps-proxy"
+            : "apps";
+        return WithGlobalTrafficMode(preset, proxyEnabled, proxyListen, proxyMode,
+            appsMode, apps, dnsMode, dnsServers);
     }
     /// <summary>Bracket-wrap a bare IPv6 literal for a URI authority (RFC 3986:
     /// <c>qeli://user@[2001:db8::1]:443</c>); IPv4 / hostnames pass through unchanged.</summary>
